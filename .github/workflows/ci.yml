@@ -20,6 +20,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # 365 needs a private repo; public caps at 90 and clamps silently.
+  ARTIFACT_RETENTION_DAYS: ${{ github.event_name == 'pull_request' && 14 || 365 }}
 
 jobs:
   changes:
@@ -243,11 +245,7 @@ jobs:
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.checksum }}
           if-no-files-found: error
-          # Release artifacts keep for a year; a pull request's are scratch
-          # and keep for 30 days. 365 is only allowed because this repository
-          # is private — public repos cap artifact retention at 90 days, and a
-          # value above the repo/org maximum is silently clamped, not rejected.
-          retention-days: ${{ github.event_name == 'pull_request' && 30 || 365 }}
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
   # Per-arch Docker build on a native runner (no qemu). The binary is taken
   # from the build-artifact job's tarball rather than recompiled inside the
