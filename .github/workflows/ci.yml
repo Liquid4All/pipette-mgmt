@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Inert until a release branch exists: a push runs the workflow file as
+    # it stands on the pushed branch.
+    branches: [main, 'release/**']
   # Unfiltered on purpose. A `branches:` filter here matches the pull request's
   # *base*, so restricting it to `main` would run CI only on the bottom of a
   # stacked pull request and leave every layer above it unbuilt until the whole
@@ -11,7 +13,9 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only pull requests supersede each other. Pushes key on run_id, so a second
+  # push to a release branch cannot cancel an in-flight publish.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -54,13 +58,24 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # ci/version.sh needs the history behind the branch point
       - name: Compute release metadata
         id: version
         run: |
-          VERSION="$(date -u +'%Y.%m.%d')-$(git rev-parse --short HEAD)"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Assign first: `echo "v=$(cmd)"` succeeds even when cmd fails, and
+          # the default shell is `bash -e` with no pipefail, so echoing the
+          # substitutions straight into tee would swallow the failure.
+          set -euo pipefail
+          version="$(ci/version.sh version)"
+          image="$(ci/version.sh image)"
+          {
+            echo "version=${version}"
+            echo "image=${image}"
+          } | tee -a "$GITHUB_OUTPUT"
 
   rust-lint:
     needs: [changes]
@@ -200,11 +215,15 @@ jobs:
 
   # Per-arch Docker build on a native runner (no qemu). The binary is taken
   # from the build-artifact job's tarball rather than recompiled inside the
-  # Dockerfile, so this step is essentially `apt-get install + COPY`. The
-  # image is built to prove the Dockerfile still works, but never published:
-  # this repository does not release. Publishing happens upstream.
+  # Dockerfile, so this step is essentially `apt-get install + COPY`.
+  #
+  # Each arch pushes a digest with no tag; docker-image-publish joins them.
+  # Tagging here would race the two runners against each other.
   docker-image-build:
     needs: [release-metadata, build-artifact, attribution]
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -239,8 +258,14 @@ jobs:
           chmod +x "target/${TARGET}/release/pipette-mgmt"
           file "target/${TARGET}/release/pipette-mgmt"
       - uses: docker/setup-buildx-action@v4
-      # No registry login: nothing from this repository is pushed anywhere.
-      - name: Build image (never pushed)
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image (pushed by digest, except on pull requests)
         id: build
         uses: docker/build-push-action@v7
         env:
@@ -251,8 +276,13 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             BIN=target/${{ matrix.target }}/release/pipette-mgmt
-          # Build only. Never `push=true`, on any branch or event.
-          outputs: type=cacheonly
+          # A pull request proves the Dockerfile still builds; only main and
+          # release branches push. Digest-only push needs the `outputs` form,
+          # so the whole exporter switches rather than a `push:` flag.
+          outputs: >-
+            ${{ github.event_name == 'pull_request'
+              && 'type=cacheonly'
+              || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.release-metadata.outputs.image) }}
           # Layer cache to GitHub Actions cache. The wrapper image only has
           # one heavy layer (apt-get install in the runtime stage), so the
           # cache is small. Per-arch scope so amd64 and arm64 don't invalidate
@@ -261,6 +291,57 @@ jobs:
             type=gha,scope=docker-${{ matrix.arch }}-${{ github.ref_name }}
             type=gha,scope=docker-${{ matrix.arch }}-main
           cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}-${{ github.ref_name }}
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Filename is the digest; contents unused.
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v6
+        if: github.event_name != 'pull_request'
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-image-publish:
+    if: github.event_name != 'pull_request'
+    needs: [release-metadata, docker-image-build]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: docker-digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.release-metadata.outputs.image }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          # Read it back so a broken manifest fails here, not at pull time.
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+            break
+          done
 
   # Single aggregate gate so the default branch can require one check instead of
   # naming each job. Without it, branch protection has to list contexts by hand,
@@ -279,6 +360,7 @@ jobs:
       - python-check
       - build-artifact
       - docker-image-build
+      - docker-image-publish
     if: always()
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
@@ -296,3 +378,39 @@ jobs:
               exit 1
               ;;
           esac
+
+  # Main pushes the image; only a release branch also cuts a release.
+  github-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
+    needs: [release-metadata, build-complete]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Two pushes to one release branch must not race to create the same tag.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          # Only the shipped tarballs; the digest artifacts are build plumbing.
+          pattern: pipette-mgmt-*
+          merge-multiple: true
+          path: dist
+      - name: Create GitHub release
+        # Pinned: the only job here holding a repo-write token.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.release-metadata.outputs.version }}
+          name: ${{ needs.release-metadata.outputs.version }}
+          generate_release_notes: true
+          body: |
+            ### Container image
+
+            ```
+            docker pull ${{ needs.release-metadata.outputs.image }}:${{ needs.release-metadata.outputs.version }}
+            ```
+
+            Multi-arch (`linux/amd64`, `linux/arm64`).
+            Per-target binaries and checksums are attached below.
+          files: dist/*
