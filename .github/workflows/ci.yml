@@ -243,7 +243,11 @@ jobs:
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.checksum }}
           if-no-files-found: error
-          retention-days: 14
+          # Release artifacts keep for a year; a pull request's are scratch
+          # and keep for 30 days. 365 is only allowed because this repository
+          # is private — public repos cap artifact retention at 90 days, and a
+          # value above the repo/org maximum is silently clamped, not rejected.
+          retention-days: ${{ github.event_name == 'pull_request' && 30 || 365 }}
 
   # Per-arch Docker build on a native runner (no qemu). The binary is taken
   # from the build-artifact job's tarball rather than recompiled inside the
@@ -367,14 +371,18 @@ jobs:
           cd /tmp/digests
           # `tags` is space-separated bare tag names; expand each to -t <ref>.
           TAG_ARGS=()
+          TAG_COUNT=0
           for tag in ${TAGS}; do
             TAG_ARGS+=(-t "${IMAGE}:${tag}")
+            TAG_COUNT=$((TAG_COUNT + 1))
           done
           SOURCES=()
           for digest in *; do
             SOURCES+=("${IMAGE}@sha256:${digest}")
           done
-          echo "joining ${#SOURCES[@]} arch digests into ${#TAG_ARGS[@]} tag(s)"
+          # Count tags, not array slots: each tag contributes two entries to
+          # TAG_ARGS (`-t` and the ref), so ${#TAG_ARGS[@]} reads double.
+          echo "joining ${#SOURCES[@]} arch digests into ${TAG_COUNT} tag(s)"
           docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
       - name: Inspect published manifest
         run: |
