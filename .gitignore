@@ -1,0 +1,7 @@
+/target
+/config.toml
+.ipynb_checkpoints
+__pycache__/
+.DS_Store
+/data/
+/sample_data/

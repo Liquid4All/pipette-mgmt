@@ -1,0 +1,38 @@
+# Configuration for `cargo about generate`, which produces
+# THIRD-PARTY-LICENSES.md — the attribution notice that ships with the
+# release binary. See docs/third-party-attribution.md for the workflow.
+
+# The release artifact is the Linux binary packaged by
+# docker/pipette-mgmt.Dockerfile, for both architectures build.sh can target.
+# Attribution covers exactly what is linked into that binary, so macOS-only
+# and Windows-only dependencies are out of scope.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Build- and dev-dependencies are not linked into the distributed binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Skip workspace members that are not published; pipette-mgmt itself is the
+# work being licensed, not a third-party notice.
+private = { ignore = true }
+
+# Order is significant: for a crate offering a choice (`MIT OR Apache-2.0`),
+# the first entry that matches is the license taken, so Apache-2.0 is listed
+# ahead of MIT to elect the option carrying an explicit patent grant.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "MPL-2.0",
+    "0BSD",
+    "MIT-0",
+    "Unlicense",
+]

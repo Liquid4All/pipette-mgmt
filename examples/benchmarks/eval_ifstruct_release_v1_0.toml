@@ -1,0 +1,4 @@
+benchmark_type = "eval"
+parameter_eval_id = "ifstruct"
+parameter_dataset_name = "release_v1_0"
+parameter_max_tokens = 8192

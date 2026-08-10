@@ -1,0 +1,5 @@
+benchmark_type          = "vl_max_memory"
+parameter_image_width   = 512
+parameter_image_height  = 512
+parameter_text_tokens   = 1024
+parameter_num_images    = 1

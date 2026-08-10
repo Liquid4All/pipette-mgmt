@@ -1,0 +1,3 @@
+benchmark_type = "end_to_end_latency"
+parameter_prefill_tokens = 512
+parameter_decode_tokens = 256

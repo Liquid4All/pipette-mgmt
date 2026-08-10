@@ -1,0 +1,73 @@
+[package]
+name = "pipette-mgmt"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+# Distributed as a container image and release tarball rather than a crates.io
+# crate. This also marks the package private to `cargo about`, which then
+# reports third-party notices only.
+publish = false
+
+[[bin]]
+name = "pipette-mgmt"
+path = "src/bin/pipette-mgmt.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["json"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+hex = "0.4"
+parquet = "59"
+arrow = { version = "59", default-features = false, features = ["json"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+anyhow = "1"
+thiserror = "2"
+email_address = "0.2"
+tabled = "0.20"
+async-trait = "0.1"
+bytes = "1"
+flate2 = "1"
+object_store = { version = "0.14", features = ["aws"] }
+aws-config = "1"
+# The default feature set adds `rustls`, which selects the SDK's legacy TLS
+# backend and pulls a second, parallel HTTP stack (hyper 0.14, h2 0.3, rustls
+# 0.21) alongside the one `default-https-client` already provides. Listing the
+# defaults explicitly minus `rustls` leaves a single TLS stack.
+aws-sdk-s3 = { version = "1.93", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+futures = "0.3"
+libc = "0.2"
+derive_more = { version = "2", features = ["display", "from", "as_ref", "into"] }
+dirs = "6.0.0"
+strum = { version = "0.28", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+rstest = { version = "0.26.1", default-features = false }
+# `test-util` here (dev-deps only) keeps the mock machinery out of release builds.
+# The feature set mirrors the one above so test builds resolve the same single
+# TLS stack; `test-util` itself still requires the hyper 0.14 connector.
+aws-sdk-s3 = { version = "1.93", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+    "test-util",
+] }
+aws-smithy-mocks = "0.2"

@@ -1,0 +1,50 @@
+# Required: URL of the upstream evals server for scoring eval-type benchmarks.
+evals_server_url = "http://localhost:8080"
+
+# Address to bind the HTTP server to.
+# Default: "0.0.0.0:3000"
+# listen_addr = "127.0.0.1:3000"
+
+# Maximum number of recent month partitions to scan when reading job metrics.
+# Default: 3
+# warehouse_read_months = 3
+
+# Maximum rows per Parquet part file in warehouse partitions.
+# Default: 10000
+# warehouse_max_rows_per_part = 10000
+
+# How many seconds to cache the benchmark catalog before re-reading from disk.
+# Default: 180
+# catalog_ttl_secs = 180
+
+# Outbound HTTP client request timeout in seconds (scoring/evals server calls).
+# Default: 600
+# http_timeout_secs = 600
+
+# Storage backend configuration.
+# Default: local_fs with data_dir = "./data"
+[storage]
+backend = "local_fs"
+data_dir = "./sample_data"
+
+# To use S3 instead:
+# [storage]
+# backend = "s3"
+# bucket = "my-bucket"
+# prefix = "v1/"
+# region = "us-east-1"
+# endpoint = "https://..."  # optional, for MinIO/R2/custom S3
+# Credentials via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars or IAM role.
+
+# Required: storage for client auth data (keys, identities).
+# Use a separate private bucket to isolate auth data from
+# benchmark/warehouse data.
+[auth_storage]
+backend = "local_fs"
+data_dir = "./sample_data"
+
+# To use S3 instead:
+# [auth_storage]
+# backend = "s3"
+# bucket = "my-auth-bucket"
+# region = "us-east-1"

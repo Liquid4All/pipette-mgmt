@@ -1,0 +1,2 @@
+benchmark_type = "max_memory_usage"
+parameter_prefill_tokens = 256

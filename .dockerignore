@@ -1,0 +1,16 @@
+# Exclude the cargo target tree to keep the build context small, but let the
+# release binary through — the wrapper Dockerfile copies it from
+# target/<target-triple>/release/pipette-mgmt (or target/release/...).
+target/*
+!target/release
+target/release/*
+!target/release/pipette-mgmt
+!target/*-unknown-linux-*
+target/*-unknown-linux-*/*
+!target/*-unknown-linux-*/release
+target/*-unknown-linux-*/release/*
+!target/*-unknown-linux-*/release/pipette-mgmt
+
+.git
+.gitignore
+.github

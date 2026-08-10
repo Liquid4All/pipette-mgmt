@@ -1,0 +1,26 @@
+[project]
+name = "pipette-mgmt-notebooks"
+version = "0.1.0"
+description = "Notebook environment for exploring pipette-mgmt warehouse parquet"
+requires-python = ">=3.12"
+dependencies = [
+    "jupyter>=1.1.1",
+    "pandas>=2.2.3",
+    "pyarrow>=21.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [
+    ".ipynb_checkpoints",
+    ".venv",
+    ".uv-cache",
+]

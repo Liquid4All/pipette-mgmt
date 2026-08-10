@@ -1,0 +1,298 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Unfiltered on purpose. A `branches:` filter here matches the pull request's
+  # *base*, so restricting it to `main` would run CI only on the bottom of a
+  # stacked pull request and leave every layer above it unbuilt until the whole
+  # stack merged. The `build-complete` gate is required on `main`, and it can
+  # only gate what it runs on.
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  changes:
+    # Detect what changed so PRs that don't touch Rust/Python code can skip
+    # the expensive compile jobs. Push events (main) always run everything
+    # so releases keep building regardless of which paths changed.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'about.toml'
+              - 'about.hbs'
+              - 'LICENSE'
+              - 'NOTICE'
+              - 'THIRD-PARTY-LICENSES.md'
+              - 'docker/**'
+              - '.github/**'
+            python:
+              - '**/*.py'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/**'
+
+  release-metadata:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compute release metadata
+        id: version
+        run: |
+          VERSION="$(date -u +'%Y.%m.%d')-$(git rev-parse --short HEAD)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  rust-lint:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # THIRD-PARTY-LICENSES.md ships inside the release tarball and the container
+  # image, so a copy that lags the dependency graph publishes incomplete
+  # attribution. Regenerate and require the committed file to match.
+  attribution:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      # This job compiles a third-party tool from source rather than first-party
+      # code, so the workflow-wide `-D warnings` does not apply: a new lint in a
+      # future stable release would turn a warning somewhere in cargo-about's
+      # dependency tree into a failed attribution check.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: attribution
+      - name: Install cargo-about
+        # The `cli` feature gates the binary; without it `cargo install`
+        # silently installs nothing. The version is pinned because the
+        # generator's output must match the committed file byte for byte, and a
+        # release that alters template context or license-text selection would
+        # fail the comparison on an unrelated change.
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Regenerate and compare
+        run: |
+          set -euo pipefail
+          cargo about generate about.hbs -o /tmp/THIRD-PARTY-LICENSES.md
+          if ! diff -u THIRD-PARTY-LICENSES.md /tmp/THIRD-PARTY-LICENSES.md; then
+            echo "::error::THIRD-PARTY-LICENSES.md is stale. Regenerate it with 'cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md' and commit the result. See docs/third-party-attribution.md."
+            exit 1
+          fi
+
+  rust-test:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - run: cargo test --locked
+
+  python-check:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync Python dev environment
+        run: uv sync --group dev
+      - name: Ruff check
+        run: uv run ruff check examples
+      - name: Ruff format
+        run: uv run ruff format --check examples
+
+  build-artifact:
+    needs: [release-metadata, changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bin-${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package tarball
+        id: pkg
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          NAME="pipette-mgmt-${VERSION}-${TARGET}"
+          STAGE="dist/${NAME}"
+          mkdir -p "${STAGE}"
+          cp "target/${TARGET}/release/pipette-mgmt" "${STAGE}/"
+          strip "${STAGE}/pipette-mgmt" || true
+          cp README.md "${STAGE}/"
+          # The tarball redistributes first-party and third-party code together,
+          # so it carries the terms covering each: the project's own license and
+          # NOTICE, which Apache-2.0 section 4 requires travel with any
+          # distribution, plus the notices the dependency licenses require
+          # alongside their code.
+          cp LICENSE NOTICE THIRD-PARTY-LICENSES.md "${STAGE}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "tarball=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pipette-mgmt-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # Per-arch Docker build on a native runner (no qemu). The binary is taken
+  # from the build-artifact job's tarball rather than recompiled inside the
+  # Dockerfile, so this step is essentially `apt-get install + COPY`. The
+  # image is built to prove the Dockerfile still works, but never published:
+  # this repository does not release. Publishing happens upstream.
+  docker-image-build:
+    needs: [release-metadata, build-artifact, attribution]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: blacksmith-2vcpu-ubuntu-2404
+            platform: linux/amd64
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
+            platform: linux/arm64
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download prebuilt binary artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: pipette-mgmt-${{ matrix.target }}
+          path: artifact
+      - name: Stage binary into target/<triple>/release
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          NAME="pipette-mgmt-${RELEASE_VERSION}-${TARGET}"
+          tar -C artifact -xzf "artifact/${NAME}.tar.gz"
+          mkdir -p "target/${TARGET}/release"
+          cp "artifact/${NAME}/pipette-mgmt" "target/${TARGET}/release/pipette-mgmt"
+          chmod +x "target/${TARGET}/release/pipette-mgmt"
+          file "target/${TARGET}/release/pipette-mgmt"
+      - uses: docker/setup-buildx-action@v4
+      # No registry login: nothing from this repository is pushed anywhere.
+      - name: Build image (never pushed)
+        id: build
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          file: docker/pipette-mgmt.Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BIN=target/${{ matrix.target }}/release/pipette-mgmt
+          # Build only. Never `push=true`, on any branch or event.
+          outputs: type=cacheonly
+          # Layer cache to GitHub Actions cache. The wrapper image only has
+          # one heavy layer (apt-get install in the runtime stage), so the
+          # cache is small. Per-arch scope so amd64 and arm64 don't invalidate
+          # each other; PRs also fall back to main's scope.
+          cache-from: |
+            type=gha,scope=docker-${{ matrix.arch }}-${{ github.ref_name }}
+            type=gha,scope=docker-${{ matrix.arch }}-main
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}-${{ github.ref_name }}
+
+  # Single aggregate gate so the default branch can require one check instead of
+  # naming each job. Without it, branch protection has to list contexts by hand,
+  # and a job added later is unprotected until someone remembers to add it.
+  build-complete:
+    # `changes` and `release-metadata` are included deliberately: a job whose
+    # `needs` failed is reported as "skipped", and the check below tolerates
+    # skips. Depending on them directly means a failure in the path filter or
+    # version computation fails this gate instead of passing as a skip.
+    needs:
+      - changes
+      - release-metadata
+      - rust-lint
+      - attribution
+      - rust-test
+      - python-check
+      - build-artifact
+      - docker-image-build
+    if: always()
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Verify all upstream jobs succeeded
+        run: |
+          set -euo pipefail
+          # Treat 'skipped' as OK: the compile jobs are gated by path filters on
+          # PRs that touch neither Rust nor Python. Only real failures and
+          # cancellations should fail the gate.
+          result='${{ join(needs.*.result, ',') }}'
+          echo "upstream results: ${result}"
+          case "${result}" in
+            *failure*|*cancelled*)
+              echo "::error::one or more upstream jobs did not succeed"
+              exit 1
+              ;;
+          esac

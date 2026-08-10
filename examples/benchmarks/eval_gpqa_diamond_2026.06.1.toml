@@ -1,0 +1,4 @@
+benchmark_type = "eval"
+parameter_eval_id = "gpqa_diamond"
+parameter_dataset_name = "2026.06.1"
+parameter_max_tokens = 8192

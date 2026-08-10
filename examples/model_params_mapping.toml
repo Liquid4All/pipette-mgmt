@@ -1,0 +1,152 @@
+# Model catalog: maps a normalized model_name to its parameter count(s) in
+# millions. Loaded by `pipette-mgmt serve` and `pipette-mgmt score` from
+# `{data_dir}/model_params_mapping.toml` for local-fs or `{prefix}/model_params_mapping.toml` in the
+# S3 bucket. The scorer uses this to set the canonical
+# `model_params_total_millions` and `model_params_active_millions` columns on
+# every warehouse row.
+#
+# Counts are in millions. Integer entries are shorthand for dense models:
+# total = active = value.
+#
+# For MoE / selective-activation architectures (Granite MoE, Gemma E*B /
+# 3n, LFM2 A1B), spell both with the inline-table form:
+#
+#   "DenseModel-X" = 1234                                  # total = active = 1234
+#   "MoE-Model"    = { total = 8000, active = 1000 }       # MoE / selective activation
+#
+# `total` is the primary model-weight memory footprint proxy. Runtime
+# RAM/VRAM also depends on dtype/quantization, KV cache, context length,
+# batching, tensor parallelism, and serving implementation. `active` is
+# the parameter path used as the prefill/decode throughput proxy.
+#
+# Counts should be exact tensor / state-dict parameter counts rounded or
+# truncated to the nearest whole million, unless the upstream card only
+# provides a rounded marketing count. Marketing labels like "7B" or "8B"
+# are not assumed to be exact.
+#
+# For VLMs, `total` includes the language model, vision encoder, and any
+# projectors. `active` means the text-token decode path unless explicitly
+# stated otherwise — image prefill may activate additional vision encoder
+# parameters beyond the text LM path.
+#
+# Validation: total > 0, active > 0, active <= total. Bad values are
+# rejected at load time.
+#
+# Keys are the *normalized* model name — no `org/` prefix, no
+# `:file.gguf` suffix, no `-GGUF` suffix. Submissions go through the
+# same normalization before lookup.
+#
+# Operators: copy this file to `data/model_params_mapping.toml` (or
+# `s3://<bucket>/<prefix>/model_params_mapping.toml`) and add entries as new models
+# come online. A missing model_params_mapping.toml is not an error — the scorer just
+# trusts whatever values the client sent.
+#
+# Every entry below is anchored to the upstream HuggingFace model card.
+
+# LiquidAI
+"LFM2-350M" = 354
+"LFM2-700M" = 742
+"LFM2-1.2B" = 1170
+"LFM2-2.6B" = 2569
+"LFM2-2.6B-Exp" = 2569
+"LFM2-8B-A1B" = { total = 8340, active = 1500 }       # MoE: card states 8.3B total, 1.5B active
+"LFM2.5-8B-A1B" = { total = 8340, active = 1500 }     # MoE: 8B total, 1.5B active
+"LFM2.5-230M" = 230                                    # dense: card states 229,693,184 params (BF16 safetensors)
+"LFM2.5-350M" = 350
+"LFM2.5-1.2B-Instruct" = 1170
+"LFM2.5-VL-450M" = 450                                 # 350M LM + 86M SigLIP2
+
+# Qwen
+"Qwen3-0.6B" = 752
+"Qwen3-1.7B" = 2032
+"Qwen3-4B" = 4000
+"Qwen3-8B" = 8191
+"Qwen3.5-0.8B" = 873
+"Qwen3.5-2B" = 2274
+"Qwen3.5-4B" = 4660
+"Qwen3.5-9B" = 9653
+"Qwen2.5-0.5B-Instruct" = 494
+"Qwen2.5-1.5B-Instruct" = 1544
+"Qwen2.5-3B-Instruct" = 3086
+"Qwen2.5-7B-Instruct" = 7616
+
+# IBM Granite
+"granite-4.0-h-350m" = 340
+"granite-4.0-350m" = 352
+"granite-4.0-h-1b" = 1462
+"granite-4.0-h-micro" = 3191
+"granite-4.0-h-tiny" = { total = 6939, active = 1000 }     # MoE: card states ~7B total / ~1B activated
+"granite-4.0-h-small" = { total = 32000, active = 9000 }   # MoE: 10/72 experts
+"granite-4.1-8b" = 8792
+
+# Google Gemma
+"gemma-3-270m-it" = 270
+"gemma-3-1b-it" = 1000
+"gemma-3-4b-it" = 4300
+"gemma-3-12b-it" = 12000
+# Gemma 3n / Gemma 4 use selective activation (MatFormer / Per-Layer
+# Embeddings). The "E*B" name labels the *effective* (active) param
+# count rounded down for marketing; the raw total weight count is
+# higher. Cards explicitly state both for Gemma 4: E2B is "2.3B
+# effective (5.1B with embeddings)" and E4B is "4.5B effective (8B
+# with embeddings)".
+"gemma-3n-E4B-it" = { total = 8000, active = 4000 }
+"gemma-4-E2B-it" = { total = 5123, active = 2300 }
+"gemma-4-E4B-it" = { total = 7996, active = 4500 }
+
+# Meta Llama
+"Llama-3.2-1B-Instruct" = 1236
+"Llama-3.2-3B-Instruct" = 3213
+"Meta-Llama-3.1-8B-Instruct" = 8030
+"Llama-3.1-8B-Instruct" = 8030
+"llama-3.2-1b" = 1236
+"llama-3.2-3b" = 3213
+
+# HuggingFace SmolLM
+"SmolLM2-360M-Instruct" = 360
+"SmolLM2-1.7B-Instruct" = 1700
+"SmolLM3-3B" = 3075
+
+# Microsoft Phi
+"Phi-4-mini-instruct" = 3800
+"Phi-3-mini-4k-instruct" = 3821
+
+# Mistral (3.4B LM + 0.4B vision encoder = 3.8B)
+"Ministral-3-3B-Instruct-2512" = 3800
+"Ministral-3-3B-Reasoning-2512" = 3800
+
+# DeepSeek
+"DeepSeek-R1-Distill-Qwen-7B" = 7616
+
+# Stability
+"stablelm-zephyr-3b" = 2795
+
+# Zyphra
+"ZAYA1-8B" = { total = 8840, active = 760 }                # MoE: card states 760M active; safetensors total is ~8.84B
+
+# TinyLlama
+"TinyLlama-1.1B-Chat-v1.0" = 1100
+
+# Nous Research
+"Hermes-2-Pro-Mistral-7B" = 7242
+
+# Cohere (CohereForAI redirects to CohereLabs on HF)
+"aya-23-8B" = 8028
+"aya-expanse-8b" = 8028
+
+# TII Falcon
+"Falcon3-1B-Instruct" = 1669
+"Falcon3-3B-Instruct" = 3228
+"Falcon3-7B-Instruct" = 7456
+"Falcon3-Mamba-7B-Instruct" = 7273
+
+# AllenAI OLMo
+"OLMo-2-0425-1B-Instruct" = 1485
+"Olmo-3-7B-Instruct" = 7298
+
+# NVIDIA Nemotron
+"NVIDIA-Nemotron-Nano-9B-v2" = 8888
+"NVIDIA-Nemotron-3-Nano-4B-BF16" = 3970
+
+# OpenAI gpt-oss
+"gpt-oss-20b" = { total = 21000, active = 3600 }       # MoE: card states 21B total, 3.6B active

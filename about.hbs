@@ -1,0 +1,41 @@
+{{!--
+    Template for `cargo about generate`, producing THIRD-PARTY-LICENSES.md.
+
+    Every interpolation uses the raw `{{{ }}}` form. Handlebars HTML-escapes
+    by default, which would rewrite the quotes and ampersands inside verbatim
+    license text as character entities and alter the terms being reproduced.
+--}}
+# Third-party licenses
+
+`pipette-mgmt` links the third-party Rust crates listed below. Their license
+terms require that the notices be reproduced when the binary is distributed, so
+this file is part of the release artifact.
+
+This file is generated — see `docs/third-party-attribution.md` for how to
+regenerate it and when that is required.
+
+Crates offering a choice of license are recorded under the option elected in
+`about.toml`, not under every option they offer.
+
+## Summary
+
+| License | Crates |
+| --- | --- |
+{{#each overview}}
+| {{{name}}} (`{{{id}}}`) | {{{count}}} |
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Applies to:
+
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} — {{{crate.repository}}}{{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

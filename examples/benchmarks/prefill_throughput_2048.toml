@@ -1,0 +1,2 @@
+benchmark_type = "prefill_throughput"
+parameter_prefill_tokens = 2048
