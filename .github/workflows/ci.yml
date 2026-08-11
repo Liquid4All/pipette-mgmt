@@ -340,8 +340,6 @@ jobs:
             $(printf "${IMAGE}@sha256:%s " *)
           # Read it back so a broken manifest fails here, not at pull time.
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-            break
-          done
 
   # Single aggregate gate so the default branch can require one check instead of
   # naming each job. Without it, branch protection has to list contexts by hand,
