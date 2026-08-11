@@ -27,7 +27,7 @@ jobs:
     # Detect what changed so PRs that don't touch Rust/Python code can skip
     # the expensive compile jobs. Push events (main) always run everything
     # so releases keep building regardless of which paths changed.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
@@ -55,7 +55,7 @@ jobs:
               - '.github/**'
 
   release-metadata:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       image: ${{ steps.version.outputs.image }}
@@ -80,7 +80,7 @@ jobs:
   rust-lint:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
   attribution:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     env:
       # This job compiles a third-party tool from source rather than first-party
       # code, so the workflow-wide `-D warnings` does not apply: a new lint in a
@@ -130,7 +130,7 @@ jobs:
   rust-test:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -142,7 +142,7 @@ jobs:
   python-check:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.python == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -162,10 +162,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-4vcpu-ubuntu-2404
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          - os: blacksmith-4vcpu-ubuntu-2404-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
     runs-on: ${{ matrix.os }}
@@ -228,11 +228,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-2vcpu-ubuntu-2404
+          - os: ubuntu-24.04
             platform: linux/amd64
             arch: amd64
             target: x86_64-unknown-linux-gnu
-          - os: blacksmith-4vcpu-ubuntu-2404-arm
+          - os: ubuntu-24.04-arm
             platform: linux/arm64
             arch: arm64
             target: aarch64-unknown-linux-gnu
@@ -314,7 +314,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -360,7 +360,7 @@ jobs:
       - docker-image-build
       - docker-image-publish
     if: always()
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Verify all upstream jobs succeeded
         run: |
@@ -381,7 +381,7 @@ jobs:
   github-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
     needs: [release-metadata, build-complete]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Two pushes to one release branch must not race to create the same tag.
     concurrency:
       group: release-${{ github.ref }}
