@@ -24,15 +24,21 @@ use helpers::{
 /// as `TEST_LIST_LIMIT`).
 const TEST_CHUNK_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
 
-/// Assert a nullable string column holds `expected` on every scored row of a
-/// partition, `None` standing for SQL NULL. Returns the number of rows checked
-/// so callers can prove the partition wasn't empty — an assertion that runs
-/// zero times passes for the wrong reason.
-fn assert_string_column(
+/// Assert a nullable column holds `expected` on every scored row of a
+/// partition, `None` standing for SQL NULL. `A` is the arrow array the column
+/// downcasts to, and `value` reads one cell of it. Returns the number of rows
+/// checked so callers can prove the partition wasn't empty — an assertion that
+/// runs zero times passes for the wrong reason.
+fn assert_column<A, T>(
     partition: &std::path::Path,
     column: &str,
-    expected: Option<&str>,
-) -> anyhow::Result<usize> {
+    expected: Option<T>,
+    value: impl Fn(&A, usize) -> T,
+) -> anyhow::Result<usize>
+where
+    A: Array + Clone + 'static,
+    T: PartialEq + std::fmt::Debug,
+{
     let parquet_files = std::fs::read_dir(partition)?
         .map(|entry| Ok(entry?.path()))
         .collect::<anyhow::Result<Vec<_>>>()?
@@ -52,12 +58,12 @@ fn assert_string_column(
                         .column_by_name(column)
                         .ok_or_else(|| anyhow::anyhow!("{column} column must exist"))?
                         .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
+                        .downcast_ref::<A>()
                         .ok_or_else(|| anyhow::anyhow!("{column} has unexpected type"))?
                         .clone();
                     (0..batch.num_rows()).for_each(|i| {
                         assert_eq!(
-                            (!values.is_null(i)).then(|| values.value(i)),
+                            (!values.is_null(i)).then(|| value(&values, i)),
                             expected,
                             "{column} on row {i}"
                         );
@@ -65,6 +71,33 @@ fn assert_string_column(
                     Ok(checked + batch.num_rows())
                 })
         })
+}
+
+/// [`assert_column`] over a nullable string column. Compares owned `String`s,
+/// because a borrowed cell would tie the compared value to the array it came
+/// from.
+fn assert_string_column(
+    partition: &std::path::Path,
+    column: &str,
+    expected: Option<&str>,
+) -> anyhow::Result<usize> {
+    assert_column::<arrow::array::StringArray, _>(
+        partition,
+        column,
+        expected.map(String::from),
+        |values, i| values.value(i).to_string(),
+    )
+}
+
+/// [`assert_column`] over a nullable `int64` column.
+fn assert_i64_column(
+    partition: &std::path::Path,
+    column: &str,
+    expected: Option<i64>,
+) -> anyhow::Result<usize> {
+    assert_column::<arrow::array::Int64Array, _>(partition, column, expected, |values, i| {
+        values.value(i)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1111,60 @@ async fn test_vl_throughput_scoring_canonicalizes_model_descriptor() -> anyhow::
     Ok(())
 }
 
+/// Submit one `prefill_throughput` run, score it, and return the warehouse
+/// partition it landed in. `extra` holds the fields to add to the standard
+/// body — the ones under test.
+///
+/// The returned `TempDir` owns the data directory the partition lives in, so a
+/// caller must hold it for as long as it reads the partition.
+async fn score_one_submission(
+    extra: &[(&str, serde_json::Value)],
+) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let state = make_state(dir.path()).await?;
+    let (sk, client_id) = register_and_approve(&state).await?;
+
+    let mut body = json!({
+        "benchmark_id": "prefill_throughput_256",
+        "device_name": "test-device",
+        "device_form_factor": "embedded",
+        "device_os_name": "Linux",
+        "device_os_version": "22.04",
+        "device_chip_model": "test-chip",
+        "device_ram_bytes": 17179869184i64,
+        "model_name": "m",
+        "model_quant": "q",
+        "runtime_name": "rt",
+        "runtime_version": "v1",
+        "prefill_time_ms": 10.0
+    });
+    body.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("body is not a JSON object"))?
+        .extend(
+            extra
+                .iter()
+                .map(|(field, value)| ((*field).to_string(), value.clone())),
+        );
+
+    submit_benchmark(&state, &sk, &client_id, &body).await?;
+    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+
+    let data_dir = state
+        .config
+        .storage
+        .data_dir()
+        .ok_or_else(|| anyhow::anyhow!("expected local_fs config"))?;
+    let partition = warehouse::warehouse_day_partition_dir(
+        &data_dir.join("warehouse/results"),
+        &BenchmarkId::try_new("prefill_throughput_256")?,
+        &client_id,
+        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+    );
+    assert!(partition.exists(), "expected a scored partition");
+    Ok((dir, partition))
+}
+
 /// What reaches the warehouse for each shape of `benchmark_flags`.
 ///
 /// A top-level empty object carries no information an absent field does not, so
@@ -1098,48 +1185,9 @@ async fn test_benchmark_flags_reaches_the_warehouse(
     #[case] wire: &str,
     #[case] expected: Option<&str>,
 ) -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (sk, client_id) = register_and_approve(&state).await?;
-
-    submit_benchmark(
-        &state,
-        &sk,
-        &client_id,
-        &json!({
-            "benchmark_id": "prefill_throughput_256",
-            "device_name": "test-device",
-            "device_form_factor": "embedded",
-            "device_os_name": "Linux",
-            "device_os_version": "22.04",
-            "device_chip_model": "test-chip",
-            "device_ram_bytes": 17179869184i64,
-            "model_name": "m",
-            "model_quant": "q",
-            "runtime_name": "rt",
-            "runtime_version": "v1",
-            "benchmark_flags": wire,
-            "prefill_time_ms": 10.0
-        }),
-    )
-    .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    let (_dir, partition) = score_one_submission(&[("benchmark_flags", json!(wire))]).await?;
 
     let expected_sha = expected.map(pipette_mgmt::canonical_json::sha256_hex);
-    let data_dir = state
-        .config
-        .storage
-        .data_dir()
-        .ok_or_else(|| anyhow::anyhow!("expected local_fs config"))?;
-    let partition = warehouse::warehouse_day_partition_dir(
-        &data_dir.join("warehouse/results"),
-        &BenchmarkId::try_new("prefill_throughput_256")?,
-        &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
-    );
-    assert!(partition.exists(), "expected a scored partition");
-
     let checked = assert_string_column(&partition, "benchmark_flags", expected)?;
     assert_string_column(
         &partition,
@@ -1160,48 +1208,40 @@ async fn test_benchmark_flags_reaches_the_warehouse(
 async fn test_client_version_reaches_the_warehouse(
     #[case] wire: Option<&str>,
 ) -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (sk, client_id) = register_and_approve(&state).await?;
-
-    let mut body = json!({
-        "benchmark_id": "prefill_throughput_256",
-        "device_name": "test-device",
-        "device_form_factor": "embedded",
-        "device_os_name": "Linux",
-        "device_os_version": "22.04",
-        "device_chip_model": "test-chip",
-        "device_ram_bytes": 17179869184i64,
-        "model_name": "m",
-        "model_quant": "q",
-        "runtime_name": "rt",
-        "runtime_version": "v1",
-        "prefill_time_ms": 10.0
-    });
-    if let Some(v) = wire {
-        body.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("body is not a JSON object"))?
-            .insert("client_version".to_string(), json!(v));
-    }
-
-    submit_benchmark(&state, &sk, &client_id, &body).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
-
-    let data_dir = state
-        .config
-        .storage
-        .data_dir()
-        .ok_or_else(|| anyhow::anyhow!("expected local_fs config"))?;
-    let partition = warehouse::warehouse_day_partition_dir(
-        &data_dir.join("warehouse/results"),
-        &BenchmarkId::try_new("prefill_throughput_256")?,
-        &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
-    );
-    assert!(partition.exists(), "expected a scored partition");
+    let extra: Vec<_> = wire
+        .map(|v| ("client_version", json!(v)))
+        .into_iter()
+        .collect();
+    let (_dir, partition) = score_one_submission(&extra).await?;
 
     let checked = assert_string_column(&partition, "client_version", wire)?;
+    assert!(checked > 0, "expected at least one scored row");
+    Ok(())
+}
+
+/// The per-run swap / host memory peaks reach every warehouse row of a
+/// submission, and stay NULL for a client that doesn't measure them. A
+/// `prefill_throughput` body carries them here: every benchmark type reports
+/// them, so the scorer applies no per-type gate.
+#[rstest]
+#[case::reported(Some(6_442_450_944), Some(12_884_901_888))]
+#[case::not_reported(None, None)]
+#[tokio::test]
+async fn test_observed_memory_reaches_the_warehouse(
+    #[case] swap: Option<i64>,
+    #[case] host: Option<i64>,
+) -> anyhow::Result<()> {
+    let extra: Vec<_> = [
+        ("observation_max_swap_bytes", swap),
+        ("observation_max_host_bytes", host),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| Some((field, json!(value?))))
+    .collect();
+    let (_dir, partition) = score_one_submission(&extra).await?;
+
+    let checked = assert_i64_column(&partition, "observation_max_swap_bytes", swap)?;
+    assert_i64_column(&partition, "observation_max_host_bytes", host)?;
     assert!(checked > 0, "expected at least one scored row");
     Ok(())
 }
