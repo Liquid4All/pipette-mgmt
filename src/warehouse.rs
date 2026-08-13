@@ -438,6 +438,11 @@ pub fn parquet_schema() -> Schema {
         // Appended last for back-compat.
         Field::new("model_flags_sha256", DataType::Utf8, true),
         Field::new("runtime_flags_sha256", DataType::Utf8, true),
+        // Peak swap / host memory the run held, reported by every benchmark
+        // and denormalized onto every row. NULL from clients that do not
+        // sample memory. Appended last for back-compat.
+        Field::new("observation_max_swap_bytes", DataType::Int64, true),
+        Field::new("observation_max_host_bytes", DataType::Int64, true),
     ])
 }
 
@@ -574,6 +579,23 @@ pub struct MetricRow {
     /// client-supplied); the grouping key for "runs configured the same way".
     /// `None` when absent.
     pub runtime_flags_sha256: Option<String>,
+    /// Peak swap and host memory that the run held, in bytes. Every benchmark
+    /// type reports them, so the scorer denormalizes them onto every row of the
+    /// submission. `None` from clients that do not sample memory.
+    ///
+    /// The swap term is contained in the host peak rather than additional to
+    /// it, so the two are never summed. `Some(0)` swap is a real reading — the
+    /// platform sampled swap and the run stayed resident — while `None` means
+    /// nothing sampled it.
+    ///
+    /// [`Self::observation_max_host_bytes`] is not the `max_host_usage` metric.
+    /// The wire field `max_host_bytes` is the measurement that the peak-memory
+    /// benchmarks require, and it lands on the `value` axis of its own row.
+    /// This field is a per-run observation that every row carries, and it
+    /// counts compressed and paged-out memory where the platform exposes it.
+    /// The two therefore disagree by design on a peak-memory row.
+    pub observation_max_swap_bytes: Option<i64>,
+    pub observation_max_host_bytes: Option<i64>,
 }
 
 #[cfg(test)]
@@ -653,6 +675,8 @@ impl Default for MetricRow {
             model_flags_sha256: None,
             runtime_flags_sha256: None,
             client_version: None,
+            observation_max_swap_bytes: None,
+            observation_max_host_bytes: None,
         }
     }
 }
@@ -1700,6 +1724,24 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
                 .ok_or_else(|| anyhow::anyhow!("eval_metadata column has unexpected type"))
         })
         .transpose()?;
+    // Lenient: absent in pre-feature parquet, reads back as all-null.
+    let obs_swap_bytes = batch
+        .column_by_name("observation_max_swap_bytes")
+        .map(|c| {
+            c.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                anyhow::anyhow!("observation_max_swap_bytes column has unexpected type")
+            })
+        })
+        .transpose()?;
+    // Lenient: absent in pre-feature parquet, reads back as all-null.
+    let obs_host_bytes = batch
+        .column_by_name("observation_max_host_bytes")
+        .map(|c| {
+            c.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                anyhow::anyhow!("observation_max_host_bytes column has unexpected type")
+            })
+        })
+        .transpose()?;
 
     let mut rows = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
@@ -1824,6 +1866,10 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
             runtime_flags_sha256: runtime_flags_sha256s
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
+            observation_max_swap_bytes: obs_swap_bytes
+                .and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
+            observation_max_host_bytes: obs_host_bytes
+                .and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
         });
     }
 
@@ -2015,6 +2061,10 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
         .collect();
     let eval_metadatas: Vec<Option<&str>> =
         rows.iter().map(|r| r.eval_metadata.as_deref()).collect();
+    let obs_swap_bytes: Vec<Option<i64>> =
+        rows.iter().map(|r| r.observation_max_swap_bytes).collect();
+    let obs_host_bytes: Vec<Option<i64>> =
+        rows.iter().map(|r| r.observation_max_host_bytes).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -2090,6 +2140,8 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
             Arc::new(StringArray::from(client_versions)),
             Arc::new(StringArray::from(model_flags_sha256s)),
             Arc::new(StringArray::from(runtime_flags_sha256s)),
+            Arc::new(Int64Array::from(obs_swap_bytes)),
+            Arc::new(Int64Array::from(obs_host_bytes)),
         ],
     )?;
 
@@ -2569,6 +2621,24 @@ mod tests {
         assert_eq!(rows[0].observation_vl_throughput_image_tokens, Some(194));
         assert_eq!(rows[1].observation_vl_throughput_prefill_tokens, None);
         assert_eq!(rows[1].observation_vl_throughput_image_tokens, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_observed_memory_columns_round_trip() -> anyhow::Result<()> {
+        // The per-run swap / host peaks round-trip as nullable `Int64` columns:
+        // one row reports them, one leaves them None. Both values sit above
+        // `2^32`, so a narrowing to `Int32` would truncate them.
+        let mut reported = make_test_row("ttft", 50.0, "ms")?;
+        reported.observation_max_swap_bytes = Some(6_442_450_944);
+        reported.observation_max_host_bytes = Some(12_884_901_888);
+        let silent = make_test_row("decode_throughput", 42.0, "tokens/sec")?;
+        let rows = round_trip(&[reported, silent])?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].observation_max_swap_bytes, Some(6_442_450_944));
+        assert_eq!(rows[0].observation_max_host_bytes, Some(12_884_901_888));
+        assert_eq!(rows[1].observation_max_swap_bytes, None);
+        assert_eq!(rows[1].observation_max_host_bytes, None);
         Ok(())
     }
 
@@ -3378,24 +3448,27 @@ mod tests {
         Ok(())
     }
 
-    /// A file written before `client_version` existed still reads back — the
-    /// column is absent from the file, not null within it — and appending a
-    /// reporting row to it backfills the column without losing the old row.
-    #[test]
-    fn test_client_version_none_when_column_absent() -> anyhow::Result<()> {
+    /// Write a stand-in for an older build's output — one row of the current
+    /// batch with `absent` projected away — then append `new_row` to that file
+    /// and read every row back.
+    ///
+    /// The old row carries `result_id` `"job1_0"`, so give `new_row` a
+    /// different one and tell the two apart with [`row_by_id`].
+    fn append_to_file_without_columns(
+        absent: &[&str],
+        new_row: MetricRow,
+    ) -> anyhow::Result<Vec<MetricRow>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("test.parquet");
 
-        // Stand in for an older build's output: the current batch with the
-        // column projected away.
         let mut old_row = make_test_row("accuracy", 0.8, "ratio")?;
         old_row.result_id = "job1_0".to_string();
         let schema = Arc::new(parquet_schema());
         let batch = rows_to_batch(&schema, &[old_row])?;
         let keep: Vec<usize> = (0..batch.num_columns())
-            .filter(|&i| batch.schema().field(i).name() != "client_version")
+            .filter(|&i| !absent.contains(&batch.schema().field(i).name().as_str()))
             .collect();
-        assert_eq!(keep.len(), batch.num_columns() - 1);
+        assert_eq!(keep.len(), batch.num_columns() - absent.len());
         let old_batch = batch.project(&keep)?;
 
         let file = std::fs::File::create(&path)?;
@@ -3403,25 +3476,72 @@ mod tests {
         writer.write(&old_batch)?;
         writer.close()?;
 
+        append_to_parquet(WriterOpts::default(), &path, &[new_row])?;
+
+        Ok(
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?
+                .build()?
+                .map(|b| batch_to_rows(&b?))
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .concat(),
+        )
+    }
+
+    /// The one row carrying `result_id`, or an error naming the id that is
+    /// missing.
+    fn row_by_id(rows: &[MetricRow], id: &str) -> anyhow::Result<MetricRow> {
+        rows.iter()
+            .find(|r| r.result_id == id)
+            .cloned()
+            .with_context(|| format!("expected row with result_id {id}"))
+    }
+
+    /// A file written before `client_version` existed still reads back — the
+    /// column is absent from the file, not null within it — and appending a
+    /// reporting row to it backfills the column without losing the old row.
+    #[test]
+    fn test_client_version_none_when_column_absent() -> anyhow::Result<()> {
         let mut new_row = make_test_row("accuracy", 0.9, "ratio")?;
         new_row.result_id = "job2_0".to_string();
         new_row.client_version = Some("0.14.2".to_string());
-        append_to_parquet(WriterOpts::default(), &path, &[new_row])?;
 
-        let rows = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?
-            .build()?
-            .map(|b| batch_to_rows(&b?))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .concat();
-        let by_id = |id: &str| -> anyhow::Result<MetricRow> {
-            rows.iter()
-                .find(|r| r.result_id == id)
-                .cloned()
-                .with_context(|| format!("expected row with result_id {id}"))
-        };
+        let rows = append_to_file_without_columns(&["client_version"], new_row)?;
+
         assert_eq!(rows.len(), 2);
-        assert_eq!(by_id("job1_0")?.client_version, None);
-        assert_eq!(by_id("job2_0")?.client_version.as_deref(), Some("0.14.2"));
+        assert_eq!(row_by_id(&rows, "job1_0")?.client_version, None);
+        assert_eq!(
+            row_by_id(&rows, "job2_0")?.client_version.as_deref(),
+            Some("0.14.2")
+        );
+        Ok(())
+    }
+
+    /// A file written before the memory-observation columns existed still reads
+    /// back — the columns are absent from the file, not null within it — and
+    /// appending a reporting row backfills them without losing the old row.
+    #[test]
+    fn test_observed_memory_none_when_columns_absent() -> anyhow::Result<()> {
+        let mut new_row = make_test_row("accuracy", 0.9, "ratio")?;
+        new_row.result_id = "job2_0".to_string();
+        new_row.observation_max_swap_bytes = Some(6_442_450_944);
+        new_row.observation_max_host_bytes = Some(12_884_901_888);
+
+        let rows = append_to_file_without_columns(
+            &["observation_max_swap_bytes", "observation_max_host_bytes"],
+            new_row,
+        )?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_by_id(&rows, "job1_0")?.observation_max_swap_bytes, None);
+        assert_eq!(row_by_id(&rows, "job1_0")?.observation_max_host_bytes, None);
+        assert_eq!(
+            row_by_id(&rows, "job2_0")?.observation_max_swap_bytes,
+            Some(6_442_450_944)
+        );
+        assert_eq!(
+            row_by_id(&rows, "job2_0")?.observation_max_host_bytes,
+            Some(12_884_901_888)
+        );
         Ok(())
     }
 }
