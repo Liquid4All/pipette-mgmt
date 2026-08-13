@@ -724,13 +724,39 @@ The `device_android_thermal_sensors_*` and `device_linux_thermal_zones_*`
 
 #### Per-benchmark observation columns
 
-Measured workload facts (not parameters, not metrics). Nullable — only
-populated for the relevant benchmark type.
+Measured workload facts (not parameters, not metrics). All columns are
+nullable. `Used by` names the benchmark types that populate a column; `all`
+means every type reports it.
 
 | Column | Type | Used by |
 |--------|------|---------|
 | `observation_vl_throughput_prefill_tokens` | int32 | vl_throughput |
 | `observation_vl_throughput_image_tokens` | int32 | vl_throughput |
+| `observation_max_swap_bytes` | int64 | all |
+| `observation_max_host_bytes` | int64 | all |
+
+`observation_max_swap_bytes` and `observation_max_host_bytes` are the peak swap
+and peak host memory of the run, in bytes. The client sends each one under the
+column name. Every benchmark type reports them, so the scorer copies the same
+pair of values onto every row of the submission. A client that does not sample
+memory sends neither, and both columns stay null.
+
+The swap term is **contained in** the host peak, not additional to it. Never sum
+the two columns. A row with `observation_max_swap_bytes = 0` reports a real
+reading: the platform sampled swap, and the run stayed resident. A null instead
+means nothing sampled it.
+
+`observation_max_host_bytes` is not the same fact as `max_host_bytes`.
+`observation_max_host_bytes` is a per-run observation, and every row carries it.
+It counts pages the kernel compressed or paged out, wherever the platform can
+see them. `max_host_bytes` is the required input of the `max_memory_usage` and
+`vl_max_memory` benchmarks. It becomes the `max_host_usage` metric row, with
+`unit = "bytes"` — see [Peak memory](methodology/peak-memory.md).
+
+The two therefore disagree by design on a `max_memory_usage` row. The Linux
+metric counts resident pages only, so a Linux row whose observation exceeds its
+metric names a host where swap hid part of the peak. Read the metric to compare
+peak-memory runs. Read the observation column to see the memory any run held.
 
 ### 3.2. Glossary
 

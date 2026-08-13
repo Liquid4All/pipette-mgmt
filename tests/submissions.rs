@@ -710,6 +710,46 @@ async fn test_submit_active_exceeds_total_returns_400() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The per-run memory observations are byte counts, so a negative value is
+/// impossible and is a `400`. Zero is a real reading — a run that touched no
+/// swap reports `0` rather than omitting the field — so it is accepted.
+#[rstest]
+#[case::negative_swap("observation_max_swap_bytes", -1, StatusCode::BAD_REQUEST)]
+#[case::negative_host("observation_max_host_bytes", -4096, StatusCode::BAD_REQUEST)]
+#[case::zero_swap("observation_max_swap_bytes", 0, StatusCode::ACCEPTED)]
+#[case::zero_host("observation_max_host_bytes", 0, StatusCode::ACCEPTED)]
+#[tokio::test]
+async fn test_submit_observed_memory_sign(
+    #[case] field: &str,
+    #[case] value: i64,
+    #[case] expected: StatusCode,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let state = make_state(dir.path()).await?;
+    let (sk, client_id) = register_and_approve(&state).await?;
+
+    let mut body = json!({
+        "benchmark_id": "prefill_throughput_256",
+        "device_name": "test-device",
+        "device_form_factor": "embedded",
+        "device_os_name": "Linux",
+        "device_os_version": "22.04",
+        "device_chip_model": "test-chip",
+        "device_ram_bytes": 17179869184i64,
+        "model_name": "m",
+        "model_quant": "q",
+        "runtime_name": "rt",
+        "runtime_version": "v1",
+        "prefill_time_ms": 10.0
+    });
+    body[field] = json!(value);
+
+    let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &body).await?;
+    assert_eq!(resp.status(), expected);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_submit_invalid_form_factor_returns_400() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

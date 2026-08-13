@@ -907,6 +907,10 @@ async fn score_success(
             parameter_num_images: get_param_num_images(benchmark),
             observation_vl_throughput_prefill_tokens: obs_prefill_tokens,
             observation_vl_throughput_image_tokens: obs_image_tokens,
+            // Every benchmark type reports these, so they are denormalized
+            // onto every row of the submission with no per-type gate.
+            observation_max_swap_bytes: submission.wire.observation_max_swap_bytes,
+            observation_max_host_bytes: submission.wire.observation_max_host_bytes,
             score_runtime_version: derived.score_runtime_version.clone(),
             // Every MetricRow of this submission carries the same
             // eval_metadata blob — denormalized like the device /
