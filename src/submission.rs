@@ -268,6 +268,21 @@ pub struct SuccessInput {
     /// older clients omit it and it deserializes to `None`.
     pub client_version: Option<NonEmptyTrimmedString>,
 
+    /// Peak swap and host memory that the run held, in bytes. Every benchmark
+    /// reports them, so the scorer gates neither on `benchmark_type`. The swap
+    /// term is contained in the host peak rather than additional to it.
+    ///
+    /// Distinct from [`Self::max_host_bytes`], the measurement that the
+    /// peak-memory benchmarks require, which becomes a `max_host_usage`
+    /// metric. These count compressed and paged-out memory where the platform
+    /// exposes it, so the two disagree by design on a peak-memory run.
+    ///
+    /// The client sends each observation under its warehouse column name.
+    /// Optional: a client that does not sample memory omits them, and they
+    /// deserialize to `None`.
+    pub observation_max_swap_bytes: Option<i64>,
+    pub observation_max_host_bytes: Option<i64>,
+
     // Per-benchmark-type metrics — all optional on the struct;
     // `validate` enforces the right field is present given the
     // resolved `benchmark_type`.
@@ -301,8 +316,9 @@ pub struct SuccessInput {
 impl SuccessInput {
     /// Post-deserialize rules that serde can't express on the struct
     /// shape: form-factor enum parse, mill-params positivity +
-    /// ordering, GPU/NPU presence-of-X-implies-Y, per-`benchmark_type`
-    /// metric field presence, and completion-id uniqueness on `Eval`.
+    /// ordering, observed-byte-count non-negativity, GPU/NPU
+    /// presence-of-X-implies-Y, per-`benchmark_type` metric field
+    /// presence, and completion-id uniqueness on `Eval`.
     pub fn validate(&self, benchmark: &Benchmark) -> Result<(), ValidationError> {
         // `TrimmedString` already stripped whitespace, so parse
         // directly — `"  embedded\n"` from a shell-pipe client
@@ -334,6 +350,26 @@ impl SuccessInput {
                 active: a,
                 total: t,
             });
+        }
+
+        // A byte count is a peak, so `0` is a real reading — a run that
+        // touched no swap reports `0`, not `null`. Only a negative value is
+        // impossible, and it would reach the warehouse as a nonsense peak and
+        // skew every aggregate over the column.
+        if let Some((field, _)) = [
+            (
+                "observation_max_swap_bytes",
+                self.observation_max_swap_bytes,
+            ),
+            (
+                "observation_max_host_bytes",
+                self.observation_max_host_bytes,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, value)| value.is_some_and(|v| v < 0))
+        {
+            return Err(ValidationError::NegativeBytes(field));
         }
 
         if self.device_gpu_vram_bytes.is_some() && self.device_gpu_model.is_none() {
@@ -553,6 +589,8 @@ pub enum ValidationError {
     FormFactor(String),
     #[error("{0} must be a positive integer")]
     NonPositiveMillParams(&'static str),
+    #[error("{0} must not be negative")]
+    NegativeBytes(&'static str),
     #[error(
         "model_params_active_millions ({active}) must not exceed \
          model_params_total_millions ({total})"
@@ -1243,6 +1281,47 @@ mod tests {
             success.wire.device_android_cpu_affinity_excludes_top_tier,
             None
         );
+        // The per-run memory observations are optional too.
+        assert_eq!(success.wire.observation_max_swap_bytes, None);
+        assert_eq!(success.wire.observation_max_host_bytes, None);
+        Ok(())
+    }
+
+    /// A body carrying the per-run memory observations deserializes both as
+    /// `i64`, including a value above `2^32` — the swap and host peaks of a
+    /// large run exceed what an `i32` holds. Every benchmark type reports them,
+    /// so a `prefill_throughput` body carries them here.
+    #[test]
+    fn success_input_with_observed_memory_fields_deserializes() -> anyhow::Result<()> {
+        let body = json!({
+            "message_type": "success",
+            "benchmark_id": "prefill_throughput_256",
+            "benchmark_type": "prefill_throughput",
+            "client_id": "c1",
+            "job_id": "j1",
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "device_name": "d",
+            "device_form_factor": "phone",
+            "device_os_name": "Android",
+            "device_os_version": "15",
+            "device_chip_model": "Snapdragon 8 Elite",
+            "device_ram_bytes": 12_000_000_000_i64,
+            "model_name": "m",
+            "model_quant": "q",
+            "runtime_name": "rt",
+            "runtime_version": "v1",
+            "observation_max_swap_bytes": 2_147_483_648_i64,
+            "observation_max_host_bytes": 5_368_709_120_i64,
+            "prefill_time_ms": 10.0,
+        });
+        let Submission::Success(success) = parse_stored_submission(&body)? else {
+            anyhow::bail!("expected a success submission");
+        };
+        assert_eq!(success.wire.observation_max_swap_bytes, Some(2_147_483_648));
+        assert_eq!(success.wire.observation_max_host_bytes, Some(5_368_709_120));
+        // The peak-memory benchmarks' own measurement is a separate field and
+        // stays absent.
+        assert_eq!(success.wire.max_host_bytes, None);
         Ok(())
     }
 
