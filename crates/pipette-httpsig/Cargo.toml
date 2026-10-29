@@ -1,0 +1,27 @@
+[package]
+name = "pipette-httpsig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# The `http` types and no server framework, so a client can sign with it too.
+[dependencies]
+pipette-plan-types.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+http.workspace = true
+nutype.workspace = true
+sfv.workspace = true
+sha2.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

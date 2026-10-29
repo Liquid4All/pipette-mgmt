@@ -1,0 +1,4 @@
+/node_modules/
+/dist/
+# svelte-check --tsgo writes the transpiled components here.
+/.svelte-check/

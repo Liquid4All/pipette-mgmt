@@ -1,0 +1,51 @@
+[package]
+name = "pipette-store-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# Shared test fixtures for tests in other crates. A `#[cfg(test)]` item exists
+# only in this crate's own test build, so tests in other crates enable this
+# feature through a dev-dependency. Production code does not use these fixtures.
+[features]
+testkit = []
+
+[dependencies]
+pipette-core.workspace = true
+pipette-plan-types.workspace = true
+pipette-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-types.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The contract suite that tests this backend, plus `TEST_LIST_LIMIT`. A
+# dev-dependency, so none of it reaches a release build.
+pipette-store-testkit.workspace = true
+# The mock transport this crate's own tests build their bucket from. A
+# dev-dependency, so `test-util` and the hyper 0.14 connector it requires stay
+# out of every release build.
+aws-sdk-s3 = { workspace = true, features = ["test-util"] }
+aws-smithy-mocks.workspace = true
+hex.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "pipette-store-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[dependencies]
+pipette-core.workspace = true
+pipette-store.workspace = true
+pipette-store-fs.workspace = true
+pipette-store-s3.workspace = true
+pipette-store-sql.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+libc.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

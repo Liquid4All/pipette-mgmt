@@ -1,0 +1,5 @@
+{
+  "public_key": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+  "key_details": "ssh-keygen -t ed25519, CI runner",
+  "expires_at": "2026-12-31T00:00:00Z"
+}

@@ -1,0 +1,6 @@
+benchmarks = ["decode_throughput_512_100", "end_to_end_latency_512_256"]
+
+[[variants]]
+requires = ["os:ios"]
+models = [{ type = "apple_foundation_text" }]
+runtimes = [{ type = "apple_foundation", private_thermal = true }]

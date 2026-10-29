@@ -1,0 +1,183 @@
+name: Security
+
+# The supply-chain and secret gates, held in step with the same three jobs in
+# the other Pipette repositories:
+#
+#   * cargo-deny    — RUSTSEC advisories, banned crates, registry sources.
+#   * cargo-machete — dependencies kept past their last caller.
+#   * gitleaks      — a secret scan, redacted: the commits a pull request adds,
+#                     and the full history on `main`, on the cron and on a
+#                     manual dispatch.
+#
+# Its own workflow rather than steps in ci.yml, because none of this is about
+# whether the code compiles: these read the dependency graph and the git
+# history, they need no build, and — unlike every gate in ci.yml — they can go
+# red with no change on the branch, which is why the cron below exists. Being
+# separate also keeps them off ci.yml's path filters: a docs-only PR still gets
+# scanned.
+#
+# `cargo deny check licenses` is deliberately NOT here. It stays in ci.yml's
+# rust-lint job, next to the THIRD-PARTY-LICENSES.md attribution that follows
+# from it; deny.toml is one policy file read by both, and both install
+# cargo-deny at the one version ci/install-tool.sh pins.
+#
+# Requiring these on `main` is a branch protection change, named by job
+# (see CONTRIBUTING.md §3).
+
+on:
+  push:
+    branches: [main]
+  # Unfiltered on purpose, for the same reason as ci.yml: a `branches:` filter
+  # matches the pull request's *base*, so restricting it to `main` would skip
+  # every layer of a stacked pull request but the bottom one.
+  pull_request:
+  # New advisories are published without anyone touching this repository, and a
+  # gate that only runs on PRs would not notice until the next one. Daily, well
+  # clear of the working day's first pushes.
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # The schedule never cancels: a cancelled run reports as cancelled, not failed,
+  # so the daily scan would go missing quietly.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+# Least-privilege default: every job here reads the checkout and reports.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Each tool arrives as a pinned, checksum-verified tarball. The versions and
+  # digests are the table in ci/install-tool.sh — one file, identical in all
+  # three repositories, so a pin that drifts shows up as a diff. Bump them
+  # there, by hand; docs/development.md §1 says why they are pinned at all.
+  #
+  # Every job carries a timeout because every job reaches the network: a release
+  # asset, the crates.io index, the RUSTSEC database over `git`, which has no
+  # timeout of its own. The work itself is seconds. Without a bound a stall sits
+  # until the six-hour default and reports as a check still in progress, which
+  # is the one state worse than red.
+  cargo-deny:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-deny resolves the graph through cargo metadata, so it needs a
+      # toolchain even though it compiles nothing.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - name: Install cargo-deny (pinned, checksum-verified)
+        run: ci/install-tool.sh cargo-deny
+      - name: Advisories, bans and sources
+        # deny.toml carries the policy, and the reason for every ignored
+        # advisory.
+        #
+        # `-D advisory-not-detected` promotes a STALE ignore to an error. An
+        # `[advisories].ignore` entry whose crate has left the lockfile matches
+        # nothing, and cargo-deny says so — but only as a warning that still
+        # exits 0, so dead entries would accumulate behind a green check. Under
+        # this flag the PR that drops the last affected crate fails here and
+        # deletes the ignore in the same change. It is a lint level, so it can
+        # only be set on the command line, not in deny.toml.
+        run: cargo deny check -D advisory-not-detected advisories bans sources
+
+  unused-deps:
+    name: unused deps (cargo-machete)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-machete (pinned, checksum-verified)
+        run: ci/install-tool.sh cargo-machete
+      - name: Scan for unused dependencies
+        # The dependency half of dead-code detection: `dead_code` and
+        # `unreachable_pub` catch an item nothing calls, but neither notices
+        # that the last use of a whole crate went with it.
+        #
+        # Invoked as the binary rather than `cargo machete`, which is why this
+        # job installs no toolchain: the scan reads manifests and greps the
+        # crate's own sources, so its result does not depend on the runner
+        # either. That text-level read is also where its false positives come
+        # from — a crate reached only through a macro expansion. Suppress those
+        # in `[package.metadata.cargo-machete]` with a comment naming what
+        # reaches the crate (docs/development.md §1); the list is honoured in
+        # this mode.
+        run: cargo-machete
+
+  secrets:
+    # SCOPE, by event, and a correctness decision rather than a speed one.
+    #
+    # `gitleaks git .` walks every commit reachable in the local clone, which
+    # with `fetch-depth: 0` is every ref ever pushed. One branch carrying a
+    # matched string would then red this check on every OTHER branch's pull
+    # request: a failure the author did not cause and cannot clear. Scanning
+    # `base..HEAD` puts each finding in front of the person who introduced it.
+    #
+    # Full history is not abandoned — the `push: main` run and the daily cron
+    # still read all of it, and those are the runs that have any business
+    # failing over a commit already on `main`. What changes is who a finding
+    # blocks.
+    name: secrets (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Still the whole history: the range scan needs the MERGE BASE present
+          # locally, and the push and cron runs read everything anyway. A
+          # credential that was committed and then deleted is still in the
+          # objects a clone hands out, so a shallow checkout would show a clean
+          # tip.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: ci/install-tool.sh gitleaks
+      - name: Scan (this pull request's commits; full history otherwise)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # On a pull_request the checked-out ref is refs/pull/N/merge, whose
+          # HEAD^1 IS the current base tip — so commits other people merged
+          # after this PR opened are not blamed on its author. BASE_SHA is the
+          # fallback for a shape without that merge parent.
+          base=""
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            if git rev-parse --verify -q "HEAD^2" >/dev/null; then
+              base="$(git rev-parse HEAD^1)"
+            else
+              base="${BASE_SHA}"
+            fi
+          fi
+          # FAIL-SAFE toward MORE scanning, never less. Any shape this cannot
+          # make sense of — no base (a push to `main`, the cron, a dispatch), a
+          # base sharing no history with HEAD, or a range that turns out EMPTY —
+          # falls through to the full-history scan. The empty range is the
+          # dangerous one: gitleaks would read zero commits, exit 0, and this
+          # check would report "no secrets" having looked at nothing.
+          count=0
+          if [[ -n "${base}" ]] && git merge-base "${base}" HEAD >/dev/null 2>&1; then
+            count="$(git rev-list --count "${base}..HEAD")"
+          fi
+          echo "event=${GITHUB_EVENT_NAME} base=${base:-<none>} commits=${count}"
+          # --redact keeps a match out of the log, which anyone who can see the
+          # run can read; a finding still exits non-zero. --config is explicit
+          # rather than discovered: gitleaks falls back to its built-in rules
+          # when it finds none, so a moved .gitleaks.toml would silently drop
+          # the allowlist.
+          if [[ "${count}" -gt 0 ]]; then
+            echo ">> scanning ${count} commit(s) in ${base}..HEAD"
+            gitleaks git --redact --verbose --config .gitleaks.toml --log-opts="${base}..HEAD" .
+          else
+            echo ">> no usable commit range for this event -- scanning FULL history"
+            gitleaks git --redact --verbose --config .gitleaks.toml .
+          fi

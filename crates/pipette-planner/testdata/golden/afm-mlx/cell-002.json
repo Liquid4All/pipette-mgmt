@@ -1,0 +1,51 @@
+{
+  "requires": [
+    "os:macos"
+  ],
+  "any_of": [
+    [
+      "chip:applem1",
+      "chip:applem1max",
+      "chip:applem1pro",
+      "chip:applem1ultra",
+      "chip:applem2",
+      "chip:applem2max",
+      "chip:applem2pro",
+      "chip:applem2ultra",
+      "chip:applem3",
+      "chip:applem3max",
+      "chip:applem3pro",
+      "chip:applem3ultra",
+      "chip:applem4",
+      "chip:applem4max",
+      "chip:applem4pro",
+      "chip:applem4ultra",
+      "chip:applem5",
+      "chip:applem5max",
+      "chip:applem5pro",
+      "chip:applem5ultra"
+    ]
+  ],
+  "clients": [],
+  "spec": {
+    "benchmark": "end_to_end_latency_512_256",
+    "model": {
+      "type": "mlx",
+      "source": "huggingface",
+      "org": "LiquidAI",
+      "repo_name": "LFM2.5-350M-MLX-4bit"
+    },
+    "runtime": {
+      "type": "mlx_macos_pipette",
+      "version": "0.31.3",
+      "flavor": "macos-arm64",
+      "source": {
+        "type": "pip_requirements_text",
+        "contents": "mlx-lm==0.31.3\n"
+      }
+    },
+    "runtime_flags": null,
+    "model_flags": null,
+    "benchmark_flags": null
+  }
+}

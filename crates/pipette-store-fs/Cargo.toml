@@ -1,0 +1,35 @@
+[package]
+name = "pipette-store-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[dependencies]
+pipette-core.workspace = true
+pipette-plan-types.workspace = true
+pipette-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The contract suite that tests this backend, plus `TEST_LIST_LIMIT`. A
+# dev-dependency, so none of it reaches a release build.
+pipette-store-testkit.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

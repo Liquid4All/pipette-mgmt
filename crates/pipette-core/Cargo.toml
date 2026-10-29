@@ -1,0 +1,65 @@
+[package]
+name = "pipette-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# Shared test fixtures for consumers in other crates. A `#[cfg(test)]` item
+# exists only in this crate's own test build, so tests in other crates use this
+# feature. Tests enable it through a direct dev-dependency or through
+# `pipette-store-testkit`, which enables it as a normal dependency.
+# Production code does not require these fixtures.
+#
+# The store tier ships its shared fixtures as `pipette-store-testkit`, a crate,
+# which is the shape to prefer. Rust requires the inherent `JobId`
+# implementation and the `Default for MetricRow` implementation to remain in
+# the crate that defines those types. Put free functions and local fixture
+# types in a testkit crate. Keep implementations that Rust requires in this
+# crate behind this feature.
+#
+# One constraint outranks that choice: test-only code must take no dependency
+# the release graph does not already have. `cargo about` examines every
+# workspace member and includes each member's normal dependencies. A feature
+# does not exclude those dependencies from `THIRD-PARTY-LICENSES.md`.
+# `crates/pipette-store-s3/src/mock_bucket.rs` uses `#[cfg(test)]` to keep its
+# mock dependencies out of the license report.
+[features]
+testkit = ["pipette-plan-types/testkit"]
+
+[dependencies]
+# The eval sampling knobs a catalog entry pins are the client's vocabulary: the
+# server validates an entry through the same types the client parses it with, so
+# a bound cannot drift between the two.
+pipette-plan-types.workspace = true
+anyhow.workspace = true
+arrow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+nutype.workspace = true
+parquet.workspace = true
+regex.workspace = true
+serde.workspace = true
+# A catalog entry is parsed as the client's type for its kind, which tolerates
+# unknown keys; this finds a top-level one so the entry can be refused.
+serde_ignored.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+tabled.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# `JobId::new_unchecked` for this crate's own fixtures.
+pipette-plan-types = { workspace = true, features = ["testkit"] }
+rstest.workspace = true
+tempfile.workspace = true

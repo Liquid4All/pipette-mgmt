@@ -1,0 +1,34 @@
+[package]
+name = "pipette-store-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[dependencies]
+# `testkit` carries `sample_manifest` and the other fixtures the assertions
+# build their inputs from. `pipette-core` exposes these fixtures through a
+# feature. Rust requires the inherent `JobId` and `Default for MetricRow`
+# implementations to remain with their type definitions.
+pipette-core = { workspace = true, features = ["testkit"] }
+pipette-plan-types.workspace = true
+pipette-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# The log capture in `assert_vault_staged_write_logs_once`. Every consumer
+# takes this crate as a dev-dependency, so none of the three reaches a release
+# build.
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

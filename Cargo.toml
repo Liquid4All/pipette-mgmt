@@ -1,73 +1,374 @@
-[package]
-name = "pipette-mgmt"
+# The repository is a Cargo workspace whose crates all live under `crates/`.
+# `pipette-mgmt` is the server and CLI this repository builds, and
+# `pipette-core` is the vocabulary it is written in: the domain types, the
+# validation newtypes, the permission model, the warehouse row format and the
+# configuration. `pipette-core` is a pure data crate, so the tiers above it
+# link no storage or HTTP machinery to speak the same shapes.
+#
+# `pipette-plan-types` is the other half of that vocabulary, the part a client
+# device speaks: plans, runs and what a benchmark is on the wire. It sits beside
+# `pipette-core` at the bottom and names no crate here, which is what lets
+# `pipette-core` name it. That one edge is the whole exception: a bound the
+# server validates a catalog entry against and the client re-validates the
+# served JSON against is declared once, in the crate both sides share.
+#
+# `pipette-planner` sits on the same tier. It parses a scheduler plan document,
+# applies the capability rules, and expands the plan into the job bodies that
+# ingestion stages. It names `pipette-plan-types` and no other crate here, and
+# it does no IO, so any tier above can expand a plan.
+#
+# `pipette-httpsig` sits there too: the RFC 9421 profile user accounts sign
+# requests with, the verifier `pipette-httpapi` calls and the signer beside it. It
+# names `pipette-plan-types` and the `http` types, and no server framework, so
+# a client can sign with it.
+#
+# The store tier sits directly on it, in six crates:
+#
+#   pipette-core
+#     └─→ pipette-store ──┬─→ pipette-store-fs ───┬─→ pipette-store-init
+#                         ├─→ pipette-store-s3 ───┤
+#                         ├─→ pipette-store-sql ──┘
+#                         └─→ pipette-store-testkit  (dev-only)
+#
+# `pipette-store` holds the storage traits and the types they take and return,
+# and nothing that opens a file or a socket. `pipette-store-fs` and
+# `pipette-store-s3` are the two object-store backends; neither names the other.
+# `pipette-store-sql` keeps the records on PostgreSQL when `[database]` is set.
+# `pipette-store-init` is the one crate that depends on all three and reads the
+# config to choose between them. Only the two backends and
+# `pipette-store-init` link `object_store` and `aws-sdk-s3`.
+# `pipette-store-testkit` contains the contract suite that tests all three backends.
+# Consumers use it as a dev-dependency, so production code does not depend on it.
+#
+# `pipette-pipeline` is the processing tier, and it sits on the store traits:
+#
+#   pipette-store ─→ pipette-pipeline ─→ pipette-httpapi ─→ pipette-mgmt
+#
+# It holds the work the server does away from a request. That is submissions,
+# scoring, plan ingestion, plan maintenance, queue maintenance, and shared
+# device, account and organization administration. It reaches storage through
+# `pipette-store` alone, so it names no backend and links no HTTP server
+# framework.
+#
+# `pipette-httpapi` is the HTTP tier above it: the route table and every route
+# behind it, grouped by caller (the client protocol at the root, the operator
+# API under `/api/v1`) and then by path resource, on the kernel every route
+# shares (`AppState`, `AppError`, the authentication and request extractors). It
+# also embeds and serves the app, which calls that API itself. `pipette-mgmt` is
+# the binary above it: the CLI, and `serve`.
+#
+# `pipette-hub-testkit` is a mock HuggingFace Hub and its CDN. The import tests
+# in `pipette-pipeline` and the ingestion tests in `pipette-httpapi` use it.
+# Each consumer is a test crate or takes it as a dev-dependency.
+#
+# `pipette-web-testkit` holds the fixtures the HTTP integration tests share. It
+# depends on `pipette-httpapi`, so a test drives the route table the binary
+# serves. The app's tests reach it back through a dev-dependency, which is a
+# cycle Cargo permits because it runs through `[dev-dependencies]` alone.
+#
+# `pipette-plan-types` is owned here and shared with
+# Liquid4All/pipette-clients, which takes it by git, pinned to a
+# commit: it is the vocabulary the plan TOML, the queue protocol and the
+# `model_descriptor` / `runtime_descriptor` columns are written in (see
+# docs/queue.md and docs/storage.md).
+[workspace]
+members = [
+    "crates/pipette-core",
+    "crates/pipette-httpapi",
+    "crates/pipette-httpsig",
+    "crates/pipette-hub-testkit",
+    "crates/pipette-mgmt",
+    "crates/pipette-pipeline",
+    "crates/pipette-plan-types",
+    "crates/pipette-planner",
+    "crates/pipette-store",
+    "crates/pipette-store-fs",
+    "crates/pipette-store-init",
+    "crates/pipette-store-s3",
+    "crates/pipette-store-sql",
+    "crates/pipette-store-testkit",
+    "crates/pipette-web-testkit",
+]
+
+# A virtual manifest has no package, so there is no `edition` for Cargo to take
+# a default resolver from, and the default it falls back to is resolver 1.
+# Naming resolver 3 explicitly keeps the feature unification that
+# `pipette-mgmt`'s `edition = "2024"` selected while it was the root, which is
+# what keeps Cargo.lock unchanged by this move.
+resolver = "3"
+
+# `publish = false` also makes `cargo about` skip first-party crates; see
+# docs/third-party-attribution.md.
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-# Distributed as a container image and release tarball rather than a crates.io
-# crate. This also marks the package private to `cargo about`, which then
-# reports third-party notices only.
 publish = false
 
-[[bin]]
-name = "pipette-mgmt"
-path = "src/bin/pipette-mgmt.rs"
-
-[dependencies]
+[workspace.dependencies]
+pipette-core = { path = "crates/pipette-core" }
+pipette-httpapi = { path = "crates/pipette-httpapi" }
+pipette-hub-testkit = { path = "crates/pipette-hub-testkit" }
+pipette-pipeline = { path = "crates/pipette-pipeline" }
+pipette-plan-types = { path = "crates/pipette-plan-types" }
+pipette-httpsig = { path = "crates/pipette-httpsig" }
+pipette-planner = { path = "crates/pipette-planner" }
+pipette-store = { path = "crates/pipette-store" }
+pipette-store-fs = { path = "crates/pipette-store-fs" }
+pipette-store-init = { path = "crates/pipette-store-init" }
+pipette-store-s3 = { path = "crates/pipette-store-s3" }
+pipette-store-sql = { path = "crates/pipette-store-sql" }
+pipette-store-testkit = { path = "crates/pipette-store-testkit" }
+pipette-web-testkit = { path = "crates/pipette-web-testkit" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+# `StreamReader` and `SyncIoBridge`, which read an object-store body on a
+# blocking thread as its bytes arrive; `TaskTracker` (feature `rt`), which
+# `serve` waits on at shutdown for the audit writes.
+tokio-util = { version = "0.7", features = ["io", "io-util", "rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The JSON Schemas of the responses the console app generates its TypeScript
+# types from (`pipette_httpapi::api_schema`).
+schemars = { version = "1.2", features = ["chrono04"] }
+# Checks response bodies against those schemas, in tests only.
+jsonschema = { version = "0.60", default-features = false }
+serde_ignored = "0.1"
+# The API reference page's Markdown; `html` alone, without the CLI's `getopts`.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.13", features = ["json"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-sha2 = "0.10"
+ed25519-dalek = "3"
+sha2 = "0.11"
 hex = "0.4"
-parquet = "59"
-arrow = { version = "59", default-features = false, features = ["json"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.23"
+parquet = "60"
+arrow = { version = "60", default-features = false, features = ["json"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
 anyhow = "1"
 thiserror = "2"
+# The closest catalog name an unknown benchmark id suggests. Already in the tree
+# through clap.
+strsim = "0.11"
+# The RFC 5987 `filename*` of a results download. Already in the tree through
+# `url`.
+percent-encoding = "2.3"
 email_address = "0.2"
-tabled = "0.20"
+tabled = "0.22"
 async-trait = "0.1"
 bytes = "1"
 flate2 = "1"
+# Only the header type, for the deterministic archive of an import. The default
+# `xattr` feature reads extended attributes from disk, which nothing here does.
+tar = { version = "0.4", default-features = false }
 object_store = { version = "0.14", features = ["aws"] }
 aws-config = "1"
 # The default feature set adds `rustls`, which selects the SDK's legacy TLS
 # backend and pulls a second, parallel HTTP stack (hyper 0.14, h2 0.3, rustls
 # 0.21) alongside the one `default-https-client` already provides. Listing the
 # defaults explicitly minus `rustls` leaves a single TLS stack.
-aws-sdk-s3 = { version = "1.93", default-features = false, features = [
-    "sigv4a",
+#
+# `sigv4a` is left out too: only Multi-Region Access Points sign with it, and it
+# links `crypto-bigint` 0.5, which RUSTSEC-2026-0387 fixes only from 0.7.6.
+#
+# `test-util` is absent from the shared feature list and requires the hyper 0.14
+# connector, so whatever turns it on reaches a second HTTP stack.
+# `pipette-store-s3` and `pipette-mgmt` require this feature for their mock
+# transports. They enable it only in `[dev-dependencies]`.
+aws-sdk-s3 = { version = "1.152", default-features = false, features = [
     "http-1x",
     "default-https-client",
     "rt-tokio",
 ] }
+# `Storable`, for the state that the S3 request counter keeps between two
+# interceptor hooks. `aws-sdk-s3` already links this crate.
+aws-smithy-types = { version = "1", default-features = false }
 futures = "0.3"
+# `macros` is for `migrate!` alone; queries are built at runtime with binds.
+# TLS is aws-lc-rs, the provider the rest of this tree ships.
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "chrono",
+    "migrate",
+    "macros",
+] }
 libc = "0.2"
+# `system::uname`: the host name the audit log records for a CLI command, on
+# every Unix without `unsafe`. Already in the graph through `tempfile`.
+rustix = { version = "1.1", features = ["system"] }
 derive_more = { version = "2", features = ["display", "from", "as_ref", "into"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 strum = { version = "0.28", features = ["derive"] }
+# RFC 9651 structured fields, which RFC 9421 signatures are written in.
+sfv = "0.16"
+nutype = { version = "0.8.0", features = ["serde"] }
+# Already linked through rustls; declared for the RS256 check on a Clerk token.
+# Its defaults add `ring` compatibility shims nothing here uses.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+csv = "1"
+regex = "1"
+time = { version = "0.3", features = [
+    "formatting",
+    "parsing",
+    "serde",
+    "serde-well-known",
+] }
 
-[dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip", "timeout"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server-graceful", "service", "tokio"] }
 http-body-util = "0.1"
-rstest = { version = "0.26.1", default-features = false }
-# `test-util` here (dev-deps only) keeps the mock machinery out of release builds.
-# The feature set mirrors the one above so test builds resolve the same single
-# TLS stack; `test-util` itself still requires the hyper 0.14 connector.
-aws-sdk-s3 = { version = "1.93", default-features = false, features = [
-    "sigv4a",
-    "http-1x",
-    "default-https-client",
-    "rt-tokio",
-    "test-util",
-] }
-aws-smithy-mocks = "0.2"
+http = "1"
+rstest = { version = "0.28.0", default-features = false }
+aws-smithy-mocks = "0.3"
+httpmock = { version = "0.9.0", default-features = false }
+
+# Single source of truth for lint policy, so a local `cargo clippy` enforces the
+# same gate as CI — which is why the CI steps pass no `-D warnings`. Each member
+# opts in with `[lints] workspace = true`. Unlike a `RUSTFLAGS` environment
+# variable, this applies to the workspace's own crates only: a warning
+# introduced by a new compiler release in a dependency's source cannot fail the
+# build, and the flag is not part of the fingerprint every dependency is cached
+# under.
+[workspace.lints.rust]
+warnings = "deny"
+
+# `warnings = "deny"` already makes `dead_code` a gate, and that is what covers
+# the binary: every helper in `crates/pipette-mgmt/src/bin/pipette-mgmt.rs` is
+# private, so one that stops being called fails the build. In a library the lint
+# reaches what the crate keeps private and stops at the `pub` surface, because
+# rustc counts a `pub` item as used by a downstream crate. Every member sets
+# `publish = false`, so that downstream crate does not exist and the surface goes
+# unchecked. `unreachable_pub` closes the part of that hole it can reach: a `pub`
+# written where `pub(crate)` or private would do is what puts an item beyond
+# `dead_code`'s sight in the first place.
+unreachable_pub = "deny"
+
+# `warnings = "deny"` covers rustdoc too, so `cargo doc` is a gate. One lint is
+# opted out of deliberately: nothing here is published to crates.io, so a doc
+# comment pointing at a crate-internal item is a working cross-reference for the
+# only readers there are, not a dead link in a published page. Broken and
+# ambiguous links stay denied — those are rot.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
+# Panicking constructs are banned. A reachable failure must return a typed
+# `Result` — tests included: they should be `-> anyhow::Result<()>` and use `?`
+# to propagate. An unreachable case should be made unrepresentable in the types,
+# not asserted at runtime. This is a server: a panic in a request handler takes
+# down the task holding a lock or a half-written record, and `unwrap` on an
+# `Option` that "cannot" be `None` is how that happens.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+# `.get(i).unwrap()` is an index that `indexing_slicing` does not see.
+get_unwrap = "deny"
+# Slicing a `str` off a char boundary, or indexing past the end, panics — the
+# same class of hidden panic as the lints above.
+string_slice = "deny"
+indexing_slicing = "deny"
+# A suppression carries its justification: `#[expect(lint, reason = "...")]`,
+# which also fails once the lint it silences stops firing.
+allow_attributes_without_reason = "deny"
+
+# The lints from here down match the set that pipette-clients enables.
+# Code that moves between the two repositories meets the same gate in both.
+#
+# Picked from `pedantic` one at a time: the group grows with every toolchain
+# release and CI tracks stable, so enabling it whole would break CI on a release
+# day with no change here.
+#
+# Considered and left off:
+# - `cast_precision_loss`: a count turned into an `f64` for a rate or a mean,
+#   where the loss starts past 2^53.
+# - `unnecessary_wraps`: flags the `-> anyhow::Result<()>` tests the rule above
+#   asks for.
+# - `redundant_closure_for_method_calls`: its rewrite spells out full paths —
+#   `std::string::ToString::to_string` for `|s| s.to_string()`.
+# - `match_same_arms`: matches here are tables on purpose, one row per case.
+# - `needless_pass_by_value`: most hits must own their argument (a `nutype`
+#   sanitizer), the rest are churn.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+case_sensitive_file_extension_comparisons = "deny"
+items_after_statements = "deny"
+manual_let_else = "deny"
+bool_to_int_with_if = "deny"
+checked_conversions = "deny"
+implicit_clone = "deny"
+inefficient_to_string = "deny"
+large_futures = "deny"
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+manual_assert = "deny"
+match_wildcard_for_single_variants = "deny"
+range_plus_one = "deny"
+unused_async = "deny"
+wildcard_imports = "deny"
+
+# From `nursery`, same one-at-a-time rule.
+future_not_send = "deny"
+needless_pass_by_ref_mut = "deny"
+or_fun_call = "deny"
+
+# A `_` arm on an enum is where a new variant goes unnoticed: adding one
+# compiles clean and takes the wildcard's behavior, right or wrong. Listing
+# the variants turns that into a compile error at every site that must decide.
+# A `#[non_exhaustive]` enum from another crate needs `_` anyway, so a
+# match on one takes an `#[expect]` rather than a list that guards nothing.
+# `if let` and `let … else` escape the lint; use them only where "not this
+# variant" is the whole answer, as in an `as_*` accessor.
+#
+# Considered and left off:
+# - `let_underscore_must_use`: its hits are deliberate best-effort discards — a
+#   temp-file or empty-directory cleanup, a note written into a lock file — and
+#   the lint has no idiom for those that says more than `let _ =` already does.
+wildcard_enum_match_arm = "deny"
+
+# From `restriction`: every `unsafe` block states why it is sound, one
+# operation per block so the `SAFETY:` comment covers exactly one claim, and
+# pointer casts say which of type or mutability they change.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_doc = "deny"
+borrow_as_ptr = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+fn_to_numeric_cast_any = "deny"
+# Also from `restriction`, each a bug class that has no legitimate use here.
+# `HashMap` order changes run to run, and a listing or a written record must not.
+iter_over_hash_type = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+infinite_loop = "deny"
+try_err = "deny"
+lossy_float_literal = "deny"
+float_cmp_const = "deny"
+mixed_read_write_in_expression = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+mutex_atomic = "deny"
+verbose_file_reads = "deny"
+
+# The dev profile builds dependencies at `opt-level = 1`. Unoptimized, the
+# dependency code makes the `__eh_frame` section of `pipette-mgmt` larger than
+# 16 MiB. Above that size, Apple's linker can't reference DWARF unwind entries
+# from the compact unwind table, and it warns at each link. Workspace members
+# stay at `opt-level = 0`, for fast rebuilds and full debugging.
+[profile.dev.package."*"]
+opt-level = 1

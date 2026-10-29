@@ -1,7 +1,6 @@
-# Model catalog: maps a normalized model_name to its parameter count(s) in
-# millions. Loaded by `pipette-mgmt serve` and `pipette-mgmt score` from
-# `{data_dir}/model_params_mapping.toml` for local-fs or `{prefix}/model_params_mapping.toml` in the
-# S3 bucket. The scorer uses this to set the canonical
+# Model parameter counts in millions, in the form `pipette-mgmt models import`
+# reads: one model-params row per entry, under its normalized name. The rows
+# form the model parameter table. The scorer reads the table to set the canonical
 # `model_params_total_millions` and `model_params_active_millions` columns on
 # every warehouse row.
 #
@@ -36,9 +35,8 @@
 # `:file.gguf` suffix, no `-GGUF` suffix. Submissions go through the
 # same normalization before lookup.
 #
-# Operators: copy this file to `data/model_params_mapping.toml` (or
-# `s3://<bucket>/<prefix>/model_params_mapping.toml`) and add entries as new models
-# come online. A missing model_params_mapping.toml is not an error — the scorer just
+# Operators: `pipette-mgmt models import <this file>` adds a row for each
+# entry that has none. An empty table is not an error — the scorer just
 # trusts whatever values the client sent.
 #
 # Every entry below is anchored to the upstream HuggingFace model card.

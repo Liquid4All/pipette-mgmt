@@ -1,0 +1,8 @@
+{
+  "add": [
+    "read_clients"
+  ],
+  "remove": [
+    "cancel_plans"
+  ]
+}

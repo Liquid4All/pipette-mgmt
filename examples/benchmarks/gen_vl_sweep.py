@@ -6,8 +6,8 @@ Writes the benchmark TOMLs flat into the catalog dir. Run from
 examples/benchmarks/: python3 gen_vl_sweep.py [--toml-dir .] [--json-dir <dir>]
 
 Benchmark IDs spell out each axis: `text{N}` (text prefill tokens),
-`decode{N}` (generated tokens, throughput only), `img{N}` (images packed into
-one prompt; >1 = multi-frame / video).
+`decode{N}` (generated tokens; a vl_max_memory id without it decodes one),
+`img{N}` (images packed into one prompt; >1 = multi-frame / video).
 """
 
 import argparse

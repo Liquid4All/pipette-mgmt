@@ -14,11 +14,11 @@ available.
 
 Report privately through either channel:
 
-- **GitHub** — open the
+- **GitHub**: open the
   [Security tab](https://github.com/Liquid4All/pipette-mgmt/security/advisories/new)
   and choose *Report a vulnerability*. The report stays visible only to you and
   the maintainers.
-- **Email** — send the report to support@liquid.ai.
+- **Email**: send the report to support@liquid.ai.
 
 Maintainers should acknowledge reports within 7 business days and coordinate
 next steps with the reporter.
@@ -30,7 +30,7 @@ A useful report includes:
   credentials);
 - the affected version or commit;
 - steps to reproduce, ideally against a local `serve` instance;
-- any log output or request/response capture that shows the behavior — with
+- any log output or request/response capture that shows the behavior, with
   keys, signatures, and tokens redacted.
 
 ## Scope
@@ -40,16 +40,23 @@ verification, scoring orchestration, and warehouse writes. Findings in the
 client harnesses belong to
 [pipette-clients](https://github.com/Liquid4All/pipette-clients).
 
-The security-relevant surfaces here are request authentication and client
-identity (see [`docs/authentication.md`](docs/authentication.md)), the
-submission path that accepts and stores client-supplied data, and object-store
-access.
+The security-relevant surfaces here are:
+
+- request authentication and identity: device signatures, user sign-in and
+  keys, and the permission model
+  ([`docs/authentication.md`](docs/authentication.md));
+- the vault, which holds customers' private model weights and serves them only
+  to their owner's devices ([Vault](docs/api/vault.md));
+- the submission path that accepts and stores client-supplied data;
+- the PostgreSQL database that holds the records (accounts, organizations,
+  devices, plans, campaigns, vault records), and object-store access.
 
 Reports we are glad to receive but do not treat as vulnerabilities in this
 project:
 
-- findings that require an operator's own object-store credentials or filesystem
-  access — that trust is assumed by the deployment model;
+- findings that require an operator's own database or object-store
+  credentials, or filesystem access. That trust is assumed by the deployment
+  model;
 - vulnerabilities in third-party crates, unless this project's use of the crate
   is what makes them exploitable. Report those upstream; tell us as well if a
   version bump here is the fix.

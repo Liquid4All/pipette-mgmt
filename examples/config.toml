@@ -1,50 +1,168 @@
-# Required: URL of the upstream evals server for scoring eval-type benchmarks.
+# pipette-mgmt config file. Each key's meaning is the doc comment on `Config` in
+# crates/pipette-core/src/config.rs; this file shows every key with its default.
+# Credentials stay out of it: S3 reads AWS_* or an instance role, PostgreSQL reads
+# PGPASSWORD. The [duckdb] password is the one secret the file holds.
+
+# Required: the edge-evals scoring service. `score-eval` scores through it,
+# `serve` fetches eval benchmark samples from it, and `dataset-cache` builds
+# vlm_eval corpora from it.
 evals_server_url = "http://localhost:8080"
 
-# Address to bind the HTTP server to.
-# Default: "0.0.0.0:3000"
-# listen_addr = "127.0.0.1:3000"
-
-# Maximum number of recent month partitions to scan when reading job metrics.
-# Default: 3
-# warehouse_read_months = 3
-
-# Maximum rows per Parquet part file in warehouse partitions.
-# Default: 10000
-# warehouse_max_rows_per_part = 10000
-
-# How many seconds to cache the benchmark catalog before re-reading from disk.
-# Default: 180
+# --- serve ---
+# listen_addr = "0.0.0.0:3000"          # plain HTTP: put a TLS proxy in front
+# read_timeout_secs = 75                 # above the load balancer's idle timeout
+# max_connections = 512                  # below the open-file limit
 # catalog_ttl_secs = 180
+# warehouse_read_days = 14
+# plan_lease_duration_secs = 300
+# default_body_limit_bytes = 65536        # 64 KB
+# plan_body_limit_bytes = 134217728       # 128 MB
+# submission_body_limit_bytes = 524288000 # 500 MB
+# vault_blob_limit_bytes = 137438953472   # 128 GiB
+# list_default_limit = 50
+# list_max_limit = 200
+# dataset_probe_max_age_secs = 180
+# require_client_preauth_key = false
+# require_user_preauth_key = false
+# accept_legacy_signatures = true
+# accept_v2_signatures = true
+# Default []: refuses every RFC 9421 signature. The local dev hosts, the Vite
+# proxy's included:
+authorities = ["localhost:3000", "127.0.0.1:3000", "localhost:5173", "127.0.0.1:5173"]
 
-# Outbound HTTP client request timeout in seconds (scoring/evals server calls).
-# Default: 600
+# --- plan filing (serve and the `campaigns` commands) ---
+# plan_max_jobs = 5000
+# hf_import_endpoint = "https://huggingface.co"
+# hf_import_max_concurrent = 2
+# hf_max_concurrent_requests = 8         # must exceed hf_import_max_concurrent
+
+# --- scoring and warehouse writes ---
 # http_timeout_secs = 600
+# http_connect_timeout_secs = 3          # also serve's pipette-duckdb client
+# score_chunk_size = 50
+# warehouse_max_rows_per_part = 1000
+# warehouse_lock_age_secs = 259200       # 72 hours
+# parquet_zstd_level = 3                 # 1..=22
+# mutate_lock_ttl_secs = 1800
 
-# Storage backend configuration.
-# Default: local_fs with data_dir = "./data"
+# --- queue-maintenance ---
+# plan_lost_lease_limit = 3              # 0 turns the count off
+# todo_tmp_max_age_secs = 86400
+# plan_creating_max_age_secs = 21600
+# queue_maintenance_read_timeout_secs = 60   # unset: the 30 s request timeout
+
+# --- the `todo/` queue's S3 client (every command) ---
+# todo_attempt_timeout_secs = 5          # one attempt, then the client retries
+# todo_operation_timeout_secs = 20       # a request with its retries
+
+# --- dataset-cache ---
+# dataset_probe_timeout_secs = 30
+# dataset_build_timeout_secs = 900
+# dataset_asr_build_timeout_secs = 7200   # an asr-eval-corpus/1 build or `pins`
+
+# Probe an s3 [storage] / [auth_storage] for conditional PUT at startup.
+# probe_backend_capabilities = true
+
+# Default: local_fs with data_dir = "./data".
 [storage]
 backend = "local_fs"
 data_dir = "./sample_data"
 
-# To use S3 instead:
+# On S3:
 # [storage]
 # backend = "s3"
 # bucket = "my-bucket"
 # prefix = "v1/"
 # region = "us-east-1"
-# endpoint = "https://..."  # optional, for MinIO/R2/custom S3
-# Credentials via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars or IAM role.
+# endpoint = "https://s3.example.test"   # MinIO, R2 or another S3-compatible store
+# max_concurrent_requests = 32
 
-# Required: storage for client auth data (keys, identities).
-# Use a separate private bucket to isolate auth data from
-# benchmark/warehouse data.
+# Required: identities, keys and their claims. Use a separate private bucket on S3.
 [auth_storage]
 backend = "local_fs"
 data_dir = "./sample_data"
 
-# To use S3 instead:
-# [auth_storage]
+# Optional: the `todo/` queue. Defaults to [storage]; on S3 it must be an
+# Express One Zone bucket (docs/storage.md).
+# [todo_storage]
 # backend = "s3"
-# bucket = "my-auth-bucket"
+# bucket = "my-todo--use1-az4--x-s3"
 # region = "us-east-1"
+
+# Optional: hold a pending client's submissions instead of refusing them.
+# [unverified_submissions]
+# enabled = false
+
+# Optional: approve a client at registration by its self-reported contact_email.
+# Not a security control.
+# [auto_approve]
+# emails = ["alice@example.test"]
+# domains = ["example.test"]
+
+# Optional: offer rules for the descriptor catalog. The default has no rules, so
+# no device receives a catalog member.
+# `serve` warns once for each known flavor without a rule.
+# `llamacpp_min_build_age_secs` is the minimum age, in seconds, of a daily
+# llama.cpp build. Run the import at least this long after 00:00 UTC, or a day
+# can take an older build.
+# `expiry` moves an importer entry from active to hidden by its release time.
+# The newest `stable_keep_newest` active or pinned stable entries stay active.
+# Another stable entry stays active for `stable_max_age_days`, and a daily entry
+# for `daily_max_age_days`. Expiry never changes a pinned or hand-made entry.
+# [descriptor_catalog]
+# llamacpp_min_build_age_secs = 10800
+# precedence.llamacpp = ["macos-arm64", "macos-x64"]
+#
+# [descriptor_catalog.expiry]
+# stable_keep_newest = 2
+# stable_max_age_days = 60
+# daily_max_age_days = 14
+#
+# [[descriptor_catalog.offer_rules]]
+# runtime_type = "llamacpp_cli_stock_tools"
+# flavor = "macos-arm64"
+# requires = ["os:macos"]
+# any_of = [["chip:applem1", "chip:applem1pro", "chip:applem1max", "chip:applem1ultra",
+#            "chip:applem2", "chip:applem2pro", "chip:applem2max", "chip:applem2ultra",
+#            "chip:applem3", "chip:applem3pro", "chip:applem3max", "chip:applem3ultra",
+#            "chip:applem4", "chip:applem4pro", "chip:applem4max", "chip:applem4ultra",
+#            "chip:applem5", "chip:applem5pro", "chip:applem5max", "chip:applem5ultra"]]
+#
+# [[descriptor_catalog.offer_rules]]
+# runtime_type = "llamacpp_cli_stock_tools"
+# flavor = "macos-x64"
+# requires = ["os:macos"]
+
+# Optional: pipette-duckdb, which plan and campaign results are read from.
+# [duckdb]
+# url = "http://localhost:3100"
+# user = "dev-admin"
+# password = "local-dev-password-only"
+# database = "internal"
+# timeout_secs = 30
+
+# Optional: the PostgreSQL database the records live on. An absent key falls back
+# to its libpq variable (PGHOST, PGPORT, PGUSER, PGDATABASE, PGSSLMODE).
+# [database]
+# host = "localhost"
+# port = 5432
+# user = "pipette_mgmt"
+# database = "pipette_mgmt"
+# ssl_mode = "prefer"                    # disable, prefer, require, verify-full
+# max_connections = 8
+
+# Optional: console sign-in through a Clerk instance (docs/operations.md §6.3).
+# [clerk]
+# publishable_key = "pk_test_…"
+# public_key = """
+# -----BEGIN PUBLIC KEY-----
+# …
+# -----END PUBLIC KEY-----
+# """
+# authorized_parties = ["http://localhost:3000"]
+# jwt_template = "pipette-mgmt"
+# allowed_domains = ["example.test"]
+#
+# [[clerk.provision]]
+# domain = "example.test"
+# org = "acme"

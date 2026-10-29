@@ -1,0 +1,74 @@
+# Example scheduler-mode plan: `pipette-ctl campaigns create` sends it to the
+# management server, which expands it into jobs and stages them onto the job
+# server.
+#
+#   pipette-ctl campaigns create --name "AFM smoke" \
+#     --plan examples/plans/scheduler/afm-mlx.toml --note afm-mlx-smoke
+#
+# A distinct format from the local-dispatch plans alongside it: no `plan_id`,
+# no `[[transports]]`, no `[retry]`. A variant declares *eligibility* — which
+# registered clients may run it — instead of naming execution targets, and the
+# server leases each job to a matching device. The two formats don't parse as
+# each other, so a mis-selected mode is a loud failure.
+
+# `expires_at` is stamped on every generated job; after it the server stops
+# handing them out. This plan omits it, so each job takes ingestion's 30-day
+# default. Set a date, or "never" for jobs the server never expires on its own.
+# expires_at = "2026-12-01T00:00:00Z"
+# expires_at = "never"
+
+# The server merges a job into one that already runs the same cell. Uncomment
+# for a plan that needs its own run of every cell, such as a variance
+# measurement.
+# merge_duplicates = false
+
+benchmarks = [
+  "decode_throughput_512_100",
+  "end_to_end_latency_512_256",
+]
+
+# iOS Apple Foundation. `requires` is what this variant commits to; the
+# supported-iPhone family is injected by the server's capability rules, so
+# the plan never spells out which devices can run AFM. `clients` widens
+# eligibility to that device whatever its capabilities say. Drop `requires` to
+# pin the variant to the roster instead: a roster-only variant takes no
+# injection, so only the named devices run it.
+#
+# Uncomment `client_versions` to run the variant only on a client at one of
+# these app builds: a client reports a `client_version:<v>` flag for each build
+# it can run. The roster ignores it, so the device `clients` names runs at any
+# build. Pin a device with a `tag:` flag in `requires` to pin its build too.
+#
+# Copy the runtime from the build's release manifest (`pipette-ios-<v>.json`)
+# as written: the internal builds carry `private_thermal = true`, and
+# pipette-ios-proxy matches the whole descriptor, so on the proxied iPhones a
+# runtime without it is in no build.
+[[variants]]
+requires   = ["os:ios"]
+clients    = ["ev1_9f2c1d3e4b5a6c7d"]
+# client_versions = ["2026.10.02-430a0bf-internal"]
+models     = [{ type = "apple_foundation_text" }]
+runtimes   = [{ type = "apple_foundation", private_thermal = true }]
+benchmarks = ["decode_throughput_512_100"]
+
+# macOS MLX: eligibility by capability alone — any registered, approved macOS
+# client that matches claims it. Both top-level benchmarks run here.
+#
+# The three commented clauses narrow that set. A denial beats the `clients`
+# roster, and each clause defaults to empty, which denies nobody. Uncomment one
+# to keep the cells off a known-bad unit, off a machine on a broken OS build, or
+# off one combination that crashes while each part of it stays allowed.
+#
+# Take care with `not_all_of`: an *empty* group denies every client, because
+# every capability set contains it. The server rejects that group.
+[[variants]]
+requires = ["os:macos"]
+# exclude_clients = ["ev1_4a1b2c3d4e5f6a7b"]
+# excludes = ["os_version:15.0"]
+# not_all_of = [["chip:applem1", "runtime:mlx:0.31.3"]]
+models = [
+  { type = "mlx", source = "huggingface", org = "LiquidAI", repo_name = "LFM2.5-350M-MLX-4bit" },
+]
+runtimes = [
+  { type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-arm64", source = { type = "pip_requirements_text", contents = "mlx-lm==0.31.3\n" } },
+]
