@@ -1,0 +1,24 @@
+[package]
+name = "pipette-hub-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# A mock HuggingFace Hub and its CDN, for the import tests in
+# `pipette-pipeline` and the ingestion tests in `pipette-httpapi`. Each
+# consumer is a test crate, such as `pipette-web-testkit`, or takes this crate
+# as a dev-dependency, so none of it reaches a release build. Each dependency is already in the release graph, so the crate
+# adds nothing to `THIRD-PARTY-LICENSES.md`.
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

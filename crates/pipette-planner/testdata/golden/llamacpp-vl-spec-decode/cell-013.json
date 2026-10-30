@@ -1,0 +1,53 @@
+{
+  "requires": [],
+  "any_of": [],
+  "clients": [
+    "ev1_9f2c1d3e4b5a6c7d"
+  ],
+  "merge_duplicates": false,
+  "spec": {
+    "benchmark": "vl_spec_decode_mmspec_test_gqa_k7",
+    "model": {
+      "type": "gguf_vision_speculative",
+      "source": "huggingface",
+      "org": "example-org",
+      "repo_name": "VLM-3B-Draft-GGUF",
+      "model": "VLM-3B-Draft-F16.gguf",
+      "mmproj": "mmproj-VLM-3B-F16.gguf"
+    },
+    "runtime": {
+      "type": "llamacpp_cli_stock_tools",
+      "source": "remote_archive",
+      "url": "https://REPLACE_WITH_HOST/llamacpp/llama-fork-bin-macos-arm64.tar.gz",
+      "flavor": "macos-arm64"
+    },
+    "runtime_flags": {
+      "runtime_type": "llamacpp_cli_stock_tools",
+      "model_type": "gguf_vision_speculative",
+      "benchmark_type": "vl_spec_decode",
+      "speculative_enabled": true,
+      "number_gpu_layers": 99,
+      "mmap": true,
+      "flash_attention": "on",
+      "ctx_size": 8192,
+      "envs": [
+        "DRAFT_FUSED=1",
+        "GGML_DRAFT_DELTA=16"
+      ],
+      "raw": [
+        "--spec-type",
+        "draft-fused",
+        "--spec-draft-n-min",
+        "0"
+      ]
+    },
+    "model_flags": null,
+    "benchmark_flags": {
+      "runtime_type": "llamacpp_cli_stock_tools",
+      "model_type": "gguf_vision_speculative",
+      "benchmark_type": "vl_spec_decode",
+      "http_timeout_seconds": 600,
+      "bench_timeout_seconds": 10800
+    }
+  }
+}

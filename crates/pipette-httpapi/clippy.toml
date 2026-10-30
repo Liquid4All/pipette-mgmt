@@ -1,0 +1,13 @@
+# The HTTP tier answers with typed bodies (`pipette_plan_types`), never
+# JSON built by hand. Tests opt out at their root.
+disallowed-macros = [
+    { path = "serde_json::json", reason = "answer with a `#[derive(Serialize)]` type; a `json!` literal is a second copy of the wire shape" },
+]
+disallowed-methods = [
+    { path = "serde_json::to_value", reason = "answer with the typed body itself; a `Value` built from one is reshaped by hand next" },
+    { path = "serde_json::Map::new", reason = "an object built key by key is a second copy of the wire shape; add a `pipette_plan_types` body" },
+    { path = "serde_json::Value::as_object_mut", reason = "patching a serialized body is a second copy of the wire shape; add a `pipette_plan_types` body" },
+]
+
+# Repeated from the root `clippy.toml`, which this file shadows.
+allow-indexing-slicing-in-tests = true

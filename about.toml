@@ -15,8 +15,8 @@ targets = [
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# Skip workspace members that are not published; pipette-mgmt itself is the
-# work being licensed, not a third-party notice.
+# Skip workspace members that are not published; this repository's own crates
+# are the work being licensed, not a third-party notice.
 private = { ignore = true }
 
 # Order is significant: for a crate offering a choice (`MIT OR Apache-2.0`),
@@ -35,4 +35,7 @@ accepted = [
     "0BSD",
     "MIT-0",
     "Unlicense",
+    # webpki-roots, sqlx's TLS root store: a data license for the
+    # certificates, not code.
+    "CDLA-Permissive-2.0",
 ]

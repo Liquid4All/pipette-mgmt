@@ -1,0 +1,288 @@
+/* The app's own sheet: the classic console's layout (`static/templates/style.css`)
+   in liquid.ai's light palette. Every colour is a variable here, so a palette
+   change is this block alone. Fonts fall back to the system's when Inter and
+   Geist Mono are not installed, since the page loads nothing from elsewhere. */
+:root { --bg: #fff; --surface: #fafafa; --surface-2: #f4f4f5; --hover: #f4f4f5;
+        --border: #00000014; --border-strong: #00000026; --text: #18181b; --text-muted: #71717a;
+        --accent: #7c3aed; --accent-soft: #f2ecff; --selected: #f8f5ff;
+        --primary: #18181b; --primary-hover: #27272a; --on-primary: #fafafa;
+        --red: #dc2626; --red-soft: #fef2f2; --red-border: #fecaca;
+        --amber: #b45309; --amber-soft: #fffbeb; --amber-border: #fde68a;
+        --green: #15803d; --green-soft: #f0fdf4; --green-border: #bbf7d0;
+        --radius: 6px; --shadow: #00000026; --backdrop: #18181b40;
+        /* Chart series in a fixed order; 3–5 sit under 3:1 on white, so a marker shape and the value tables carry them too. */
+        --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+        --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+        --grid: #e4e4e7; --band: #94a3b8;
+        --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+body { margin: 0; font: 13px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+       color: var(--text); background: var(--bg); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header { position: sticky; top: 0; z-index: 10; display: flex; gap: 12px; align-items: center;
+         height: 44px; box-sizing: border-box; padding: 0 20px; background: var(--bg);
+         border-bottom: 1px solid var(--border); }
+header .brand { margin-right: auto; color: var(--text); font-size: 18px; font-weight: 500; }
+header .brand:hover { text-decoration: none; }
+header .fold { display: flex; margin-left: -8px; padding: 4px; border-color: transparent;
+               color: var(--text-muted); }
+header .fold:hover { color: var(--text); }
+header .fold[aria-expanded="false"] { color: var(--text); }
+header .who { font-size: 12px; color: var(--text-muted); }
+
+/* The tree keeps to its column and scrolls on its own; the rule beside it is the page's, as a tree stretched to
+   the window would ride up under the header at the page's end. */
+.frame { display: flex; align-items: flex-start; min-height: calc(100vh - 44px); --tree-width: 184px; }
+.tree { position: sticky; top: 44px; flex: 0 0 var(--tree-width); box-sizing: border-box;
+        max-height: calc(100vh - 44px); overflow-y: auto; padding: 6px 10px 24px 14px; }
+.tree + main { align-self: stretch; border-left: 1px solid var(--border); }
+.tree.folded + main { border-left: 0; }
+.tree .branch { margin: 14px 0 4px; color: var(--text); font-weight: 500; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+.tree ul { list-style: none; margin: 0 0 0 5px; padding: 0 0 0 7px;
+           border-left: 1px solid var(--border); }
+/* An open organization: its name, then its leaves one step in. */
+.tree ul ul { margin-left: 8px; }
+.tree .org { display: block; padding: 3px 8px; color: var(--text); overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }
+.tree a { display: block; padding: 3px 8px; border-radius: var(--radius); color: var(--text-muted); }
+.tree a:hover { background: var(--hover); color: var(--text); text-decoration: none; }
+.tree a[aria-current] { background: var(--accent-soft); color: var(--accent); }
+/* Slides out whole rather than squeezing its leaves; hidden once out so its links leave the tab order. */
+.tree { transition: margin-left .15s ease, visibility 0s; }
+.tree.folded { margin-left: calc(-1 * var(--tree-width)); visibility: hidden;
+               transition: margin-left .15s ease, visibility 0s .15s; }
+@media (prefers-reduced-motion: reduce) { .tree, .tree.folded { transition: none; } }
+main { flex: 1; min-width: 0; padding: 16px 20px 40px; }
+/* A narrow window stacks the tree above the page rather than squeezing both. */
+@media (max-width: 760px) {
+  .frame { display: block; min-height: 0; }
+  .tree { position: static; max-height: none; border-bottom: 1px solid var(--border); }
+  .tree + main { border-left: 0; }
+  .tree.folded { display: none; }
+}
+footer { padding: 10px 20px; border-top: 1px solid var(--border); color: var(--text-muted);
+         font-size: 11px; }
+footer code { font-size: inherit; }
+
+h1 { font-size: 18px; font-weight: 500; margin: 4px 0 12px; }
+/* `.h2` titles a section that must not take a place in the heading outline. */
+h2, .h2 { font-size: 14px; font-weight: 500; margin: 28px 0 10px; padding-bottom: 6px;
+          border-bottom: 1px solid var(--border); }
+h3 { font-size: 13px; font-weight: 500; margin: 20px 0 8px; }
+p { max-width: 70em; }
+.muted { color: var(--text-muted); }
+
+table { border-collapse: separate; border-spacing: 0; width: 100%; margin: 8px 0 14px;
+        border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px;
+        font-variant-numeric: tabular-nums; }
+th, td { text-align: left; vertical-align: top; padding: 5px 8px;
+         border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); }
+th:last-child, td:last-child { border-right: 0; }
+tbody tr:last-child > td { border-bottom: 0; }
+th { background: var(--surface); font-size: 11px; font-weight: 500; white-space: nowrap;
+     border-bottom-color: var(--border-strong); }
+th:first-child { border-top-left-radius: var(--radius); }
+th:last-child { border-top-right-radius: var(--radius); }
+tbody tr:hover > td { background: var(--surface); }
+/* Figures line up on the right. */
+td.num { text-align: right; }
+/* Lighter than a status pill's tint, so an `active` pill still reads on it. */
+tr.shown > td, tbody tr.shown:hover > td { background: var(--selected); }
+
+/* A wide table keeps each row on one line and scrolls sideways as a whole. */
+.wide { overflow-x: auto; margin: 8px 0 14px; }
+.wide table { margin: 0; }
+.wide th, .wide td { white-space: nowrap; }
+/* A fixed width wraps a long descriptor; the table scrolls sideways. */
+.descriptor { display: block; width: 30em; white-space: pre-wrap; word-break: break-all;
+              font-size: 11px; color: var(--text-muted); }
+/* A client's failure reason can be a page of runtime output, and scrolls in place. */
+.reason { width: 36em; max-height: 26em; overflow: auto; overflow-wrap: anywhere;
+          white-space: pre-wrap; font-size: 11px; font-weight: 400; }
+/* A table whose reader set its column widths is exactly as wide as its columns. Text past a column's
+   edge ends in an ellipsis; a descriptor or a reason wraps at the column's width. */
+table.sized { table-layout: fixed; width: 0; }
+table.sized th, table.sized td { overflow: hidden; text-overflow: ellipsis; }
+table.sized .descriptor, table.sized .reason { width: auto; max-width: none; }
+
+/* A record's facts sit on the page itself, as wide as it. */
+dl { display: grid; grid-template-columns: minmax(9em, max-content) minmax(0, max-content);
+     gap: 4px 20px; margin: 8px 0 14px; }
+dt { color: var(--text-muted); }
+dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+/* A record at a glance: each fact a label over its value, in columns that wrap. */
+/* At most three columns, so an id has room; fewer where the page is narrow. */
+dl.summary { grid-template-columns: repeat(auto-fill, minmax(max(14em, calc((100% - 48px) / 3)), 1fr));
+             gap: 12px 24px; }
+dl.summary dt { margin-bottom: 2px; font-size: 11px; }
+/* A record's fields as a box of rows, as Settings lays out its writes: a label beside each value. */
+dl.facts { display: block; max-width: 56em; margin: 8px 0 18px; border: 1px solid var(--border);
+           border-radius: var(--radius); }
+dl.facts > div { display: grid; grid-template-columns: 11em minmax(0, 1fr); gap: 4px 16px; padding: 8px 16px;
+                 align-items: baseline; }
+dl.facts > div + div { border-top: 1px solid var(--border); }
+/* A job's metrics, without the panel. */
+td dl { margin: 0; gap: 0 10px; grid-template-columns: max-content max-content; }
+td dd, td.value { font-weight: 500; }
+
+code, pre, textarea, .id { font-family: var(--mono); }
+code, .id { font-size: 12px; }
+/* An id is for copying rather than reading. */
+td.id { color: var(--text-muted); font-size: 11px; }
+pre { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 8px 12px; overflow: auto; max-height: 22em; font-size: 12px; }
+pre code { font-size: inherit; }
+/* A device can have many capability flags. The list scrolls inside its box. */
+ul.flags { list-style: none; margin: 2px 0 0; padding: 4px 8px; font-family: var(--mono); font-size: 12px;
+           width: max-content; max-width: 100%; box-sizing: border-box; white-space: nowrap;
+           max-height: 16em; overflow: auto; scrollbar-gutter: stable; background: var(--surface);
+           border: 1px solid var(--border); border-radius: var(--radius); }
+
+/* A device's backlog by campaign sits under the backlog count, as wide as its rows. */
+table.backlog { width: auto; margin: 4px 0 0; }
+/* A breakdown from another count than the backlog total: its counts and its note are red. */
+table.backlog.disagrees td.num, p.disagrees { color: var(--red); }
+p.disagrees { margin: 4px 0 0; font-size: 12px; }
+
+input, select, textarea, button { font: inherit; color: inherit; }
+input[type=text], input[type=password], select, textarea {
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg); }
+input[type=text], input[type=password] { width: 32em; max-width: 100%; box-sizing: border-box; }
+textarea { display: block; box-sizing: border-box; width: 100%; min-height: 14em;
+           font-family: var(--mono); font-size: 12px; }
+textarea[rows] { min-height: 0; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+/* A page heading takes focus on navigation for screen readers, not to be drawn as a control. */
+main [tabindex="-1"]:focus, main[tabindex="-1"]:focus { outline: none; }
+button { padding: 5px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+         background: var(--bg); font-size: 12px; cursor: pointer; }
+button:hover { background: var(--hover); border-color: var(--border-strong); }
+button:disabled, button[aria-disabled="true"] { opacity: .55; cursor: default; }
+/* Its own rule: a selector list fails whole on a browser without it. */
+::file-selector-button { margin-right: 8px; padding: 5px 12px; border: 1px solid var(--border);
+                         border-radius: var(--radius); background: var(--bg); font: inherit;
+                         cursor: pointer; }
+/* The primary action is near-black; violet marks links and the place you are. */
+button.primary, .bar > a.primary { background: var(--primary); border-color: var(--primary);
+                                   color: var(--on-primary); }
+button.primary:hover, .bar > a.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+button.danger { color: var(--red); }
+button.danger:hover { background: var(--red-soft); border-color: var(--red-border); }
+/* An action beside a line of text, so it reads as a link. */
+button.again { padding: 0; border: 0; background: none; color: var(--accent); font-size: inherit; }
+button.again:hover { background: none; text-decoration: underline; }
+/* A link or button after a line of text, in an outlined pill with its icon first, so it is apart from the text. */
+.pill { display: inline-block; margin-left: 4px; padding: 1px 8px; border: 1px solid var(--border-strong);
+        border-radius: 10px; background: var(--bg); color: var(--accent); font-size: 11px; line-height: 1.5; }
+.pill:hover { background: var(--accent-soft); border-color: var(--accent); text-decoration: none; }
+
+/* Words for a screen reader alone. */
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+      white-space: nowrap; }
+
+label { display: block; margin: 10px 0; }
+label > span, .caption { display: block; color: var(--text-muted); font-size: 12px; margin-bottom: 3px; }
+/* A checkbox beside its words. */
+label.check { display: flex; gap: 6px; align-items: baseline; margin: 4px 0; }
+/* A permission form's boxes, as wide as their names. */
+table.fit { width: auto; }
+table.fit label { display: inline; margin: 0; }
+.bar { margin: 10px 0; display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+.bar label { margin: 0; }
+
+/* Red for what failed or was refused, amber for what needs a look. */
+.err { color: var(--red); }
+p.err { white-space: pre-wrap; background: var(--red-soft); border: 1px solid var(--red-border);
+        border-radius: var(--radius); padding: 10px 14px; }
+p.err.code { font-family: var(--mono); font-size: 12px; }
+.notice { color: var(--amber); background: var(--amber-soft); border: 1px solid var(--amber-border);
+          border-radius: var(--radius); padding: 10px 14px; margin: 10px 0; }
+/* Green for a write that took. */
+p.ok { color: var(--green); background: var(--green-soft); border: 1px solid var(--green-border);
+       border-radius: var(--radius); padding: 10px 14px; margin: 10px 0; }
+/* What a field takes, under it, and in its place why what was typed would be refused. */
+.hint { margin-top: 4px; color: var(--text-muted); font-size: 12px; }
+.hint.err { color: var(--red); }
+input[aria-invalid=true], textarea[aria-invalid=true] { border-color: var(--red); }
+.hint.ok { color: var(--green); }
+/* A check under way: the last answer stays, dimmed, until the next replaces it. */
+.hint[aria-busy=true] { opacity: .6; }
+/* Source: one logical line a visual line, so a line number points at what it says. */
+textarea.code { white-space: pre; overflow-wrap: normal; overflow-x: auto; tab-size: 2; }
+
+/* A Settings tab: sections, each a heading over a box of rows, one write a row:
+   what it does, then its control under it, a rule between rows. Red marks the danger zone. */
+.settings { max-width: 56em; }
+.settings-box { border: 1px solid var(--border); border-radius: var(--radius); }
+.settings-box.danger { border-color: var(--red-border); }
+.setting { padding: 12px 16px; }
+/* `~`, not `+`: a closed dialog may sit between rows. */
+.setting ~ .setting { border-top: 1px solid var(--border); }
+.settings-box.danger .setting ~ .setting { border-top-color: var(--red-border); }
+.setting h3 { margin: 0; }
+.setting .what p { margin: 2px 0 0; }
+.setting .control, .setting .body { margin-top: 10px; }
+.setting .control button { white-space: nowrap; }
+/* A row whose write is done, such as a requested cancel, keeps its words alone. */
+.setting .control:empty { display: none; }
+.setting .body .bar { margin: 0; }
+
+[data-state], .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+               font-weight: 500; line-height: 1.5; white-space: nowrap;
+               background: var(--surface-2); color: var(--text-muted); }
+[data-state=active], [data-state=running] { background: var(--accent-soft); color: var(--accent); }
+[data-state=complete], [data-state=finished],
+[data-state=approved], [data-state=succeeded] { background: var(--green-soft); color: var(--green); }
+[data-state=failed], [data-state=expired],
+[data-state=complete_with_failures], [data-state=refused] { background: var(--red-soft); color: var(--red); }
+[data-state^=pending], [data-state=creating],
+[data-state=cancelling] { background: var(--amber-soft); color: var(--amber); }
+/* Which of a campaign's plans a value is: the one it runs, or one before it. */
+.tag.current { background: var(--accent-soft); color: var(--accent); }
+.tag.earlier { background: var(--amber-soft); color: var(--amber); }
+.tag.error { background: var(--red-soft); color: var(--red); }
+.tag.warning { background: var(--amber-soft); color: var(--amber); }
+
+/* Sign-in is a form, not a table, so it reads at a form's width. */
+.narrow { max-width: 40em; }
+
+/* The pages above this one; the separator is drawn, not read, where `content` takes alt text. */
+.crumbs ol { display: flex; flex-wrap: wrap; margin: 0; padding: 0; list-style: none; font-size: 12px;
+             color: var(--text-muted); }
+.crumbs li + li::before { content: "/"; content: "/" / ""; margin: 0 6px; }
+.crumbs a { color: var(--text-muted); }
+.crumbs a:hover { color: var(--text); }
+/* The page itself as the last step: its heading, at the trail's size. */
+.crumbs h1 { display: inline; margin: 0; font-size: inherit; color: var(--text); }
+
+.head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.head h1, .head > .crumbs { margin-right: auto; }
+.head > .crumbs h1 { margin-right: 0; }
+/* A link that reads as a button: an action that opens a page. */
+a.button, .bar > a { display: inline-block; padding: 5px 12px; border: 1px solid var(--border);
+                     border-radius: var(--radius); background: var(--bg); color: var(--text);
+                     font-size: 12px; }
+a.button:hover, .bar > a:hover { background: var(--hover); border-color: var(--border-strong);
+                                 text-decoration: none; }
+div.muted.id { font-size: 11px; }
+/* Lined up with a control's text rather than with its caption. */
+.bar > span { padding-bottom: 5px; }
+.dirty { color: var(--amber); font-weight: 500; }
+
+details { margin: 10px 0; }
+summary { cursor: pointer; color: var(--text-muted); }
+summary:hover { color: var(--text); }
+fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 10px 0; padding: 6px 14px 12px; }
+legend { color: var(--text-muted); font-size: 12px; padding: 0 4px; }
+.clauses { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+.clause { margin: 0; }
+.clause p { margin: 2px 0 8px; font-size: 11px; width: 17em; }
+.clause input[type=text] { width: 17em; }
+.clause button { padding: 2px 8px; font-size: 11px; }
+.entry { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+/* A row's own action keeps to its cell. */
+td.claim { white-space: nowrap; }
+td.claim button, td.claim select { padding: 2px 8px; font-size: 11px; }

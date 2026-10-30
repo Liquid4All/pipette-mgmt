@@ -14,3 +14,7 @@ target/*-unknown-linux-*/release/*
 .git
 .gitignore
 .github
+
+# The Svelte app's packages and build; build.rs embeds ui/dist into the binary.
+ui/node_modules
+ui/dist

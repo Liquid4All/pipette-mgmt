@@ -1,0 +1,92 @@
+# Example scheduler-mode plan: the VL spec-decode benchmark on llama.cpp,
+# filed with the management server as a campaign rather than driven over a local
+# transport.
+#
+#   pipette-ctl campaigns create --name llamacpp-vl-spec-decode \
+#     --plan examples/plans/scheduler/llamacpp-vl-spec-decode.toml
+#
+# The local-dispatch twin is ../llamacpp-macos-vl-spec-decode.toml; see it for
+# what `vl_spec_decode` measures and what `speculative_enabled` does. This file
+# differs in one thing: eligibility instead of transports.
+#
+# One job per (model, benchmark id): eighteen with the regular model,
+# speculation off, and eighteen with the spec-decoding model, speculation on,
+# over the same benchmark ids. Each is its own row; the speedup between a
+# pair is computed outside the server from the stored rows, never by a client.
+#
+# Both variants run on the reference harness's llama.cpp fork build, hosted as
+# an archive: see the local twin for why and how to build it.
+#
+# Eligibility is a named roster and nothing else. Each job pulls an ~80 MB
+# corpus from the server and refuses to start on battery, so the machines that
+# claim it are chosen, not matched: the server doc calls for a client-reported
+# capability flag here, and the roster is what stands in until the client can
+# advertise one. Widen `clients` rather than adding `requires`: a client is
+# eligible when it is rostered *or* matches the flags, so `requires =
+# ["os:macos"]` beside the roster would hand these cells to every Mac.
+
+# No `expires_at`: each job takes ingestion's 30-day default.
+# Each dataset is its own measurement; do not merge into another plan's run.
+merge_duplicates = false
+
+# Each subset at three draft lengths, alike in everything else: k8 is the
+# reference condition, k7 and k9 measure where the optimum sits on this
+# silicon. A pair is joined on the whole benchmark id, so every k pays for its
+# own speculation-off row even though that arm never drafts. One k at a time is
+# fine; splitting a pair is not.
+benchmarks = [
+  "vl_spec_decode_mmspec_test_gqa_k8",
+  "vl_spec_decode_mmspec_test_textvqa_k8",
+  "vl_spec_decode_mmspec_test_charxiv_k8",
+  "vl_spec_decode_mmspec_test_mmmu_pro_k8",
+  "vl_spec_decode_mmspec_test_coco_k8",
+  "vl_spec_decode_mmspec_test_multi_turn_k8",
+  "vl_spec_decode_mmspec_test_gqa_k7",
+  "vl_spec_decode_mmspec_test_textvqa_k7",
+  "vl_spec_decode_mmspec_test_charxiv_k7",
+  "vl_spec_decode_mmspec_test_mmmu_pro_k7",
+  "vl_spec_decode_mmspec_test_coco_k7",
+  "vl_spec_decode_mmspec_test_multi_turn_k7",
+  "vl_spec_decode_mmspec_test_gqa_k9",
+  "vl_spec_decode_mmspec_test_textvqa_k9",
+  "vl_spec_decode_mmspec_test_charxiv_k9",
+  "vl_spec_decode_mmspec_test_mmmu_pro_k9",
+  "vl_spec_decode_mmspec_test_coco_k9",
+  "vl_spec_decode_mmspec_test_multi_turn_k9",
+]
+
+# The regular model: speculation off.
+[[variants]]
+clients = ["ev1_9f2c1d3e4b5a6c7d"]
+models = [
+  { type = "gguf_vision", source = "huggingface", org = "example-org", repo_name = "VLM-3B-GGUF", model = "VLM-3B-F16.gguf", mmproj = "mmproj-VLM-3B-F16.gguf" },
+]
+runtimes = [
+  { type = "llamacpp_cli_stock_tools", source = "remote_archive", url = "https://REPLACE_WITH_HOST/llamacpp/llama-fork-bin-macos-arm64.tar.gz", flavor = "macos-arm64" },
+]
+runtime_flags = [
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision", speculative_enabled = false, flash_attention = "on", number_gpu_layers = 99, ctx_size = 8192, mmap = true },
+]
+benchmark_flags = [
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+]
+
+# The spec-decoding model: speculation on. The spec-decoding release merges the
+# drafter into the weights, so there is no `draft` file; a drafter shipped
+# separately adds `draft = "..."` beside `mmproj`. The draft length comes from
+# the benchmark's `parameter_draft_length`, and a separate drafter from the
+# model, so neither may be restated.
+[[variants]]
+clients = ["ev1_9f2c1d3e4b5a6c7d"]
+models = [
+  { type = "gguf_vision_speculative", source = "huggingface", org = "example-org", repo_name = "VLM-3B-Draft-GGUF", model = "VLM-3B-Draft-F16.gguf", mmproj = "mmproj-VLM-3B-F16.gguf" },
+]
+runtimes = [
+  { type = "llamacpp_cli_stock_tools", source = "remote_archive", url = "https://REPLACE_WITH_HOST/llamacpp/llama-fork-bin-macos-arm64.tar.gz", flavor = "macos-arm64" },
+]
+runtime_flags = [
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision_speculative", speculative_enabled = true, flash_attention = "on", number_gpu_layers = 99, ctx_size = 8192, mmap = true, envs = ["DRAFT_FUSED=1", "GGML_DRAFT_DELTA=16"], raw = ["--spec-type", "draft-fused", "--spec-draft-n-min", "0"] },
+]
+benchmark_flags = [
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision_speculative", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+]

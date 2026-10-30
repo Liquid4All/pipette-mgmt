@@ -1,0 +1,117 @@
+/* The API reference page (site.rs), on Starlight's palette: a sidebar, and a sticky route card beside each route when wide. */
+:root {
+  /* Starlight's tokens: --white is the strongest text, so it is dark in light mode. */
+  --white: #17181c; --gray-1: #23262f; --gray-2: #353841; --gray-3: #555962; --gray-4: #888c96;
+  --gray-5: #c1c3c8; --gray-6: #edeef3; --gray-7: #f6f7f9; --black: #fff;
+  --accent: #3d50f5; --side-bg: var(--black); --side-line: var(--gray-6); --code-bg: var(--gray-6); --pre-bg: var(--gray-7);
+  --req: hsl(41 80% 30%);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --side-w: 18.75rem;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --white: #fff; --gray-1: #edeef3; --gray-2: #c1c3c8; --gray-3: #888c96; --gray-4: #555962;
+    --gray-5: #353841; --gray-6: #23262f; --gray-7: #1c1e24; --black: #17181c;
+    --accent: #b3c7ff; --side-bg: var(--gray-6); --side-line: var(--black); --code-bg: var(--gray-5); --pre-bg: var(--gray-6);
+    --b-fill: 13%; --b-line: 63%; --req: hsl(41 82% 63%);
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 1rem; }
+body { margin: 0; background: var(--black); color: var(--gray-2); font: 16px/1.75 var(--sans); }
+a { color: var(--accent); text-underline-offset: 3px; }
+a.self { color: inherit; text-decoration: none; }
+code, pre { font-family: var(--mono); }
+:not(pre) > code { font-size: .875em; background: var(--code-bg); padding: .125rem .25rem; border-radius: .25rem; overflow-wrap: anywhere; }
+pre { background: var(--pre-bg); border: 1px solid var(--gray-5); border-radius: .25rem; padding: .75rem 1rem; font-size: .875rem;
+  line-height: 1.65; overflow-x: auto; margin: 0 0 1rem; color: var(--gray-1); }
+
+.sidebar { position: fixed; inset: 0 auto 0 0; width: var(--side-w); overflow-y: auto; background: var(--side-bg);
+  border-right: 1px solid var(--side-line); padding: 1rem; line-height: 1.4; }
+.toc, .toc ul { list-style: none; margin: 0; padding: 0; }
+.toc > li { margin-bottom: .25rem; }
+.toc ul { margin: .25rem 0 .5rem .5rem; border-left: 1px solid var(--gray-5); }
+.toc a { display: flex; gap: .5rem; justify-content: space-between; align-items: center; padding: .3em .5rem;
+  border-radius: .25rem; color: var(--gray-2); text-decoration: none; font-size: .875rem; }
+.toc ul a { margin-left: .5rem; }
+.toc a:hover { color: var(--white); background: var(--gray-5); }
+.toc > li > a, .toc summary { color: var(--white); font-size: 1rem; font-weight: 600; }
+.toc summary { display: flex; justify-content: space-between; padding: .3em .5rem; cursor: pointer; list-style: none; }
+.toc summary::-webkit-details-marker { display: none; }
+.toc summary::after { content: "\203A"; color: var(--gray-3); transition: transform .2s; }
+.toc details[open] > summary::after { transform: rotate(90deg); }
+
+/* Methods and "human only" as Starlight's badges: white on a filled hue. */
+.m, .badge { flex: none; font: .8125rem/1 var(--mono); border-radius: .25rem; padding: .125rem .375rem; border: 1px solid; }
+.badge { font-family: var(--sans); color: var(--gray-2); background: var(--code-bg); border-color: var(--gray-5); }
+/* Light fills come from each class's --l; dark mode sets one fill and border for all. */
+.m, .badge.warn { color: #fff; background: hsl(var(--h) 90% var(--b-fill, var(--l)));
+  border-color: hsl(var(--h) 90% var(--b-line, calc(var(--l) + 20%))); }
+.m { text-transform: uppercase; }
+.get { --h: 204; --l: 40%; } .post { --h: 101; --l: 21%; } .put, .badge.warn { --h: 41; --l: 32%; }
+.patch { --h: 181; --l: 25%; } .delete { --h: 339; --l: 35%; } .head { --h: 281; --l: 35%; }
+
+main { margin-left: var(--side-w); padding: 2rem 3rem 4rem; }
+main > section { max-width: 45rem; margin: 0 auto 3rem; }
+main > section + section { border-top: 1px solid var(--gray-5); padding-top: 3rem; }
+h1, h2, h3, h4 { color: var(--white); font-weight: 600; line-height: 1.2; margin: 0 0 1rem; }
+h1 { font-size: 2.625rem; } h2 { font-size: 2.1875rem; } h3 { font-size: 1.8125rem; }
+.prose h3, .prose h4, .prose h5, .prose h6 { font-size: 1.25rem; margin: 2rem 0 .5rem; }
+.prose p, .prose ul, .prose ol { margin: 0 0 1rem; }
+.prose ul, .prose ol { padding-left: 1.5rem; }
+table { display: block; overflow-x: auto; border-collapse: collapse; margin: 0 0 1rem; font-size: .875rem; line-height: 1.5; }
+th, td { border-bottom: 1px solid var(--gray-5); padding: .5rem 1rem; text-align: left; vertical-align: top; }
+th { color: var(--white); white-space: nowrap; }
+
+.badges { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: -.25rem 0 1rem; }
+.badges > code { background: none; padding: 0; color: var(--white); }
+h4.sub { font-size: 1.25rem; margin: 2.5rem 0 0; padding-bottom: .75rem; border-bottom: 1px solid var(--gray-5); }
+.mt, .mtl, .schema-name, .ptype { font: .8125rem var(--mono); color: var(--gray-3); }
+.mtl { margin: 1rem 0 .25rem; }
+.schema-name { padding-top: .625rem; }
+.props, .arms, .responses { list-style: none; margin: 0; padding: 0; }
+.prop { border-bottom: 1px solid var(--gray-5); padding: .75rem 0; font-size: .875rem; line-height: 1.6; }
+.prop:last-child { border-bottom: 0; }
+.prop-h { display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
+code.pname, code.st { font: 600 .8125rem var(--mono); color: var(--white); background: none; padding: 0; }
+.preq { font-size: .75rem; color: var(--req); }
+.ptype code, .facts code { font-size: 1em; }
+.pdesc { margin-top: .25rem; }
+.pdesc p { margin: 0 0 .375rem; }
+.facts { color: var(--gray-3); font-size: .8125rem; margin-top: .25rem; }
+/* Starlight's <details>. */
+details.kids, details.model { border-left: .25rem solid var(--gray-5); padding: 0 1rem; margin: .5rem 0; }
+details > summary { cursor: pointer; }
+details.kids > summary { font-size: .8125rem; font-weight: 600; color: var(--white); padding: .25rem 0; }
+details.model > summary { font: 600 .875rem var(--mono); color: var(--white); padding: .5rem 0; }
+details.model > div { scroll-margin-top: 2.5rem; }
+.arm { border-left: 2px solid var(--gray-5); padding: .25rem 0 .25rem .75rem; margin: .375rem 0; font-size: .875rem; }
+.arm-t { font: 600 .8125rem var(--mono); color: var(--white); }
+.responses > li { border-bottom: 1px solid var(--gray-5); font-size: .875rem; }
+.responses summary { padding: .625rem 0; }
+.rd p { display: inline; margin: 0; }
+.resp-body { padding: 0 0 .75rem 1.25rem; }
+
+/* The route card, for examples only: after the body when narrow, its header hidden since the badges show the route. */
+.ex { margin: 1rem 0; }
+.ex-h { display: none; }
+section.op > .ex:not(:has(pre)) { display: none; }
+.ex pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (min-width: 80rem) {
+  main > section { max-width: 68rem; }
+  main > section:not(.op) > * { max-width: 45rem; }
+  section.op { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); column-gap: 3rem; }
+  section.op > * { grid-column: 1; }
+  section.op > .ex { grid-column: 2; grid-row: 1 / span 99; align-self: start; position: sticky; top: 1rem; display: block;
+    margin: 0; border: 1px solid var(--gray-5); border-radius: .5rem; background: var(--pre-bg); overflow: hidden; }
+  .ex-h { display: block; padding: .5rem 1rem; font: .875rem var(--mono); color: var(--white); border-bottom: 1px solid var(--gray-5); }
+  .ex .mtl { margin: 0; padding: .5rem 1rem 0; }
+  .ex pre { border: 0; margin: 0; max-height: 70vh; overflow-y: auto; white-space: pre; overflow-wrap: normal; }
+}
+
+@media (max-width: 50rem) {
+  .sidebar { position: static; width: auto; max-height: 50vh; border-right: 0; border-bottom: 1px solid var(--gray-5); }
+  main { margin-left: 0; padding: 2rem 1rem; }
+}

@@ -1,0 +1,71 @@
+[package]
+name = "pipette-plan-types"
+version.workspace = true
+# This repository owns the crate; pipette-clients takes it by git,
+# pinned to a commit.
+edition.workspace = true
+publish.workspace = true
+
+# Declared rather than auto-discovered, which `ci/checks/test-targets.sh`
+# requires of every crate holding integration tests.
+autotests = false
+
+[[test]]
+name = "example_plans"
+path = "tests/example_plans.rs"
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[features]
+# Adds `clap::ValueEnum` derives on the flavor enums so CLI consumers can
+# `#[arg(long, value_enum)]` against them directly without re-modelling. Off
+# here: nothing in this repository builds a CLI over the flavors yet, while
+# pipette-clients' `pipette-torch-oai` turns it on.
+clap = ["dep:clap"]
+# `schemars::JsonSchema` on `ClientRunSpec` and every type it reaches, so mgmt
+# can generate its app's TypeScript from them. Off by default, like `clap`.
+schemars = ["dep:schemars"]
+# `JobId::new_unchecked` for fixtures, which a release build has no way to call.
+testkit = []
+
+[dependencies]
+# A `vlm-eval-corpus/1` image's bytes to and from the `data:` URI the evals
+# server writes.
+base64.workspace = true
+# Timestamps and a job's deadline, which every body and record shares.
+chrono.workspace = true
+clap = { workspace = true, optional = true }
+# `ContactEmail`'s grammar.
+email_address.workspace = true
+hex.workspace = true
+# `RemoteArchiveUrl`'s scheme-default warning; tracing users get it via tracing-log.
+log.workspace = true
+# The `regex` feature backs the `validate(regex = ...)` newtypes in `location`,
+# `huggingface`, `dataset` and `runtime::uv`; the other members need only
+# `serde`, and Cargo unions the two.
+nutype = { workspace = true, features = ["regex"] }
+# Not named anywhere in the sources: `nutype`'s `validate(regex = ...)` expands to
+# a `::regex::Regex` path, so the crate has to be a direct dependency here for
+# those modules to compile. `cargo machete` reads the sources, so it needs the
+# entry below to see that.
+regex.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+# `raw_value` lets `keep_last_elements` keep each array element as sent.
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+# `PlanId::from_uuid` and `JobId::from_uuid`; minting itself is mgmt's.
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["regex"]

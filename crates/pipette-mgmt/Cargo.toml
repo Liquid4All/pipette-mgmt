@@ -1,0 +1,57 @@
+[package]
+name = "pipette-mgmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pipette-mgmt"
+path = "src/bin/pipette-mgmt.rs"
+
+[[test]]
+name = "config_check"
+path = "tests/config_check.rs"
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[dependencies]
+pipette-core.workspace = true
+pipette-plan-types.workspace = true
+pipette-httpapi.workspace = true
+pipette-pipeline.workspace = true
+pipette-store.workspace = true
+pipette-store-init.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+# `env-filter` reads `RUST_LOG`; `json` is the `--log-format json` line shape.
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+clap.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+tabled.workspace = true
+futures.workspace = true
+dirs.workspace = true
+strum.workspace = true
+
+[dev-dependencies]
+# `testkit` carries the shared `plan` fixtures across the crate boundary. Cargo
+# unifies features within a build, so they are present for `cargo test` and
+# absent from `cargo build --release`.
+pipette-core = { workspace = true, features = ["testkit"] }
+# The unit tests below the CLI build their fixtures on the filesystem backend.
+pipette-store-fs.workspace = true
+pipette-hub-testkit.workspace = true
+async-trait.workspace = true
+pipette-store-sql = { workspace = true, features = ["testkit"] }
+# The JSON log test drives real routes.
+pipette-web-testkit.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

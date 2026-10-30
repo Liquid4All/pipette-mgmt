@@ -1,0 +1,150 @@
+[package]
+name = "pipette-httpapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The integration tests are declared below rather than auto-discovered from
+# `tests/*.rs`, which would make one binary per file, each linking the whole
+# crate. `tests/suite.rs` documents what that costs and how the files are
+# grouped; `ci/checks/test-targets.sh` keeps the two in step.
+autotests = false
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# Everything that does not read back a log line, in one binary. The files stay
+# one-subject-per-file; they are modules of `tests/suite.rs` instead of separate
+# crate roots.
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+# Each of the following asserts on what the code logged, so it keeps a process
+# to itself: `tracing` caches a callsite's interest process-globally, and a
+# neighbour reaching the same `event!` first would empty the capture (see
+# `pipette_web_testkit::logs`).
+[[test]]
+name = "clerk_log"
+path = "tests/clerk_log.rs"
+
+[[test]]
+name = "client_registration"
+path = "tests/client_registration.rs"
+
+[[test]]
+name = "hf_import_logs"
+path = "tests/hf_import_logs.rs"
+
+[[test]]
+name = "queue_protocol"
+path = "tests/queue_protocol.rs"
+
+[[test]]
+name = "queue_maintenance_summary"
+path = "tests/queue_maintenance_summary.rs"
+
+[[test]]
+name = "request_span"
+path = "tests/request_span.rs"
+
+[[test]]
+name = "submissions"
+path = "tests/submissions.rs"
+
+# The app's page and assets, served without a session.
+[[test]]
+name = "webapp"
+path = "tests/webapp/main.rs"
+
+[dependencies]
+pipette-core.workspace = true
+pipette-httpsig.workspace = true
+# `schemars`: the bundle of the API's body schemas the app types itself from.
+pipette-plan-types = { workspace = true, features = ["schemars"] }
+# `schemars`: the variant edit's schema, a TOML body.
+pipette-pipeline = { workspace = true, features = ["schemars"] }
+# `schemars`: the plan document's schema, the other TOML body.
+pipette-planner = { workspace = true, features = ["schemars"] }
+pipette-store.workspace = true
+anyhow.workspace = true
+# Verifies a Clerk token's RS256 signature (`clerk`).
+aws-lc-rs.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+# The results download (`api_v1/plans/csv.rs`).
+csv.workspace = true
+ed25519-dalek.workspace = true
+futures.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+# `serve`, as `axum::serve` gives hyper no timer and so no header read timeout.
+hyper.workspace = true
+hyper-util.workspace = true
+# The `filename*` of the results download (`api_v1/plans/reads.rs`).
+percent-encoding.workspace = true
+# The API reference page (`api_schema/openapi/site.rs`).
+pulldown-cmark.workspace = true
+reqwest.workspace = true
+# The response schemas the app types itself from (`api_schema`).
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# The query vocabularies: parsed, iterated and spelled through its derives.
+strum.workspace = true
+thiserror.workspace = true
+# `tokio::join!`, where a handler runs two independent store calls at once.
+tokio.workspace = true
+# `TaskTracker`: the audit writes that outlive their answer, which `serve`
+# waits for before it exits.
+tokio-util.workspace = true
+# `map_request`, which hands each request its connection's peer in `serve`.
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+# `testkit` carries the shared `plan` fixtures across the crate boundary. Cargo
+# unifies features within a build, so they are present for `cargo test` and
+# absent from `cargo build --release`.
+pipette-core = { workspace = true, features = ["testkit"] }
+# The mock HuggingFace Hub of the import tests.
+pipette-hub-testkit.workspace = true
+pipette-plan-types.workspace = true
+pipette-pipeline.workspace = true
+pipette-store.workspace = true
+# Tests here that build a fleet or a queue drive the filesystem stores directly.
+pipette-store-fs.workspace = true
+# `TEST_LIST_LIMIT`, which several tests here page a listing with.
+pipette-store-testkit.workspace = true
+pipette-web-testkit.workspace = true
+anyhow.workspace = true
+arrow.workspace = true
+async-trait.workspace = true
+# The forged RFC 9421 signature in `tests/rfc9421.rs`.
+base64.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+httpmock.workspace = true
+# Checks bodies against the console app's response schemas (`tests/api_schema.rs`).
+jsonschema.workspace = true
+parquet.workspace = true
+rstest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+# `start_paused`, so a test of the ingest stream's interval reads paused time.
+tokio = { workspace = true, features = ["test-util"] }
+# The capturing subscriber a unit test installs to read back what a handler
+# logged.
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -1,0 +1,41 @@
+[package]
+name = "pipette-store-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[features]
+# `testkit` exports the `scratch` module, a migrated schema per test, for the
+# tests of other crates that run on PostgreSQL. Its dependencies are this
+# crate's own.
+testkit = []
+
+[dependencies]
+pipette-core.workspace = true
+pipette-plan-types.workspace = true
+pipette-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The contract suite that tests this backend. A dev-dependency, so none of it
+# reaches a release build.
+pipette-store-testkit.workspace = true
+# The object-store half the catalog and vault wrappers delegate to, in tests.
+pipette-store-fs.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

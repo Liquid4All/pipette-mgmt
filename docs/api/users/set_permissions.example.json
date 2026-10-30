@@ -1,0 +1,7 @@
+{
+  "permissions": [
+    "submit_plans",
+    "read_plans",
+    "cancel_plans"
+  ]
+}

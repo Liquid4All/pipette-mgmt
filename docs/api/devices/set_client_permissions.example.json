@@ -1,0 +1,6 @@
+{
+  "permissions": [
+    "submit_results",
+    "perform_work"
+  ]
+}

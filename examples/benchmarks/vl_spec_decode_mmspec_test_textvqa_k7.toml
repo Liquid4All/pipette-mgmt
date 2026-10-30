@@ -1,0 +1,32 @@
+# DSpark VL speculative decoding on the TextVQA portion of the MMSpec `test`
+# split, draft length 7 when the model speculates. One benchmark per MMSpec
+# dataset: this file's five siblings differ only in `subset`, `digest` and
+# `bytes`.
+#
+# The upstream owns the corpus. mgmt serves a repacked cache of it only while
+# the `dataset-cache probe` cron finds the upstream still publishing the pinned
+# content. See `docs/design/vl-spec-decode-dataset-delivery.md`.
+#
+# The four hashes and `bytes` come from
+# `pipette-mgmt dataset-cache pins vl_spec_decode_mmspec_test_textvqa_k7`.
+benchmark_type           = "vl_spec_decode"
+parameter_draft_length   = 7
+parameter_max_tokens     = 2048
+
+[dataset]
+format  = "vl-spec-decode-corpus/1"
+adapter = "mmspec@1"
+digest  = "6a4aa35a57faf8efea9feab7122e089c33ca7c86b8404a72ec371ab83757a9d0"
+bytes   = 22592512
+subset  = "TextVQA"
+
+[dataset.upstream]
+source   = "git"
+url      = "github.com/killthefullmoon/MMSpec"
+revision = "290486861eabd746075ca776adb66175636c1fc0"
+subpath  = "dataset/MMSpec/test"
+identity = "2923603292c7dd463ad01a119f57965817778fc3"
+digest   = "2bd3c7b41707c10d91726e90545b9ec5d741ac947637c90e2f9d5fe6321fa8f7"
+# The repository's license; the images come from COCO, GQA, TextVQA, CharXiv
+# and MMMU-Pro, each under its own terms.
+license  = "Apache-2.0"

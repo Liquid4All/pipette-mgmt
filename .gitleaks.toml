@@ -1,0 +1,41 @@
+# gitleaks configuration: the secret-scan policy for the `secrets` job in
+# .github/workflows/security.yml, which runs `gitleaks git --redact` over the
+# FULL history.
+#
+# `useDefault` keeps gitleaks' own rule set; everything below is allowlist. Each
+# entry says why the string is not a credential, the way deny.toml records an
+# ignored advisory (docs/development.md §1).
+[extend]
+useDefault = true
+
+# A model slug, not a credential. `generic-api-key` is an entropy rule that
+# fires on a high-entropy string sitting next to an identifier spelled `key`,
+# and `k2-horizon-3.7b` is the normalized model key the model tests assert
+# on (crates/pipette-pipeline/src/model_audit.rs). It matched 19 historical commits
+# of `assert_eq!(first.key, "k2-horizon-3.7b")` alone, and the tests keep
+# producing that shape, so this is anchored on the slug rather than listed as
+# fingerprints that a rewrite of the same test would invalidate.
+[[allowlists]]
+description = "k2-horizon-3.7b is a normalized model key that the model tests assert on, not a credential"
+# Scoped: a top-level allowlist otherwise exempts this string from every rule.
+targetRules = ["generic-api-key"]
+regexes = ['''^k2-horizon-3\.7b$''']
+
+# A Clerk publishable key for a test instance. A publishable key is public by
+# design (the sign-in page serves it), and this one is `pk_test_` plus the base64
+# of `clerk.example.test$`, a `.test` host that cannot exist; the no-`JA` form is
+# the malformed key the config tests refuse. Anchored on the value so a real key,
+# which names another host, still fires.
+[[allowlists]]
+description = "pk_test_ key naming clerk.example.test is a Clerk test fixture, not a key"
+targetRules = ["generic-api-key"]
+regexes = ['''^pk_test_Y2xlcmsuZXhhbXBsZS50ZXN0(JA)?$''']
+
+# The Ed25519 public key of RFC 8032 section 7.1 TEST 1, published in the RFC
+# and used as a test vector by the app's tests (ui/test/clilogin.test.ts). A
+# public key authenticates nothing; anchored on the value so any other key still
+# fires.
+[[allowlists]]
+description = "the RFC 8032 TEST 1 Ed25519 public key is a published test vector, not a key"
+targetRules = ["generic-api-key"]
+regexes = ['''^d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a$''']

@@ -1,0 +1,40 @@
+{
+  "requires": [],
+  "any_of": [],
+  "clients": [
+    "ev1_9f2c1d3e4b5a6c7d"
+  ],
+  "merge_duplicates": false,
+  "spec": {
+    "benchmark": "vl_spec_decode_mmspec_test_coco_k7",
+    "model": {
+      "type": "mlx",
+      "source": "huggingface",
+      "org": "example-org",
+      "repo_name": "VLM-3B-MLX-bf16"
+    },
+    "runtime": {
+      "type": "mlx_macos_pipette",
+      "version": "0.7.4",
+      "flavor": "macos-arm64",
+      "source": {
+        "type": "pip_requirements_text",
+        "contents": "annotated-doc==0.0.5\nannotated-types==0.8.0\nanyio==4.15.1\ncertifi==2026.7.22\ncffi==2.1.1\ncharset-normalizer==3.5.2\nclick==8.5.0\nfastapi==0.142.2\nfilelock==4.0.8\nfsspec==2026.9.0\nh11==0.16.0\nhf-xet==1.6.0\nhttpcore==1.0.9\nhttpx==0.28.1\nhuggingface-hub==1.33.0\nidna==3.20\njinja2==3.1.6\nllguidance==1.9.1\nmarkdown-it-py==4.2.0\nmarkupsafe==3.0.3\nmdurl==0.1.2\nminiaudio==1.71\nmlx==0.32.3\nmlx-audio==0.5.7\nmlx-lm==0.32.0\nmlx-metal==0.32.3\nmlx-vlm==0.7.4\nnumpy==2.5.3\nopencv-python==5.0.0.93\nopentelemetry-api==1.45.0\npackaging==26.3\npillow==12.3.0\nprotobuf==7.36.2\npycparser==3.0\npydantic==2.13.5\npydantic-core==2.46.5\npygments==2.21.0\npython-multipart==0.0.32\npyyaml==6.0.3\nregex==2026.9.29\nrequests==2.34.2\nrich==15.0.0\nsafetensors==0.8.0\nscipy==1.18.1\nsentencepiece==0.2.2\nshellingham==1.5.4\nsounddevice==0.5.6\nstarlette==1.7.0\ntokenizers==0.23.2\ntqdm==4.70.1\ntransformers==5.18.0\ntyper==0.27.2\ntyping-extensions==4.16.0\ntyping-inspection==0.4.4\nurllib3==2.8.0\nuvicorn==0.54.0\nwebsockets==17.1\n"
+      }
+    },
+    "runtime_flags": {
+      "runtime_type": "mlx_macos_pipette",
+      "model_type": "mlx",
+      "benchmark_type": "vl_spec_decode",
+      "speculative_enabled": false
+    },
+    "model_flags": null,
+    "benchmark_flags": {
+      "runtime_type": "mlx_macos_pipette",
+      "model_type": "mlx",
+      "benchmark_type": "vl_spec_decode",
+      "http_timeout_seconds": 600,
+      "bench_timeout_seconds": 10800
+    }
+  }
+}

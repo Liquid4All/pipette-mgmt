@@ -20,6 +20,11 @@ cd "$(git rev-parse --show-toplevel)"
 TAG="${TAG:-pipette-mgmt:dev}"
 TARGET="${TARGET:-}"
 
+# The binary embeds the console app's build, and PIPETTE_REQUIRE_UI fails it
+# rather than shipping the placeholder page.
+(cd ui && npm ci && npm run build)
+export PIPETTE_REQUIRE_UI=1
+
 if [[ -n "${TARGET}" ]]; then
   cargo build --release --locked --target "${TARGET}"
   BIN="target/${TARGET}/release/pipette-mgmt"

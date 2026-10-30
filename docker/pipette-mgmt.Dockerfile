@@ -10,6 +10,7 @@
 #
 # Manual:
 #
+#   (cd ui && npm ci && npm run build)   # the /app/ bundle
 #   cargo build --release --locked
 #   docker build -f docker/pipette-mgmt.Dockerfile -t pipette-mgmt:dev .
 #
@@ -22,7 +23,8 @@
 #     -f docker/pipette-mgmt.Dockerfile -t pipette-mgmt:dev .
 #
 # TLS uses rustls, so the runtime image only needs ca-certificates plus the
-# baseline glibc/libgcc that come with debian-slim.
+# baseline glibc/libgcc that come with debian-slim. `git` is for the
+# `dataset-cache` commands, which fetch upstream corpora.
 
 # Debian 13 (trixie) ships glibc 2.41. The release binary is built on
 # ubuntu-24.04 runners (glibc 2.39) and references symbols up to
@@ -39,6 +41,7 @@ ARG BIN=target/release/pipette-mgmt
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 pipette \
     && useradd --system --uid 10001 --gid 10001 \

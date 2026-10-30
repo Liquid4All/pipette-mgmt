@@ -1,0 +1,3 @@
+# A panicking index in a test fails that test the same way an `assert!` does,
+# so `indexing_slicing` (Cargo.toml) only gates code that ships.
+allow-indexing-slicing-in-tests = true

@@ -1,0 +1,16 @@
+benchmarks = [
+  "prefill_throughput_512",
+  "decode_throughput_512_100",
+  "end_to_end_latency_512_256",
+  "max_memory_usage_512",
+]
+
+[[variants]]
+requires = ["os:macos"]
+models = [
+  { type = "mlx", source = "huggingface", org = "LiquidAI", repo_name = "LFM2.5-350M-MLX-4bit" },
+  { type = "mlx", source = "huggingface", org = "mlx-community", repo_name = "Qwen3.5-0.8B-4bit" },
+]
+runtimes = [
+  { type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-arm64", source = { type = "pip_requirements_text", contents = "mlx-lm==0.31.3\n" } },
+]

@@ -1,0 +1,43 @@
+[package]
+name = "pipette-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Declared rather than auto-discovered, which `ci/checks/test-targets.sh`
+# requires of every crate holding integration tests.
+autotests = false
+
+[[test]]
+name = "parity"
+path = "tests/parity.rs"
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+[features]
+# `schemars::JsonSchema` on the plan document, which mgmt's OpenAPI document
+# describes the TOML bodies with.
+schemars = ["dep:schemars", "pipette-plan-types/schemars"]
+
+[dependencies]
+pipette-plan-types.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+# The capability-rule tests compare the rules' copies of the reserved
+# namespaces and of `slugify` with the server's own, which live here.
+pipette-core.workspace = true
+# The parity test keys each body the way ingestion does, so it proves that a
+# server-expanded job and a client-expanded job merge onto one content key.
+pipette-pipeline.workspace = true
+rstest.workspace = true
+strum.workspace = true

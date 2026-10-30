@@ -1,0 +1,56 @@
+[package]
+name = "pipette-web-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Levels and the reasoning for each live in the root manifest.
+[lints]
+workspace = true
+
+# Every consumer takes this crate as a dev-dependency, so nothing here reaches a
+# release build. `tempfile`, `rstest` and `httpmock` are deliberately absent:
+# none is in `THIRD-PARTY-LICENSES.md`, and a normal dependency here would put
+# them there.
+# The fixtures take a `&Path` and leave the caller owning the tempdir, which is
+# what keeps `tempfile` out of every signature.
+[dependencies]
+pipette-core = { workspace = true, features = ["testkit"] }
+# `test_app` is the served route table, so a test exercises the routes and body
+# limits the binary serves rather than a second copy of them.
+pipette-httpapi.workspace = true
+# The mock HuggingFace Hub that the import fixtures start.
+pipette-hub-testkit.workspace = true
+pipette-pipeline.workspace = true
+pipette-httpsig.workspace = true
+pipette-plan-types.workspace = true
+pipette-store.workspace = true
+# The fixtures build their fleets and queues on the filesystem backend.
+pipette-store-fs.workspace = true
+# `seeded_sql_state` puts the records on a scratch PostgreSQL database.
+pipette-store-sql = { workspace = true, features = ["testkit"] }
+anyhow.workspace = true
+# Signs the tokens a Clerk instance would issue.
+aws-lc-rs.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+# The `pattern` keyword of the OpenAPI document's schemas (`src/schema_check.rs`).
+regex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# The response check's typed violations (`src/contract.rs`).
+thiserror.workspace = true
+tokio.workspace = true
+# Reads a TOML answer for the response check (`src/contract.rs`).
+toml.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

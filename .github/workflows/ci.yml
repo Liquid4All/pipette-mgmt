@@ -20,27 +20,38 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # No `RUSTFLAGS: -D warnings` here. Lint levels live in `[workspace.lints]`
+  # in the root Cargo.toml, which applies them to this workspace's own crates
+  # only and makes a local `cargo clippy` enforce exactly what CI does. As an
+  # environment variable they also reached every dependency's source and were
+  # part of the fingerprint each one was cached under.
 
 jobs:
   changes:
     # Detect what changed so PRs that don't touch Rust/Python code can skip
-    # the expensive compile jobs. Push events (main) always run everything
-    # so releases keep building regardless of which paths changed.
+    # the expensive compile jobs. Pushes (main and release branches) always
+    # run everything so releases keep building regardless of which paths
+    # changed.
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
+      catalog: ${{ steps.filter.outputs.catalog }}
+      console_ui: ${{ steps.filter.outputs.console_ui }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           filters: |
             rust:
               - '**/*.rs'
+              - '**/migrations/*.sql'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deny.toml'
+              # rust-lint installs cargo-deny through it.
+              - 'ci/install-tool.sh'
               - 'about.toml'
               - 'about.hbs'
               - 'LICENSE'
@@ -48,10 +59,35 @@ jobs:
               - 'THIRD-PARTY-LICENSES.md'
               - 'docker/**'
               - '.github/**'
+              # Rust tests include and parse the scheduler plans.
+              - 'examples/plans/**'
+              # httpapi's plan_validation test posts the app's examples.
+              - 'ui/src/lib/plan-examples/**'
+              # rust-lint's clippy reads them.
+              - '**/clippy.toml'
+              # route_docs.rs compiles them into the OpenAPI document, and its
+              # tests read them.
+              - 'docs/api/**'
+              # Compiled in or read by tests: site.css, the planner's testdata.
+              - 'crates/**'
             python:
               - '**/*.py'
+              # python-check also tests tools/sign.ts.
+              - 'tools/**'
               - 'pyproject.toml'
               - 'uv.lock'
+              - '.github/**'
+            # The `rust` filter skips `examples/benchmarks/`, so a catalog-only
+            # PR needs its own filter to reach the jobs that parse the catalog.
+            # Just the TOML here: a change to the types it parses into is a
+            # `.rs` change, which rust-test already covers.
+            catalog:
+              - 'examples/benchmarks/**'
+              - '.github/**'
+            # about.hbs credits the app's bundled npm packages by version.
+            console_ui:
+              - 'ui/**'
+              - 'about.hbs'
               - '.github/**'
 
   release-metadata:
@@ -60,7 +96,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       image: ${{ steps.version.outputs.image }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0 # ci/version.sh needs the history behind the branch point
       - name: Compute release metadata
@@ -77,20 +113,71 @@ jobs:
             echo "image=${image}"
           } | tee -a "$GITHUB_OUTPUT"
 
+  conventions:
+    # Repo-convention checks (see ci/README.md): the rules rustfmt, clippy and
+    # rustdoc cannot express. Its own job so a failure shows up as a distinct
+    # `conventions` status rather than buried in rust-lint, and deliberately
+    # unfiltered — it needs no toolchain, so it stays seconds long, and running
+    # on every PR is what lets `rust-path-refs` catch a Rust-only change that
+    # breaks a reference from `docs/`, and a docs-only PR still have its prose
+    # checked.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Convention checks
+        run: ./ci/lint.sh
+
   rust-lint:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: lint
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Install cargo-deny (pinned, checksum-verified)
+        # The same pinned, checksum-verified build security.yml runs, from
+        # ci/install-tool.sh. One policy file deserves one version of the tool
+        # that reads it: a marketplace action resolving `latest` here would let
+        # the two jobs disagree about deny.toml on a release day.
+        run: ci/install-tool.sh cargo-deny
+
+      - name: Licenses
+        # Fails on any dependency license outside deny.toml's allow-list. Placed
+        # before the compile steps because it only reads cargo metadata — a
+        # rejected license turns the job red in seconds instead of after a full
+        # build. THIRD-PARTY-LICENSES.md, checked by `attribution`, is the
+        # attribution that follows from this policy.
+        #
+        # Advisories, bans and sources are in security.yml: they need no build
+        # and can go red with no change here. Licenses stay next to the
+        # attribution they feed.
+        run: cargo deny check licenses
+
+      - name: Clippy
+        # Lint levels (deny-on-warnings, and the ban on unwrap/expect/panic)
+        # come from `[workspace.lints]` in the root Cargo.toml, so no
+        # `-- -D warnings` here. `--all-targets` is what puts tests and the
+        # binary under the same policy as the library.
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Clippy (plan-types without `schemars`)
+        # pipette-httpapi turns the feature on, so the step above always
+        # compiles it; a client builds it off.
+        run: cargo clippy -p pipette-plan-types --all-targets --locked
+
+      - name: Docs
+        # `[`Type`]` links are how the module docs connect the stores, the
+        # handlers and the CLI, and nothing in build/clippy/test reads one, so
+        # they rot silently. Lint levels come from `[workspace.lints]`, same as
+        # Clippy above; `--no-deps` keeps the gate on the workspace's own docs.
+        run: cargo doc --workspace --no-deps --locked
 
   # THIRD-PARTY-LICENSES.md ships inside the release tarball and the container
   # image, so a copy that lags the dependency graph publishes incomplete
@@ -99,16 +186,10 @@ jobs:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
-    env:
-      # This job compiles a third-party tool from source rather than first-party
-      # code, so the workflow-wide `-D warnings` does not apply: a new lint in a
-      # future stable release would turn a warning somewhere in cargo-about's
-      # dependency tree into a failed attribution check.
-      RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: attribution
       - name: Install cargo-about
@@ -127,33 +208,147 @@ jobs:
             exit 1
           fi
 
-  rust-test:
+  # The tier rules the root Cargo.toml describes: which crate may link the S3
+  # SDK, which may name a backend, which may link an HTTP server framework.
+  # `ci/checks/crate-layering.py` holds the table and reads it two ways. The
+  # `conventions` job runs the manifest half, which needs no toolchain. This job
+  # runs the resolved half, which asks cargo for each crate's whole graph and so
+  # catches a forbidden crate reached through a chain rather than a direct edge.
+  layering:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - name: Resolved dependency graph
+        # `cargo tree` resolves the graph from the lock file and compiles
+        # nothing, so this job needs no build cache.
+        run: ./ci/checks/crate-layering.py --resolved
+
+  # Operators `cp -r examples/benchmarks` into their data dir
+  # (docs/development.md), so a malformed entry there is a server that will not
+  # boot. Scoped to pipette-core and the one httpapi test that reads the catalog,
+  # so a catalog-only PR skips the full rust-test run.
+  catalog:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.catalog == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          key: catalog
+      - name: Shipped benchmark catalog
+        run: cargo test -p pipette-core --locked
+      - name: App example plans against the catalog
+        run: cargo test -p pipette-httpapi --locked --test suite -- plan_validation::every_app_example_validates --exact
+
+  rust-test:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    # The PostgreSQL tests fail rather than skip in CI without
+    # TEST_DATABASE_URL.
+    services:
+      postgres:
+        image: postgres:17@sha256:ae69c452f483507a6b99fb654cf93aad7fe156ffd2c56247707eef4e36d3c12b
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          # Listings sort in byte order, so the cluster is `C`.
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: test
-      - run: cargo test --locked
+      - name: Install nextest
+        uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab  # v2.87.13
+        with:
+          tool: nextest
+      - name: Test
+        # nextest runs the test binaries in parallel but does not execute
+        # doctests, so keep a `--doc` pass to preserve that coverage. The
+        # examples in the module docs are the ones a reader copies.
+        run: |
+          cargo nextest run --workspace --locked
+          cargo test --workspace --doc --locked
+      - name: Test plan-types without `schemars`
+        # pipette-pipeline turns the feature on, so the run above always builds
+        # it; a client builds it off.
+        run: cargo nextest run -p pipette-plan-types --locked
+
+  console-ui:
+    # The Svelte app at /app/. Its build is embedded by build-artifact; a Rust
+    # build without it serves a placeholder page instead.
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.console_ui == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        # A stalled registry otherwise hangs the job until the 6h default.
+        timeout-minutes: 10
+      - name: Generated types match api-schema.json
+        # rust-test keeps api-schema.json current with the Rust types.
+        run: npm run types && git diff --exit-code -- src/lib/api-types.ts
+      - name: Type check
+        run: npm run check
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Every bundled npm package is credited in THIRD-PARTY-LICENSES.md
+        # `npm run build` lists the packages the bundle carries (vite.config.ts).
+        run: |
+          status=0
+          while read -r name version; do
+            grep -q -- "^- ${name} ${version} — " ../about.hbs \
+              || { echo "::error::about.hbs does not credit ${name} ${version}; add it and regenerate THIRD-PARTY-LICENSES.md"; status=1; }
+          done < node_modules/.cache/bundled-packages.txt
+          exit "${status}"
 
   python-check:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.python == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync Python dev environment
         run: uv sync --group dev
       - name: Ruff check
-        run: uv run ruff check examples
+        run: uv run ruff check examples tools
       - name: Ruff format
-        run: uv run ruff format --check examples
+        run: uv run ruff format --check examples tools
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 22
+      - name: Signing tools tests
+        run: |
+          uv run python -m unittest discover -s tools/tests
+          node --test tools/tests/sign.test.ts
 
   build-artifact:
     needs: [release-metadata, changes]
@@ -172,14 +367,27 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: bin-${{ matrix.target }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build the console app
+        # build.rs embeds ui/dist; without it the binary serves a placeholder at /app/.
+        working-directory: ui
+        timeout-minutes: 10
+        run: npm ci && npm run build
       - name: Build release binary
+        env:
+          # Fails the build rather than embedding the placeholder page.
+          PIPETTE_REQUIRE_UI: "1"
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package tarball
         id: pkg
@@ -204,14 +412,44 @@ jobs:
           (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           echo "tarball=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v6
+      # PR runs are the bulk of the uploads, so a PR tarball keeps the shorter
+      # window. `docker-image-build` consumes it inside the same run, and the
+      # days after that are for a reviewer who wants to download the build and
+      # try it. A push tarball keeps the longer window, as a fallback copy
+      # while `github-release` attaches it to the release.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pipette-mgmt-${{ matrix.target }}
           path: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.checksum }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ github.event_name == 'pull_request' && 5 || 14 }}
+
+  # The API reference as a static page for another host; never mgmt, whose
+  # origin holds the app's signing keys. Skipped with build-artifact.
+  api-docs:
+    needs: [release-metadata, build-artifact]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pipette-mgmt-x86_64-unknown-linux-gnu
+          path: artifact
+      - name: Build the page
+        env:
+          NAME: pipette-mgmt-${{ needs.release-metadata.outputs.version }}-x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          tar -C artifact -xzf "artifact/${NAME}.tar.gz"
+          "artifact/${NAME}/pipette-mgmt" openapi --site api-docs
+      # mgmt serves the page at /docs/; the artifact is for reviewing a PR's render.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pipette-mgmt-api-docs
+          path: api-docs/
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'pull_request' && 5 || 14 }}
 
   # Per-arch Docker build on a native runner (no qemu). The binary is taken
   # from the build-artifact job's tarball rather than recompiled inside the
@@ -220,6 +458,8 @@ jobs:
   # Each arch pushes a digest with no tag; docker-image-publish joins them.
   # Tagging here would race the two runners against each other.
   docker-image-build:
+    # The image embeds THIRD-PARTY-LICENSES.md and pushes by digest, so the
+    # attribution check has to pass before anything reaches the registry.
     needs: [release-metadata, build-artifact, attribution]
     permissions:
       contents: read
@@ -240,9 +480,9 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Download prebuilt binary artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: pipette-mgmt-${{ matrix.target }}
           path: artifact
@@ -257,17 +497,19 @@ jobs:
           cp "artifact/${NAME}/pipette-mgmt" "target/${TARGET}/release/pipette-mgmt"
           chmod +x "target/${TARGET}/release/pipette-mgmt"
           file "target/${TARGET}/release/pipette-mgmt"
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003  # v4.4.0
+      # GHCR needs no configured secret: the job-scoped GITHUB_TOKEN carries
+      # `packages: write`.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build image (pushed by digest, except on pull requests)
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
         with:
@@ -300,7 +542,7 @@ jobs:
           # Filename is the digest; contents unused.
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: github.event_name != 'pull_request'
         with:
           name: docker-digest-${{ matrix.arch }}
@@ -316,14 +558,14 @@ jobs:
       packages: write
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           pattern: docker-digest-*
           merge-multiple: true
           path: /tmp/digests
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003  # v4.4.0
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -352,11 +594,16 @@ jobs:
     needs:
       - changes
       - release-metadata
+      - conventions
       - rust-lint
       - attribution
+      - layering
+      - catalog
       - rust-test
+      - console-ui
       - python-check
       - build-artifact
+      - api-docs
       - docker-image-build
       - docker-image-publish
     if: always()
@@ -389,15 +636,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          # Only the shipped tarballs; the digest artifacts are build plumbing.
-          pattern: pipette-mgmt-*
+          # Only the shipped tarballs; the digest and api-docs artifacts are
+          # build plumbing.
+          pattern: pipette-mgmt-*-linux-gnu
           merge-multiple: true
           path: dist
       - name: Create GitHub release
         # Pinned: the only job here holding a repo-write token.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           tag_name: ${{ needs.release-metadata.outputs.version }}
           name: ${{ needs.release-metadata.outputs.version }}
@@ -411,4 +659,6 @@ jobs:
 
             Multi-arch (`linux/amd64`, `linux/arm64`).
             Per-target binaries and checksums are attached below.
-          files: dist/*
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
