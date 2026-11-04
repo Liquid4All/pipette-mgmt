@@ -6,11 +6,15 @@ use parquet::basic::ZstdLevel;
 use serde::{Deserialize, Deserializer};
 use strum::IntoEnumIterator as _;
 
-use pipette_plan_types::{CapabilityFlag, LlamaCppFlavor, OvmsFlavor, RuntimeType};
+use pipette_plan_types::{
+    CapabilityFlag, LlamaCppFlavor, LlamacppIosPipetteFlavor, MlxIosPipetteFlavor,
+    OnnxGenaiIosPipetteFlavor, OvmsFlavor, RuntimeType,
+};
 
 use crate::parquet_utils::WriterOpts;
 
-/// One object-store section (`[storage]`, `[auth_storage]`, `[todo_storage]`),
+/// One object-store section (`[storage]`, `[auth_storage]`,
+/// `[eval_packages_storage]`, or a `[todo_storage]` that uses an object store),
 /// chosen by `backend`. S3 credentials come from the environment (`AWS_*`, or
 /// an instance or task role), never from this file.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +46,60 @@ pub enum StorageConfig {
         #[serde(skip)]
         read_timeout_secs: Option<NonZeroU64>,
     },
+}
+
+impl StorageConfig {
+    /// The keys that each variant reads from the config file, with `backend`.
+    /// Keep them in step with the fields above: `Config::unknown_keys` reports
+    /// any other key in `[todo_storage]`.
+    pub(crate) const LOCAL_FS_KEYS: &[&str] = &["backend", "data_dir"];
+    pub(crate) const S3_KEYS: &[&str] = &[
+        "backend",
+        "bucket",
+        "prefix",
+        "region",
+        "endpoint",
+        "max_concurrent_requests",
+    ];
+}
+
+/// The queue can use an object store or the configured PostgreSQL database.
+#[derive(Debug, Clone)]
+pub enum TodoStorageConfig {
+    ObjectStore(StorageConfig),
+    Database,
+}
+
+/// A `[todo_storage]` with `backend = "database"` in a config that has no
+/// `[database]` section.
+#[derive(Debug, thiserror::Error)]
+#[error("[todo_storage] backend = \"database\" requires [database]")]
+pub struct MissingDatabaseError;
+
+#[derive(Debug, Clone, Copy)]
+pub enum TodoStorageRef<'a> {
+    ObjectStore(&'a StorageConfig),
+    Database,
+}
+
+/// Reads `backend` first, so the `StorageConfig` error for an object-store
+/// section reaches the operator with its field name.
+impl<'de> Deserialize<'de> for TodoStorageConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = toml::Value::deserialize(deserializer)?;
+        match value.get("backend").and_then(toml::Value::as_str) {
+            Some("database") => Ok(Self::Database),
+            Some("local_fs" | "s3") | None => StorageConfig::deserialize(value)
+                .map(Self::ObjectStore)
+                .map_err(D::Error::custom),
+            Some(other) => Err(D::Error::unknown_variant(
+                other,
+                &["local_fs", "s3", "database"],
+            )),
+        }
+    }
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -81,7 +139,7 @@ pub struct Config {
     pub descriptor_catalog: DescriptorCatalogConfig,
     /// Required. Base URL of the edge-evals scoring service: `score-eval`
     /// scores through it, `serve` fetches an eval benchmark's samples from it,
-    /// and `dataset-cache` probes and builds a vlm_eval's corpus from it.
+    /// and `dataset-cache` asks it for the digest of an eval corpus's samples.
     pub evals_server_url: String,
     /// Address `serve` listens on. Plain HTTP on every interface by default,
     /// so put a TLS proxy in front (`docs/operations.md`). Defaults to
@@ -157,16 +215,11 @@ pub struct Config {
     /// Past it the upstream is recorded `unavailable`. Defaults to 30.
     #[serde(default = "default_dataset_probe_timeout_secs")]
     pub dataset_probe_timeout_secs: NonZeroU64,
-    /// Deadline for one dataset build: fetch, verify and pack together.
-    /// Defaults to 900.
+    /// Deadline for one dataset build: a git upstream's fetch, verify and pack
+    /// together, or the check that registers an evals-server pin's package.
+    /// The same deadline bounds `dataset-cache pins`. Defaults to 900.
     #[serde(default = "default_dataset_build_timeout_secs")]
     pub dataset_build_timeout_secs: NonZeroU64,
-    /// [`Self::dataset_build_timeout_secs`] for an `asr-eval-corpus/1`, whose
-    /// build streams gigabytes of audio from the evals server (SPGISpeech's
-    /// largest profile about 15 GB of base64). The same deadline bounds
-    /// `dataset-cache pins` for such an entry. Defaults to 7200.
-    #[serde(default = "default_dataset_asr_build_timeout_secs")]
-    pub dataset_asr_build_timeout_secs: NonZeroU64,
     /// The object store for the catalog, submissions, the warehouse, blobs,
     /// the dataset cache and, without `[todo_storage]`, the queue. Without
     /// `[database]` it also holds the records, the relations that decide access
@@ -177,6 +230,12 @@ pub struct Config {
     /// apart so a private bucket can hold them. With `[database]`, those
     /// records live there instead.
     pub auth_storage: StorageConfig,
+    /// The object store the scores service writes the eval corpora it packs
+    /// to, `scores-packages/tars/{digest}.tar`: `dataset-cache build` registers
+    /// them and `GET /datasets/{benchmark_id}` streams them. mgmt never writes
+    /// it. Defaults to `[storage]`.
+    #[serde(default)]
+    pub eval_packages_storage: Option<StorageConfig>,
     /// Unverified-submission archive settings. Off by default. When disabled, a
     /// result submission from an unapproved client is refused with `403`.
     #[serde(default)]
@@ -235,11 +294,12 @@ pub struct Config {
     /// leaves under `probe/`; the `todo/` probe is unaffected. Defaults to `true`.
     #[serde(default = "default_probe_backend_capabilities")]
     pub probe_backend_capabilities: bool,
-    /// Storage for the `todo/` job queue. Defaults to `[storage]`, for
-    /// `local_fs` development only: production needs S3 Express One Zone, the
-    /// only bucket with the atomic `RenameObject` the queue relies on.
+    /// Storage for the job queue. Set `backend = "database"` to use
+    /// `[database]`. Set `backend = "local_fs"` or `"s3"` to use an object
+    /// store. If this section is absent, the queue uses `[storage]`. An S3
+    /// queue needs Express One Zone for atomic `RenameObject`.
     #[serde(default)]
-    pub todo_storage: Option<StorageConfig>,
+    pub todo_storage: Option<TodoStorageConfig>,
     /// Lease duration, in seconds, granted on a successful claim and
     /// extended by each heartbeat. Clients see it as the claim's `time_window`
     /// and heartbeat at half of it. Must be non-zero. Defaults to 300
@@ -442,7 +502,9 @@ impl Default for DescriptorCatalogConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfferRule {
-    /// Runtime type: `llamacpp_cli_stock_tools` or `ovms`.
+    /// Runtime type: `llamacpp_cli_stock_tools`, `ovms`, or a runtime that the
+    /// iOS app builds in (`llamacpp_ios_pipette`, `mlx_ios_pipette`,
+    /// `onnx_genai_ios_pipette`).
     pub runtime_type: RuntimeType,
     /// Known flavor of that runtime type.
     pub flavor: String,
@@ -523,17 +585,30 @@ impl DescriptorCatalogConfig {
                     .map(|flavor| flavor.as_str().to_owned())
                     .collect(),
             ),
+            RuntimeType::LlamacppIosPipette => Some(
+                LlamacppIosPipetteFlavor::iter()
+                    .map(|flavor| flavor.to_string())
+                    .collect(),
+            ),
+            RuntimeType::MlxIosPipette => Some(
+                MlxIosPipetteFlavor::iter()
+                    .map(|flavor| flavor.to_string())
+                    .collect(),
+            ),
+            RuntimeType::OnnxGenaiIosPipette => Some(
+                OnnxGenaiIosPipetteFlavor::iter()
+                    .map(|flavor| flavor.to_string())
+                    .collect(),
+            ),
             RuntimeType::LlamacppApkPipette
-            | RuntimeType::LlamacppIosPipette
             | RuntimeType::MlxMacosPipette
-            | RuntimeType::MlxIosPipette
+            | RuntimeType::AppleCoreAiMacosPipette
             | RuntimeType::DockerVllm
             | RuntimeType::DockerSglang
             | RuntimeType::UvVllm
             | RuntimeType::UvSglang
             | RuntimeType::UvOpenvino
             | RuntimeType::UvOnnxGenai
-            | RuntimeType::OnnxGenaiIosPipette
             | RuntimeType::AppleFoundation
             | RuntimeType::TrtEdgellm => None,
         }
@@ -867,10 +942,6 @@ fn default_dataset_build_timeout_secs() -> NonZeroU64 {
     nonzero_u64(900)
 }
 
-fn default_dataset_asr_build_timeout_secs() -> NonZeroU64 {
-    nonzero_u64(7200)
-}
-
 fn default_plan_lease_duration_secs() -> NonZeroU64 {
     nonzero_u64(300)
 }
@@ -988,9 +1059,9 @@ impl Default for Config {
             dataset_probe_max_age_secs: default_dataset_probe_max_age_secs(),
             dataset_probe_timeout_secs: default_dataset_probe_timeout_secs(),
             dataset_build_timeout_secs: default_dataset_build_timeout_secs(),
-            dataset_asr_build_timeout_secs: default_dataset_asr_build_timeout_secs(),
             storage: StorageConfig::default(),
             auth_storage: StorageConfig::default(),
+            eval_packages_storage: None,
             unverified_submissions: UnverifiedSubmissionsConfig::default(),
             auto_approve: AutoApproveConfig::default(),
             require_client_preauth_key: false,
@@ -1063,11 +1134,22 @@ fn parse_error(path: &std::path::Path, e: toml::de::Error) -> anyhow::Error {
 }
 
 impl Config {
-    /// The `todo/` storage, falling back to `[storage]`. Commands that touch
-    /// `todo/` check for atomic `RenameObject` at startup
-    /// (`TodoStore::validate_backend`), so a regular S3 fallback is rejected.
-    pub fn todo_storage(&self) -> &StorageConfig {
-        self.todo_storage.as_ref().unwrap_or(&self.storage)
+    /// Returns the queue storage, or `[storage]` if `[todo_storage]` is absent.
+    /// Commands that use an object store check for atomic rename at startup
+    /// with `TodoStore::validate_backend`. The SQL store checks its database
+    /// and schema at startup.
+    pub fn todo_storage(&self) -> TodoStorageRef<'_> {
+        match &self.todo_storage {
+            Some(TodoStorageConfig::ObjectStore(storage)) => TodoStorageRef::ObjectStore(storage),
+            Some(TodoStorageConfig::Database) => TodoStorageRef::Database,
+            None => TodoStorageRef::ObjectStore(&self.storage),
+        }
+    }
+
+    /// The eval package store, or `[storage]` if `[eval_packages_storage]` is
+    /// absent.
+    pub fn eval_packages_storage(&self) -> &StorageConfig {
+        self.eval_packages_storage.as_ref().unwrap_or(&self.storage)
     }
 
     /// This config, with `queue_maintenance_read_timeout_secs` applied to the
@@ -1102,14 +1184,33 @@ impl Config {
 
     /// The dotted path of each key in the config file at `path` that no
     /// `Config` field reads. `load` ignores such a key, so its default applies.
-    /// A key inside a storage section is not seen: the section deserializes as
-    /// a tagged enum, which takes its keys as one unit.
+    /// A key inside `[storage]`, `[auth_storage]` or `[eval_packages_storage]`
+    /// is not seen: the section deserializes as a tagged enum, which takes its
+    /// keys as one unit. A key inside `[todo_storage]` is compared with the
+    /// keys that its `backend` reads.
     pub fn unknown_keys(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
         let content = read_config(path)?;
         let value: toml::Value = toml::from_str(&content).map_err(|e| parse_error(path, e))?;
         let mut unknown = Vec::new();
-        serde_ignored::deserialize::<_, _, Config>(value, |key| unknown.push(key.to_string()))
-            .map_err(|e| parse_error(path, e))?;
+        serde_ignored::deserialize::<_, _, Config>(value.clone(), |key| {
+            unknown.push(key.to_string())
+        })
+        .map_err(|e| parse_error(path, e))?;
+        // serde_ignored cannot see the keys inside `TodoStorageConfig`, so
+        // compare the `[todo_storage]` keys with the keys its backend reads.
+        if let Some(section) = value.get("todo_storage").and_then(toml::Value::as_table) {
+            let allowed: &[&str] = match section.get("backend").and_then(toml::Value::as_str) {
+                Some("local_fs") => StorageConfig::LOCAL_FS_KEYS,
+                Some("s3") => StorageConfig::S3_KEYS,
+                _ => &["backend"],
+            };
+            unknown.extend(
+                section
+                    .keys()
+                    .filter(|key| !allowed.contains(&key.as_str()))
+                    .map(|key| format!("todo_storage.{key}")),
+            );
+        }
         Ok(unknown)
     }
 
@@ -1123,6 +1224,10 @@ impl Config {
         const MAX_HF_IMPORTS: usize = 1024;
         const MAX_DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
         self.descriptor_catalog.validate()?;
+        if matches!(self.todo_storage, Some(TodoStorageConfig::Database)) && self.database.is_none()
+        {
+            return Err(MissingDatabaseError.into());
+        }
         if self.plan_lease_duration_secs.get() > MAX_DURATION_SECS {
             anyhow::bail!(
                 "plan_lease_duration_secs = {} exceeds the maximum of {MAX_DURATION_SECS} (10 years)",
@@ -1226,6 +1331,7 @@ backend = "local_fs"
 
     const LLAMA: &str = "llamacpp_cli_stock_tools";
     const MACOS: &str = r#"["os:macos"]"#;
+    const IOS: &str = r#"["os:ios"]"#;
 
     /// One offer rule table for the validation cases.
     fn rule(runtime_type: &str, flavor: &str, requires: &str) -> String {
@@ -1236,6 +1342,13 @@ backend = "local_fs"
 
     #[rstest]
     #[case::valid(rule(LLAMA, "macos-x64", MACOS), None)]
+    #[case::llamacpp_ios(rule("llamacpp_ios_pipette", "ios-arm64", IOS), None)]
+    #[case::mlx_ios(rule("mlx_ios_pipette", "ios-arm64", IOS), None)]
+    #[case::onnx_genai_ios(rule("onnx_genai_ios_pipette", "ios-arm64", IOS), None)]
+    #[case::ios_unknown_flavor(
+        rule("llamacpp_ios_pipette", "ios-x64", IOS),
+        Some("offer rule llamacpp_ios_pipette ios-x64: unknown flavor")
+    )]
     #[case::unsupported(
         rule("mlx_macos_pipette", "macos-x64", MACOS),
         Some("offer rule mlx_macos_pipette macos-x64: unsupported runtime type")
@@ -1312,9 +1425,10 @@ backend = "local_fs"
             config.descriptor_catalog.llamacpp_min_build_age_secs,
             10_800
         );
+        // Each of the three iOS app runtimes has the one flavor `ios-arm64`.
         assert_eq!(
             config.descriptor_catalog.unruled_flavors().count(),
-            LlamaCppFlavor::known().count() + OvmsFlavor::known().count()
+            LlamaCppFlavor::known().count() + OvmsFlavor::known().count() + 3
         );
         Ok(())
     }
@@ -2001,36 +2115,95 @@ backend = "local_fs"
         let config: Config = toml::from_str(toml)?;
         assert!(config.todo_storage.is_none());
         // todo_storage() must return the [storage] config when unset
-        let StorageConfig::S3 { bucket, .. } = config.todo_storage() else {
+        let TodoStorageRef::ObjectStore(StorageConfig::S3 { bucket, .. }) = config.todo_storage()
+        else {
             anyhow::bail!("expected S3 config from fallback");
         };
         assert_eq!(bucket, "data-bucket");
         Ok(())
     }
 
-    #[test]
-    fn test_todo_storage_explicit() -> anyhow::Result<()> {
-        let toml = r#"
-evals_server_url = "http://evals:8000"
-
-[storage]
-backend = "s3"
-bucket = "data-bucket"
-
-[auth_storage]
-backend = "local_fs"
-
-[todo_storage]
-backend = "s3"
-bucket = "todo-bucket--use1-az4--x-s3"
-region = "us-east-1"
-"#;
-        let config: Config = toml::from_str(toml)?;
-        assert!(config.todo_storage.is_some());
-        let StorageConfig::S3 { bucket, .. } = config.todo_storage() else {
-            anyhow::bail!("expected S3 todo_storage");
+    #[rstest]
+    #[case::absent("", "data-bucket")]
+    #[case::own_section(
+        "\n[eval_packages_storage]\nbackend = \"s3\"\nbucket = \"eval-bucket\"\n",
+        "eval-bucket"
+    )]
+    fn test_eval_packages_storage_falls_back_to_storage(
+        #[case] section: &str,
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        let storage = "\n[storage]\nbackend = \"s3\"\nbucket = \"data-bucket\"\n";
+        let config: Config = toml::from_str(&(minimal_toml("") + storage + section))?;
+        let StorageConfig::S3 { bucket, .. } = config.eval_packages_storage() else {
+            anyhow::bail!("expected an s3 eval package store");
         };
-        assert_eq!(bucket, "todo-bucket--use1-az4--x-s3");
+        assert_eq!(bucket, expected);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::s3(
+        "backend = \"s3\"\nbucket = \"todo-bucket--use1-az4--x-s3\"\nregion = \"us-east-1\"\n",
+        "todo-bucket--use1-az4--x-s3"
+    )]
+    #[case::local_fs("backend = \"local_fs\"\ndata_dir = \"./queue\"\n", "./queue")]
+    fn test_todo_storage_explicit(
+        #[case] section: &str,
+        #[case] location: &str,
+    ) -> anyhow::Result<()> {
+        let config: Config = toml::from_str(&(minimal_toml("") + "\n[todo_storage]\n" + section))?;
+        let found = match config.todo_storage() {
+            TodoStorageRef::ObjectStore(StorageConfig::S3 { bucket, .. }) => bucket.clone(),
+            TodoStorageRef::ObjectStore(StorageConfig::LocalFs { data_dir }) => {
+                data_dir.display().to_string()
+            }
+            TodoStorageRef::Database => anyhow::bail!("expected an object-store queue"),
+        };
+        assert_eq!(found, location);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::s3_without_bucket("backend = \"s3\"\n", "bucket")]
+    #[case::unknown_backend("backend = \"databse\"\n", "databse")]
+    fn test_todo_storage_parse_error_names_the_key(
+        #[case] section: &str,
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        let result: Result<Config, _> =
+            toml::from_str(&(minimal_toml("") + "\n[todo_storage]\n" + section));
+        let Err(error) = result else {
+            anyhow::bail!("a malformed [todo_storage] parsed");
+        };
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_todo_storage_database_requires_database_section() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            minimal_toml("") + "\n[todo_storage]\nbackend = \"database\"\n",
+        )?;
+        let Err(error) = Config::load(&path) else {
+            anyhow::bail!("a database queue without [database] loaded");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("[todo_storage]") && message.contains("[database]"),
+            "{message}"
+        );
+
+        std::fs::write(
+            &path,
+            minimal_toml("") + "\n[todo_storage]\nbackend = \"database\"\n\n[database]\n",
+        )?;
+        let config = Config::load(&path)?;
+        assert!(matches!(config.todo_storage(), TodoStorageRef::Database));
         Ok(())
     }
 

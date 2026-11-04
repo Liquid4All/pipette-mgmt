@@ -443,10 +443,10 @@ async fn creating_for_an_account_without_submit_plans_files_nothing() -> anyhow:
 
 /// A campaign store whose writes signal `entered`, then wait for `release`: the
 /// window between a route's plan write and its campaign write, held open.
-struct GatedPut {
-    inner: Arc<dyn CampaignStore>,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
+pub(crate) struct GatedPut {
+    pub(crate) inner: Arc<dyn CampaignStore>,
+    pub(crate) entered: Arc<Notify>,
+    pub(crate) release: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -540,15 +540,45 @@ async fn a_disconnect_between_the_writes_still_writes_the_campaign(
     Ok(())
 }
 
-/// A campaign write that fails after the first plan is filed is a `500` with
-/// no store detail, and the plan it strands is cancelled rather than left
-/// claimable under a campaign id nothing holds.
+/// A campaign store whose writes fail and whose reads pass through.
+struct PutFails(Arc<dyn CampaignStore>);
+
+#[async_trait::async_trait]
+impl CampaignStore for PutFails {
+    async fn get_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<Campaign>> {
+        self.0.get_campaign(campaign_id).await
+    }
+    async fn put_campaign(&self, _campaign: &Campaign) -> anyhow::Result<()> {
+        anyhow::bail!("injected campaign write failure")
+    }
+    async fn list_campaigns(
+        &self,
+        after: Option<&CampaignId>,
+        limit: NonZeroUsize,
+    ) -> anyhow::Result<CampaignPage> {
+        self.0.list_campaigns(after, limit).await
+    }
+    async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()> {
+        self.0.delete_campaign(campaign_id).await
+    }
+}
+
+/// A campaign write that fails after the first plan is filed is a `500` that
+/// names the campaign and plan without storage detail. Preserve the plan even
+/// when the read back finds no campaign: the write can still land later.
+#[rstest]
+#[case::read_back_shows_no_campaign(true)]
+#[case::read_back_fails(false)]
 #[tokio::test]
-async fn a_failed_campaign_write_cancels_the_first_plan() -> anyhow::Result<()> {
+async fn a_failed_campaign_write_is_read_back(#[case] readable: bool) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = seeded_state(dir.path()).await?;
     let owner = operator(&state).await?;
-    state.campaign_store = std::sync::Arc::new(pipette_store_testkit::CampaignStoreUnimplemented);
+    state.campaign_store = if readable {
+        Arc::new(PutFails(state.campaign_store.clone()))
+    } else {
+        Arc::new(pipette_store_testkit::CampaignStoreUnimplemented)
+    };
 
     let resp = post_campaign(&state, &owner, &[("name", "Nightly")]).await?;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -561,7 +591,17 @@ async fn a_failed_campaign_write_cancels_the_first_plan() -> anyhow::Result<()> 
     let [plan] = plans.as_slice() else {
         anyhow::bail!("expected the one staged plan, found {}", plans.len());
     };
-    assert!(state.plan_store.has_cancel_marker(&plan.plan_id).await?);
+    let campaign_id = plan
+        .campaign_id
+        .as_ref()
+        .context("the plan names its campaign")?;
+    let cancelled = state.plan_store.has_cancel_marker(&plan.plan_id).await?;
+    assert!(error.contains(plan.plan_id.as_str()), "{error}");
+    assert!(error.contains(campaign_id.as_str()), "{error}");
+    if !readable {
+        assert!(!error.contains("not implemented"), "{error}");
+    }
+    assert!(!cancelled, "an unknown outcome cancels nothing");
     Ok(())
 }
 
@@ -2712,6 +2752,11 @@ async fn a_revision_is_attributed_to_whoever_files_it(
     ]
     .concat();
     let author = registered_user(&state, &editing).await?;
+    let document = if matches!(route, RevisionRoute::Recalculate) {
+        ONE_EVAL_PLAN.to_string()
+    } else {
+        ONE_CELL_PLAN.to_string()
+    };
     let (campaign_id, filer) = match reviser {
         Reviser::TeamAdmin | Reviser::TeamMember => {
             let admin = server_admin(&state).await?;
@@ -2725,7 +2770,14 @@ async fn a_revision_is_attributed_to_whoever_files_it(
             for member in [&author, &colleague] {
                 set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
             }
-            let campaign_id = create_campaign(&state, &author, "Team", Some(&acme)).await?;
+            let campaign_id = created_campaign_from(
+                &state,
+                &author,
+                &[("name", "Team"), ("owner", &acme)],
+                &document,
+            )
+            .await?
+            .0;
             (campaign_id, colleague)
         }
         Reviser::Delegate => {
@@ -2743,7 +2795,9 @@ async fn a_revision_is_attributed_to_whoever_files_it(
             )
             .await?;
             (
-                create_campaign(&state, &author, "Mine", None).await?,
+                created_campaign_from(&state, &author, &[("name", "Mine")], &document)
+                    .await?
+                    .0,
                 delegate,
             )
         }
@@ -6207,7 +6261,8 @@ async fn a_recalculation_answers_a_new_job_from_the_record_and_cancels_what_it_r
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let owner = editor(&state).await?;
-    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let (campaign_id, first) =
+        created_campaign_from(&state, &owner, &[("name", "Nightly")], ONE_EVAL_PLAN).await?;
     let done = manifest(&state, &first).await?.job_ids[0].clone();
     answer(&state, &done, "eval").await?;
 
@@ -6285,7 +6340,8 @@ async fn a_dry_run_recalculation_files_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let owner = editor(&state).await?;
-    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let (campaign_id, first) =
+        created_campaign_from(&state, &owner, &[("name", "Nightly")], ONE_EVAL_PLAN).await?;
     let done = manifest(&state, &first).await?.job_ids[0].clone();
     answer(&state, &done, "eval").await?;
 
@@ -6299,10 +6355,7 @@ async fn a_dry_run_recalculation_files_nothing() -> anyhow::Result<()> {
     .await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
-    assert!(
-        json_str(&body, "document")?.contains("prefill_throughput_256"),
-        "{body}"
-    );
+    assert!(json_str(&body, "document")?.contains("eval_test"), "{body}");
     assert_eq!(
         state
             .submission_store

@@ -161,6 +161,10 @@ runtimes = [{ type = "mlx_macos_pipette", version = "0.20.0", requirements = { t
 This plan expands into **3 jobs**: variant 1 → 1 benchmark × 1 model × 1
 runtime = 1, variant 2 → 2 benchmarks × 1 model × 1 runtime = 2.
 
+A runtime can instead be a catalog name string, for example
+`runtimes = ["acme/example-build::macos-arm64"]`. Ingestion replaces the name
+with a runtime table before the planner runs (§6.2).
+
 The planner copies three plan-level or variant-level fields into the envelope
 of each cell's body: the plan's `expires_at` when set, its `merge_duplicates`,
 and the variant's negative clauses (`exclude_clients`, `excludes`,
@@ -587,6 +591,51 @@ Rejections:
   entry in the model parameter table (the model-params rows). Off by default,
   where the same condition is a warning instead. See the warning below for why.
 
+#### Catalog names
+
+A `runtimes` array can contain a catalog name in place of a runtime table:
+`runtimes = ["global/llamacpp-example::macos-arm64"]`. Bare names and
+organization-qualified names such as `acme/example-build` are also accepted.
+The server resolves the names before the planner expands the document. It also
+resolves them before it rewrites the gated models. It searches the campaign
+owner's organization, then the global catalog. Validation outside a campaign
+uses the filer's organization. Administrative catalog permissions do not
+broaden this scope.
+
+A catalog entry holds one descriptor, a member, for each flavor. An offer rule
+tells which devices the catalog offers a member to. A bare name selects the
+first member whose offer rule covers two things: the `requires` of the variant,
+and the effective flags of each client that the variant lists. A client in
+`exclude_clients` does not count.
+
+A runtime that the iOS app builds in (`llamacpp_ios_pipette`,
+`mlx_ios_pipette`, `onnx_genai_ios_pipette`) also needs its build flag,
+`runtime:descriptor:<digest>`. Each listed client must report the flag. A
+variant with `requires` must include the flag in `requires`. The refusal names
+the flag to add.
+
+The offer check does not read `excludes` or `not_all_of`. If those clauses
+narrow the devices, select a member with `::flavor`. An explicit `::flavor`
+selects that member and does not check its offer rule. Both forms leave the
+client eligibility of the variant unchanged.
+
+The server refuses the filing with `400` for a name that is one of these:
+
+- unknown
+- tombstoned
+- unavailable
+- not offered to every device that the variant admits
+
+Validation reports an error issue for each such name. A hidden entry is out of
+the catalog listings, but its name still resolves; the plan gets a warning. A
+server without a descriptor catalog requires runtime tables.
+
+The server replaces each name with its descriptor and adds a comment, for
+example `# catalog name at filing: global/llamacpp-example::macos-arm64`.
+Other text stays byte for byte. Later revisions use the stored descriptors and
+do not resolve the names again. Name comments survive gated-model rewrites. A
+variant edit rewrites the whole document and can remove existing comments.
+
 #### The import of a gated model
 
 A job body can carry a model `auth_token`, the access token for a gated
@@ -616,10 +665,11 @@ The token exists only in request memory while the import runs. No token reaches
 name one commit with different tokens rewrite to the same records, so they merge
 onto one job (§7).
 
-**The stored plan document.** A document with a model token is rewritten from
-its TOML values, each imported model replaced by its vault arm, under a header
-comment that counts the replaced models. A document with no model token is
-stored byte for byte. A campaign revision expands the stored document again,
+**The stored plan document.** The server rewrites a document with a model token
+from its TOML syntax tree. Layout and comments outside each replaced model stay
+unchanged. Thus the server refuses a document that names `auth_token` in a
+comment, as it refuses a document with no model token. A header comment counts the replaced models. A document with no catalog names or
+model token is stored byte for byte. A campaign revision expands the stored document again,
 so it imports nothing and calls the Hub zero times, and the content keys of the
 vault-arm bodies equal those of the jobs that the head filed, so the jobs carry
 over (§7). The table check reads a vault model with a HuggingFace origin as
@@ -808,8 +858,8 @@ whatever state it is in:
 - **Finished**, with a submission record: the revision lists the job and writes
   no marker. It counts the job `finished` or `failed` from the record, as the
   superseded plan did. The fleet match at ingestion skips it, because no client
-  has anything left to run. The record is read first, and a job that has one is
-  finished whatever the queue still holds of it.
+  has anything left to run. The record's presence is checked first, and a job
+  that has one is finished whatever the queue still holds of it.
 - **Queued**, in `avail/` or `leased/`: the revision joins it as the merge does.
   It writes its membership marker, then re-checks the job, so a teardown of the
   superseded plan that runs later finds a member and releases the job instead of
@@ -853,6 +903,12 @@ superseded plan. The revision keys a job it takes under the new digest, so the
 next revision carries it by digest. The job keeps the source it was first
 stored with.
 
+With `[database]`, a run's outcome and flags come from its `submission_outcomes`
+row ([storage.md §4.3](storage.md#43-the-outcome-index)), so the revision reads
+no record of tens of megabytes. A job with no row, or a `finished` row with no
+`run_flags`, is read from its record. A row outlives a record pruned from
+`processed/`, so its job counts as one with a record.
+
 **A revision may also take finished runs from other plans.** With
 `carry_earlier`, the campaign's earlier plans offer their finished jobs, newest
 first back along `previous_plan_id`, after the superseded plan's own; a
@@ -889,19 +945,31 @@ to the job it runs again.
 **A recalculation answers the jobs it names.** It withholds them from the carry
 as a re-run does, and each placement of their digest that no carried job takes
 is minted as a fresh job. That job is never staged into `todo/` and holds no
-membership marker. In their place, staging writes a copy of the named job's
-submission record to `submissions/incoming/`, under the fresh `job_id`,
-submitted now and naming that job in `rescored_from`. The copy keeps the
+membership marker. In its place, a copy of the named job's submission record
+goes to `submissions/incoming/`, under the fresh `job_id`, submitted now and
+naming that job in `rescored_from`. The copy keeps the
 time of the device run in `run_submitted_at`
 ([storage.md](storage.md#run_submitted_at)). The
 scorer takes the copy as it takes any submission. The job counts
 `finished` from that write, and the fleet match skips it as it skips a carried
 finished job. It reads no index and publishes no key: no plan can join a job
-that is never queued. Only an eval's success is named, because a failure holds
-no completions and every other benchmark's score is the device's measurement.
-A copy is written before the plan is finalized, so a filing that fails later
-leaves its copies to be scored under jobs of a plan that maintenance tears
-down as stranded (§8).
+that is never queued.
+
+Only an eval can be named, because a failure holds no completions and every
+other benchmark's score is the device's measurement. The check reads no result
+body. It reads each named job's outcome in one batch, and each job's benchmark
+type from its filed job source and the manifest's `benchmark_types`. A manifest
+without `benchmark_types` types each job by its id's prefix. A whole-plan
+recalculation (`all_evals`) skips a job whose filed source is not JSON, and a
+named recalculation of that job fails.
+
+The copies run after the staging writes (§8, step 3), at most four at a time.
+Each copy reads and checks the whole record. The minted jobs of the revision
+go into `avail/` only after every copy succeeds. A record that is not an eval's
+success passes the check and then fails its copy. The filing then stops with
+the revision in `creating`, and no job of it is claimable. A copy is written
+before the plan is finalized, so a filing that fails later leaves its copies to
+be scored under jobs of a plan that maintenance tears down as stranded (§8).
 
 **A re-run or a recalculation places every cell again.** It files the superseded plan's own
 document, so each job it carries must find its cell, and each named cell must
@@ -994,14 +1062,16 @@ writer: it stages complete job bodies and promotes its own `tmp/` writes into
 ([queue.md](queue.md#jobs)). There is no multi-object atomic write, so
 ingestion stages first and promotes second, gated by the manifest status:
 
-1. **Collect and check.** Expand the plan document (§6.1) and validate the
+1. **Collect and check.** Resolve catalog names and rewrite their runtime
+   entries (§6.2), then expand the plan document (§6.1) and validate the
    whole set (§6.2). Then run the import step (§6.2), and check the vault
    references of the rewritten bodies. Nothing but completed imports' vault
    records has been written. A dry run stops here
    ([Campaigns: Response `201 Created`](api/campaigns.md#response-201-created)
    gives its answer). The models the owner already holds are rewritten to
    their vault arms only for the vault check and a revision's carried-job
-   counts; the answered bodies keep the HuggingFace form.
+   counts; the answered bodies and preview document keep the token-free
+   HuggingFace form. The server rewrites catalog names in every answer.
 
    On a campaign route, a disconnect during the import, and the re-read of the
    campaign after it, are as
@@ -1032,9 +1102,10 @@ ingestion stages first and promotes second, gated by the manifest status:
 3. **Stage.** For each **distinct** job, concurrently: write the job source
    `job-sources/{job_id}.json` if absent, then the link
    `job-plan-links/{job_id}/{plan_id}`, and, for a **minted** job only, the
-   membership marker `job-plans/{job_id}/{plan_id}.{expires_at}`, then
-   `write_tmp` and the promote. A merged job is already queued, and its marker
-   was written before the merge was confirmed (§7). Three orders hold within a
+   membership marker `job-plans/{job_id}/{plan_id}.{expires_at}`. A merged job
+   is already queued, and its marker was written before the merge was
+   confirmed (§7). Then the recalculation copies run (§7), and after them, for
+   each minted job, `write_tmp` and the promote. Three orders hold within a
    job:
 
    - the job source before the link, so every link names a stored job source;
@@ -1054,10 +1125,12 @@ ingestion stages first and promotes second, gated by the manifest status:
    per-input `merges` (§11, [cli.md](cli.md)); the HTTP routes answer a
    narrower form ([Campaigns: Response `201 Created`](api/campaigns.md#response-201-created)).
 
-If ingestion fails partway, nothing is claimable that shouldn't be: staged
-`tmp/` files are reaped by the stale-`tmp/` cleanup, and a manifest stuck in
-`creating` is resolved through the same teardown path as cancel (§9). The job
-sources and links a failed ingest wrote stay with its manifest.
+If ingestion fails partway, promoted jobs stay in `avail/`. Queue maintenance
+leaves a job out of the eligible index while all its memberships point to
+`creating` or missing plans. A job also held by an active plan stays eligible.
+The stale-`tmp/` cleanup removes staged `tmp/` files. The cancel teardown also
+handles a manifest stuck in `creating` (§9). The job sources and links a failed
+ingest wrote stay with its manifest.
 `queue-maintenance` treats a `creating` manifest as stranded once it is
 older than `plan_creating_max_age_secs` (default 6 hours).
 
@@ -1100,8 +1173,8 @@ stateDiagram-v2
 means to a reader and where it moves. What the server does in each:
 
 - **creating**: the manifest is written with the full job-id list (§8 step 2)
-  before any body is staged, and nothing is claimable until the bodies are
-  promoted.
+  before any body is staged. The plan makes none of its jobs claimable while it
+  is `creating`, even after a job is promoted into `avail/`.
 - **active** / **pending_clients**: ingestion writes one of the two by the
   same fleet check (§8 step 4), and `queue-maintenance` reconciles them on every run against
   the working fleet. A plan

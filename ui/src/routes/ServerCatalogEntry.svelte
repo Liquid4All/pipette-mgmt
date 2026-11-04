@@ -1,15 +1,13 @@
 <script lang="ts">
-  // One global entry, its members, and other global names of those same
-  // descriptor digests. A runtime entry lists its members in precedence order;
-  // a model entry shows a table of formats and quantizations with each member's
-  // parameter counts. None of this page changes the catalog.
-  import { descriptorNamesByDigest, globalCatalogEntry } from "../lib/api";
+  // Read the entry selected by the address and show controls for a live, editable org entry.
+  import { catalogEntry, descriptorNamesByDigest } from "../lib/api";
   import type { DescriptorDigestNames, DescriptorEntryListRow } from "../lib/api-types";
   import { digestBatches } from "../lib/catalog-entry";
   import {
-    catalogPath, catalogSynonyms, memberLabel, modelMemberRows, parameterText, sharedParameters,
-    type CatalogSynonym,
+    ANY_DEVICE_LABEL, anyDeviceText, catalogPath, catalogSynonyms, mayEdit, memberLabel, modelMemberRows,
+    parameterText, scopeLabel, sharedParameters, type CatalogSynonym,
   } from "../lib/catalog";
+  import CatalogEntryControls from "../lib/components/CatalogEntryControls.svelte";
   import Command from "../lib/components/Command.svelte";
   import Loaded from "../lib/components/Loaded.svelte";
   import PageHead from "../lib/components/PageHead.svelte";
@@ -24,10 +22,12 @@
   let { route }: { route: RouteOf<"server-catalog-entry"> } = $props();
   interface Detail { entry: DescriptorEntryListRow | null; synonyms: CatalogSynonym[] | null }
   const read = new Loader<Detail>();
+  let controls = $state<ReturnType<typeof CatalogEntryControls>>();
   $effect(() => { here.under = catalogPath; });
-  read.run(async () => {
-    const found = await globalCatalogEntry(session.signer, route.name, session.account?.may.read_fleet ?? false);
-    const entry = found.entries.find((row) => row.scope === "global") ?? null;
+  /** Read the entry; `keep` leaves the drawn entry up until the answer replaces it. */
+  const load = (keep = false) => read.run(async () => {
+    const found = await catalogEntry(session.signer, route.name, session.account?.may.read_fleet ?? false);
+    const entry = found.entries[0] ?? null;
     if (!entry) return { entry: null, synonyms: [] };
     const batches = digestBatches((entry.members ?? []).map((member) => member.digest));
     let answers: DescriptorDigestNames[];
@@ -37,21 +37,24 @@
       return { entry, synonyms: null };
     }
     const names: DescriptorDigestNames = { names: Object.assign({}, ...answers.map((answer) => answer.names)) };
-    return { entry, synonyms: catalogSynonyms(entry, names) };
-  });
+    return { entry, synonyms: catalogSynonyms(entry, names, (hit) => scopeLabel(hit, session.account)) };
+  }, keep);
+  void load();
   const listPath = $derived(read.data?.entry?.descriptor_kind === "model" ? `${catalogPath}?kind=model` : catalogPath);
 </script>
 
-<PageHead trail={[...SERVER, { label: "Catalog", href: listPath }]} title={read.data?.entry?.name ?? route.name} />
+<PageHead trail={[...SERVER, { label: "Catalog", href: listPath }]} title={read.data?.entry?.display_name ?? route.name} />
 <Loaded of={read}>
   {#snippet children(detail)}
     {#if !detail.entry}
-      <p class="muted">No global catalog entry has this name.</p>
+      <p class="muted">No catalog entry has this name.</p>
     {:else}
       {@const entry = detail.entry}
       {@const model = entry.descriptor_kind === "model"}
       {@const shared = model ? sharedParameters(entry.members ?? []) : null}
+      {@const editable = entry.state !== "tombstoned" && mayEdit(session.account, entry)}
       <dl class="facts">
+        <div><dt>scope</dt><dd><StatusPill status={scopeLabel(entry, session.account)} /></dd></div>
         <div><dt>kind</dt><dd><StatusPill status={entry.kind} /></dd></div>
         <div><dt>state</dt><dd>{#if entry.state === "active"}active{:else}<StatusPill status={entry.state} />{/if}</dd></div>
         <div><dt>release time</dt><dd>{when(entry.release_time)}</dd></div>
@@ -62,7 +65,11 @@
             <span class="muted">(<code>{shared.model_key}</code>)</span></dd></div>
         {/if}
       </dl>
-      <p class="muted">Managed with <code>pipette-mgmt catalog</code>.</p>
+      {#if entry.scope === "global"}
+        <p class="muted">Managed with <code>pipette-mgmt catalog</code>.</p>
+      {:else if editable}
+        <CatalogEntryControls bind:this={controls} {entry} onchanged={() => load(true)} />
+      {/if}
 
       <h2>Members</h2>
       {#if model}
@@ -71,19 +78,28 @@
             <tr>
               <th>format</th><th>quantization</th>
               {#if !shared}<th>model key</th><th>parameters</th>{/if}
-              <th>added</th><th>descriptor</th>
+              <th>added</th>
+              {#if session.account?.may.read_fleet}<th>{ANY_DEVICE_LABEL}</th>{/if}
+              <th>descriptor</th>
             </tr>
           </thead>
           <tbody>
             {#each modelMemberRows(entry.members ?? []) as row (row.member.digest)}
               <tr>
                 <td>{row.format}</td>
-                <td>{row.quantization}</td>
+                <td>{row.quantization}
+                  {#if editable}
+                    <button type="button" class="again"
+                            onclick={() => controls?.relabel(row.format, row.quantization)}>change</button>
+                  {/if}</td>
                 {#if !shared}
                   <td>{#if row.member.model_key}<code>{row.member.model_key}</code>{:else}—{/if}</td>
                   <td>{parameterText(row.member.parameters)}</td>
                 {/if}
                 <td>{when(row.member.added_at)}</td>
+                {#if session.account?.may.read_fleet}
+                  <td class="muted">{anyDeviceText(row.member.evidence) ?? "Unavailable"}</td>
+                {/if}
                 <td>
                   <details>
                     <summary><code>{row.member.selector}</code></summary>
@@ -108,6 +124,8 @@
               </dd>
               <dt>approved devices offered</dt><dd>{session.account?.may.read_fleet
                 ? member.offered_device_count ?? "Unavailable" : "Requires fleet-read permission"}</dd>
+              <dt>{ANY_DEVICE_LABEL}</dt><dd class="muted">{session.account?.may.read_fleet
+                ? anyDeviceText(member.evidence) ?? "Unavailable" : "Requires fleet-read permission"}</dd>
               <dt>descriptor</dt><dd><pre><code>{JSON.stringify(member.descriptor, null, 2)}</code></pre></dd>
               <dt>in a plan</dt><dd><Command command={member.plan_toml} copyLabel="Copy as plan TOML" /></dd>
             </dl>
@@ -122,10 +140,11 @@
         <ul class="synonyms">
           {#each detail.synonyms as synonym (`${synonym.member}/${synonym.name}`)}
             <li><span class="muted">{synonym.member}</span>
-              <a href={synonym.href}>{synonym.name}</a> <StatusPill status={synonym.kind} /></li>
+              <a href={synonym.href}>{synonym.name}</a> <StatusPill status={synonym.scope} />
+              <StatusPill status={synonym.kind} /></li>
           {/each}
         </ul>
-      {:else}<p class="muted">No other global names.</p>{/if}
+      {:else}<p class="muted">No other names.</p>{/if}
     {/if}
   {/snippet}
 </Loaded>

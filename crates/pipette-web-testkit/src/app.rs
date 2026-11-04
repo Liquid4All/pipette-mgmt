@@ -167,11 +167,44 @@ pub struct SqlState {
     _db: TestDb,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum QueueBackend {
+    LocalFs,
+    Database,
+}
+
+/// A queue test state that owns its scratch database until the test ends.
+pub struct QueueState {
+    pub state: AppState,
+    _db: Option<TestDb>,
+}
+
+/// Returns a seeded state for the chosen queue backend. The `Database` backend
+/// puts the record stores and the queue in one new database. It returns `None`
+/// if `TEST_DATABASE_URL` is not set and the run is not in CI.
+pub async fn seeded_queue_state(
+    dir: &std::path::Path,
+    backend: QueueBackend,
+) -> anyhow::Result<Option<QueueState>> {
+    match backend {
+        QueueBackend::LocalFs => Ok(Some(QueueState {
+            state: seeded_state(dir).await?,
+            _db: None,
+        })),
+        QueueBackend::Database => Ok(seeded_sql_state_from(dir, test_config(dir), true)
+            .await?
+            .map(|sql| QueueState {
+                state: sql.state,
+                _db: Some(sql._db),
+            })),
+    }
+}
+
 /// Use this function to test a feature that only the SQL store keeps. It
 /// returns `None` if `TEST_DATABASE_URL` is not set and the run is not in CI.
 /// The test then skips.
 pub async fn seeded_sql_state(dir: &std::path::Path) -> anyhow::Result<Option<SqlState>> {
-    seeded_sql_state_from(dir, test_config(dir)).await
+    seeded_sql_state_from(dir, test_config(dir), false).await
 }
 
 /// A [`seeded_sql_state`] that reads Hugging Face at `endpoint`, for the tests
@@ -182,18 +215,22 @@ pub async fn seeded_sql_state_with_hf_endpoint(
 ) -> anyhow::Result<Option<SqlState>> {
     let mut config = test_config(dir);
     config.hf_import_endpoint = endpoint.to_string();
-    seeded_sql_state_from(dir, config).await
+    seeded_sql_state_from(dir, config, false).await
 }
 
 async fn seeded_sql_state_from(
     dir: &std::path::Path,
     config: Config,
+    sql_queue: bool,
 ) -> anyhow::Result<Option<SqlState>> {
     let Some(db) = TestDb::new().await? else {
         return Ok(None);
     };
     setup_benchmarks(dir)?;
-    let stores = pipette_store_sql::overlay(db.db(), build_local_fs_stores(&config)?);
+    let mut stores = pipette_store_sql::overlay(db.db(), build_local_fs_stores(&config)?);
+    if sql_queue {
+        stores.todo = std::sync::Arc::new(pipette_store_sql::SqlTodoStore::new(db.db().clone()));
+    }
     let state = AppState::new(config, stores, test_http_client()?).await?;
     Ok(Some(SqlState { state, _db: db }))
 }

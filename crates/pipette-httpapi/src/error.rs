@@ -40,6 +40,11 @@ pub enum AppError {
     BadGateway(String),
     #[error("Internal: {0}")]
     Internal(String),
+    /// A `500` after a write that can have landed. `message` names the records
+    /// that the caller must check and holds no storage detail, so the caller
+    /// sees it. Only the log carries `cause`.
+    #[error("Internal: {message}: {cause}")]
+    Unconfirmed { message: String, cause: String },
 }
 
 impl AppError {
@@ -57,6 +62,7 @@ impl AppError {
         if self.status().is_server_error() {
             return match self {
                 Self::BadGateway(_) => "upstream request failed",
+                Self::Unconfirmed { message, .. } => message,
                 Self::BadRequest(_)
                 | Self::Unauthorized(_)
                 | Self::Forbidden(_)
@@ -91,7 +97,8 @@ impl AppError {
             | Self::TooManyRequests(msg)
             | Self::RateLimited(msg, _)
             | Self::BadGateway(msg)
-            | Self::Internal(msg) => msg,
+            | Self::Internal(msg)
+            | Self::Unconfirmed { message: msg, .. } => msg,
         }
     }
 
@@ -114,7 +121,7 @@ impl AppError {
             Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             Self::TooManyRequests(_) | Self::RateLimited(..) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
-            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::Unconfirmed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -255,10 +262,13 @@ impl From<pipette_pipeline::campaign_admin::CampaignAdminError> for AppError {
             | CampaignAdminError::DeletedDuringFiling { .. }
             | CampaignAdminError::StillRunning { .. } => AppError::Conflict(message),
             CampaignAdminError::NotAdvanced { source, .. }
-            | CampaignAdminError::NotCreated { source, .. }
             | CampaignAdminError::NotCancelled { source, .. } => {
                 AppError::internal(source.context(message))
             }
+            CampaignAdminError::CommitUnknown { source, .. } => AppError::Unconfirmed {
+                message,
+                cause: format!("{source:#}"),
+            },
             CampaignAdminError::SourceMismatch(_) => AppError::internal(anyhow::anyhow!(message)),
             CampaignAdminError::Store(e) => {
                 AppError::internal(e.context("the campaign store failed"))

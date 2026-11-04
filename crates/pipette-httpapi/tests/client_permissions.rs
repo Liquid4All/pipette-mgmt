@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_httpapi::state::AppState;
-use pipette_plan_types::{ClientId, ClientPermission, ExpiresAt, JobId, UserPermission};
+use pipette_plan_types::{ClientId, ClientPermission, JobId, UserPermission};
 use pipette_store_testkit::TEST_LIST_LIMIT;
 use pipette_web_testkit::{
     authed_get, authed_patch, authed_post, body_json, job_spec, make_state, register_and_approve,
@@ -189,30 +189,16 @@ async fn leased_keys(state: &AppState) -> anyhow::Result<Vec<String>> {
     Ok(keys)
 }
 
-/// Seed a job into `avail/` and lease it to `client_id`, so a submission
-/// echoing `job_id` has a claim to bind to.
-async fn seed_claim(
-    state: &AppState,
-    dir: &std::path::Path,
-    client_id: &ClientId,
-    job_id: &str,
-) -> anyhow::Result<JobId> {
-    let job = pipette_web_testkit::seed_avail(
-        dir,
+/// Lease a job to `client_id`, so a submission that echoes `job_id` has a claim to bind
+/// to.
+async fn seed_claim(state: &AppState, client_id: &ClientId, job_id: &str) -> anyhow::Result<JobId> {
+    pipette_web_testkit::seed_leased(
+        state.todo_store.as_ref(),
         job_id,
-        ExpiresAt::Never,
+        client_id,
         &json!({"spec": job_spec()}),
-    )?;
-    state
-        .todo_store
-        .claim_job(
-            &job,
-            ExpiresAt::Never,
-            client_id,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        )
-        .await?;
-    Ok(job)
+    )
+    .await
 }
 
 /// A holder gets the route's own answer: `204` for a claim with nothing
@@ -302,11 +288,7 @@ async fn test_a_submission_requires_the_permission_its_body_names(
     let body = async |state: &AppState, client_id: &ClientId, job: &str| -> anyhow::Result<Value> {
         let mut body = pipette_web_testkit::valid_submission("prefill_throughput_256");
         if echoes_a_claim {
-            body["job_id"] = json!(
-                seed_claim(state, dir.path(), client_id, job)
-                    .await?
-                    .as_str()
-            );
+            body["job_id"] = json!(seed_claim(state, client_id, job).await?.as_str());
         }
         Ok(body)
     };
@@ -366,7 +348,7 @@ async fn test_a_batch_refuses_per_item(#[values(false, true)] archive: bool) -> 
     let (key, client_id) =
         register_approve_and_grant(&state, &[ClientPermission::SubmitResults]).await?;
 
-    let job = seed_claim(&state, dir.path(), &client_id, "job-1").await?;
+    let job = seed_claim(&state, &client_id, "job-1").await?;
     let leases_before = leased_keys(&state).await?;
     let mut claimed = pipette_web_testkit::valid_submission("prefill_throughput_256");
     claimed["job_id"] = json!(job.as_str());

@@ -141,6 +141,17 @@ export function actionShown(event: Pick<AuditEvent, "action" | "outcome" | "summ
     return { text: `First Clerk sign-in, to an account holding ${count} key${count === 1 ? "" : "s"}`,
              title: action.prior_keys.map((key) => `${key.key_id} (${key.key_details})`).join("\n"), status: null };
   }
+  if (action.type === "catalog_rename") {
+    return { text: `Renamed catalog entry ${action.old_name} to ${action.new_name}`,
+             title: `${action.scope}: ${action.old_name} → ${action.new_name}`, status: null };
+  }
+  if (action.type === "catalog_merge") {
+    return { text: `Merged catalog entry ${action.old_name} into ${action.into_name}`,
+             title: `${action.scope}: ${action.old_name} → ${action.into_name}`
+               + (action.moved.length ? `\nmoved: ${action.moved.join(", ")}` : "")
+               + (action.skipped.length ? `\nalready held: ${action.skipped.join(", ")}` : ""),
+             status: null };
+  }
   return { text: event.summary || `${action.method} ${action.route}`, title: `${action.method} ${action.path}`,
            status: event.outcome === "succeeded" ? null : action.status };
 }

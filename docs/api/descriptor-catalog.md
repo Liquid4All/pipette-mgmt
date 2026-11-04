@@ -15,6 +15,10 @@ Organization entry writes use these routes:
   creates an entry.
 - [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/members`](descriptor-catalog/add_org_descriptor_member.md)
   appends a member.
+- [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/rename`](descriptor-catalog/rename_org_descriptor_entry.md)
+  gives a hand-made entry a new name.
+- [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/relabel`](descriptor-catalog/relabel_org_descriptor_member.md)
+  changes the quantization label of a model member.
 - [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/state`](descriptor-catalog/change_org_descriptor_entry_state.md)
   changes state or tombstones an entry with confirmation.
 
@@ -56,8 +60,9 @@ To see what one registered device can use now, read
 [`GET /api/v1/descriptor-catalog/devices/{client_id}`](descriptor-catalog/list_descriptor_catalog_for_device.md).
 For each pinned or active runtime entry, it selects one offered member. For
 each model entry, it gives every member that an offered runtime member can
-load. It also reports every member that the device cannot use. This read
-needs `read_clients`. The short list contains global entries only. Its
+load. It also reports every member that the device cannot use, and gives
+each offered member its run evidence on this device and on every device. This
+read needs `read_clients`. The short list contains global entries only. Its
 selectors use the bare name.
 
 The [import-run history](descriptor-catalog/list_catalog_import_runs.md) gives

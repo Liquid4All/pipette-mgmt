@@ -71,6 +71,8 @@ export interface ServerFilter {
   placeholder?: string;
   wide?: boolean;
   options?: readonly Choice[];
+  /** The value a select is held at, drawn disabled with `why` on hover. */
+  held?: { value: string; why: string };
 }
 
 export interface TableSpec<R> {
@@ -121,6 +123,10 @@ export const drawnColumns = <C extends { key: string; shown?: boolean }>(columns
 /** Whether any filter is set; the sort is not one. */
 export const filtering = (state: TableState): boolean =>
   Object.values(state.texts).some(Boolean) || Object.values(state.choices).some((chosen) => chosen.length);
+
+/** How many rows the filters keep, as the bar says it: `noun` is plural by an `s` or `ies`, singular for one. */
+export const rowCount = (kept: number, total: number, noun: string): string =>
+  `${kept < total ? `${kept} of ${total}` : total} ${total === 1 ? noun.replace(/ies$/, "y").replace(/s$/, "") : noun}`;
 
 /** `state` as address pairs, a select's key repeated per choice. */
 export const statePairs = (state: TableState): [string, string][] => [

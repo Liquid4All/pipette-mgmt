@@ -19,6 +19,7 @@ use crate::plan_document::{DocumentError, chain, index_labels};
 use crate::plan_ingestion::{
     IngestContext, IngestError, JobRejectionError, RejectionError, validate_submission,
 };
+use crate::plan_names::{NamedDocument, OffsetMap};
 use crate::submission::without_auth_tokens;
 use crate::variant_edit::VARIANTS;
 
@@ -26,6 +27,7 @@ use crate::variant_edit::VARIANTS;
 /// error.
 #[derive(Debug, Serialize)]
 pub struct PlanValidation {
+    pub document: Option<String>,
     /// The jobs the document expands to, after equal bodies merge. `None` when
     /// it does not expand.
     pub job_count: Option<usize>,
@@ -58,6 +60,7 @@ pub enum IssueSeverity {
 impl From<PlanValidation> for pipette_plan_types::PlanValidation {
     fn from(validation: PlanValidation) -> Self {
         Self {
+            document: validation.document,
             job_count: validation.job_count,
             gated_model_count: validation.gated_model_count,
             issues: validation.issues.into_iter().map(Into::into).collect(),
@@ -90,46 +93,103 @@ impl PlanIssue {
     }
 }
 
+/// A document as its author submitted it, and the text that expansion reads:
+/// the submitted text with its catalog names rewritten. Every issue is placed
+/// in the submitted text.
+pub struct Submission {
+    pub submitted: String,
+    pub text: String,
+    pub offsets: OffsetMap,
+    /// The warnings of resolving the catalog names, placed as the planner's are.
+    pub warnings: Vec<PlanWarning>,
+}
+
+impl Submission {
+    /// A submission whose catalog names `named` rewrote.
+    pub fn named(submitted: String, named: NamedDocument) -> Self {
+        Self {
+            submitted,
+            text: named.text,
+            offsets: named.offsets,
+            warnings: named.warnings,
+        }
+    }
+
+    /// A submission with no catalog name to rewrite.
+    #[cfg(test)]
+    fn as_written(text: &str) -> Self {
+        Self {
+            submitted: text.to_owned(),
+            text: text.to_owned(),
+            offsets: OffsetMap::default(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// How far [`expand`] took a document.
 pub enum Stage {
     /// The document does not expand. The verdict holds the one error.
     Refused(PlanValidation),
     /// The document expands, and [`check`] judges its jobs.
-    Expanded { text: String, expansion: Expansion },
+    Expanded {
+        submission: Submission,
+        expansion: Expansion,
+    },
 }
 
-/// Parse and expand `text` on the blocking pool, as filing does. A fault of the
-/// document is a [`Stage::Refused`]; a fault of the server is an error.
+/// Parse and expand `submission` on the blocking pool, as filing does. A fault
+/// of the document is a [`Stage::Refused`]; a fault of the server is an error.
 pub async fn expand(
     limit: NonZeroUsize,
     types: BTreeMap<BenchmarkId, BenchmarkType>,
-    text: String,
+    submission: Submission,
 ) -> Result<Stage, DocumentError> {
-    tokio::task::spawn_blocking(move || stage(limit, types, text)).await?
+    tokio::task::spawn_blocking(move || stage(limit, types, submission)).await?
 }
 
 /// The synchronous body of [`expand`].
 fn stage(
     limit: NonZeroUsize,
     types: BTreeMap<BenchmarkId, BenchmarkType>,
-    text: String,
+    submission: Submission,
 ) -> Result<Stage, DocumentError> {
-    match plan_document::expand_text(limit, &types, &text) {
-        Ok(expansion) => Ok(Stage::Expanded { text, expansion }),
-        Err(e) => refusal(&text, e).map(Stage::Refused),
+    match plan_document::expand_text(limit, &types, &submission.text) {
+        Ok(expansion) => Ok(Stage::Expanded {
+            submission,
+            expansion,
+        }),
+        Err(e) => {
+            let mut verdict = refusal_in(&submission.submitted, &submission.offsets, e)?;
+            verdict
+                .issues
+                .extend(place(&submission.submitted, None, submission.warnings));
+            Ok(Stage::Refused(verdict))
+        }
     }
 }
 
 /// The verdict on `text` when `error` is its author's fault, or `error` when it
 /// is the server's: the rule filing answers `400` or `500` by.
-fn refusal(text: &str, error: DocumentError) -> Result<PlanValidation, DocumentError> {
+pub fn refusal(text: &str, error: DocumentError) -> Result<PlanValidation, DocumentError> {
+    refusal_in(text, &OffsetMap::default(), error)
+}
+
+/// [`refusal`] for an `error` whose offsets fall in the rewrite of `text` that
+/// `offsets` maps.
+fn refusal_in(
+    text: &str,
+    offsets: &OffsetMap,
+    error: DocumentError,
+) -> Result<PlanValidation, DocumentError> {
     if !error.is_caller_fault() {
         return Err(error);
     }
     Ok(PlanValidation {
+        document: None,
         job_count: None,
         gated_model_count: None,
-        issues: vec![issue_for(text, &error)],
+        issues: vec![issue_for(text, offsets, &error)],
     })
 }
 
@@ -137,11 +197,12 @@ fn refusal(text: &str, error: DocumentError) -> Result<PlanValidation, DocumentE
 /// issue, a store failure an error.
 pub async fn check(
     ctx: &IngestContext<'_>,
-    text: String,
+    submission: Submission,
     expansion: Expansion,
     now: DateTime<Utc>,
 ) -> Result<PlanValidation, IngestError> {
     let Expansion { bodies, warnings } = expansion;
+    let warnings: Vec<_> = warnings.into_iter().chain(submission.warnings).collect();
     let job_count = bodies.len();
     let gated_model_count = gated_models(&bodies);
     let rejection = match validate_submission(ctx, &index_labels(bodies), now).await {
@@ -149,15 +210,23 @@ pub async fn check(
         Err(IngestError::Rejected(rejection)) => Some(rejection),
         Err(e) => return Err(e),
     };
-    // Placing an issue parses the whole document, so it runs off the executor.
-    let issues = if rejection.is_none() && warnings.is_empty() {
-        Vec::new()
-    } else {
-        tokio::task::spawn_blocking(move || place(&text, rejection, warnings))
-            .await
-            .map_err(anyhow::Error::from)?
-    };
+    // Removing the tokens and placing an issue each parse the whole document,
+    // so they run off the executor. `place` finds each issue by variant index
+    // or benchmark id, which the catalog-name rewrite leaves unchanged.
+    let (document, issues) = tokio::task::spawn_blocking(move || {
+        let document = plan_document::without_model_tokens(&submission.text)?;
+        let issues = if rejection.is_none() && warnings.is_empty() {
+            Vec::new()
+        } else {
+            place(&submission.submitted, rejection, warnings)
+        };
+        Ok::<_, plan_document::StoredDocumentError>((document, issues))
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+    .map_err(anyhow::Error::new)?;
     Ok(PlanValidation {
+        document: Some(document),
         job_count: Some(job_count),
         gated_model_count: Some(gated_model_count),
         issues,
@@ -201,17 +270,25 @@ fn rejection_issue(document: &Document<'_>, rejection: RejectionError) -> PlanIs
     }
 }
 
-/// The issue `error` is to the author of `text`.
-fn issue_for(text: &str, error: &DocumentError) -> PlanIssue {
+/// The issue `error` is to the author of `text`. `offsets` maps a TOML fault's
+/// span, which falls in the rewrite of `text`, back to `text`.
+fn issue_for(text: &str, offsets: &OffsetMap, error: &DocumentError) -> PlanIssue {
     let document = Document::new(text);
     let variant = match error {
+        DocumentError::Names(e) => {
+            if let Some(span) = e.span() {
+                let (line, column) = document.position(span.start).unzip();
+                return PlanIssue::error(e.to_string(), line, column);
+            }
+            e.variant()
+        }
         DocumentError::Parse(PlanParseError::Invalid(e)) => {
             // toml places a fault of the root table at 0..0, which would read
             // as a misleading 1:1.
             let (line, column) = e
                 .span()
                 .filter(|span| span.end > 0)
-                .and_then(|span| document.position(span.start))
+                .and_then(|span| document.position(offsets.submitted(span.start)))
                 .unzip();
             return PlanIssue::error(e.message().to_owned(), line, column);
         }
@@ -374,7 +451,11 @@ mod tests {
     }
 
     fn refused(limit: NonZeroUsize, text: &str) -> anyhow::Result<PlanValidation> {
-        match stage(limit, pipette_planner::prefix_types(text), text.to_owned())? {
+        match stage(
+            limit,
+            pipette_planner::prefix_types(text),
+            Submission::as_written(text),
+        )? {
             Stage::Refused(verdict) => Ok(verdict),
             Stage::Expanded { .. } => anyhow::bail!("the document expanded"),
         }
@@ -405,19 +486,23 @@ mod tests {
         let ctx = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             NonZeroUsize::MAX,
             Duration::from_secs(3600),
         );
-        let Stage::Expanded { text, expansion } = stage(
+        let Stage::Expanded {
+            submission,
+            expansion,
+        } = stage(
             NonZeroUsize::MAX,
             pipette_planner::prefix_types(text),
-            text.to_owned(),
+            Submission::as_written(text),
         )?
         else {
             anyhow::bail!("the document was refused");
         };
-        Ok(check(&ctx, text, expansion, Utc::now()).await?)
+        Ok(check(&ctx, submission, expansion, Utc::now()).await?)
     }
 
     #[test]

@@ -178,7 +178,6 @@ pub struct HeldJob {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RevisionDryRun {
-    pub document: String,
     #[serde(flatten)]
     pub report: PlanDryRun,
     #[serde(flatten)]

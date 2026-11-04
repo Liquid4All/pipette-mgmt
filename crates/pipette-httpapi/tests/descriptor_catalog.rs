@@ -13,12 +13,13 @@ use pipette_core::config::OfferRule;
 use pipette_core::vault::blob_key;
 use pipette_httpapi::state::AppState;
 use pipette_hub_testkit::{MockFile, MockGate, MockHub, MockRepo};
+use pipette_pipeline::vault_check::descriptor_sha256;
 use pipette_plan_types::{
     CatalogName, CatalogScope, DescriptorEntryKind as Kind, DescriptorEntryState as EntryState,
-    DeviceProfile, NonEmptyTrimmedString, NonEmptyVec, OrgId, PrincipalOwner, Tag, UserPermission,
-    descriptor_digest,
+    DeviceProfile, NonEmptyTrimmedString, NonEmptyVec, OrgId, PrincipalOwner, RunMark, Tag,
+    UserPermission, descriptor_digest,
 };
-use pipette_store::{AuditFilter, DescriptorCatalogStore};
+use pipette_store::{AuditFilter, DescriptorCatalogStore, RunEvidenceRow};
 use pipette_store_testkit::{
     VAULT_BLOB, a_descriptor_entry, a_huggingface_origin, a_member, a_model_member, blob_body,
     vault_blob_sha256, vault_resource_for,
@@ -736,6 +737,97 @@ async fn short_list_selects_and_reports_every_withheld_member() -> anyhow::Resul
     Ok(())
 }
 
+/// A member of the iOS app's llama.cpp at build `version`.
+fn an_app_member(version: &str) -> anyhow::Result<pipette_plan_types::DescriptorMember> {
+    Ok(pipette_plan_types::DescriptorMember::new(
+        serde_json::from_value(json!({
+            "type": "llamacpp_ios_pipette", "repository_url": "github.com/ggml-org/llama.cpp",
+            "repository_version": version, "flavor": "ios-arm64",
+        }))?,
+        chrono::Utc::now(),
+    )?)
+}
+
+/// Each iOS app build is its own entry. A device that reports one build flag
+/// resolves that entry; the other entry withholds its member as `no_build`.
+#[tokio::test]
+async fn short_list_resolves_the_app_build_that_a_device_reports() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    let mut config = (*sql.state.config).clone();
+    config.descriptor_catalog.offer_rules.push(OfferRule {
+        runtime_type: pipette_plan_types::RuntimeType::LlamacppIosPipette,
+        flavor: "ios-arm64".into(),
+        requires: ["os:ios".to_owned()].into(),
+        any_of: Vec::new(),
+    });
+    sql.state.config = std::sync::Arc::new(config);
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let (reported, other) = (an_app_member("b2")?, an_app_member("b1")?);
+    let reported_flag = reported
+        .app_build_flag()
+        .context("an iOS app runtime has a build flag")?;
+    let other_flag = other
+        .app_build_flag()
+        .context("an iOS app runtime has a build flag")?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "App-B2",
+            Kind::HandMade,
+            200,
+            reported,
+        )?)
+        .await?;
+    store
+        .create_entry(&a_descriptor_entry("App-B1", Kind::HandMade, 100, other)?)
+        .await?;
+    let (_, client_id) = register_pending(state).await?;
+    let mut client = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("registered client missing"))?;
+    client.status = ClientStatus::Approved;
+    client.device_profile.device_os_name = Some(NonEmptyTrimmedString::try_new("iOS")?);
+    client.capabilities.insert(reported_flag);
+    state.client_store.put_client(&client).await?;
+    let signer = registered_user(state, &[UserPermission::ReadClients]).await?;
+
+    let (status, body) = read(state, &signer, &format!("{BASE}/devices/{client_id}")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        field_of(&body["items"], "name"),
+        Some(vec![json!("App-B2")])
+    );
+    assert_eq!(
+        body["items"][0]["members"][0]["descriptor"]["repository_version"],
+        "b2"
+    );
+    assert_eq!(body["withheld"]["member_count"], 1);
+    assert_eq!(body["withheld"]["entry_count"], 1);
+    assert_eq!(body["withheld"]["members"][0]["name"], "App-B1");
+    assert_eq!(body["withheld"]["members"][0]["reason_code"], "no_build");
+    assert!(
+        body["withheld"]["members"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&other_flag)
+    );
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+
+    for (name, offered) in [("App-B2", 1), ("App-B1", 0)] {
+        let uri = format!("{BASE}/names?names=global/{name}&offer_counts=true");
+        let (status, counted) = read(state, &signer, &uri).await?;
+        assert_eq!(status, StatusCode::OK, "{counted}");
+        assert_eq!(
+            counted["entries"][0]["members"][0]["offered_device_count"], offered,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn short_list_uses_fleet_read_gate_and_unknown_device_is_404() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1003,6 +1095,214 @@ async fn short_list_offers_model_members_that_an_offered_runtime_loads(
         .collect();
     assert_eq!(withheld, expected_withheld);
     crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+    Ok(())
+}
+
+/// Record one run of `digest` on `client` in the run evidence index, at
+/// second `second`, with client version `version`.
+async fn ran(
+    state: &AppState,
+    digest: &str,
+    client: &str,
+    failed: bool,
+    second: i64,
+    version: &str,
+) -> anyhow::Result<()> {
+    let index = state
+        .run_evidence
+        .as_deref()
+        .context("the SQL state keeps the run evidence index")?;
+    index
+        .upsert(&[RunEvidenceRow::of_run(
+            digest.into(),
+            pipette_plan_types::ClientId::try_new(client)?,
+            failed,
+            RunMark {
+                at: at_second(second)?,
+                client_version: Some(version.into()),
+            },
+        )])
+        .await
+}
+
+fn at_second(second: i64) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(second, 0).context("a valid time")
+}
+
+/// A Linux device that the offer rules offer the llama.cpp CUDA and CPU
+/// builds, and a reader who may read it.
+async fn linux_device(
+    sql: &mut SqlState,
+) -> anyhow::Result<(
+    pipette_plan_types::ClientId,
+    (
+        ed25519_dalek::SigningKey,
+        pipette_plan_types::UserId,
+        pipette_plan_types::UserKeyId,
+    ),
+)> {
+    let mut config = (*sql.state.config).clone();
+    config
+        .descriptor_catalog
+        .offer_rules
+        .extend(
+            ["linux-x64-cuda-13", "linux-x64-cpu"].map(|flavor| OfferRule {
+                runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
+                flavor: flavor.into(),
+                requires: ["os:linux".to_owned()].into(),
+                any_of: Vec::new(),
+            }),
+        );
+    sql.state.config = std::sync::Arc::new(config);
+    let state = &sql.state;
+    let (_, client_id) = register_pending(state).await?;
+    let mut client = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("registered client missing"))?;
+    client.device_profile.device_os_name = Some(NonEmptyTrimmedString::try_new("Linux")?);
+    state.client_store.put_client(&client).await?;
+    let signer = registered_user(state, &[UserPermission::ReadClients]).await?;
+    Ok((client_id, signer))
+}
+
+/// The device resolves the CUDA member. The CPU member succeeded on the
+/// device, and the CUDA member only failed there: the evidence of the CUDA
+/// member shows no success. A hidden entry with a success stays out.
+#[tokio::test]
+async fn short_list_gives_the_resolved_member_its_own_run_evidence() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    let (device, signer) = linux_device(&mut sql).await?;
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let cuda = a_member("b1", "linux-x64-cuda-13")?;
+    let cpu = a_member("b1", "linux-x64-cpu")?;
+    let model = a_model_member("gguf_text", "AcmeLM-3B-GGUF", "q4_0")?;
+    let hidden = a_member("b2", "linux-x64-cpu")?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "llamacpp-b1",
+            Kind::Stable,
+            300,
+            cuda.clone(),
+        )?)
+        .await?;
+    store
+        .append_members(
+            &CatalogScope::Global,
+            &CatalogName::try_new("llamacpp-b1")?,
+            NonEmptyVec::try_new(vec![cpu.clone()])?,
+        )
+        .await?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "AcmeLM-3B",
+            Kind::HandMade,
+            200,
+            model.clone(),
+        )?)
+        .await?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "Hidden-1",
+            Kind::Stable,
+            400,
+            hidden.clone(),
+        )?)
+        .await?;
+    store
+        .set_state(
+            &CatalogScope::Global,
+            &CatalogName::try_new("Hidden-1")?,
+            EntryState::Hidden,
+        )
+        .await?;
+    let device = device.as_str();
+    ran(state, cpu.digest(), device, false, 10, "v-cpu").await?;
+    ran(state, cuda.digest(), device, true, 20, "v-fail").await?;
+    ran(state, cuda.digest(), "ev1_other_b", false, 30, "v3").await?;
+    ran(state, cuda.digest(), "ev1_other_c", false, 25, "v2").await?;
+    ran(state, cuda.digest(), "ev1_other_c", true, 5, "v1").await?;
+    ran(state, model.digest(), device, false, 15, "v-model").await?;
+    ran(state, hidden.digest(), device, false, 40, "v-hidden").await?;
+
+    let (status, body) = read(state, &signer, &format!("{BASE}/devices/{device}")).await?;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        field_of(&body["items"], "name"),
+        Some(vec![json!("llamacpp-b1"), json!("AcmeLM-3B")]),
+        "{body}"
+    );
+    let resolved = &body["items"][0]["members"][0];
+    assert_eq!(resolved["selector"], "llamacpp-b1::linux-x64-cuda-13");
+    assert_eq!(
+        resolved["evidence"],
+        json!({
+            "this_device": {
+                "last_success": null,
+                "last_failure": {"at": at_second(20)?, "client_version": "v-fail"},
+            },
+            "any_device": {"last_success_at": at_second(30)?, "devices_with_success": 2},
+        }),
+        "{body}"
+    );
+    assert_eq!(
+        body["items"][1]["members"][0]["evidence"],
+        json!({
+            "this_device": {
+                "last_success": {"at": at_second(15)?, "client_version": "v-model"},
+                "last_failure": null,
+            },
+            "any_device": {"last_success_at": at_second(15)?, "devices_with_success": 1},
+        }),
+        "{body}"
+    );
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+    Ok(())
+}
+
+/// A name lookup gives each member its evidence on every device only on
+/// request, and only to a reader of the fleet.
+#[tokio::test]
+async fn name_lookup_gives_fleet_run_evidence_on_request() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let cuda = a_member("b1", "linux-x64-cuda-13")?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "llamacpp-b1",
+            Kind::Stable,
+            300,
+            cuda.clone(),
+        )?)
+        .await?;
+    ran(state, cuda.digest(), "ev1_other_b", false, 30, "v3").await?;
+    ran(state, cuda.digest(), "ev1_other_c", true, 35, "v4").await?;
+    let reader = registered_user(state, &[UserPermission::ReadClients]).await?;
+    let without_fleet = registered_user(state, &[]).await?;
+    let names = format!("{BASE}/names?names=llamacpp-b1");
+    let with_evidence = format!("{names}&evidence=true");
+
+    let (status, body) = read(state, &reader, &with_evidence).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["entries"][0]["members"][0]["evidence"],
+        json!({"any_device": {"last_success_at": at_second(30)?, "devices_with_success": 1}}),
+        "{body}"
+    );
+    crate::api_schema::assert_conforms("DescriptorEntryLookup", &body)?;
+    let (status, body) = read(state, &reader, &names).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["entries"][0]["members"][0].get("evidence").is_none());
+    assert_eq!(
+        read(state, &without_fleet, &with_evidence).await?.0,
+        StatusCode::FORBIDDEN
+    );
     Ok(())
 }
 
@@ -1960,6 +2260,156 @@ async fn vault_model_resource(
     }))
 }
 
+async fn vault_runtime_resource(state: &AppState, owner: PrincipalOwner) -> anyhow::Result<Value> {
+    let sha256 = vault_blob_sha256()?;
+    let key = blob_key(&owner, &sha256)?;
+    state
+        .vault_store
+        .put_blob(&key, &sha256, blob_body(VAULT_BLOB))
+        .await?;
+    let resource = vault_resource_for(owner.clone(), sha256.clone(), VAULT_BLOB.len() as u64)?;
+    state.vault_store.put_resource(&resource).await?;
+    Ok(json!({
+        "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
+        "url": format!("/vault/resources/{}/content", resource.resource_id),
+        "principal_id": owner.label(),
+        "custom_label": resource.name.to_string(), "flavor": "macos-arm64",
+    }))
+}
+
+/// The 400 body for a write of `body` that names `resource`, with the resource
+/// id masked, so that the refusals for two resources compare.
+async fn masked_refusal(
+    state: &AppState,
+    signer: &UserSigner,
+    path: &str,
+    body: &Value,
+    resource: &Value,
+) -> anyhow::Result<String> {
+    let response = signed_json(state, signer, "POST", path, body).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let resource_id = pipette_pipeline::vault_check::named_resources(resource)
+        .into_iter()
+        .next()
+        .context("vault resource")?;
+    Ok(body_json(response)
+        .await?
+        .to_string()
+        .replace(&resource_id.to_string(), "RESOURCE"))
+}
+
+#[tokio::test]
+async fn an_org_vault_runtime_names_rows_and_checks_each_owner() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let other = seed_org(state, "other").await?.org_id;
+    let member = registered_user(state, &[UserPermission::EditCatalog]).await?;
+    set_user_org(state, &member.1, Some(acme.clone())).await?;
+    let admin = registered_user(state, &[UserPermission::EditAnyCatalog]).await?;
+    let uri = format!("/api/v1/orgs/{acme}/descriptor-catalog");
+    let runtime = vault_runtime_resource(
+        state,
+        PrincipalOwner::Org {
+            org_id: acme.clone(),
+        },
+    )
+    .await?;
+    let mut unlabelled = runtime.clone();
+    unlabelled
+        .as_object_mut()
+        .context("runtime object")?
+        .remove("custom_label");
+    let digest = descriptor_digest(&unlabelled)?;
+    assert_eq!(
+        digest,
+        descriptor_sha256(&pipette_plan_types::canonical_json(&runtime))
+    );
+    let response = signed_json(
+        state,
+        &member,
+        "POST",
+        &uri,
+        &json!({"name": "Vault Runtime", "runtimes": [runtime.clone()]}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(body_json(response).await?["members"][0]["digest"], digest);
+
+    let mut second = runtime.clone();
+    second["flavor"] = json!("linux-x64");
+    let response = signed_json(
+        state,
+        &member,
+        "POST",
+        &format!("{uri}/Vault%20Runtime/members"),
+        &json!({"runtime": second}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await?["members"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let resource_id = pipette_pipeline::vault_check::named_resources(&runtime)
+        .into_iter()
+        .next()
+        .context("runtime resource")?;
+    state.vault_store.delete_resource(&resource_id).await?;
+    let (status, names) = read(
+        state,
+        &member,
+        &format!("{BASE}/by-digest?digests={digest}"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(names["names"][&digest][0]["name"], "Vault Runtime");
+
+    // The resource of `runtime` is gone. A resource outside the organization
+    // gets the same refusal, so a refusal does not show that the resource exists.
+    let writes = |resource: &Value| {
+        [
+            (
+                uri.clone(),
+                json!({"name": "Foreign", "runtimes": [resource.clone()]}),
+            ),
+            (
+                format!("{uri}/Vault%20Runtime/members"),
+                json!({"runtime": resource.clone()}),
+            ),
+        ]
+    };
+    let unknown = futures::future::try_join_all(
+        writes(&runtime)
+            .iter()
+            .map(|(path, body)| masked_refusal(state, &member, path, body, &runtime)),
+    )
+    .await?;
+    for owner in [
+        PrincipalOwner::Org { org_id: other },
+        PrincipalOwner::User {
+            user_id: member.1.clone(),
+        },
+    ] {
+        let foreign = vault_runtime_resource(state, owner).await?;
+        for ((path, body), unknown) in writes(&foreign).iter().zip(&unknown) {
+            assert_eq!(
+                &masked_refusal(state, &member, path, body, &foreign).await?,
+                unknown
+            );
+        }
+        let (path, body) = &writes(&foreign)[0];
+        assert_eq!(
+            masked_refusal(state, &admin, path, body, &foreign).await?,
+            unknown[0]
+        );
+    }
+    Ok(())
+}
+
 /// A SQL state that pins against `hub`, the `acme` org's uri, and a member of
 /// `acme` that holds `edit_catalog`.
 async fn model_writer(
@@ -2061,17 +2511,43 @@ async fn an_org_vault_model_names_its_plan_and_verified_result_alias() -> anyhow
     assert_eq!(status, StatusCode::OK);
     assert_eq!(hidden["names"], json!({}));
 
-    let other = seed_org(state, "other").await?.org_id;
-    let foreign = vault_model_resource(state, &other, false).await?;
-    let response = signed_json(
+    let missing = vault_model_resource(state, &org_id, false).await?;
+    let missing_id = pipette_pipeline::vault_check::named_resources(&missing)
+        .into_iter()
+        .next()
+        .context("model resource")?;
+    state.vault_store.delete_resource(&missing_id).await?;
+    let unknown = masked_refusal(
         state,
         &member,
-        "POST",
         &uri,
-        &model_body("ForeignLM", "q4_0", foreign),
+        &model_body("ForeignLM", "q4_0", missing.clone()),
+        &missing,
     )
     .await?;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let other = seed_org(state, "other").await?.org_id;
+    let foreign = vault_model_resource(state, &other, false).await?;
+    let personal = vault_model_resource(state, &org_id, false).await?;
+    let personal_id = pipette_pipeline::vault_check::named_resources(&personal)
+        .into_iter()
+        .next()
+        .context("model resource")?;
+    let mut record = state
+        .vault_store
+        .get_resource(&personal_id)
+        .await?
+        .context("model record")?;
+    record.owner = PrincipalOwner::User {
+        user_id: member.1.clone(),
+    };
+    state.vault_store.put_resource(&record).await?;
+    for model in [foreign, personal] {
+        let body = model_body("ForeignLM", "q4_0", model.clone());
+        assert_eq!(
+            masked_refusal(state, &member, &uri, &body, &model).await?,
+            unknown
+        );
+    }
     Ok(())
 }
 
@@ -2270,5 +2746,646 @@ async fn a_model_member_joins_no_runtime_entry() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// The `acme` org with a hand-made runtime entry `Fork`, a hand-made `Held`, a
+/// tombstoned `Dead`, a model entry `AcmeLM` with the members
+/// `gguf::f16_q4_0` and `gguf::q8_0`, and a tombstoned model entry `DeadLM`.
+/// The result is the org's catalog path and a member that holds
+/// `edit_catalog`.
+async fn renamable_org(state: &AppState) -> anyhow::Result<(OrgId, String, UserSigner)> {
+    let store = store_of(state)?;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let member = registered_user(state, &[UserPermission::EditCatalog]).await?;
+    set_user_org(state, &member.1, Some(acme.clone())).await?;
+    let scope = CatalogScope::Org(acme.clone());
+    let gguf = a_model_member("gguf_text", "AcmeLM-GGUF", "f16_q4_0")?;
+    let mut model = a_descriptor_entry("AcmeLM", Kind::HandMade, 300, gguf.clone())?;
+    model.members = NonEmptyVec::try_new(vec![
+        gguf.clone(),
+        a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?,
+    ])?;
+    let entries = [
+        a_descriptor_entry("Fork", Kind::HandMade, 200, a_member("b1", "macos-arm64")?)?,
+        a_descriptor_entry("Held", Kind::HandMade, 190, a_member("b1", "macos-arm64")?)?,
+        a_descriptor_entry(
+            "Vulkn",
+            Kind::HandMade,
+            185,
+            a_member("b1", "linux-x64-vulkan")?,
+        )?,
+        a_descriptor_entry(
+            "Rebuilt",
+            Kind::HandMade,
+            185,
+            a_member("b2", "linux-x64-cuda")?,
+        )?,
+        a_descriptor_entry("Dead", Kind::HandMade, 180, a_member("b1", "macos-arm64")?)?,
+        model,
+        a_descriptor_entry("DeadLM", Kind::HandMade, 170, gguf)?,
+    ];
+    for mut entry in entries {
+        entry.scope = scope.clone();
+        store.create_entry(&entry).await?;
+    }
+    for name in ["Dead", "DeadLM"] {
+        store
+            .set_state(&scope, &CatalogName::try_new(name)?, EntryState::Tombstoned)
+            .await?;
+    }
+    let base = format!("/api/v1/orgs/{acme}/descriptor-catalog");
+    Ok((acme, base, member))
+}
+
+#[rstest]
+#[case::renamed("Fork", json!({"name": "Spoon"}), StatusCode::OK)]
+#[case::case_only("Fork", json!({"name": "FORK"}), StatusCode::OK)]
+#[case::bad_name("Fork", json!({"name": "-Spoon"}), StatusCode::BAD_REQUEST)]
+#[case::unknown_field("Fork", json!({"name": "Spoon", "scope": "global"}), StatusCode::BAD_REQUEST)]
+#[case::missing("Missing", json!({"name": "Spoon"}), StatusCode::NOT_FOUND)]
+#[case::tombstoned("Dead", json!({"name": "Spoon"}), StatusCode::CONFLICT)]
+#[case::same_name("Fork", json!({"name": "Fork"}), StatusCode::CONFLICT)]
+#[case::other_build("Fork", json!({"name": "rebuilt"}), StatusCode::BAD_REQUEST)]
+#[case::runtime_into_model("Fork", json!({"name": "AcmeLM"}), StatusCode::BAD_REQUEST)]
+#[case::tombstoned_holder("Fork", json!({"name": "DEAD"}), StatusCode::CONFLICT)]
+#[tokio::test]
+async fn an_org_entry_rename_answers(
+    #[case] name: &str,
+    #[case] body: Value,
+    #[case] status: StatusCode,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, member) = renamable_org(state).await?;
+    let response = signed_json(
+        state,
+        &member,
+        "POST",
+        &format!("{base}/{name}/rename"),
+        &body,
+    )
+    .await?;
+    assert_eq!(response.status(), status);
+    if status == StatusCode::OK {
+        super::api_schema::assert_conforms("RenameDescriptorEntryRequest", &body)?;
+        let entry = body_json(response).await?;
+        assert_eq!(entry["name"], body["name"], "{entry}");
+        let renamed = store_of(state)?
+            .get_entry(&CatalogScope::Org(acme), &CatalogName::try_new(name)?)
+            .await?
+            .map(|entry| entry.name.to_string());
+        let new_name = body["name"].as_str().unwrap_or_default();
+        let expected = name
+            .eq_ignore_ascii_case(new_name)
+            .then(|| new_name.to_owned());
+        assert_eq!(
+            renamed, expected,
+            "the old name resolves only for a case-only rename"
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::new_flavor("Vulkn", "fork", &["macos-arm64", "linux-x64-vulkan"], &["linux-x64-vulkan"], &[])]
+#[case::identical_member("Held", "FORK", &["macos-arm64"], &[], &["macos-arm64"])]
+#[tokio::test]
+async fn an_org_rename_to_a_live_name_merges_and_is_audited(
+    #[case] name: &str,
+    #[case] new_name: &str,
+    #[case] flavors: &[&str],
+    #[case] moved: &[&str],
+    #[case] skipped: &[&str],
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, member) = renamable_org(state).await?;
+    let scope = CatalogScope::Org(acme.clone());
+    let body = json!({ "name": new_name });
+    let response = signed_json(
+        state,
+        &member,
+        "POST",
+        &format!("{base}/{name}/rename"),
+        &body,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let entry = body_json(response).await?;
+    assert_eq!(entry["name"], "Fork", "{entry}");
+    let selectors: Vec<&str> = entry["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|member| member["selector"].as_str())
+        .collect();
+    let expected: Vec<String> = flavors
+        .iter()
+        .map(|flavor| format!("Fork::{flavor}"))
+        .collect();
+    assert_eq!(selectors, expected, "{entry}");
+    let store = store_of(state)?;
+    assert!(
+        store
+            .get_entry(&scope, &CatalogName::try_new(name)?)
+            .await?
+            .is_none(),
+        "the merge must delete {name}"
+    );
+
+    let page = state
+        .audit_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("audit store"))?
+        .list_events(
+            &AuditFilter {
+                org_id: Some(acme),
+                ..Default::default()
+            },
+            None,
+            NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+        )
+        .await?;
+    let merges: Vec<_> = page
+        .items
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.action,
+                pipette_plan_types::AuditAction::CatalogMerge { .. }
+            )
+        })
+        .map(|event| event.action.clone())
+        .collect();
+    let owned = |keys: &[&str]| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        merges,
+        [pipette_plan_types::AuditAction::CatalogMerge {
+            scope,
+            old_name: CatalogName::try_new(name)?,
+            into_name: CatalogName::try_new("Fork")?,
+            moved: owned(moved),
+            skipped: owned(skipped),
+        }]
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::relabeled("AcmeLM", json!({"format": "gguf", "from": "f16_q4_0", "to": "q4_0"}), StatusCode::OK)]
+#[case::bad_label("AcmeLM", json!({"format": "gguf", "from": "f16_q4_0", "to": "Q4_0"}), StatusCode::BAD_REQUEST)]
+#[case::bad_format("AcmeLM", json!({"format": "onnx2", "from": "f16_q4_0", "to": "q4_0"}), StatusCode::BAD_REQUEST)]
+#[case::runtime_entry("Fork", json!({"format": "gguf", "from": "f16_q4_0", "to": "q4_0"}), StatusCode::BAD_REQUEST)]
+#[case::missing("Missing", json!({"format": "gguf", "from": "f16_q4_0", "to": "q4_0"}), StatusCode::NOT_FOUND)]
+#[case::no_member("AcmeLM", json!({"format": "gguf", "from": "q2_k", "to": "q4_0"}), StatusCode::NOT_FOUND)]
+#[case::tombstoned("DeadLM", json!({"format": "gguf", "from": "f16_q4_0", "to": "q4_0"}), StatusCode::CONFLICT)]
+#[case::same_label("AcmeLM", json!({"format": "gguf", "from": "f16_q4_0", "to": "f16_q4_0"}), StatusCode::CONFLICT)]
+#[case::taken("AcmeLM", json!({"format": "gguf", "from": "f16_q4_0", "to": "q8_0"}), StatusCode::CONFLICT)]
+#[tokio::test]
+async fn an_org_member_relabel_answers(
+    #[case] name: &str,
+    #[case] body: Value,
+    #[case] status: StatusCode,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (_, base, member) = renamable_org(state).await?;
+    let uri = format!("{base}/{name}/members/relabel");
+    let response = signed_json(state, &member, "POST", &uri, &body).await?;
+    assert_eq!(response.status(), status);
+    if status == StatusCode::OK {
+        super::api_schema::assert_conforms("RelabelDescriptorMemberRequest", &body)?;
+        let entry = body_json(response).await?;
+        let selectors: Vec<&str> = entry["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|member| member["selector"].as_str())
+            .collect();
+        assert_eq!(
+            selectors,
+            ["AcmeLM::gguf::q4_0", "AcmeLM::gguf::q8_0"],
+            "{entry}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, member) = renamable_org(state).await?;
+    let reader = registered_user(state, &[]).await?;
+    set_user_org(state, &reader.1, Some(acme.clone())).await?;
+    let rename = json!({"name": "Spoon"});
+    let relabel = json!({"format": "gguf", "from": "f16_q4_0", "to": "q4_0"});
+    let writes = [
+        (format!("{base}/fork/rename"), &rename),
+        (format!("{base}/AcmeLM/members/relabel"), &relabel),
+    ];
+    for (uri, body) in &writes {
+        let response = signed_json(state, &reader, "POST", uri, body).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    store_of(state)?
+        .create_entry(&a_descriptor_entry(
+            "Fork",
+            Kind::HandMade,
+            100,
+            a_member("b2", "macos-arm64")?,
+        )?)
+        .await?;
+    let lookup = format!("{BASE}/names?names=Fork");
+    let (status, named) = read(state, &reader, &lookup).await?;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    assert_eq!(
+        named["entries"][0]["scope"],
+        json!(acme.as_str()),
+        "{named}"
+    );
+    for (uri, body) in &writes {
+        let response = signed_json(state, &member, "POST", uri, body).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    }
+    let (status, named) = read(state, &reader, &lookup).await?;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    assert_eq!(named["entries"][0]["scope"], "global", "{named}");
+
+    let audit = state
+        .audit_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("audit store"))?;
+    let page = audit
+        .list_events(
+            &AuditFilter {
+                org_id: Some(acme.clone()),
+                ..Default::default()
+            },
+            None,
+            NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+        )
+        .await?;
+    let audited: Vec<(String, u16)> = page
+        .items
+        .iter()
+        .filter_map(|event| {
+            if let pipette_plan_types::AuditAction::Http { route, status, .. } = &event.action
+                && (route.ends_with("/rename") || route.ends_with("/relabel"))
+            {
+                Some((route.clone(), *status))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for suffix in ["/rename", "/members/relabel"] {
+        for status in [200, 403] {
+            assert!(
+                audited
+                    .iter()
+                    .any(|(route, got)| route.ends_with(suffix) && *got == status),
+                "{suffix} {status}: {audited:?}"
+            );
+        }
+    }
+    let renames: Vec<_> = page
+        .items
+        .iter()
+        .filter_map(|event| match &event.action {
+            pipette_plan_types::AuditAction::CatalogRename {
+                scope,
+                old_name,
+                new_name,
+            } => Some((scope, old_name, new_name)),
+            pipette_plan_types::AuditAction::Http { .. }
+            | pipette_plan_types::AuditAction::Cli { .. }
+            | pipette_plan_types::AuditAction::CatalogMerge { .. }
+            | pipette_plan_types::AuditAction::FirstClerkSignIn { .. } => None,
+        })
+        .collect();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0].0, &CatalogScope::Org(acme));
+    assert_eq!(renames[0].1, &CatalogName::try_new("Fork")?);
+    assert_eq!(renames[0].2, &CatalogName::try_new("Spoon")?);
+    Ok(())
+}
+
+/// The bytes inside the `runtimes = [ … ]` array of a document from
+/// `submittable_document`, where a test writes a catalog name instead.
+fn runtime_array_span(document: &str) -> anyhow::Result<std::ops::Range<usize>> {
+    let start = document.find("runtimes = [").context("runtime array")? + "runtimes = [".len();
+    let len = document
+        .get(start..)
+        .context("runtime slice")?
+        .find(']')
+        .context("runtime end")?;
+    Ok(start..start + len)
+}
+
+#[tokio::test]
+async fn plan_names_are_stored_and_returned_without_resolving_again() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let store = store_of(state)?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "example",
+            Kind::HandMade,
+            100,
+            a_member("b5000", "macos-arm64")?,
+        )?)
+        .await?;
+    let signer = registered_user(
+        state,
+        &[
+            UserPermission::SubmitPlans,
+            UserPermission::ReadPlans,
+            UserPermission::ReadClients,
+            UserPermission::CancelPlans,
+        ],
+    )
+    .await?;
+    let (_, client) = register_and_approve(state).await?;
+    let twin = submittable_document(&client, "named", 1);
+    let runtimes = runtime_array_span(&twin)?;
+    let mut text = twin.clone();
+    text.replace_range(runtimes, "\"global/example::macos-arm64\"");
+    let dry = post_plan_document(
+        state,
+        &signer,
+        "/api/v1/campaigns?name=Names&dry_run=true",
+        &text,
+    )
+    .await?;
+    assert_eq!(dry.status(), StatusCode::OK);
+    let dry = body_json(dry).await?;
+    let document = json_str(&dry, "document")?;
+    assert!(document.contains("# catalog name at filing: global/example::macos-arm64"));
+    let twin_dry = body_json(
+        post_plan_document(
+            state,
+            &signer,
+            "/api/v1/campaigns?name=Twin&dry_run=true",
+            &twin,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(dry["bodies"], twin_dry["bodies"]);
+    assert_nothing_staged(state).await?;
+    let filed = post_plan_document(state, &signer, "/api/v1/campaigns?name=Names", &text).await?;
+    assert_eq!(filed.status(), StatusCode::CREATED);
+    let filed = body_json(filed).await?;
+    let plan = &filed["plan"];
+    assert_eq!(plan["document"], document);
+    let id = pipette_plan_types::PlanId::try_new(json_str(plan, "plan_id")?)?;
+    let stored = state
+        .plan_store
+        .get_plan_source(&id)
+        .await?
+        .context("stored document")?;
+    assert_eq!(stored.text(), document);
+    let manifest = state
+        .plan_store
+        .get_plan(&id)
+        .await?
+        .context("filed manifest")?;
+    assert_eq!(
+        manifest.submitted_sha256.as_ref(),
+        Some(pipette_core::plan::PlanSource::new(text.clone())?.sha256())
+    );
+    let bare = text.replace("global/example::macos-arm64", "example");
+    for offered in [false, true] {
+        let mut test_state = state.clone();
+        let mut config = (*state.config).clone();
+        if offered {
+            config.descriptor_catalog.offer_rules.push(OfferRule {
+                runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
+                flavor: "macos-arm64".into(),
+                requires: ["os:linux".into()].into(),
+                any_of: Vec::new(),
+            });
+        }
+        test_state.config = std::sync::Arc::new(config);
+        let document = bare.replace(
+            &format!("clients  = [\"{client}\"]"),
+            "requires = ['os:macos']",
+        );
+        let refusal = post_plan_document(
+            &test_state,
+            &signer,
+            "/api/v1/campaigns?name=Ambiguous",
+            &document,
+        )
+        .await?;
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        let verdict = body_json(
+            post_plan_document(&test_state, &signer, "/api/v1/plans/validate", &document).await?,
+        )
+        .await?;
+        assert_eq!(verdict["issues"][0]["severity"], "error");
+        let message = json_str(&verdict["issues"][0], "message")?;
+        assert!(
+            message.contains(if offered {
+                "excludes some devices"
+            } else {
+                "offers no member"
+            }),
+            "{message}"
+        );
+    }
+    // A bare name cannot establish its offer for a client the roster does not
+    // hold. An explicit member still files with the planner's fleet warning.
+    let tag = pipette_plan_types::Tag::try_new("catalog-test")?;
+    state.tag_store.add_client_tag(&client, &tag).await?;
+    let mut open_state = state.clone();
+    let mut config = (*state.config).clone();
+    config.descriptor_catalog.offer_rules.push(OfferRule {
+        runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
+        flavor: "macos-arm64".into(),
+        requires: [pipette_core::client::tag_flag(&tag)].into(),
+        any_of: Vec::new(),
+    });
+    open_state.config = std::sync::Arc::new(config);
+    let unknown = bare.replace(
+        &format!("clients  = [\"{client}\"]"),
+        &format!("clients  = [\"{client}\", \"ev1_nobody\"]"),
+    );
+    let refused_unknown = post_plan_document(
+        &open_state,
+        &signer,
+        "/api/v1/campaigns?name=UnknownBare",
+        &unknown,
+    )
+    .await?;
+    assert_eq!(refused_unknown.status(), StatusCode::BAD_REQUEST);
+    let explicit_unknown = text.replace(
+        &format!("clients  = [\"{client}\"]"),
+        &format!("clients  = [\"{client}\", \"ev1_nobody\"]"),
+    );
+    let filed_unknown = post_plan_document(
+        &open_state,
+        &signer,
+        "/api/v1/campaigns?name=Unknown",
+        &explicit_unknown,
+    )
+    .await?;
+    let status = filed_unknown.status();
+    let filed_unknown = body_json(filed_unknown).await?;
+    assert_eq!(status, StatusCode::CREATED, "{filed_unknown}");
+    assert!(
+        filed_unknown.to_string().contains("ev1_nobody"),
+        "{filed_unknown}"
+    );
+    let campaign_id = json_str(&filed, "campaign_id")?;
+    let edit = text
+        .get(text.find("[[variants]]").context("variant block")?..)
+        .context("variant slice")?;
+    let edit_uri =
+        format!("/api/v1/campaigns/{campaign_id}/variants?base_plan_id={id}&dry_run=true");
+    let edited = post_plan_document(state, &signer, &edit_uri, edit).await?;
+    assert_eq!(edited.status(), StatusCode::OK);
+    let edited = body_json(edited).await?;
+    assert!(
+        json_str(&edited, "document")?
+            .contains("# catalog name at filing: global/example::macos-arm64")
+    );
+    store
+        .set_state(
+            &CatalogScope::Global,
+            &CatalogName::try_new("example")?,
+            EntryState::Hidden,
+        )
+        .await?;
+    let hidden =
+        body_json(post_plan_document(state, &signer, "/api/v1/plans/validate", &text).await?)
+            .await?;
+    assert!(
+        hidden["issues"]
+            .as_array()
+            .context("issues")?
+            .iter()
+            .any(|i| i["severity"] == "warning"
+                && i["line"].is_number()
+                && i["message"].as_str().is_some_and(|m| m.contains("hidden")))
+    );
+    let filed_hidden =
+        post_plan_document(state, &signer, "/api/v1/campaigns?name=Hidden", &text).await?;
+    let status = filed_hidden.status();
+    let filed_hidden = body_json(filed_hidden).await?;
+    assert_eq!(status, StatusCode::CREATED, "{filed_hidden}");
+    assert!(
+        filed_hidden["plan"]["plan_warnings"]
+            .as_array()
+            .context("plan warnings")?
+            .iter()
+            .any(|w| w.as_str().is_some_and(|m| m.contains("hidden"))),
+        "{filed_hidden}"
+    );
+    store
+        .set_state(
+            &CatalogScope::Global,
+            &CatalogName::try_new("example")?,
+            EntryState::Tombstoned,
+        )
+        .await?;
+    let validate = body_json(
+        post_plan_document(state, &signer, "/api/v1/plans/validate", stored.text()).await?,
+    )
+    .await?;
+    assert_eq!(validate["document"], document);
+    assert_eq!(validate["job_count"], 1);
+    // The original text is the head's own: its dry run and its filing both
+    // resolve nothing again, so the tombstone refuses neither.
+    let revise = format!("/api/v1/campaigns/{campaign_id}/document?base_plan_id={id}");
+    let again = put_plan_document(state, &signer, &format!("{revise}&dry_run=true"), &text).await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let again = body_json(again).await?;
+    assert_eq!(again["unchanged"], true, "{again}");
+    assert_eq!(again["document"], document);
+    assert_eq!(again["bodies"], dry["bodies"]);
+    let again = put_plan_document(state, &signer, &revise, &text).await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(body_json(again).await?["changed"], false);
+    for bad in ["global/example::macos-arm64", "global/missing"] {
+        let bad_text = text.replace("global/example::macos-arm64", bad);
+        let refusal =
+            post_plan_document(state, &signer, "/api/v1/campaigns?name=Bad", &bad_text).await?;
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        let verdict = body_json(
+            post_plan_document(state, &signer, "/api/v1/plans/validate", &bad_text).await?,
+        )
+        .await?;
+        assert!(verdict["document"].is_null());
+        assert_eq!(verdict["issues"][0]["severity"], "error");
+        assert!(verdict["issues"][0]["line"].is_number());
+        assert!(verdict["issues"][0]["column"].is_number());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_names_use_the_owner_org_and_never_every_org() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let beta = seed_org(state, "beta").await?.org_id;
+    let store = store_of(state)?;
+    for (scope, version) in [
+        (CatalogScope::Global, "b5000"),
+        (CatalogScope::Org(acme.clone()), "b6000"),
+        (CatalogScope::Org(beta), "b7000"),
+    ] {
+        let mut entry = a_descriptor_entry(
+            "example",
+            Kind::HandMade,
+            100,
+            a_member(version, "macos-arm64")?,
+        )?;
+        entry.scope = scope;
+        store.create_entry(&entry).await?;
+    }
+    let signer = registered_user(
+        state,
+        &[
+            UserPermission::SubmitPlans,
+            UserPermission::SubmitAnyPlans,
+            UserPermission::EditAnyCatalog,
+        ],
+    )
+    .await?;
+    set_user_org(state, &signer.1, Some(acme)).await?;
+    let (_, client) = register_and_approve(state).await?;
+    let twin = submittable_document(&client, "scope", 1);
+    let runtimes = runtime_array_span(&twin)?;
+    for (name, expected) in [
+        ("example", Some("b6000")),
+        ("global/example", Some("b5000")),
+        ("acme/example", Some("b6000")),
+        ("beta/example", None),
+    ] {
+        let mut text = twin.clone();
+        text.replace_range(runtimes.clone(), &format!("\"{name}::macos-arm64\""));
+        let verdict =
+            body_json(post_plan_document(state, &signer, "/api/v1/plans/validate", &text).await?)
+                .await?;
+        if let Some(expected) = expected {
+            assert!(
+                json_str(&verdict, "document")?.contains(expected),
+                "{verdict}"
+            );
+        } else {
+            assert!(verdict["document"].is_null(), "{verdict}");
+        }
+    }
     Ok(())
 }

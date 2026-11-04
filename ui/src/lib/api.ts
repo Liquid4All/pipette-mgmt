@@ -7,12 +7,12 @@ import { everyPage } from "./table";
 import type {
   AddDescriptorMemberRequest, AddUserKeyRequest, AmendClientPermissionsRequest, AmendUserPermissionsRequest, AnyValueIngestEvent, CampaignCreated, CampaignDocument, CampaignRevised, CatalogImportRuns,
   CampaignVariants,
-  ChangedModelParams, ChangedOrgView, ClientDetail, ClientListRowPage, ClientPreauthKeyMinted, ClientPreauthKeyViewPage, CreateDescriptorEntryRequest, CreateModelParamsRequest, CreateOrgRequest, CreateUserRequest,
-  DescriptorCatalogShortList, DescriptorDigestNames, DescriptorEntryListRow, DescriptorEntryListRowPage, DescriptorEntryLookup, MintClientPreauthRequest, MintUserPreauthRequest,
+  ChangeDescriptorEntryStateRequest, ChangedModelParams, ChangedOrgView, ClientDetail, ClientListRowPage, ClientPreauthKeyMinted, ClientPreauthKeyViewPage, CreateDescriptorEntryRequest, CreateModelParamsRequest, CreateOrgRequest, CreateUserRequest,
+  DescriptorCatalogShortList, DescriptorDigestNames, DescriptorEntryListRow, DescriptorEntryListRowPage, DescriptorEntryLookup, JobPlans, MintClientPreauthRequest, MintUserPreauthRequest,
   ModelParams, ModelParamsPage,
   NamedAuditEventPage, NamedCampaignOverview, NamedCampaignView, NamedCampaignViewPage, NamedPlanJobs, NamedPlanView, NamedPlanViewPage, NamedVaultResourceDetail, NamedVaultResourceDetailPage, OrgBenchmarks,
   OrgOverview, OrgView, OrgViewPage, OwnUserView, OwnerMatches, OwnerType, PlanCancelRequested, PlanJob,
-  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest,
+  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RelabelDescriptorMemberRequest, RenameDescriptorEntryRequest, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest,
   SetClientOwnerRequest, SetUserOrgRequest, UpdateCampaignRequest, UpdateModelParamsRequest, UpdateOrgRequest, UpdatePlanRequest, UpdateUserRequest,
   UploadVaultResourcesRequest, UserDetail, UserKeyPage, UserKeyRegistered, UserPreauthKeyMinted, UserPreauthKeyViewPage, UserView, UserViewPage, VaultResourcesUploaded,
   VaultTypes,
@@ -199,18 +199,25 @@ export const updateOrg = (signer: Signer, org_id: string, body: UpdateOrgRequest
 export const descriptorNamesByDigest = (signer: Signer, digests: readonly string[]) =>
   signed<DescriptorDigestNames>(signer, "GET", `/api/v1/descriptor-catalog/by-digest?digests=${digests.join(",")}`);
 
-/** One page of global entries, with compact member summaries. */
-export const globalCatalog = (signer: Signer, query: string) =>
+/** One page of the entries of every scope that the reader can read, with compact member summaries. */
+export const catalogEntries = (signer: Signer, query: string) =>
   signed<DescriptorEntryListRowPage>(signer, "GET", `/api/v1/descriptor-catalog?${query}`);
 
 /** Recent import and refresh runs, with the last successful import time. */
 export const catalogImportRuns = (signer: Signer) =>
   signed<CatalogImportRuns>(signer, "GET", "/api/v1/descriptor-catalog/import-runs");
 
-/** One global entry with its full members; fleet readers can request offer counts. */
-export const globalCatalogEntry = (signer: Signer, name: string, offerCounts: boolean) => {
-  const query = new URLSearchParams({ names: `global/${name}` });
-  if (offerCounts) query.set("offer_counts", "true");
+/**
+ * A bare name selects the reader's organization entry. If absent, it selects the global entry.
+ * `global/x` and `acme/x` select a specified scope. A fleet reader also gets each member's offer count and its run
+ * evidence on every device.
+ */
+export const catalogEntry = (signer: Signer, name: string, readFleet: boolean) => {
+  const query = new URLSearchParams({ names: name });
+  if (readFleet) {
+    query.set("offer_counts", "true");
+    query.set("evidence", "true");
+  }
   return signed<DescriptorEntryLookup>(signer, "GET", `/api/v1/descriptor-catalog/names?${query}`);
 };
 
@@ -228,6 +235,23 @@ export const addOrgDescriptorMember = (signer: Signer, org_id: string, name: str
                                        body: AddDescriptorMemberRequest) =>
   signed<DescriptorEntryListRow>(signer, "POST",
     orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/members`), body);
+
+/** Pins, unpins, hides, unhides or tombstones the entry `name` of the organization `org_id`. */
+export const changeOrgDescriptorEntryState = (signer: Signer, org_id: string, name: string,
+                                              body: ChangeDescriptorEntryStateRequest) =>
+  signed<unknown>(signer, "POST", orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/state`), body);
+
+/** Gives the entry `name` of the organization `org_id` a new name. The answer is the entry under the new name. */
+export const renameOrgDescriptorEntry = (signer: Signer, org_id: string, name: string,
+                                         body: RenameDescriptorEntryRequest) =>
+  signed<DescriptorEntryListRow>(signer, "POST",
+    orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/rename`), body);
+
+/** Changes the quantization label of one model member of the entry `name`. The answer is the entry with its members. */
+export const relabelOrgDescriptorMember = (signer: Signer, org_id: string, name: string,
+                                           body: RelabelDescriptorMemberRequest) =>
+  signed<DescriptorEntryListRow>(signer, "POST",
+    orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/members/relabel`), body);
 
 /** Every live entry of the organization `org_id`, read page by page. With `members`, each row has the descriptors of
  * its members. */
@@ -417,6 +441,14 @@ const planPath = (plan_id: string, rest = "", query = "") =>
 /** One plan, its submitter named. */
 export const plan = (signer: Signer, plan_id: string) =>
   signed<NamedPlanView>(signer, "GET", planPath(plan_id, "", "names=true"));
+
+/** The readable plans that hold a job, oldest first. Also returns the job body. */
+export const jobPlans = async (signer: Signer, job_id: string) => {
+  // The URL parser drops a `.` or `..` segment: `..` lands on the plan listing, which refuses the signature with a 401
+  // that ends the session, and `.` on no route, whose 404 would read as a job in no plan.
+  if (job_id === "." || job_id === "..") throw new ApiError(400, "job_id contains invalid character '.'; allowed: [A-Za-z0-9-]");
+  return signed<JobPlans>(signer, "GET", `/api/v1/jobs/${encodeURIComponent(job_id)}/plans`);
+};
 
 /** `T` with the keys `K` required and non-null. */
 type Present<T, K extends keyof T> = Omit<T, K> & { [P in K]-?: NonNullable<T[P]> };

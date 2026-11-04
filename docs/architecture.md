@@ -15,7 +15,7 @@ One binary, `pipette-mgmt`, runs as these processes:
 | `process-submissions` (alias `score`) | fast cron | routes evals into the score queue, scores everything else, and finalizes scored evals into the warehouse |
 | `score-eval` | slow cron | calls the scoring service for each queued eval and stages the result |
 | `queue-maintenance` | cron, every minute | recycles lapsed leases, expires jobs, rebuilds the eligible index, reconciles plan status, collects orphans |
-| `dataset-cache` | cron (`probe`), on demand (`build`) | builds and probes the corpora that `vl_spec_decode` and `vlm_eval` benchmarks serve |
+| `dataset-cache` | cron (`probe`), on demand (`build`) | builds the corpora that `vl_spec_decode` benchmarks serve, registers the eval corpora the scores service packs, and probes them all |
 
 ## 2. Backends
 
@@ -23,6 +23,8 @@ One binary, `pipette-mgmt`, runs as these processes:
   submissions, the warehouse, vault blobs and the dataset cache.
 - `[auth_storage]`: without `[database]`, the identity records.
 - `[todo_storage]`: the job queue; an S3 Express One Zone bucket in production.
+- `[eval_packages_storage]`: the eval corpora the scores service packs, read
+  only; `[storage]` without it.
 - `[database]`: PostgreSQL for the records (plans, campaigns, identities,
   organizations, vault records). Production runs it.
 

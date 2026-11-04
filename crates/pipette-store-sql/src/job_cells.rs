@@ -6,10 +6,10 @@ use futures::stream::{StreamExt, TryStreamExt};
 
 use pipette_core::plan::SettledOutcome;
 use pipette_plan_types::JobId;
-use pipette_store::{SubmissionStore, UnreadableObjectError};
+use pipette_store::SubmissionStore;
 
 use crate::db::SqlDatabase;
-use crate::submissions::outcome_row;
+use crate::submissions::{is_unreadable_record, outcome_row};
 
 /// The rows that one statement of the backfill reads.
 const PAGE: i64 = 500;
@@ -153,6 +153,8 @@ async fn backfill_outcomes(
                     "SELECT s.job_id FROM job_sources s
                      LEFT JOIN submission_outcomes o ON o.job_id = s.job_id
                      WHERE s.job_id > $1
+                       AND NOT EXISTS (SELECT 1 FROM submission_outcome_repairs r
+                                       WHERE r.job_id = s.job_id AND r.pending)
                        AND (o.job_id IS NULL OR (o.outcome = 'finished' AND o.run_flags IS NULL))
                      ORDER BY s.job_id
                      LIMIT $2",
@@ -199,10 +201,7 @@ async fn read_record(records: &dyn SubmissionStore, job_id: String) -> anyhow::R
         Ok(None) => Ok(RecordRead::Absent),
         // The object stores give a bare `serde_json::Error` for a record that
         // does not parse, gzip damage included.
-        Err(e)
-            if e.root_cause().is::<UnreadableObjectError>()
-                || e.root_cause().is::<serde_json::Error>() =>
-        {
+        Err(e) if is_unreadable_record(&e) => {
             tracing::warn!(
                 job_id = %parsed,
                 error = %e,
@@ -224,11 +223,15 @@ async fn write_backfilled_outcome(
 ) -> anyhow::Result<()> {
     db.execute("backfill_outcome", || {
         sqlx::query(
-            "INSERT INTO submission_outcomes (job_id, outcome, run_flags) VALUES ($1, $2, $3)
+            "INSERT INTO submission_outcomes (job_id, outcome, run_flags)
+             SELECT $1, $2, $3 WHERE NOT EXISTS
+               (SELECT 1 FROM submission_outcome_repairs r WHERE r.job_id = $1 AND r.pending)
              ON CONFLICT (job_id) DO UPDATE
                  SET outcome = EXCLUDED.outcome, run_flags = EXCLUDED.run_flags
                  WHERE submission_outcomes.outcome = 'finished'
-                   AND submission_outcomes.run_flags IS NULL",
+                   AND submission_outcomes.run_flags IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM submission_outcome_repairs r
+                                   WHERE r.job_id = $1 AND r.pending)",
         )
         .bind(job_id.as_str())
         .bind(outcome.label())
@@ -240,6 +243,7 @@ async fn write_backfilled_outcome(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use serde_json::json;
 
     use pipette_store_fs::LocalFsSubmissionStore;
@@ -365,6 +369,64 @@ mod tests {
                 ..JobCellBackfill::default()
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_backfill_skips_a_pending_outcome() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        let dir = tempfile::tempdir()?;
+        let records = LocalFsSubmissionStore::new(dir.path().to_path_buf());
+        let id = JobId::try_new("job-pending")?;
+        put_source(db, id.as_str(), &json!({"spec": 1}).to_string()).await?;
+        records
+            .write_processed(&id, &json!({"message_type": "failure"}))
+            .await?;
+        sqlx::query(
+            "INSERT INTO submission_outcome_repairs (job_id, generation, pending)
+                     VALUES ($1, 1, true)",
+        )
+        .bind(id.as_str())
+        .execute(db.pool())
+        .await?;
+        let result = backfill_job_cells(db, &records, &|_| "cell".into(), false).await?;
+        assert_eq!(result.cells_written, 1);
+        assert_eq!(result.outcomes_written, 0);
+        assert!(index(db).await?.1.is_empty());
+        Ok(())
+    }
+
+    /// A marker that turns pending after the backfill read its page keeps the
+    /// backfill write from the row, whether the row is absent or `finished`
+    /// with no flags.
+    #[rstest]
+    #[case::no_row(None)]
+    #[case::finished_without_flags(Some("finished"))]
+    #[tokio::test]
+    async fn the_backfill_write_skips_a_pending_outcome(
+        #[case] existing: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        let id = JobId::try_new("job-pending-at-write")?;
+        if let Some(outcome) = existing {
+            put_outcome(db, id.as_str(), outcome, None).await?;
+        }
+        sqlx::query(
+            "INSERT INTO submission_outcome_repairs (job_id, generation, pending)
+                     VALUES ($1, 1, true)",
+        )
+        .bind(id.as_str())
+        .execute(db.pool())
+        .await?;
+
+        write_backfilled_outcome(db, &id, SettledOutcome::Failed, None).await?;
+        let expected: Outcomes = existing
+            .map(|outcome| (id.to_string(), outcome.to_owned(), None))
+            .into_iter()
+            .collect();
+        assert_eq!(index(db).await?.1, expected);
         Ok(())
     }
 }

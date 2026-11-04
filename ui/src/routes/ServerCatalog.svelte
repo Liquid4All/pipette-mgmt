@@ -1,10 +1,9 @@
 <script lang="ts">
-  // The global catalog, read page by page from its compact listing: one tab for
-  // runtime entries and one for model entries.
-  import { catalogImportRuns, globalCatalog } from "../lib/api";
+  import { catalogEntries, catalogImportRuns } from "../lib/api";
   import { IMPORT_STALE_HOURS, importStatus } from "../lib/catalog-import-status";
   import {
-    CATALOG_TABS, catalogKindOf, catalogListQuery, catalogTabs, flavors, offerWarning,
+    catalogKindOf, catalogListQuery, catalogRowId, catalogTabSpecs, catalogTabs, flavors, formatGroups, offerWarning,
+    scopeLabel,
   } from "../lib/catalog";
   import DataTable from "../lib/components/DataTable.svelte";
   import Loaded from "../lib/components/Loaded.svelte";
@@ -25,6 +24,7 @@
   const kind = $derived(catalogKindOf(here.query));
   const prefix = $derived(here.query.get("prefix") ?? "");
   const showHidden = $derived(here.query.get("hidden") === "1");
+  const tabs = $derived(catalogTabSpecs((row) => scopeLabel(row, session.account)));
   const read = new Loader<CursorPage<DescriptorEntryListRow>>();
   const runs = new Loader<CatalogImportRuns>();
   let seen = $state(Date.now());
@@ -38,7 +38,7 @@
   });
   $effect(() => {
     const query = catalogListQuery(prefix, showHidden, kind);
-    read.run(() => everyPage((cursor) => globalCatalog(session.signer, withCursor(query, cursor))));
+    read.run(() => everyPage((cursor) => catalogEntries(session.signer, withCursor(query, cursor))));
   });
 
   function toggleHidden(checked: boolean) {
@@ -50,7 +50,12 @@
 </script>
 
 {#snippet flavorsCell(row: DescriptorEntryListRow)}
-  <span class="flavors">{flavors(row)}</span>
+  {#if row.descriptor_kind === "model"}
+    <span class="flavors">{#each formatGroups(row) as group, index (group.format)}{#if index}{" · "}{/if}<strong>{group.format}</strong>
+      {group.quantizations.join(" ")}{/each}</span>
+  {:else}
+    <span class="flavors">{flavors(row)}</span>
+  {/if}
 {/snippet}
 {#snippet offerCell(row: DescriptorEntryListRow)}
   {@const warning = offerWarning(row)}
@@ -102,9 +107,9 @@
       <div class="bar"><span class="err">{listed.unreadable} unreadable catalog entry(s)</span></div>
     {/if}
     {#key kind}
-      <DataTable spec={CATALOG_TABS[kind].table} rows={listed.items} id={(row) => row.name} noun="catalog entries"
+      <DataTable spec={tabs[kind].table} rows={listed.items} id={catalogRowId} noun="catalog entries"
                  {path} kept={[["kind", kind === "model" ? "model" : ""], ["hidden", showHidden ? "1" : ""]]}
-                 columnsKey={CATALOG_TABS[kind].columnsKey} empty={`No global ${kind} entries.`}
+                 columnsKey={tabs[kind].columnsKey} empty={`No ${kind} entries.`}
                  cells={{ flavors: flavorsCell, offer_rule: offerCell }} />
     {/key}
   {/snippet}

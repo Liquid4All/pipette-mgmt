@@ -5,17 +5,32 @@
 
 import { ApiError } from "./api";
 import type {
-  DescriptorDisplay, DescriptorEntryListRow, DescriptorKind, DescriptorNameHit, NamedCampaignOverview,
+  DescriptorDisplay, DescriptorEntryAction, DescriptorEntryListRow, DescriptorEntryState, DescriptorKind,
+  DescriptorNameHit, NamedCampaignOverview,
 } from "./api-types";
 import { describe } from "./components/guard";
 import { canonical } from "./report";
-import { parsed, vaultIds } from "./vault";
+import { parsed, unlabelled, vaultIds, vaultOwnedBy } from "./vault";
 
 /** The longest catalog name, as `CatalogName::MAX_LEN` allows. */
 export const CATALOG_NAME_MAX = 200;
 
 /** The most digests that one `/by-digest` read takes. */
 export const DIGEST_BATCH = 100;
+
+export function stateActions(state: DescriptorEntryState):
+  { action: Exclude<DescriptorEntryAction, "tombstone">; label: string }[] {
+  switch (state) {
+    case "active":
+      return [{ action: "pin", label: "Pin" }, { action: "hide", label: "Hide" }];
+    case "pinned":
+      return [{ action: "unpin", label: "Unpin" }];
+    case "hidden":
+      return [{ action: "unhide", label: "Unhide" }];
+    case "tombstoned":
+      return [];
+  }
+}
 
 /** The organization where a campaign page's reader may name runtimes. */
 export interface CatalogOrg {
@@ -60,6 +75,13 @@ export function quantizationError(text: string): string | null {
   if (!/^[a-z0-9_]+$/.test(text)) return "Use only lowercase letters, digits and '_' in the quantization label.";
   return null;
 }
+
+/** A change of letter case only is a valid rename. */
+export const renameError = (typed: string, current: string): string | null =>
+  catalogNameError(typed) ?? (typed === current ? "Type a name that differs from the current name." : null);
+
+export const relabelError = (typed: string, current: string): string | null =>
+  quantizationError(typed) ?? (typed === current ? "Type a label that differs from the current label." : null);
 
 /** Every string in `value`, in the order of the JSON text. */
 function strings(value: unknown): string[] {
@@ -140,10 +162,14 @@ export type EntryTarget =
   | { to: "add"; entry: DescriptorEntryListRow }
   | { to: "taken"; why: "kind" | "build"; entry: DescriptorEntryListRow };
 
-/** A runtime descriptor without its flavor, as canonical JSON: the build that the server's `build_identity` compares. */
+/**
+ * A runtime descriptor without its flavor and its vault `custom_label`s, as canonical JSON: the build that the
+ * server's `DescriptorEntry::validate_runtime_build` compares.
+ */
 function build(runtime: unknown): string {
-  if (typeof runtime !== "object" || runtime === null) return canonical(runtime);
-  const { flavor: _, ...rest } = runtime as Record<string, unknown>;
+  const value = unlabelled(runtime);
+  if (typeof value !== "object" || value === null) return canonical(value);
+  const { flavor: _, ...rest } = value as Record<string, unknown>;
   return canonical(rest);
 }
 
@@ -170,18 +196,20 @@ export function displayOf(hits: readonly DescriptorNameHit[]): DescriptorDisplay
   return first ? { display: first.selector, name: first.display_name, synonyms: rest.map((hit) => hit.selector) } : null;
 }
 
-/** Whether the organization `org_id` names a descriptor of `kind` with one of `hits`. A global name does not count. */
+/**
+ * Whether one of `hits` names a descriptor of `kind` in the organization `org_id`: a name of the organization, or a
+ * global name. The name of another organization does not count.
+ */
 export const namedIn = (hits: readonly DescriptorNameHit[], org_id: string, kind: DescriptorKind): boolean =>
-  hits.some((hit) => hit.scope === org_id && hit.descriptor_kind === kind);
+  hits.some((hit) => (hit.scope === org_id || hit.scope === "global") && hit.descriptor_kind === kind);
 
 /**
  * What a runtime cell or a model cell offers:
  * - `create`: a button that creates an entry;
- * - `vault`: a disabled button, for a runtime descriptor with a vault source;
  * - `foreign`: a disabled button, for a model with a source outside Hugging Face and the org vault;
  * - `unpinned`: a disabled button, for a model with a Hugging Face revision that is not a commit.
  */
-export type EntryOffer = "create" | "vault" | "foreign" | "unpinned";
+export type EntryOffer = "create" | "foreign" | "unpinned";
 
 /** A commit: 40 lowercase hex characters, as the server's `GitOid` takes. */
 const COMMIT = /^[0-9a-f]{40}$/;
@@ -203,28 +231,28 @@ function modelOffer(descriptor: string): EntryOffer {
 }
 
 /**
- * The offer for `descriptor`, a descriptor of `kind` whose digest is `digest`, in the organization `org_id`. The offer
- * is null in these cases:
+ * The offer for `descriptor`, a descriptor of `kind` whose digest is `digest`, in the organization `org_id`.
+ * `resources` is the read's names of vault resources. The offer is null in these cases:
  * - the names are not read yet;
  * - the descriptor has no digest;
- * - the organization names the descriptor already.
+ * - the organization names the descriptor already, or a global name names it;
+ * - the descriptor names a vault resource that is gone or that the organization does not own. The two read the same,
+ *   so the page does not show that another owner's resource exists.
  */
 export function entryOffer(descriptor: string, kind: DescriptorKind, digest: string | undefined,
-                           names: DigestNames | null, org_id: string): EntryOffer | null {
+                           names: DigestNames | null, org_id: string,
+                           resources: Readonly<Record<string, string>>): EntryOffer | null {
   if (!digest || !names || namedIn(names.get(digest) ?? [], org_id, kind)) return null;
-  if (vaultIds(descriptor).length) {
-    if (kind === "runtime") return "vault";
-    return sources(parsed(descriptor)).every((source) => String(source.source).startsWith("vault_"))
-      ? "create" : "foreign";
-  }
-  return kind === "model" ? modelOffer(descriptor) : "create";
+  if (!vaultIds(descriptor).length) return kind === "model" ? modelOffer(descriptor) : "create";
+  if (!vaultOwnedBy(descriptor, org_id, resources)) return null;
+  if (kind === "runtime") return "create";
+  return sources(parsed(descriptor)).every((source) => String(source.source).startsWith("vault_"))
+    ? "create" : "foreign";
 }
 
-/** Why a disabled button cannot create an entry for a descriptor of `kind`. */
-export function offerReason(offer: Exclude<EntryOffer, "create">, kind: DescriptorKind): string {
+/** Why a disabled button cannot create an entry. */
+export function offerReason(offer: Exclude<EntryOffer, "create">): string {
   switch (offer) {
-    case "vault":
-      return `The catalog cannot name a vault ${kind} yet.`;
     case "foreign":
       return "The catalog names models on Hugging Face or in the organization's vault.";
     case "unpinned":
@@ -240,13 +268,23 @@ export function digestBatches(digests: Iterable<string>): string[][] {
     (_, i) => unique.slice(i * DIGEST_BATCH, (i + 1) * DIGEST_BATCH));
 }
 
+const WRITES = {
+  entry: { noun: "entry", outcome: "created the entry" },
+  member: { noun: "member", outcome: "added the member" },
+  name: { noun: "name", outcome: "renamed the entry" },
+  label: { noun: "label", outcome: "changed the label" },
+  state: { noun: "change", outcome: "changed the state of the entry" },
+} as const;
+
+export type CatalogWrite = keyof typeof WRITES;
+
 /**
- * What the dialog says after a failed write, which `noun` names: `entry` for a create, `member` for an add. For a
- * refusal, it gives the reason from the server. For any other failure, it says how to learn the outcome.
+ * What the page says after a failed `write`. For a refusal, it gives the reason from the server. For any other failure,
+ * it says how to learn the outcome.
  */
-export function writeFailure(e: unknown, noun: "entry" | "member"): string {
+export function writeFailure(e: unknown, write: CatalogWrite): string {
+  const { noun, outcome } = WRITES[write];
   if (e instanceof ApiError && e.status >= 400 && e.status < 500) return `The server refused the ${noun}: ${e.message}`;
-  const outcome = noun === "entry" ? "created the entry" : "added the member";
   const maybe = `Read the page again to see whether the server ${outcome}.`;
   if (e instanceof ApiError) return `The server failed (${e.message}). ${maybe}`;
   return `No answer from the server (${describe(e)}). ${maybe}`;

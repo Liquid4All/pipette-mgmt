@@ -8,12 +8,12 @@
 //! part: a VL corpus no audio, an ASR corpus no image. The functions taking a
 //! [`CorpusFormat`] convert either; the others are the VL ones.
 //!
-//! mgmt packs a corpus from the evals server's `/samples`; a client rebuilds
-//! the evals server's samples from it. Both convert with the functions here,
-//! and both check what they hold against the samples digest the evals server
-//! reports ([`SamplesDigest`]): the build before it stores a corpus, the client
-//! before it sends a prompt. A corpus that does not rebuild the exact samples
-//! the scorer grades is never stored and never run.
+//! The scores service packs a corpus from the samples it serves; a client
+//! rebuilds those samples from it with the functions here. Both check the
+//! rebuilt samples against the samples digest the evals server reports
+//! ([`SamplesDigest`]): the scores service before it stores a corpus, the
+//! client before it sends a prompt. A corpus that does not rebuild the exact
+//! samples the scorer grades is never stored and never run.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;

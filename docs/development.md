@@ -37,9 +37,43 @@ Two test sets need more than the command:
   (e.g. `postgres://postgres@127.0.0.1:5432/postgres`). Unset, they skip
   locally and fail in CI. Each test makes and drops a schema of its own in a
   `pipette_test` database, which the first test creates and later runs reuse.
+
+  `scripts/dev-postgres.sh` starts the server that CI uses, in a Docker
+  container, and prints the line that sets `TEST_DATABASE_URL`. Run
+  `export_line=$(scripts/dev-postgres.sh) && eval "$export_line"` to start it
+  and set the variable in one step. Set `PORT` to use a port other than 5432.
+  A second run reuses the container if its settings match CI. If its
+  authentication, port binding, or initialized locale differs, the script
+  tells you to remove it. To remove it, run
+  `docker rm -f pipette-test-postgres`.
 - The `pipette-store-s3` counter tests read process-wide counters, so run them
   under nextest or with `cargo test -p pipette-store-s3 -- --test-threads=1`;
   plain `cargo test` fails them.
+
+The opt-in recalculation load test needs PostgreSQL and several GB of free RAM.
+The test uses these settings:
+
+- An in-memory S3 submission store.
+- A pool of 32 SQL connections, with the production acquire timeout of 10 seconds.
+- 256 results of 30 MiB each.
+
+```bash
+cargo test -p pipette-pipeline --locked large_recalculation_pool_reproduction -- --ignored --nocapture
+```
+
+To run a smaller test, set `PIP_RECALC_JOBS` (the number of jobs) and
+`PIP_RECALC_MB` (the size of each result in MiB). The test prints the
+recalculation duration apart from the seed time.
+
+To measure the peak memory:
+
+1. Build the test with `--no-run`.
+2. Run the test executable under `/usr/bin/time -l` on macOS, or under
+   `/usr/bin/time -v` on Linux.
+3. Give the same test filter, `--ignored`, and `--nocapture`.
+
+Run the same test on the baseline revision and on the changed revision. Report
+the pool errors, the elapsed time, and the peak memory.
 
 What each gate is for:
 

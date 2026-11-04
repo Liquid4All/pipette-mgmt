@@ -1,4 +1,5 @@
-//! [`DatasetCacheStore`] over `{prefix}/dataset-cache/artifacts/`.
+//! [`DatasetCacheStore`] over `{prefix}/dataset-cache/artifacts/`, and
+//! [`EvalPackageStore`] over `{prefix}/scores-packages/tars/`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio::io::AsyncReadExt;
 
 use pipette_core::dataset::DatasetArtifact;
 use pipette_plan_types::Sha256;
-use pipette_store::{ArtifactBody, DatasetCacheStore};
+use pipette_store::{ArtifactBody, DatasetCacheStore, EvalPackageStore};
 
 use crate::{get_bytes, obj_path, put_bytes};
 
@@ -99,14 +100,47 @@ impl DatasetCacheStore for S3DatasetCacheStore {
     }
 
     async fn open_tar(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>> {
-        let result = match self.store.get(&self.tar_path(digest)).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let bytes = result.meta.size;
-        let stream = result.into_stream().map_err(anyhow::Error::from).boxed();
-        Ok(Some(ArtifactBody { bytes, stream }))
+        open(&self.store, &self.tar_path(digest)).await
+    }
+}
+
+async fn open(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjPath,
+) -> anyhow::Result<Option<ArtifactBody>> {
+    let result = match store.get(path).await {
+        Ok(result) => result,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = result.meta.size;
+    let stream = result.into_stream().map_err(anyhow::Error::from).boxed();
+    Ok(Some(ArtifactBody { bytes, stream }))
+}
+
+pub(crate) struct S3EvalPackageStore {
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) prefix: String,
+}
+
+impl S3EvalPackageStore {
+    fn tar_path(&self, digest: &Sha256) -> ObjPath {
+        obj_path(&self.prefix, &format!("scores-packages/tars/{digest}.tar"))
+    }
+}
+
+#[async_trait]
+impl EvalPackageStore for S3EvalPackageStore {
+    async fn package_bytes(&self, digest: &Sha256) -> anyhow::Result<Option<u64>> {
+        match self.store.head(&self.tar_path(digest)).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn open_package(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>> {
+        open(&self.store, &self.tar_path(digest)).await
     }
 }
 
@@ -122,5 +156,19 @@ mod tests {
             prefix: "root".to_string(),
         };
         pipette_store_testkit::assert_dataset_cache_store_roundtrip(&store, dir.path()).await
+    }
+
+    #[tokio::test]
+    async fn eval_package_store_contract() -> anyhow::Result<()> {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = S3EvalPackageStore {
+            store: bucket.clone(),
+            prefix: "root".to_string(),
+        };
+        pipette_store_testkit::assert_eval_package_store_contract(&store, |key, body| {
+            let bucket = bucket.clone();
+            async move { put_bytes(&bucket, &obj_path("root", &key), body).await }
+        })
+        .await
     }
 }

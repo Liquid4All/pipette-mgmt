@@ -547,9 +547,10 @@ mod tests {
             .into_iter()
             .map(|event| match event.action {
                 AuditAction::Http { status, .. } => (event.outcome, status),
-                AuditAction::Cli { .. } | AuditAction::FirstClerkSignIn { .. } => {
-                    (event.outcome, 0)
-                }
+                AuditAction::Cli { .. }
+                | AuditAction::FirstClerkSignIn { .. }
+                | AuditAction::CatalogRename { .. }
+                | AuditAction::CatalogMerge { .. } => (event.outcome, 0),
             })
             .collect();
         assert_eq!(written, Vec::from_iter(expected));

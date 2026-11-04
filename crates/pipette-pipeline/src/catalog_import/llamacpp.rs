@@ -338,7 +338,7 @@ fn record_unknown(tag: &str, classified: &Classified, finish: &mut CatalogImport
     for asset in &classified.unknown {
         let tagged = format!("{tag}/{asset}");
         if !finish.unclassified_assets.contains(&tagged) {
-            warn!(release_tag = tag, asset, "catalog asset is not classified");
+            info!(release_tag = tag, asset, "catalog asset is not classified");
             finish.unclassified_assets.push(tagged);
         }
     }
@@ -697,7 +697,7 @@ async fn import_stable(
         unexpected
             .into_iter()
             .inspect(|asset| {
-                warn!(release_tag = %release.tag_name, asset, "catalog asset is not classified");
+                info!(release_tag = %release.tag_name, asset, "catalog asset is not classified");
             })
             .map(|asset| format!("{}/{asset}", release.tag_name)),
     );
@@ -896,14 +896,7 @@ where
 {
     let id = uuid::Uuid::now_v7().to_string();
     runs.start_run(&id, command, target, Utc::now()).await?;
-    let mut finish = work.await;
-    // Unclassified assets put the run in an error state, even when every
-    // entry and member was written.
-    if !finish.unclassified_assets.is_empty() && finish.error_summary.is_none() {
-        finish.error_summary = Some(pipette_plan_types::unclassified_summary(
-            finish.unclassified_assets.len(),
-        ));
-    }
+    let finish = work.await;
     if let Some(error) = &finish.error_summary {
         tracing::error!(
             run_id = %id,
@@ -925,6 +918,7 @@ where
     tracing::info!(
         run_id = %id,
         command,
+        unclassified_assets = finish.unclassified_assets.len(),
         entries_created = finish.entries_created,
         members_added = finish.members_added,
         entries_hidden = finish.entries_hidden,

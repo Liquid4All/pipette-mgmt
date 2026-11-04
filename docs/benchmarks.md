@@ -1634,8 +1634,8 @@ URI, so an image several questions share is repeated once per question; POPE's
 therefore pins its samples as a **`vlm-eval-corpus/1`** corpus, which the
 device downloads from `GET /datasets/{benchmark_id}` like a `vl_spec_decode`
 corpus ([§2.8.1](#281-the-dataset-object)): the same samples, each image stored
-once under `media/`, cached and served by mgmt only while a fresh probe finds
-the evals server still serving them.
+once under `media/`, packed by the scores service and served by mgmt only while
+a fresh probe finds the evals server still serving them.
 
 ```toml
 benchmark_type            = "vlm_eval"
@@ -1667,20 +1667,22 @@ identity        = "115955fff4f95d524c81964dbe712b97ff3e8443ff180df38e4db9531aa3d
 | `upstream.source` | `evals_server`: the deployment's evals server (`evals_server_url`); the pin names content, not a host |
 | `upstream.eval_id`, `upstream.dataset_version`, `upstream.prompt_profile` | Must equal the entry's `parameter_lmms_task`, `parameter_dataset_version` and `parameter_prompt_profile`, or the entry fails to load: the corpus must hold the samples the scorer grades the entry on. Each is one plain name (letters, digits, `.`, `_`, `-`) |
 | `upstream.identity` | The evals server's digest of those samples, the hex of `GET …/samples/digest`: SHA-256 over each sample's canonical JSON (keys sorted, compact, UTF-8) and a newline, in served order |
-| `upstream.license` | Optional. Recorded, not interpreted |
+| `upstream.license` | Leave it out: the scores service's package manifest has none, and `dataset-cache build` refuses a pin whose upstream differs from its package's |
 
 Every catalog entry pins a corpus; an entry without one fails to load, and
-`GET /benchmarks/{benchmark_id}` no longer carries a vlm_eval's samples.
-`pipette-mgmt dataset-cache pins <benchmark_id>` prints the three hashes and
-`bytes` from the entry's task, version and profile.
+`GET /benchmarks/{benchmark_id}` no longer carries a vlm_eval's samples. The
+scores service lists the three hashes and `bytes` of each profile's corpus in
+its index, `scores-packages/index/<scores version>/<eval_id>/<dataset_version>.json`
+([cli.md](cli.md#pipette-mgmt-dataset-cache-probebuildpins) shows how to copy
+them).
 
-**Lossless, and checked twice.** The build fetches `/samples` once, hashes every
-sample as served and requires the pinned identity (and the evals server's own
-`X-Samples-Digest`), packs the corpus, then reads the tar back, rebuilds every
-sample from it and requires the identity again. Nothing that would not give a
-device the exact prompts the scorer grades is stored. The device repeats the
-check before it runs: the tar must hash to `digest` and its rebuilt samples to
-`upstream.identity`. **Unlike `vl_spec_decode`, a mismatch fails the run**: a
+**Lossless, and checked twice.** The scores service packs the corpus from the
+samples it serves and stores it only once the packed lines and media rebuild
+samples of the same digest. `dataset-cache build` registers it without a
+download: the package must be the pinned `bytes`, its manifest must name this
+pin, and the evals server must still report `upstream.identity`. The device
+repeats the check before it runs: the tar must hash to `digest` and its rebuilt
+samples to `upstream.identity`. **Unlike `vl_spec_decode`, a mismatch fails the run**: a
 throughput number over another corpus is still a measurement, but answers to
 prompts the scorer does not hold would be graded against the wrong questions.
 
@@ -2410,8 +2412,8 @@ version, profile) is a corpus of its own (the profiles' prompts, turns and
 template kwargs differ, and `gemma4` cuts clips longer than 30 s).
 `upstream.identity` is the evals server's digest of that profile's samples,
 VLM Eval's definition, so it covers every id, its order, the prompt text, the
-template kwargs and every audio byte. `pipette-mgmt dataset-cache pins
-<benchmark_id>` prints the pin.
+template kwargs and every audio byte. The scores service's index lists the pin,
+as for VLM Eval.
 
 | Entry | Content |
 |---|---|
@@ -2421,15 +2423,10 @@ template kwargs and every audio byte. `pipette-mgmt dataset-cache pins
 
 An audio part rebuilds as `{"type": "input_audio", "input_audio": {"data":
 "<standard base64 of the file>", "format": "wav"}}`, byte for byte what the
-evals server sent. The build refuses a clip in any other format, a clip that
-is not canonical base64, and an image part (a `vlm-eval-corpus/1` refuses an
-audio part the same way). A clip is a 16 kHz mono WAV: 16-bit PCM when every
-sample is a 16-bit value, else 32-bit float, the same samples either way.
-
-The build parses the stream as it arrives and never stores the body; scratch
-holds the media and the packed tar, about twice the corpus. An asr-eval corpus builds under its own deadline,
-`dataset_asr_build_timeout_secs` (default 7200), and after the other corpora,
-one at a time. The full catalog's corpora take well over a hundred gigabytes of dataset cache.
+evals server sent. A corpus holds no clip in any other format, no clip that is
+not canonical base64, and no image part (a `vlm-eval-corpus/1` holds no audio
+part). A clip is a 16 kHz mono WAV: 16-bit PCM when every sample is a 16-bit
+value, else 32-bit float, the same samples either way.
 
 **Scored only as the corpus it pins**, as a vlm_eval is: mgmt accepts and
 scores an asr_eval submission only when its `observation_dataset_digest` is the

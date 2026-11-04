@@ -11,7 +11,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 
 use pipette_core::plan::{ExpiredJob, sample_manifest};
-use pipette_core::todo_filename::{leased_key, parse_avail_filename};
+use pipette_core::todo_filename::parse_avail_filename;
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
@@ -19,9 +19,9 @@ use pipette_plan_types::{
     UserPermission,
 };
 use pipette_web_testkit::{
-    UserSigner, add_starved_snapshot, approved_client, authed_get, authed_user_get, body_json,
-    grant_plan_user_detail, grant_user, plan_ids, put_loose_plan, registered_user,
-    registered_user_with_detail, submit_plan_as, unauthed_get,
+    QueueBackend, UserSigner, add_starved_snapshot, approved_client, approved_queue_client,
+    authed_get, authed_user_get, body_json, grant_plan_user_detail, grant_user, plan_ids,
+    put_loose_plan, registered_user, registered_user_with_detail, submit_plan_as, unauthed_get,
 };
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -765,19 +765,27 @@ async fn test_get_plan_surfaces_a_pending_cancel() -> anyhow::Result<()> {
 
 /// A freshly staged plan's jobs are `available`, carry the deadline the
 /// `avail/` key encodes, and hold no lease.
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_list_jobs_reports_queued_jobs_as_available() -> anyhow::Result<()> {
+async fn test_list_jobs_reports_queued_jobs_as_available(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let (key, user_id, key_id) = registered_user(
-        &state,
+        state,
         &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
     )
     .await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "p", 2).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client_id, "p", 2).await?;
 
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -953,22 +961,25 @@ async fn test_a_job_without_a_readable_source_names_no_request() -> anyhow::Resu
     Ok(())
 }
 
-/// Write a lease on `job_id` held by `client` until `expiry`, as
+/// Lease `job_id` to `client` until `expiry`, as
 /// [`pipette_web_testkit::seed_leased`] does for a live one.
-fn seed_lease(
-    dir: &std::path::Path,
+async fn seed_lease(
+    state: &AppState,
     job_id: &JobId,
     client: &str,
     expiry: chrono::DateTime<Utc>,
     body: &Value,
 ) -> anyhow::Result<()> {
     let client = ClientId::try_new(client)?;
-    let path =
-        dir.join("todo")
-            .join("leased")
-            .join(leased_key(job_id, ExpiresAt::Never, &client, expiry));
-    std::fs::create_dir_all(path.parent().context("a lease path has a parent")?)?;
-    std::fs::write(path, serde_json::to_vec(body)?)?;
+    pipette_web_testkit::seed_leased_until(
+        state.todo_store.as_ref(),
+        job_id.as_str(),
+        ExpiresAt::Never,
+        &client,
+        expiry,
+        body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -999,8 +1010,9 @@ async fn test_a_lapsed_lease_reads_running_until_a_live_one_answers() -> anyhow:
     for client in [
         "ev1_a", "ev1_b", "ev1_c", "ev1_d", "ev1_w", "ev1_x", "ev1_y", "ev1_z",
     ] {
-        seed_lease(dir.path(), job_id, client, lapsed, &job_body)?;
+        seed_lease(&state, job_id, client, lapsed, &job_body).await?;
     }
+    assert_eq!(state.todo_store.list_leased().await?.len(), 8);
     let uri = format!("/api/v1/plans/{plan_id}/jobs");
 
     let resp = authed_user_get(&state, &key, &user_id, &key_id, &uri).await?;
@@ -1017,12 +1029,14 @@ async fn test_a_lapsed_lease_reads_running_until_a_live_one_answers() -> anyhow:
 
     // A live lease among the lapsed ones: the job is held, not stranded.
     seed_lease(
-        dir.path(),
+        &state,
         job_id,
         "ev1_m",
         Utc::now() + Duration::hours(1),
         &job_body,
-    )?;
+    )
+    .await?;
+    assert_eq!(state.todo_store.list_leased().await?.len(), 9);
     let resp = authed_user_get(&state, &key, &user_id, &key_id, &uri).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
@@ -1060,7 +1074,13 @@ async fn test_a_queued_job_past_its_deadline_reads_available_and_expired() -> an
     state.todo_store.delete_avail_by_job(job_id).await?;
     // Whole seconds, as the `avail/` key keeps it.
     let deadline = ExpiresAt::At((Utc::now() - Duration::hours(1)).trunc_subsecs(0));
-    pipette_web_testkit::seed_avail(dir.path(), job_id.as_str(), deadline, &job_body)?;
+    pipette_web_testkit::seed_avail(
+        state.todo_store.as_ref(),
+        job_id.as_str(),
+        deadline,
+        &job_body,
+    )
+    .await?;
 
     let resp = authed_user_get(
         &state,
@@ -1484,6 +1504,12 @@ impl pipette_store::SubmissionStore for CountingFindJob {
         _: &[JobId],
     ) -> anyhow::Result<std::collections::HashMap<JobId, pipette_core::plan::SettledOutcome>> {
         Err(self.unexpected.record("find_outcomes"))
+    }
+    async fn find_runs(
+        &self,
+        _: &[JobId],
+    ) -> anyhow::Result<std::collections::HashMap<JobId, pipette_store::RecordedRun>> {
+        Err(self.unexpected.record("find_runs"))
     }
     async fn enqueue(
         &self,

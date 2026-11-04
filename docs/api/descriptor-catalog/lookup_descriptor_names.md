@@ -22,11 +22,21 @@ runtime member also has its offer-rule coverage. A model member also has its
 Set `offer_counts=true` to add `offered_device_count` to each runtime member.
 The caller needs `read_clients`; the server returns `403` without it.
 It counts approved devices whose capabilities and assigned tags meet that
-member's offer rule, even if precedence would select another member. The
+member's offer rule, even if precedence would select another member. For a
+runtime that the iOS app builds in, a device must also report the member's
+build flag. The
 server reads the fleet and tags once for the whole lookup. If any device
 record is unreadable, or either read fails, the count is absent for every
 member rather than incomplete.
 Without this option, the server does not read the fleet for counts.
+
+Set `evidence=true` to add the run `evidence` of each member on every device.
+The caller needs `read_clients`; the server returns `403` without it. The
+evidence has `any_device` only, which is weaker evidence: `last_success_at`
+and `devices_with_success`. See
+[the short list](list_descriptor_catalog_for_device.md) for its meaning. The
+evidence never selects an entry. Without a `[database]`, `evidence` is
+absent.
 
 For example, `names=llamacpp-v0.7.0,global/my-fork` looks up a bare name
 and a global name.

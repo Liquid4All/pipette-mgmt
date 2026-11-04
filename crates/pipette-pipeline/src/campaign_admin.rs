@@ -19,7 +19,8 @@ use pipette_plan_types::{
     RevisionChange, UserId,
 };
 use pipette_store::{
-    CampaignStore, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter, PlanStore, Stores, SubmissionStore,
+    CampaignStore, Listing, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter, PlanStore, Stores,
+    SubmissionStore,
 };
 
 use crate::campaign_chain;
@@ -33,7 +34,6 @@ use crate::plan_document::{DocumentDryRun, DryRunReport, SourceRead};
 use crate::plan_ingestion::{
     CampaignMembership, CarryDraw, IngestContext, IngestReport, IngestSettings, Offered, draw_carry,
 };
-use crate::recalculation;
 use crate::variant_edit;
 use crate::variant_edit::{VariantEdit, VariantEditError};
 
@@ -85,27 +85,25 @@ pub enum CampaignAdminError {
     /// Worded for neither surface: the CLI's flags are not the route's fields.
     #[error("name an owner: an account or an organization")]
     NoOwnerNamed,
-    /// The plan is staged and claimable; only the head is stale, and the repair
-    /// is to file again.
-    #[error(
-        "plan {plan_id} was filed into {campaign_id} but the campaign still runs its previous plan"
-    )]
+    /// The route staged a revision, but could not read its campaign before
+    /// writing the new head. The campaign has not advanced to this plan.
+    #[error("plan {plan_id} was filed into {campaign_id}, but the campaign could not be read")]
     NotAdvanced {
         campaign_id: CampaignId,
         plan_id: PlanId,
         source: anyhow::Error,
     },
-    /// The first plan is staged, and the campaign it names was never written.
-    /// Its own arm so the plan is named, and whether it still needs stopping.
+    /// The write reported a failure, and the read back does not show that the
+    /// campaign runs the plan. The write can still land later, so preserve the
+    /// plan until an operator confirms the outcome.
     #[error(
-        "plan {plan_id} was filed as the first plan of {campaign_id} but the campaign was not created"
+        "plan {plan_id} was filed into {campaign_id}, but the server could not confirm that the \
+         campaign runs it. Read the campaign again. If it runs {plan_id}, the filing is complete. \
+         Do not cancel or refile until the write outcome is reconciled"
     )]
-    NotCreated {
+    CommitUnknown {
         campaign_id: CampaignId,
         plan_id: PlanId,
-        /// Whether [`create_around`] cancelled the plan. `false` leaves it
-        /// claimable until an operator runs `plans cancel`.
-        cancelled: bool,
         source: anyhow::Error,
     },
     /// A record written before a campaign had to have a first plan.
@@ -173,7 +171,8 @@ pub enum CampaignAdminError {
         plan_id: PlanId,
         revised: PlanId,
         /// Whether [`complete_revision`] cancelled `plan_id`. `false` leaves
-        /// it claimable until an operator runs `plans cancel`.
+        /// its jobs in the queue, unclaimable, until an operator runs
+        /// `plans cancel`.
         cancelled: bool,
     },
     #[error(
@@ -183,8 +182,8 @@ pub enum CampaignAdminError {
     DeletedDuringFiling {
         campaign_id: CampaignId,
         plan_id: PlanId,
-        /// Whether [`advance`] cancelled `plan_id`. `false` leaves it
-        /// claimable until an operator runs `plans cancel`.
+        /// Whether [`advance`] cancelled `plan_id`. `false` leaves its jobs
+        /// in the queue, unclaimable, until an operator runs `plans cancel`.
         cancelled: bool,
     },
     /// The revision advanced, and the replaced plan was not cancelled: its
@@ -211,7 +210,7 @@ fn cancel_outcome(cancelled: &bool) -> &'static str {
     if *cancelled {
         "; the filing cancelled the plan"
     } else {
-        "; stop the plan with `plans cancel`"
+        "; preserve live jobs with a successful filing before cancelling the plan"
     }
 }
 
@@ -270,7 +269,9 @@ pub async fn owner(
 }
 
 /// Write the campaign `new` stands for, running `plan_id`: the plan just filed
-/// under its id. A failed write cancels the plan, which no campaign now names.
+/// under its id. Read the campaign after a write reports a failure. A campaign
+/// that runs the plan is a success. Otherwise, preserve the plan because the
+/// write can still land after the read.
 pub async fn create_around(
     campaigns: &dyn CampaignStore,
     plans: &dyn PlanStore,
@@ -279,31 +280,44 @@ pub async fn create_around(
 ) -> Result<Campaign, CampaignAdminError> {
     let campaign = new.around(plan_id.clone(), Utc::now());
     if let Err(source) = campaigns.put_campaign(&campaign).await {
-        // The marker `plans cancel` writes; `queue-maintenance` tears the plan down.
-        let cancelled = plans
-            .write_cancel_marker(&plan_id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(
+        match landed(campaigns, plans, &campaign.campaign_id, &plan_id).await {
+            Ok(Some(stored)) => {
+                tracing::info!(
+                    campaign_id = %stored.campaign_id,
+                    %plan_id,
+                    error = %format_args!("{source:#}"),
+                    "campaign write reported a failure, but the read back shows the campaign runs its first plan"
+                );
+                return Ok(stored);
+            }
+            Ok(None) => {
+                tracing::warn!(
                     campaign_id = %campaign.campaign_id,
                     %plan_id,
-                    error = %format_args!("{e:#}"),
-                    "could not cancel the first plan of a campaign that was not created"
+                    error = %format_args!("{source:#}"),
+                    "campaign creation outcome unknown: the read back did not find the plan"
                 );
-            })
-            .is_ok();
-        tracing::warn!(
-            campaign_id = %campaign.campaign_id,
-            %plan_id,
-            cancelled,
-            "campaign not created around its first plan"
-        );
-        return Err(CampaignAdminError::NotCreated {
-            campaign_id: campaign.campaign_id,
-            plan_id,
-            cancelled,
-            source,
-        });
+                return Err(CampaignAdminError::CommitUnknown {
+                    campaign_id: campaign.campaign_id,
+                    plan_id,
+                    source,
+                });
+            }
+            Err(readback) => {
+                tracing::warn!(
+                    campaign_id = %campaign.campaign_id,
+                    %plan_id,
+                    error = %format_args!("{source:#}"),
+                    readback_error = %format_args!("{readback:#}"),
+                    "campaign creation outcome unknown: the write and its read back both failed"
+                );
+                return Err(CampaignAdminError::CommitUnknown {
+                    campaign_id: campaign.campaign_id,
+                    plan_id,
+                    source: source.context(readback),
+                });
+            }
+        }
     }
     tracing::info!(
         campaign_id = %campaign.campaign_id,
@@ -328,7 +342,7 @@ pub async fn advance(
     plan_id: PlanId,
 ) -> Result<Advanced, CampaignAdminError> {
     let campaign = reread(campaigns, plans, campaign_id, &plan_id).await?;
-    write_head(campaigns, campaign, plan_id).await
+    write_head(campaigns, plans, campaign, plan_id).await
 }
 
 /// [`advance`], only while the campaign still runs `from` and `owner` still
@@ -347,7 +361,9 @@ async fn advance_from(
     if campaign.current_plan_id.as_ref() != Some(from) || campaign.owner != *owner {
         return Ok(None);
     }
-    write_head(campaigns, campaign, plan_id).await.map(Some)
+    write_head(campaigns, plans, campaign, plan_id)
+        .await
+        .map(Some)
 }
 
 /// The record [`advance`] moves, read fresh. A failure names the staged plan.
@@ -394,9 +410,12 @@ async fn reread(
     }
 }
 
-/// Point `campaign` at `plan_id` and write it, unless it already runs it.
+/// Point `campaign` at `plan_id` and write it, unless it already runs it. Read
+/// the campaign after a write reports a failure. A campaign whose history
+/// reaches `plan_id` is a success; preserve the plan otherwise.
 async fn write_head(
     campaigns: &dyn CampaignStore,
+    plans: &dyn PlanStore,
     mut campaign: Campaign,
     plan_id: PlanId,
 ) -> Result<Advanced, CampaignAdminError> {
@@ -404,14 +423,42 @@ async fn write_head(
     let superseded = campaign.current_plan_id.clone();
 
     let changed = campaign.advance(plan_id.clone(), Utc::now());
-    if changed {
-        campaigns.put_campaign(&campaign).await.map_err(|source| {
-            CampaignAdminError::NotAdvanced {
-                campaign_id: campaign_id.clone(),
-                plan_id: plan_id.clone(),
-                source,
+    if changed && let Err(source) = campaigns.put_campaign(&campaign).await {
+        match landed(campaigns, plans, &campaign_id, &plan_id).await {
+            Ok(Some(_)) => tracing::info!(
+                %campaign_id,
+                %plan_id,
+                error = %format_args!("{source:#}"),
+                "campaign head write reported a failure, but the read back shows the campaign runs the plan"
+            ),
+            Ok(None) => {
+                tracing::warn!(
+                    %campaign_id,
+                    %plan_id,
+                    error = %format_args!("{source:#}"),
+                    "campaign advance outcome unknown: the read back did not find the plan"
+                );
+                return Err(CampaignAdminError::CommitUnknown {
+                    campaign_id,
+                    plan_id,
+                    source,
+                });
             }
-        })?;
+            Err(readback) => {
+                tracing::warn!(
+                    %campaign_id,
+                    %plan_id,
+                    error = %format_args!("{source:#}"),
+                    readback_error = %format_args!("{readback:#}"),
+                    "campaign advance outcome unknown: the write and its read back both failed"
+                );
+                return Err(CampaignAdminError::CommitUnknown {
+                    campaign_id,
+                    plan_id,
+                    source: source.context(readback),
+                });
+            }
+        }
     }
     tracing::info!(
         %campaign_id,
@@ -424,6 +471,33 @@ async fn write_head(
         superseded,
         changed,
     })
+}
+
+/// Read `campaign_id` back after a write that reported a failure. Return the
+/// campaign if its head is `plan_id`, or if its history reaches `plan_id`
+/// from the head. Return `None` if the campaign is absent or its history does
+/// not reach the plan. A read error propagates: it shows neither outcome.
+async fn landed(
+    campaigns: &dyn CampaignStore,
+    plans: &dyn PlanStore,
+    campaign_id: &CampaignId,
+    plan_id: &PlanId,
+) -> anyhow::Result<Option<Campaign>> {
+    let Some(stored) = campaigns
+        .get_campaign(campaign_id)
+        .await
+        .with_context(|| format!("reading campaign {campaign_id} back"))?
+    else {
+        return Ok(None);
+    };
+    if stored.current_plan_id.as_ref() == Some(plan_id) {
+        return Ok(Some(stored));
+    }
+    let reached = campaign_chain::find(plans, &stored, plan_id)
+        .await
+        .with_context(|| format!("walking the history of campaign {campaign_id}"))?
+        .is_some();
+    Ok(reached.then_some(stored))
 }
 
 /// Delete the record of `campaign` and keep its plans; refused while one of
@@ -774,9 +848,10 @@ impl Head {
         // inference in the handlers that await this.
         futures::stream::iter(job_ids.clone())
             .map(|job_id| async move {
-                match submissions.find_job(&job_id).await? {
-                    Some(_) => Ok(()),
-                    None => Err(CampaignAdminError::Unanswered(job_id)),
+                if submissions.has_record(&job_id).await? {
+                    Ok(())
+                } else {
+                    Err(CampaignAdminError::Unanswered(job_id))
                 }
             })
             .buffer_unordered(PLAN_JOB_CONCURRENCY)
@@ -795,19 +870,13 @@ impl Head {
     ) -> Result<Revision, CampaignAdminError> {
         // `content_keys`, not `job_ids`: a job with no digest cannot be re-run.
         let job_ids: Vec<JobId> = self.manifest.content_keys.keys().cloned().collect();
-        let rerun: BTreeSet<JobId> = futures::stream::iter(job_ids)
-            .map(|job_id| async move {
-                let record = submissions.find_job(&job_id).await?;
-                Ok::<_, CampaignAdminError>(
-                    record
-                        .filter(|record| answered_takes(which, &record.body))
-                        .map(|_| job_id),
-                )
-            })
-            .buffer_unordered(PLAN_JOB_CONCURRENCY)
-            .try_filter_map(|job_id| async move { Ok(job_id) })
-            .try_collect()
-            .await?;
+        let rerun: BTreeSet<JobId> = submissions
+            .find_outcomes(&job_ids)
+            .await?
+            .into_iter()
+            .filter(|(_, outcome)| answered_takes(which, *outcome))
+            .map(|(job_id, _)| job_id)
+            .collect();
         if rerun.is_empty() {
             return Err(CampaignAdminError::NoneAnswered {
                 plan_id: self.manifest.plan_id.clone(),
@@ -829,19 +898,21 @@ impl Head {
     ) -> Result<Revision, CampaignAdminError> {
         self.require_held(&job_ids)?;
         let document = self.document(plans).await?;
-        futures::stream::iter(job_ids.clone())
-            .map(|job_id| async move {
-                match submissions.find_job(&job_id).await? {
-                    None => Err(CampaignAdminError::Unanswered(job_id)),
-                    Some(record) if !recalculation::rescorable(&record.body) => {
-                        Err(CampaignAdminError::NotRescorable(job_id))
-                    }
-                    Some(_) => Ok(()),
-                }
-            })
-            .buffer_unordered(PLAN_JOB_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
+        let ids: Vec<_> = job_ids.iter().cloned().collect();
+        let outcomes = submissions.find_outcomes(&ids).await?;
+        let rescorable = self.rescorable_jobs(plans, &ids).await?;
+        // A named job whose source cannot be read is not known to be no eval.
+        if let Some(error) = rescorable.unreadable.into_iter().next() {
+            return Err(anyhow::Error::from(error).into());
+        }
+        let eligible: BTreeSet<JobId> = rescorable.items.into_iter().collect();
+        job_ids
+            .iter()
+            .try_for_each(|job_id| match outcomes.get(job_id) {
+                None => Err(CampaignAdminError::Unanswered(job_id.clone())),
+                Some(SettledOutcome::Finished) if eligible.contains(job_id) => Ok(()),
+                Some(_) => Err(CampaignAdminError::NotRescorable(job_id.clone())),
+            })?;
         Ok(self.filed_again(
             document,
             Change::Recalculate { all: false },
@@ -859,19 +930,23 @@ impl Head {
     ) -> Result<Revision, CampaignAdminError> {
         // `content_keys`, not `job_ids`: a job with no digest cannot be placed.
         let job_ids: Vec<JobId> = self.manifest.content_keys.keys().cloned().collect();
-        let recalculate: BTreeSet<JobId> = futures::stream::iter(job_ids)
-            .map(|job_id| async move {
-                let record = submissions.find_job(&job_id).await?;
-                Ok::<_, CampaignAdminError>(
-                    record
-                        .filter(|record| recalculation::rescorable(&record.body))
-                        .map(|_| job_id),
-                )
+        let outcomes = submissions.find_outcomes(&job_ids).await?;
+        let rescorable = self.rescorable_jobs(plans, &job_ids).await?;
+        for error in &rescorable.unreadable {
+            tracing::warn!(
+                plan_id = %self.manifest.plan_id,
+                key = %error.key,
+                reason = %error.reason,
+                "whole-plan recalculation skips a job whose source is unreadable"
+            );
+        }
+        let eligible: BTreeSet<JobId> = rescorable.items.into_iter().collect();
+        let recalculate = job_ids
+            .into_iter()
+            .filter(|id| {
+                outcomes.get(id) == Some(&SettledOutcome::Finished) && eligible.contains(id)
             })
-            .buffer_unordered(PLAN_JOB_CONCURRENCY)
-            .try_filter_map(|job_id| async move { Ok(job_id) })
-            .try_collect()
-            .await?;
+            .collect::<BTreeSet<_>>();
         if recalculate.is_empty() {
             return Err(CampaignAdminError::NoneRescorable(
                 self.manifest.plan_id.clone(),
@@ -884,6 +959,45 @@ impl Head {
             BTreeSet::new(),
             recalculate,
         ))
+    }
+
+    /// The jobs among `job_ids` whose filed source names a benchmark that the
+    /// server scores, and the sources that are not JSON. The filed sources are
+    /// small, so this check reads no result body.
+    async fn rescorable_jobs(
+        &self,
+        plans: &dyn PlanStore,
+        job_ids: &[JobId],
+    ) -> anyhow::Result<Listing<JobId>> {
+        let sources = plans.get_job_sources(job_ids).await?;
+        let benchmarks: Vec<(JobId, BenchmarkId)> = sources
+            .items
+            .into_iter()
+            .filter_map(|(job_id, body)| {
+                let benchmark = body
+                    .pointer("/spec/benchmark")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| BenchmarkId::try_new(id).ok())?;
+                Some((job_id, benchmark))
+            })
+            .collect();
+        let types = crate::plan_cells::filed_types(
+            &self.manifest.benchmark_types,
+            benchmarks.iter().map(|(_, benchmark)| benchmark),
+        );
+        let items = benchmarks
+            .into_iter()
+            .filter(|(_, benchmark)| {
+                types
+                    .get(benchmark)
+                    .is_some_and(|kind| kind.is_scored_via_server())
+            })
+            .map(|(job_id, _)| job_id)
+            .collect();
+        Ok(Listing {
+            items,
+            unreadable: sources.unreadable,
+        })
     }
 
     /// Refuse a re-run or a recalculation that names no job, or one the head
@@ -925,14 +1039,10 @@ impl Head {
     }
 }
 
-/// Reads the outcome as the plan page does ([`SettledOutcome::from_message_type`]).
-fn answered_takes(which: Answered, body: &serde_json::Value) -> bool {
+fn answered_takes(which: Answered, outcome: SettledOutcome) -> bool {
     match which {
         Answered::All => true,
-        Answered::Failed => {
-            let message_type = body.get("message_type").and_then(serde_json::Value::as_str);
-            SettledOutcome::from_message_type(message_type) == SettledOutcome::Failed
-        }
+        Answered::Failed => outcome == SettledOutcome::Failed,
     }
 }
 
@@ -944,8 +1054,9 @@ fn answered_phrase(which: &Answered) -> &'static str {
 }
 
 /// Whether `manifest`'s plan, whose stored document is `stored`, was filed from
-/// `document`. A document with a model token is stored in another text, so
-/// such a document matches by the digest of the text that the client sent.
+/// `document`. A document with a model token or a catalog name is stored in
+/// another text, so such a document matches by the digest of the text that the
+/// client sent. Its catalog names keep the meaning they had at filing.
 fn filed_from(manifest: &PlanManifest, stored: &str, document: &str) -> bool {
     stored == document
         || manifest
@@ -1256,8 +1367,18 @@ impl Revision {
         Self { offer, ..self }
     }
 
+    pub fn owner(&self) -> &VaultOwner {
+        &self.campaign.owner
+    }
+
     pub fn document(&self) -> &str {
         &self.document
+    }
+
+    /// The head's stored document. Its catalog names were rewritten when it
+    /// was filed, so expanding it resolves no name again.
+    pub fn head_document(&self) -> &str {
+        &self.previous_document
     }
 
     pub fn campaign_id(&self) -> &CampaignId {
@@ -1502,8 +1623,6 @@ fn rekeyed(bodies: &[serde_json::Value]) -> HashMap<String, String> {
 /// that document, and what it would do to the plan it replaces.
 #[derive(Debug, serde::Serialize)]
 pub struct RevisionDryRun {
-    /// The document without the token of any model.
-    pub document: String,
     #[serde(flatten)]
     pub report: DryRunReport,
     #[serde(flatten)]
@@ -1513,7 +1632,6 @@ pub struct RevisionDryRun {
 impl From<RevisionDryRun> for pipette_plan_types::RevisionDryRun {
     fn from(dry: RevisionDryRun) -> Self {
         Self {
-            document: dry.document,
             report: dry.report.into(),
             preview: dry.preview.into(),
         }
@@ -1521,29 +1639,22 @@ impl From<RevisionDryRun> for pipette_plan_types::RevisionDryRun {
 }
 
 impl RevisionDryRun {
-    /// The dry run of `document`, with every model token removed.
-    pub fn new(
-        document: &str,
-        report: DryRunReport,
-        preview: RevisionPreview,
-    ) -> Result<Self, plan_document::StoredDocumentError> {
-        Ok(Self {
-            document: plan_document::without_model_tokens(document)?,
-            report,
-            preview,
-        })
+    /// The dry run of a revision: its report, and what it would do to the head.
+    pub fn new(report: DryRunReport, preview: RevisionPreview) -> Self {
+        Self { report, preview }
     }
 
-    /// The dry run of a revision whose document is the head's own, which
-    /// expands to `jobs` and `plan_warnings`. It runs no check and no import.
+    /// The dry run of a revision whose document is the head's own: `document`,
+    /// the head's stored text, which holds no token and expands to `jobs` and
+    /// `plan_warnings`. It runs no check and no import.
     pub fn unchanged(
-        document: &str,
+        document: String,
         jobs: &[serde_json::Value],
         plan_warnings: Vec<String>,
-    ) -> Result<Self, plan_document::StoredDocumentError> {
+    ) -> Self {
         tracing::info!("revision dry run found the head's own document and ran no checks");
-        let report = DryRunReport::unchecked(jobs, plan_warnings);
-        Self::new(document, report, RevisionPreview::unchanged())
+        let report = DryRunReport::unchecked(document, jobs, plan_warnings);
+        Self::new(report, RevisionPreview::unchanged())
     }
 }
 
@@ -2012,13 +2123,13 @@ async fn dry_run_revision(
     let catalog = crate::org_catalog::load_server_catalog(&*stores.catalog).await?;
     let ctx = IngestContext::with_settings(stores, &catalog, settings);
     if revision.changes_nothing() {
-        let expanded = plan_cli::expand_text(&ctx, revision.document(), note).await?;
+        let expanded =
+            plan_cli::expand_text(&ctx, revision.owner(), revision.head_document(), note).await?;
         return Ok(RevisionDryRun::unchanged(
-            revision.document(),
+            expanded.source.text().to_owned(),
             &expanded.jobs,
             expanded.plan_warnings,
-        )
-        .map_err(anyhow::Error::new)?);
+        ));
     }
     let membership = revision.membership(&*stores.plans).await?;
     let DocumentDryRun {
@@ -2035,7 +2146,7 @@ async fn dry_run_revision(
         )
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(RevisionDryRun::new(revision.document(), report, preview).map_err(anyhow::Error::new)?)
+    Ok(RevisionDryRun::new(report, preview))
 }
 
 #[cfg(test)]
@@ -2262,6 +2373,330 @@ mod tests {
         async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()> {
             self.0.delete_campaign(campaign_id).await
         }
+    }
+
+    /// How a campaign write fails in [`FaultyPut`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WriteFault {
+        /// Nothing persists.
+        BeforePersist,
+        /// The record persists, then the write reports a failure.
+        AfterPersist,
+        /// The record persists, a later revision advances the campaign past
+        /// it, then the write reports a failure.
+        AfterPersistThenRevised,
+        /// Nothing persists, and every read after the failure fails too.
+        BeforePersistUnreadable,
+        /// The record persists, and every read after the failure fails.
+        AfterPersistUnreadable,
+    }
+
+    /// A campaign store whose writes fail as `fault` says. Reads pass through
+    /// until a write fails.
+    struct FaultyPut {
+        inner: std::sync::Arc<dyn CampaignStore>,
+        fault: WriteFault,
+        /// The head that [`WriteFault::AfterPersistThenRevised`] writes.
+        revised_to: Option<PlanId>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultyPut {
+        fn new(inner: std::sync::Arc<dyn CampaignStore>, fault: WriteFault) -> Self {
+            Self {
+                inner,
+                fault,
+                revised_to: None,
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignStore for FaultyPut {
+        async fn get_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<Campaign>> {
+            let unreadable = matches!(
+                self.fault,
+                WriteFault::BeforePersistUnreadable | WriteFault::AfterPersistUnreadable
+            );
+            if unreadable && self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected campaign read failure");
+            }
+            self.inner.get_campaign(campaign_id).await
+        }
+        async fn put_campaign(&self, campaign: &Campaign) -> anyhow::Result<()> {
+            match self.fault {
+                WriteFault::BeforePersist | WriteFault::BeforePersistUnreadable => {}
+                WriteFault::AfterPersist | WriteFault::AfterPersistUnreadable => {
+                    self.inner.put_campaign(campaign).await?;
+                }
+                WriteFault::AfterPersistThenRevised => {
+                    self.inner.put_campaign(campaign).await?;
+                    let mut revised = campaign.clone();
+                    let later = self.revised_to.clone().context("a later head to write")?;
+                    revised.advance(later, Utc::now());
+                    self.inner.put_campaign(&revised).await?;
+                }
+            }
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("injected campaign write failure")
+        }
+        async fn list_campaigns(
+            &self,
+            after: Option<&CampaignId>,
+            limit: NonZeroUsize,
+        ) -> anyhow::Result<pipette_store::CampaignPage> {
+            self.inner.list_campaigns(after, limit).await
+        }
+        async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()> {
+            self.inner.delete_campaign(campaign_id).await
+        }
+    }
+
+    /// Report a write failure now, then land that write after the caller's
+    /// read back. This models a remote write that outlives its timed-out send.
+    struct LatePut {
+        inner: std::sync::Arc<dyn CampaignStore>,
+        pending: std::sync::Mutex<Option<Campaign>>,
+        read_back: std::sync::atomic::AtomicBool,
+    }
+
+    impl LatePut {
+        fn new(inner: std::sync::Arc<dyn CampaignStore>) -> Self {
+            Self {
+                inner,
+                pending: std::sync::Mutex::new(None),
+                read_back: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        async fn land_after_readback(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.read_back.load(std::sync::atomic::Ordering::SeqCst),
+                "the caller must read back before the write lands"
+            );
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("late write lock poisoned"))?
+                .take()
+                .context("a pending campaign write")?;
+            self.inner.put_campaign(&pending).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignStore for LatePut {
+        async fn get_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<Campaign>> {
+            if self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("late write lock poisoned"))?
+                .is_some()
+            {
+                self.read_back
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_campaign(campaign_id).await
+        }
+
+        async fn put_campaign(&self, campaign: &Campaign) -> anyhow::Result<()> {
+            *self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("late write lock poisoned"))? = Some(campaign.clone());
+            anyhow::bail!("injected campaign write timeout")
+        }
+
+        async fn list_campaigns(
+            &self,
+            after: Option<&CampaignId>,
+            limit: NonZeroUsize,
+        ) -> anyhow::Result<pipette_store::CampaignPage> {
+            self.inner.list_campaigns(after, limit).await
+        }
+
+        async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()> {
+            self.inner.delete_campaign(campaign_id).await
+        }
+    }
+
+    /// An `active` manifest of `campaign_id` on top of `previous`.
+    async fn put_filed(
+        plans: &dyn PlanStore,
+        plan_id: &PlanId,
+        campaign_id: &CampaignId,
+        previous: Option<&PlanId>,
+    ) -> anyhow::Result<()> {
+        plans
+            .put_plan(&PlanManifest {
+                campaign_id: Some(campaign_id.clone()),
+                previous_plan_id: previous.cloned(),
+                ..pipette_core::plan::sample_manifest(plan_id.clone(), PlanStatus::Active, false)?
+            })
+            .await
+    }
+
+    /// What a write that reported a failure comes to, by what the read back
+    /// shows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reconciled {
+        Committed,
+        Unknown,
+    }
+
+    #[rstest::rstest]
+    #[case::lost(WriteFault::BeforePersist, Reconciled::Unknown)]
+    #[case::landed(WriteFault::AfterPersist, Reconciled::Committed)]
+    #[case::landed_then_revised(WriteFault::AfterPersistThenRevised, Reconciled::Committed)]
+    #[case::lost_and_unreadable(WriteFault::BeforePersistUnreadable, Reconciled::Unknown)]
+    #[case::landed_and_unreadable(WriteFault::AfterPersistUnreadable, Reconciled::Unknown)]
+    #[tokio::test]
+    async fn a_failed_campaign_creation_is_read_back(
+        #[case] fault: WriteFault,
+        #[case] expect: Reconciled,
+    ) -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let new = a_new_campaign("nightly")?;
+        let campaign_id = new.campaign_id().clone();
+        let plan_id = PlanId::try_new("plan-first")?;
+        let later = PlanId::try_new("plan-later")?;
+        put_filed(&*stores.plans, &plan_id, &campaign_id, None).await?;
+        put_filed(&*stores.plans, &later, &campaign_id, Some(&plan_id)).await?;
+        let faulty = FaultyPut {
+            revised_to: Some(later),
+            ..FaultyPut::new(stores.campaigns.clone(), fault)
+        };
+
+        let outcome = create_around(&faulty, &*stores.plans, new, plan_id.clone()).await;
+
+        let cancelled = stores.plans.has_cancel_marker(&plan_id).await?;
+        match (expect, outcome) {
+            (Reconciled::Committed, Ok(campaign)) => {
+                assert_eq!(campaign.campaign_id, campaign_id);
+                assert!(!cancelled, "a committed plan is never cancelled");
+            }
+            (
+                Reconciled::Unknown,
+                Err(CampaignAdminError::CommitUnknown {
+                    campaign_id: named_campaign,
+                    plan_id: named_plan,
+                    ..
+                }),
+            ) => {
+                assert_eq!((named_campaign, named_plan), (campaign_id, plan_id));
+                assert!(!cancelled, "an unknown outcome cancels nothing");
+            }
+            (expect, outcome) => anyhow::bail!("expected {expect:?}, got {outcome:?}"),
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::lost(WriteFault::BeforePersist, Reconciled::Unknown)]
+    #[case::landed(WriteFault::AfterPersist, Reconciled::Committed)]
+    #[case::landed_then_revised(WriteFault::AfterPersistThenRevised, Reconciled::Committed)]
+    #[case::lost_and_unreadable(WriteFault::BeforePersistUnreadable, Reconciled::Unknown)]
+    #[case::landed_and_unreadable(WriteFault::AfterPersistUnreadable, Reconciled::Unknown)]
+    #[tokio::test]
+    async fn a_failed_head_write_is_read_back(
+        #[case] fault: WriteFault,
+        #[case] expect: Reconciled,
+    ) -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let campaign = seed(&stores, "nightly").await?;
+        let campaign_id = campaign.campaign_id.clone();
+        let seed_plan = PlanId::try_new("plan-seed")?;
+        let plan_id = PlanId::try_new("plan-first")?;
+        let later = PlanId::try_new("plan-later")?;
+        put_filed(&*stores.plans, &seed_plan, &campaign_id, None).await?;
+        put_filed(&*stores.plans, &plan_id, &campaign_id, Some(&seed_plan)).await?;
+        put_filed(&*stores.plans, &later, &campaign_id, Some(&plan_id)).await?;
+        let faulty = FaultyPut {
+            revised_to: Some(later),
+            ..FaultyPut::new(stores.campaigns.clone(), fault)
+        };
+
+        let outcome = advance(&faulty, &*stores.plans, &campaign_id, plan_id.clone()).await;
+
+        match (expect, outcome) {
+            (Reconciled::Committed, Ok(advanced)) => {
+                assert_eq!(
+                    advanced,
+                    Advanced {
+                        superseded: Some(seed_plan),
+                        changed: true,
+                    }
+                );
+            }
+            (
+                Reconciled::Unknown,
+                Err(CampaignAdminError::CommitUnknown {
+                    campaign_id: named_campaign,
+                    plan_id: named_plan,
+                    ..
+                }),
+            ) => {
+                assert_eq!((named_campaign, named_plan), (campaign_id, plan_id.clone()));
+            }
+            (expect, outcome) => anyhow::bail!("expected {expect:?}, got {outcome:?}"),
+        }
+        assert!(
+            !stores.plans.has_cancel_marker(&plan_id).await?,
+            "a failed head write cancels nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_does_not_cancel_a_write_that_lands_after_readback() -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let new = a_new_campaign("nightly")?;
+        let campaign_id = new.campaign_id().clone();
+        let plan_id = PlanId::try_new("plan-first")?;
+        put_filed(&*stores.plans, &plan_id, &campaign_id, None).await?;
+        let late = LatePut::new(stores.campaigns.clone());
+
+        let outcome = create_around(&late, &*stores.plans, new, plan_id.clone()).await;
+
+        assert!(matches!(
+            outcome,
+            Err(CampaignAdminError::CommitUnknown { .. })
+        ));
+        assert!(!stores.plans.has_cancel_marker(&plan_id).await?);
+        assert_eq!(stores.campaigns.get_campaign(&campaign_id).await?, None);
+        late.land_after_readback().await?;
+        let stored = require(&*stores.campaigns, &campaign_id).await?;
+        assert_eq!(stored.current_plan_id, Some(plan_id.clone()));
+        assert!(!stores.plans.has_cancel_marker(&plan_id).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advance_preserves_a_write_that_lands_after_readback() -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let campaign = seed(&stores, "nightly").await?;
+        let campaign_id = campaign.campaign_id.clone();
+        let previous = PlanId::try_new("plan-seed")?;
+        let plan_id = PlanId::try_new("plan-revision")?;
+        put_filed(&*stores.plans, &previous, &campaign_id, None).await?;
+        put_filed(&*stores.plans, &plan_id, &campaign_id, Some(&previous)).await?;
+        let late = LatePut::new(stores.campaigns.clone());
+
+        let outcome = advance(&late, &*stores.plans, &campaign_id, plan_id.clone()).await;
+
+        assert!(matches!(
+            outcome,
+            Err(CampaignAdminError::CommitUnknown { .. })
+        ));
+        assert!(!stores.plans.has_cancel_marker(&plan_id).await?);
+        let before = require(&*stores.campaigns, &campaign_id).await?;
+        assert_ne!(before.current_plan_id, Some(plan_id.clone()));
+        late.land_after_readback().await?;
+        let stored = require(&*stores.campaigns, &campaign_id).await?;
+        assert_eq!(stored.current_plan_id, Some(plan_id.clone()));
+        assert!(!stores.plans.has_cancel_marker(&plan_id).await?);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2622,11 +3057,214 @@ mod tests {
     /// import.
     fn settings(models: ModelCheck<'_>) -> IngestSettings<'_> {
         IngestSettings {
+            descriptor_config: crate::plan_ingestion::no_offer_rules(),
             models,
             max_jobs: MAX_JOBS,
             creating_max_age: CREATING_MAX_AGE,
             import: None,
         }
+    }
+
+    /// An in-memory S3 queue whose second promotion reports an ambiguous
+    /// error. The destination either has the body or stays absent.
+    fn second_promotion_fails(
+        landed: bool,
+    ) -> (
+        pipette_store_s3::S3TodoStore,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        use aws_sdk_s3::operation::rename_object::{RenameObjectError, RenameObjectOutput};
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_sdk_s3::types::Object;
+        use aws_sdk_s3::types::error::NoSuchKey;
+        use aws_smithy_mocks::{MockResponse, RuleMode, mock};
+
+        let objects = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+            String,
+            Vec<u8>,
+        >::new()));
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_source = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let put = {
+            let objects = objects.clone();
+            mock!(aws_sdk_s3::Client::put_object).then_compute_response(move |req| {
+                let key = req.key().unwrap_or_default().to_string();
+                let bytes = req.body().bytes().unwrap_or_default().to_vec();
+                objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key, bytes);
+                MockResponse::Output(PutObjectOutput::builder().build())
+            })
+        };
+        let get = {
+            let objects = objects.clone();
+            mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
+                match objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(req.key().unwrap_or_default())
+                {
+                    Some(bytes) => MockResponse::Output(
+                        GetObjectOutput::builder()
+                            .body(ByteStream::from(bytes.clone()))
+                            .build(),
+                    ),
+                    None => {
+                        MockResponse::Error(GetObjectError::NoSuchKey(NoSuchKey::builder().build()))
+                    }
+                }
+            })
+        };
+        let list = {
+            let objects = objects.clone();
+            mock!(aws_sdk_s3::Client::list_objects_v2).then_compute_response(move |req| {
+                let prefix = req.prefix().unwrap_or_default();
+                let now = aws_sdk_s3::primitives::DateTime::from_secs(Utc::now().timestamp());
+                let contents = objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .keys()
+                    .filter(|key| key.starts_with(prefix))
+                    .map(|key| Object::builder().key(key).last_modified(now).build())
+                    .collect::<Vec<_>>();
+                MockResponse::Output(
+                    ListObjectsV2Output::builder()
+                        .set_contents(Some(contents))
+                        .is_truncated(false)
+                        .build(),
+                )
+            })
+        };
+        let delete = {
+            let objects = objects.clone();
+            mock!(aws_sdk_s3::Client::delete_object).then_compute_response(move |req| {
+                objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(req.key().unwrap_or_default());
+                MockResponse::Output(
+                    aws_sdk_s3::operation::delete_object::DeleteObjectOutput::builder().build(),
+                )
+            })
+        };
+        let rename = {
+            let objects = objects.clone();
+            let sends = sends.clone();
+            let failed_source = failed_source.clone();
+            mock!(aws_sdk_s3::Client::rename_object).then_compute_response(move |req| {
+                let src = req.rename_source().unwrap_or_default();
+                let dst = req.key().unwrap_or_default();
+                let call = sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut failed = failed_source
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if call == 1 {
+                    *failed = Some(src.to_string());
+                }
+                let ambiguous = failed.as_deref() == Some(src);
+                if ambiguous && !landed {
+                    return MockResponse::Error(RenameObjectError::generic(
+                        ErrorMetadata::builder()
+                            .code("AccessDenied")
+                            .message("injected ambiguous promotion failure")
+                            .build(),
+                    ));
+                }
+                let moved = objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(src);
+                if let Some(bytes) = moved {
+                    objects
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(dst.to_string(), bytes);
+                }
+                if ambiguous {
+                    MockResponse::Error(RenameObjectError::generic(
+                        ErrorMetadata::builder()
+                            .code("AccessDenied")
+                            .message("injected ambiguous promotion failure")
+                            .build(),
+                    ))
+                } else {
+                    MockResponse::Output(RenameObjectOutput::builder().build())
+                }
+            })
+        };
+        let client = aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&put, &get, &list, &delete, &rename]
+        );
+        (
+            pipette_store_s3::S3TodoStore::new(client, "test-bucket", ""),
+            sends,
+        )
+    }
+
+    #[rstest::rstest]
+    #[case::landed(true)]
+    #[case::not_landed(false)]
+    #[tokio::test]
+    async fn three_job_create_reconciles_second_promotion(
+        #[case] landed: bool,
+    ) -> anyhow::Result<()> {
+        let (dir, mut stores) = stores()?;
+        let path = afm_mlx_plan(dir.path())?;
+        let (todo, sends) = second_promotion_fails(landed);
+        stores.todo = std::sync::Arc::new(todo);
+        let new = a_new_campaign("nightly")?;
+        let campaign_id = new.campaign_id().clone();
+
+        let outcome = create(&stores, settings(ModelCheck::none()), new, &path, None).await;
+
+        if landed {
+            let (campaign, report) = outcome?;
+            assert_eq!(report.job_count, 3);
+            assert_eq!(campaign.current_plan_id, Some(report.plan_id));
+            assert!(stores.campaigns.get_campaign(&campaign_id).await?.is_some());
+            assert!(sends.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        } else {
+            assert!(
+                outcome.is_err(),
+                "an absent destination must fail the filing"
+            );
+            assert!(stores.campaigns.get_campaign(&campaign_id).await?.is_none());
+            let plans = pipette_store::drain_plans(&*stores.plans, None)
+                .await?
+                .items;
+            let [creating] = plans.as_slice() else {
+                anyhow::bail!("expected one creating plan, found {}", plans.len());
+            };
+            assert_eq!(creating.status, PlanStatus::Creating);
+            assert!(!stores.plans.has_cancel_marker(&creating.plan_id).await?);
+            crate::queue_maintenance::run(
+                &*stores.todo,
+                &*stores.clients,
+                &*stores.tags,
+                &*stores.submissions,
+                &*stores.plans,
+                &std::collections::HashMap::new(),
+                crate::queue_maintenance::MaintenanceSettings {
+                    tmp_max: std::time::Duration::from_secs(86_400),
+                    plan_creating_max: CREATING_MAX_AGE,
+                    lost_lease_limit: 3,
+                },
+            )
+            .await?;
+            assert!(
+                stores.todo.read_eligible_indexed().await?.is_empty(),
+                "maintenance must not index jobs of the creating plan"
+            );
+            assert!(sends.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        }
+        Ok(())
     }
 
     /// `campaigns create --plan` files the document as the campaign's first
@@ -2662,10 +3300,10 @@ mod tests {
         Ok(())
     }
 
-    /// A campaign write that fails after the first plan is filed names that
-    /// plan and cancels it: it is staged under a campaign id nothing holds.
+    /// A failed campaign write can still land after its negative read back.
+    /// Keep the first plan available for reconciliation.
     #[tokio::test]
-    async fn create_cancels_the_plan_when_the_campaign_write_fails() -> anyhow::Result<()> {
+    async fn create_preserves_the_plan_when_the_campaign_write_fails() -> anyhow::Result<()> {
         let (dir, mut stores) = stores()?;
         stores.campaigns = std::sync::Arc::new(PutFails(stores.campaigns.clone()));
         let path = afm_mlx_plan(dir.path())?;
@@ -2674,10 +3312,9 @@ mod tests {
 
         let outcome = create(&stores, settings(ModelCheck::none()), new, &path, None).await;
 
-        let Err(CampaignAdminError::NotCreated {
+        let Err(CampaignAdminError::CommitUnknown {
             campaign_id: named_campaign,
             plan_id,
-            cancelled,
             ..
         }) = outcome
         else {
@@ -2691,8 +3328,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("the plan was filed"))?;
         assert_eq!(manifest.campaign_id, Some(campaign_id.clone()));
         assert_eq!(stores.campaigns.get_campaign(&campaign_id).await?, None);
-        assert!(cancelled);
-        assert!(stores.plans.has_cancel_marker(&plan_id).await?);
+        assert!(!stores.plans.has_cancel_marker(&plan_id).await?);
         Ok(())
     }
 
@@ -4750,6 +5386,7 @@ benchmarks = ["decode_throughput_512_100"]
         let ctx = IngestContext::from_stores(
             stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -4861,9 +5498,9 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
-    /// The campaign write fails after the revision is filed. The campaign stays
-    /// on its plan, and neither plan is cancelled: nothing the edit kept stops,
-    /// and the error names the revision for an operator to stop.
+    /// The campaign write fails after the revision is filed. The error names
+    /// the revision, and neither plan is cancelled while the write outcome is
+    /// unknown.
     #[tokio::test]
     async fn a_variant_edit_that_cannot_advance_leaves_both_plans_running() -> anyhow::Result<()> {
         let (dir, mut stores) = stores()?;
@@ -4881,8 +5518,8 @@ benchmarks = ["decode_throughput_512_100"]
         )
         .await;
 
-        let Err(CampaignAdminError::NotAdvanced { plan_id, .. }) = outcome else {
-            anyhow::bail!("expected NotAdvanced, got {outcome:?}");
+        let Err(CampaignAdminError::CommitUnknown { plan_id, .. }) = outcome else {
+            anyhow::bail!("expected CommitUnknown, got {outcome:?}");
         };
         assert_ne!(plan_id, first.plan_id);
         let revision = stores
@@ -5246,6 +5883,8 @@ benchmarks = ["decode_throughput_512_100"]
         );
 
         pipette_store_testkit::finish_job(&*stores.submissions, &*stores.todo, &queued).await?;
+        // Only the record's presence is checked: a read of it fails.
+        pipette_store_testkit::local_fs_spoil_record(dir.path(), &queued)?;
         let (_, revised) = rerun(BTreeSet::from([queued])).await?;
         assert_eq!(revised.rerun_job_count, 1);
         Ok(())
@@ -5318,6 +5957,111 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// With the SQL index, a whole-plan re-run uses outcome rows to find
+    /// answered jobs. It does not read their records. A job with a record but
+    /// no outcome row remains unanswered.
+    #[tokio::test]
+    async fn a_whole_plan_rerun_reads_the_outcome_rows() -> anyhow::Result<()> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let (dir, stores) = stores()?;
+        let object = stores.submissions.clone();
+        let stores = pipette_store_sql::overlay(db.db(), stores);
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let jobs: Vec<JobId> = first
+            .job_ids
+            .iter()
+            .map(|(_, job_id)| job_id.clone())
+            .collect();
+        pipette_store_testkit::finish_job(&*stores.submissions, &*stores.todo, &jobs[0]).await?;
+        pipette_store_testkit::finish_job_with_failure(
+            &*stores.submissions,
+            &*stores.todo,
+            &jobs[1],
+        )
+        .await?;
+        pipette_store_testkit::finish_job(&*object, &*stores.todo, &jobs[2]).await?;
+        pipette_store_testkit::local_fs_spoil_record(dir.path(), &jobs[0])?;
+        pipette_store_testkit::local_fs_spoil_record(dir.path(), &jobs[1])?;
+        let head = || Head::read(&*stores.plans, campaign.clone(), None);
+
+        let failed = head()
+            .await?
+            .rerun_answered(&*stores.plans, &*stores.submissions, Answered::Failed)
+            .await?;
+        let all = head()
+            .await?
+            .rerun_answered(&*stores.plans, &*stores.submissions, Answered::All)
+            .await?;
+
+        let unindexed = head()
+            .await?
+            .rerun(
+                &*stores.plans,
+                &*stores.submissions,
+                BTreeSet::from([jobs[2].clone()]),
+            )
+            .await;
+
+        assert_eq!(failed.rerun, BTreeSet::from([jobs[1].clone()]));
+        assert_eq!(
+            all.rerun,
+            BTreeSet::from([jobs[0].clone(), jobs[1].clone()])
+        );
+        assert!(
+            matches!(&unindexed, Err(CampaignAdminError::Unanswered(job_id)) if *job_id == jobs[2]),
+            "{unindexed:?}"
+        );
+        Ok(())
+    }
+
+    /// With the SQL index, a revert uses outcome rows to restore finished runs
+    /// from an earlier plan. It does not read their records.
+    #[tokio::test]
+    async fn a_revert_reads_the_outcome_rows() -> anyhow::Result<()> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let (dir, stores) = stores()?;
+        let stores = pipette_store_sql::overlay(db.db(), stores);
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let (second, _) = edit_variants(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign.campaign_id,
+            &first.plan_id,
+            &VariantEdit::parse("remove = [1]")?,
+            None,
+            Offer::default(),
+        )
+        .await?;
+        for job_id in &ran {
+            pipette_store_testkit::local_fs_spoil_record(dir.path(), job_id)?;
+        }
+
+        let (filed, _) = revert_to(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign.campaign_id,
+            &second.plan_id,
+            &first.plan_id,
+            None,
+        )
+        .await?
+        .context("the revert filed a plan")?;
+        let reverted = stores
+            .plans
+            .get_plan(&filed.plan_id)
+            .await?
+            .context("the revert")?;
+        assert!(!ran.is_empty());
+        assert!(ran.iter().all(|job_id| reverted.job_ids.contains(job_id)));
+        Ok(())
+    }
+
     /// `campaigns rerun --dry-run` checks the jobs as a re-run does and answers
     /// the head's document and its bodies, and writes nothing.
     #[tokio::test]
@@ -5344,7 +6088,7 @@ benchmarks = ["decode_throughput_512_100"]
         let report = dry_run(BTreeSet::from([queued.clone()])).await?;
 
         assert_eq!(
-            report.document,
+            report.report.document,
             include_str!("../../../examples/plans/scheduler/afm-mlx.toml")
         );
         assert_eq!(report.report.bodies.len(), first.job_ids.len());
@@ -5409,6 +6153,7 @@ benchmarks = ["decode_throughput_512_100"]
         let ctx = IngestContext::from_stores(
             stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -5445,12 +6190,326 @@ benchmarks = ["decode_throughput_512_100"]
         .await
     }
 
+    /// Write an eval definition for each of `evals`, and the plan `dir/file`
+    /// whose variant runs `benchmarks`.
+    fn eval_plan(
+        dir: &std::path::Path,
+        file: &str,
+        evals: &[&str],
+        benchmarks: &[&str],
+    ) -> anyhow::Result<std::path::PathBuf> {
+        for id in evals {
+            std::fs::write(
+                dir.join("benchmarks").join(format!("{id}.toml")),
+                include_str!("../../../examples/benchmarks/eval_ifbench_2026.06.1.toml"),
+            )?;
+        }
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            MLX_700M_VARIANT.replace(
+                "benchmarks = [\"decode_throughput_512_100\"]",
+                &format!("benchmarks = {benchmarks:?}"),
+            ),
+        )?;
+        Ok(path)
+    }
+
+    async fn created_evals(
+        stores: &Stores,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<(Campaign, IngestReport)> {
+        afm_mlx_plan(dir)?;
+        let path = eval_plan(
+            dir,
+            "eval-plan.toml",
+            &["eval_a", "eval_b"],
+            &["eval_a", "eval_b", "decode_throughput_512_100"],
+        )?;
+        let (campaign, mut report) = create(
+            stores,
+            settings(ModelCheck::none()),
+            a_new_campaign("nightly")?,
+            &path,
+            None,
+        )
+        .await?;
+        // Sort the two evals first, so that the tests can name them as
+        // `job_ids[0]` and `job_ids[1]`.
+        let evals: BTreeSet<JobId> = futures::stream::iter(&report.job_ids)
+            .then(|(_, id)| async move {
+                let body = stores
+                    .plans
+                    .get_job_source(id)
+                    .await?
+                    .context("job source")?;
+                let eval = body["spec"]["benchmark"]
+                    .as_str()
+                    .is_some_and(|benchmark| benchmark.starts_with("eval_"));
+                anyhow::Ok(eval.then(|| id.clone()))
+            })
+            .try_filter_map(|id| async move { Ok(id) })
+            .try_collect()
+            .await?;
+        report.job_ids.sort_by_key(|(_, id)| !evals.contains(id));
+        Ok((campaign, report))
+    }
+
+    /// This test is opt-in. It writes hundreds of large processed results and
+    /// uses the production pool timeout of 10 seconds. One request task runs
+    /// all the staging futures.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "large recalculation reproduction; requires PostgreSQL and several GB of RAM"]
+    async fn large_recalculation_pool_reproduction() -> anyhow::Result<()> {
+        let db = pipette_store_sql::scratch::TestDb::with_pool_size(32)
+            .await?
+            .context("TEST_DATABASE_URL is required")?;
+        let (dir, mut stores) = stores()?;
+        stores.submissions = pipette_store_s3::in_memory_submission_store();
+        let stores = pipette_store_sql::overlay(db.db(), stores);
+        afm_mlx_plan(dir.path())?;
+        let count: usize = std::env::var("PIP_RECALC_JOBS")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(256);
+        let megabytes: usize = std::env::var("PIP_RECALC_MB")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(30);
+        let benchmarks: Vec<_> = (0..count).map(|i| format!("eval_load_{i:04}")).collect();
+        let benchmarks: Vec<&str> = benchmarks.iter().map(String::as_str).collect();
+        let path = eval_plan(dir.path(), "load-plan.toml", &benchmarks, &benchmarks)?;
+        let (campaign, first) = create(
+            &stores,
+            settings(ModelCheck::none()),
+            a_new_campaign("recalculation-load")?,
+            &path,
+            None,
+        )
+        .await?;
+        assert_eq!(first.job_ids.len(), count);
+        for (_, id) in &first.job_ids {
+            let mut body = pipette_store_testkit::success_record(id, "eval");
+            body["completions"][0]["completion"] =
+                serde_json::Value::String("x".repeat(megabytes * 1024 * 1024));
+            stores.submissions.write_processed(id, &body).await?;
+            stores.todo.delete_avail_by_job(id).await?;
+        }
+        eprintln!("recalculation seeded: jobs={count}, result_mb={megabytes}");
+        let started = std::time::Instant::now();
+        let result = recalculate(
+            &stores,
+            &campaign,
+            first.job_ids.iter().map(|(_, id)| id.clone()).collect(),
+        )
+        .await;
+        eprintln!(
+            "recalculation elapsed={:?}, error={:?}",
+            started.elapsed(),
+            result.as_ref().err()
+        );
+        let (report, revised) = result?;
+        assert_eq!(revised.recalculated_job_count, count);
+        assert_eq!(report.job_count, count);
+        Ok(())
+    }
+
+    /// The manifest's `benchmark_types` type each job. A manifest without
+    /// them types each job by its id's prefix.
+    #[rstest::rstest]
+    #[case::legacy(&[], true)]
+    #[case::unknown_type(&[("unrelated", BenchmarkType::Eval)], false)]
+    #[tokio::test]
+    async fn recalculation_uses_filed_types_or_legacy_prefixes(
+        #[case] recorded: &[(&str, BenchmarkType)],
+        #[case] rescorable: bool,
+    ) -> anyhow::Result<()> {
+        let (dir, stores) = stores()?;
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
+        let mut manifest = stores
+            .plans
+            .get_plan(&first.plan_id)
+            .await?
+            .context("manifest")?;
+        manifest.benchmark_types = recorded
+            .iter()
+            .map(|(id, kind)| Ok((BenchmarkId::try_new(*id)?, *kind)))
+            .collect::<anyhow::Result<_>>()?;
+        stores.plans.put_plan(&manifest).await?;
+        let id = first.job_ids[0].1.clone();
+        finish(&stores, &id, "eval").await?;
+
+        let named = Head::read(&*stores.plans, campaign.clone(), None)
+            .await?
+            .recalculate(
+                &*stores.plans,
+                &*stores.submissions,
+                BTreeSet::from([id.clone()]),
+            )
+            .await;
+        let whole = Head::read(&*stores.plans, campaign, None)
+            .await?
+            .recalculate_evals(&*stores.plans, &*stores.submissions)
+            .await;
+
+        if rescorable {
+            assert_eq!(named?.recalculate, BTreeSet::from([id.clone()]));
+            assert_eq!(whole?.recalculate, BTreeSet::from([id]));
+        } else {
+            assert!(
+                matches!(named, Err(CampaignAdminError::NotRescorable(_))),
+                "{named:?}"
+            );
+            assert!(
+                matches!(whole, Err(CampaignAdminError::NoneRescorable(_))),
+                "{whole:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A whole-plan recalculation skips a job whose source is unreadable. A
+    /// named recalculation of that job fails, because the job may be an eval.
+    #[tokio::test]
+    async fn an_unreadable_source_is_skipped_only_by_a_whole_plan_recalculation()
+    -> anyhow::Result<()> {
+        let (dir, stores) = stores()?;
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
+        let (readable, unreadable) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
+        finish(&stores, &readable, "eval").await?;
+        finish(&stores, &unreadable, "eval").await?;
+        std::fs::write(
+            dir.path()
+                .join("job-sources")
+                .join(format!("{unreadable}.json")),
+            "not json",
+        )?;
+
+        let whole = Head::read(&*stores.plans, campaign.clone(), None)
+            .await?
+            .recalculate_evals(&*stores.plans, &*stores.submissions)
+            .await?;
+        assert_eq!(whole.recalculate, BTreeSet::from([readable.clone()]));
+
+        let named = Head::read(&*stores.plans, campaign, None)
+            .await?
+            .recalculate(
+                &*stores.plans,
+                &*stores.submissions,
+                BTreeSet::from([readable, unreadable]),
+            )
+            .await;
+        assert!(
+            matches!(named, Err(CampaignAdminError::Store(_))),
+            "{named:?}"
+        );
+        Ok(())
+    }
+
+    /// The pre-check reads no result body. A finished eval job whose record is
+    /// not an eval's success passes it, and its copy then fails. The revision
+    /// stays in `creating`.
+    #[tokio::test]
+    async fn a_record_that_is_not_an_eval_success_fails_at_the_copy() -> anyhow::Result<()> {
+        let (dir, stores) = stores()?;
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
+        let id = first.job_ids[0].1.clone();
+        let body = pipette_store_testkit::success_record(&id, "decode_throughput");
+        stores.submissions.write_processed(&id, &body).await?;
+        stores.todo.delete_avail_by_job(&id).await?;
+
+        let result = recalculate(&stores, &campaign, BTreeSet::from([id.clone()])).await;
+
+        let error = result.err().context("the copy must fail")?;
+        assert!(matches!(&error, CampaignAdminError::Store(_)), "{error:?}");
+        assert!(format!("{error:#}").contains("answering job"), "{error:#}");
+        let plans = pipette_store::drain_plans(&*stores.plans, None)
+            .await?
+            .items;
+        let creating = plans
+            .iter()
+            .find(|p| p.plan_id != first.plan_id)
+            .context("creating revision")?;
+        assert_eq!(creating.status, PlanStatus::Creating);
+        Ok(())
+    }
+
+    /// SQL summaries answer both pre-checks even when result bodies are
+    /// unreadable. A job with a record but no outcome row remains unanswered.
+    #[rstest::rstest]
+    #[case(BenchmarkType::Eval)]
+    #[case(BenchmarkType::VlmEval)]
+    #[case(BenchmarkType::AsrEval)]
+    #[tokio::test]
+    async fn recalculation_prechecks_use_summaries(
+        #[case] kind: BenchmarkType,
+    ) -> anyhow::Result<()> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let (dir, stores) = stores()?;
+        // Seed the catalog and plan before the overlay; the test only needs SQL outcomes.
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
+        let submissions = pipette_store_sql::overlay(db.db(), stores.clone()).submissions;
+        let mut manifest = stores
+            .plans
+            .get_plan(&first.plan_id)
+            .await?
+            .context("manifest")?;
+        for value in manifest.benchmark_types.values_mut() {
+            if value.is_scored_via_server() {
+                *value = kind;
+            }
+        }
+        stores.plans.put_plan(&manifest).await?;
+        // The second eval's record has no outcome row, so it is unanswered.
+        let unindexed = first.job_ids[1].1.clone();
+        for (_, id) in &first.job_ids {
+            let writer = if *id == unindexed {
+                &*stores.submissions
+            } else {
+                &*submissions
+            };
+            writer
+                .write_processed(id, &pipette_store_testkit::success_record(id, "eval"))
+                .await?;
+            pipette_store_testkit::local_fs_spoil_record(dir.path(), id)?;
+        }
+        let expected = BTreeSet::from([first.job_ids[0].1.clone()]);
+        let head = || Head::read(&*stores.plans, campaign.clone(), None);
+        let whole = head()
+            .await?
+            .recalculate_evals(&*stores.plans, &*submissions)
+            .await?;
+        assert_eq!(whole.recalculate, expected);
+        let named = head()
+            .await?
+            .recalculate(&*stores.plans, &*submissions, expected.clone())
+            .await?;
+        assert_eq!(named.recalculate, expected);
+        let refused = head()
+            .await?
+            .recalculate(
+                &*stores.plans,
+                &*submissions,
+                BTreeSet::from([unindexed.clone()]),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(CampaignAdminError::Unanswered(job_id)) if *job_id == unindexed),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
     /// The named cell becomes an unclaimable new job answered by a copy of the
     /// named job's record; the other jobs carry over.
     #[tokio::test]
     async fn a_recalculation_scores_one_eval_again_and_keeps_the_rest() -> anyhow::Result<()> {
         let (dir, stores) = stores()?;
-        let (campaign, first) = created(&stores, dir.path()).await?;
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let jobs: Vec<JobId> = first
             .job_ids
             .iter()
@@ -5629,7 +6688,7 @@ benchmarks = ["decode_throughput_512_100"]
     #[tokio::test]
     async fn a_whole_head_recalculation_takes_only_the_finished_evals() -> anyhow::Result<()> {
         let (dir, stores) = stores()?;
-        let (campaign, first) = created(&stores, dir.path()).await?;
+        let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let [eval, failed, measured] = [0, 1, 2].map(|i| first.job_ids[i].1.clone());
         finish(&stores, &eval, "eval").await?;
         pipette_store_testkit::finish_job_with_failure(
@@ -5673,7 +6732,7 @@ benchmarks = ["decode_throughput_512_100"]
             Offer::default(),
         )
         .await?;
-        assert!(dry_run.document.contains("LFM2-700M-MLX-4bit"));
+        assert!(dry_run.report.document.contains("LFM2-700M-MLX-4bit"));
         assert_eq!(dry_run.report.bodies.len(), 3);
         let ios = queued_requiring(&stores, &first, "os:ios").await?;
         assert_eq!(
@@ -5717,7 +6776,7 @@ benchmarks = ["decode_throughput_512_100"]
             Offer::default(),
         )
         .await?;
-        assert_eq!(dry_run.document, document);
+        assert_eq!(dry_run.report.document, document);
         assert_eq!(dry_run.report.bodies.len(), 4);
         let unchanged = dry_run_revise_document(
             &stores,

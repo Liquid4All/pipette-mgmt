@@ -60,10 +60,14 @@ export const entryDescriptor = (entry: VaultEntry | null | undefined): Model | R
 /** A vault path, as a source holds one under whichever key. */
 const VAULT_PATH = /^\/vault\/resources\/([^/]+)\/content$/;
 
-/** One vault source of a descriptor: the resources its paths name, and the `custom_label` it gives them. */
+/**
+ * One vault source of a descriptor: the resources its paths name, the `custom_label` it gives them, and the
+ * `principal_id` it fetches them for.
+ */
 interface VaultSource {
   ids: string[];
   label: string | null;
+  principal: string | null;
 }
 
 /** Every object of `value` that holds a vault path, in the order its JSON does. */
@@ -74,7 +78,10 @@ function vaultSources(value: unknown): VaultSource[] {
   const fields = Object.values(rest);
   const ids = fields.flatMap((field) => (typeof field === "string" ? VAULT_PATH.exec(field)?.[1] ?? [] : []));
   return [
-    ...(ids.length ? [{ ids, label: typeof label === "string" ? label : null }] : []),
+    ...(ids.length ? [{
+      ids, label: typeof label === "string" ? label : null,
+      principal: typeof rest.principal_id === "string" ? rest.principal_id : null,
+    }] : []),
     ...fields.flatMap(vaultSources),
   ];
 }
@@ -101,6 +108,14 @@ export function unlabelled(value: unknown): unknown {
 /** Every vault resource a descriptor names, each once, in the order its JSON does. */
 export const vaultIds = (descriptor: unknown): string[] =>
   [...new Set(vaultSources(parsed(descriptor)).flatMap(({ ids }) => ids))];
+
+/**
+ * Whether `owner` owns every vault resource that `descriptor` names: each source is for `owner`, and `names` has each
+ * resource. A read's `names` holds only the resources that exist and that the reader can reach.
+ */
+export const vaultOwnedBy = (descriptor: unknown, owner: string, names: Readonly<Record<string, string>>): boolean =>
+  vaultSources(parsed(descriptor))
+    .every(({ ids, principal }) => principal === owner && ids.every((id) => names[id] !== undefined));
 
 /** What a descriptor's vault source reads as, and the resource whose page says more. */
 export interface DescriptorName {

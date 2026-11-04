@@ -57,12 +57,12 @@ body above or a dry run's `200` body.
 
 **The two writes, and their order.** The plan is written first and the campaign
 second. The reverse order would create a campaign naming a plan that may not
-exist. If the campaign write fails, the server cancels the plan it just filed,
-because no record holds the campaign id the plan names. The `500`
-[error body](../../httpapi.md#11-error-responses) carries no detail. The
-server log names both ids and whether the cancel took. If the cancel failed too, an operator cancels the plan.
-Either way, the create can be sent again. Once the plan write begins, both
-writes finish even if the client disconnects.
+exist. If the campaign write reports a failure, the server reads the campaign
+back. If it does not find the new plan, the `500` [error body](../../httpapi.md#11-error-responses)
+names both ids and the server preserves the plan. A timed-out write can still
+land after that read. Reconcile the outcome before cancelling or refiling
+([recovery](../../operations.md#35-recover-from-a-failed-campaign-filing)).
+Once the plan write begins, both writes finish even if the client disconnects.
 
 The [console app](../../../ui/README.md#pages) draws the same create as a form.
 
@@ -82,3 +82,7 @@ The route also answers the errors every filing answers
 | 415 | The `Content-Type` is not `application/toml` |
 | 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |
 | 502 | HuggingFace failed during an import, as [the filing errors](../campaigns.md#errors) describe |
+
+A `runtimes` entry can be a catalog name.
+[Catalog names](../campaigns.md#catalog-names) describes how the server resolves
+it, and what the `document` of the answer holds.

@@ -134,6 +134,8 @@ runtimes = [{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-ar
     format!("expires_at = 2026-12-01T00:00:00Z\nbenchmarks = [\"b\"]\n{VARIANT}"),
     true
 )]
+#[case::catalog_name(CREATE, include_str!("../../../examples/plans/catalog/runtime-name.toml").to_owned(), true)]
+#[case::no_runtimes(CREATE, VARIANT.replace("runtimes = [{ type = \"mlx_macos_pipette\"", "runtimes = [] #"), false)]
 #[case::no_models(CREATE, VARIANT.replace("models = [{ type = \"mlx\"", "models = [] #"), false)]
 #[case::an_edit("~1api~1v1~1campaigns~1{campaign_id}~1variants/post", format!("remove = [0]\n{VARIANT}"), true)]
 #[case::an_edit_with_a_plan_key(

@@ -145,11 +145,7 @@ pub struct TestDb {
 impl TestDb {
     /// `None` if no server exists to test against and the run is not in CI.
     pub async fn new() -> anyhow::Result<Option<Self>> {
-        let Some(test_db) = Self::unmigrated().await? else {
-            return Ok(None);
-        };
-        crate::migrate::migrate(&test_db.db, None, false).await?;
-        Ok(Some(test_db))
+        Self::with_pool_size(POOL_SIZE).await
     }
 
     /// A schema with no tables, for the tests of the migrator.
@@ -160,6 +156,20 @@ impl TestDb {
         let schema = Schema::create(&admin).await?;
         Ok(Some(Self {
             db: schema.connect(POOL_SIZE),
+            _schema: schema,
+        }))
+    }
+
+    /// A migrated schema with a specific pool size for opt-in load tests.
+    pub async fn with_pool_size(max_connections: u32) -> anyhow::Result<Option<Self>> {
+        let Some(admin) = server()? else {
+            return Ok(None);
+        };
+        let schema = Schema::create(&admin).await?;
+        let db = schema.connect(max_connections);
+        crate::migrate::migrate(&db, None, false).await?;
+        Ok(Some(Self {
+            db,
             _schema: schema,
         }))
     }

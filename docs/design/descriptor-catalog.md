@@ -27,11 +27,11 @@ catalog adds a readable name on top.
 
 | Property | Because |
 |---|---|
-| A new member never changes the member that a name selects for a device | a new member can only go at the end of the precedence, and a name is never used twice |
+| A new member never changes the member that a name selects for a device | a new member can only go at the end of the precedence |
 | A result row shows which build ran | a row shows `name::flavor`, never the bare name |
 | The catalog only names builds | the catalog stores no claim about success; run evidence comes from result rows and never selects an entry |
 | Results from before the catalog can get names | the console looks up names by descriptor digest, exactly or through a verified alias |
-| A stored plan never changes meaning | ingestion replaces each name with its descriptor before it stores the plan |
+| A stored plan never changes meaning | ingestion replaces each name with its descriptor before it stores the plan, so a later rename does not touch it |
 | A device is offered only what it can run | offer rules deny by default |
 | A name means the same thing to every reader of its scope | each scope has one namespace, and a reader outside an organization sees the qualified name |
 | Catalog reads follow their scope | a global name names only public artifacts. Only the members of an organization and the holders of `edit_any_catalog` read an org entry |
@@ -115,7 +115,12 @@ members after it is created, with three limits:
 - **The end of the precedence.** A new member goes after every member that the
   entry has. A device that resolved the name before resolves it to the same
   member after.
-- **No other change.** Nothing removes, changes or reorders a member.
+- **No other change.** Nothing removes or reorders a member. The only change
+  to a member is a new quantization label for a model member
+  ([below](#renames)).
+
+A merge of two entries adds members in the same way: at the end of the target
+entry, with the same checks ([below](#merges)).
 
 A different build is a new entry under a new name. An entry with one member is
 valid. That is the usual shape of a hand-made entry for a custom build.
@@ -130,8 +135,9 @@ by precedence
 A single space can separate two other characters, for example
 `LFM2.5 Audio 1.5B`. A name has at most 200 characters.
 
-The catalog shows a name in the case that its creator wrote. Uniqueness and
-lookup ignore case, so two names cannot differ only in case. A name contains
+The catalog shows a name in the case that its creator wrote, or in the case of
+its last rename ([below](#renames)). Uniqueness and lookup ignore case, so two
+names cannot differ only in case. A name contains
 no `:`, so `::` is always
 the member separator. A name contains no `/`, so `/` always separates a scope
 from a name.
@@ -295,12 +301,71 @@ A Mac matches only `macos-*` flavors, so one ordered list per entry is
 sufficient. On a Linux host with a GPU, the order is a decision. For example,
 the CUDA build can come before the CPU build.
 
+An iOS app runtime has one flavor, `ios-arm64`, so an entry for it has one
+member. Each app build has its own entry. A device can report more than one
+build, and it resolves each entry whose build it reports.
+
 **A new member does not become the default for a device that the entry already
 served.** Suppose that `llamacpp-v0.7.0` selects `linux-cuda-12-8` on a CUDA host,
 and the entry later gets a CUDA 13.4 member. The bare name still selects
 `linux-cuda-12-8` on that host. A user who wants the new build selects it with
 `::`. A new member at any other position would change what a bare name selects,
 so the same plan text would select different builds at different times.
+
+### iOS app runtime builds
+
+The iOS app can contain `llamacpp_ios_pipette`, `mlx_ios_pipette`, and
+`onnx_genai_ios_pipette` runtimes. Each descriptor has the `ios-arm64` flavor.
+For each runtime it can run, a device reports
+`runtime:descriptor:<digest>`, where `<digest>` is the full 64-character,
+lowercase hex SHA-256 of that runtime's canonical descriptor JSON. Use the
+existing `pipette-plan-types::descriptor_digest` algorithm over the **full
+runtime descriptor**, including the runtime type, repository and version,
+every package pin, flavor, and other identity fields. For these runtimes this
+is the catalog member's runtime descriptor digest, not a shortened commit or
+a digest of just one package. Clients report build flags, never catalog names.
+
+`pipette-plan-types::runtime_build_flag` takes a runtime descriptor. It
+returns this flag for the three runtime types that the iOS app contains. It
+returns `None` for every other runtime type. The server and the Rust iOS proxy
+use that function.
+The Swift app computes the same canonical digest from the descriptor that it
+ships. A cross-language test checks that the Swift output matches the shared
+function. Old `runtime:llama_cpp:<build>` and package-level flags remain
+alongside the new flag while plans require them.
+They do not satisfy the catalog's build check.
+
+**An iOS member needs both checks.** A configured offer rule for its runtime
+type and `ios-arm64` flavor must exist, and the device must satisfy that
+rule's `requires` and `any_of` clauses. The device must also report the
+member's exact `runtime:descriptor:<digest>` flag. Without the rule or the
+flag, the member is withheld.
+
+A device that does not meet the rule's clauses
+gets the withheld reason `not_met`. A device that meets them but does not
+report the build flag gets `no_build`, and the reason names the flag. A rule
+can require `os:ios` or a `device:` flag; it must not depend on `chip:` until
+iOS clients report one consistent form.
+
+The build check applies to catalog offers and name resolution, not to job
+matching. The catalog offers no runtime from the iOS app to a device that
+reports only the old runtime flags.
+
+A plan variant that gives the bare name of an iOS entry must admit only
+devices that report the build. Each listed client must report the build flag.
+A variant with `requires` must include the flag in `requires`. Otherwise
+ingestion refuses the name, and the refusal names the flag to add. An explicit
+`name::ios-arm64` skips the check, as for every explicit member.
+
+An app running directly reports the builds it contains. A device behind
+`pipette-ios-proxy` reports the union of the runtime descriptors in the app
+builds that its pool can install for that device. The proxy installs the app
+whose runtime matches the selected job. Its advertised set does not shrink
+to whichever app happens to be installed now.
+
+Operators first create app-build entries by hand with `pipette-mgmt catalog
+create` and set their member precedence. Importing a manifest of shipped
+app builds is a later step.
 
 ### Fields that the clients do not send yet
 
@@ -311,9 +376,11 @@ send these fields before the catalog can offer `linux-*` members. The client
 change is ticket CAT23. Linux clients report `os:<distribution>`. macOS clients
 report `os:macos` and `chip:` flags.
 
-A build that is compiled into the iOS or Android app is a later step. The
-client reports it as `runtime:<name>:<build>`, and the server maps that build to
-a catalog name. A client never reports a catalog name.
+The new iOS app runtime build flags described above are not yet in every
+client profile. Until the app and proxy send them, the catalog withholds
+their runtime members. Android runs use `llamacpp_cli_stock_tools` with an
+Android flavor, which the existing offer rules cover; they do not use the
+iOS app runtime build flag.
 
 ## Names in plans
 
@@ -373,7 +440,8 @@ A member that the entry gets later goes at the end of the precedence. So it
 does not change the candidate of a plan that resolved before.
 
 **Ingestion rewrites the document before it stores it.** Each name becomes its
-member's descriptor, with a comment that gives the qualified name. Nothing else in the
+member's descriptor, with a comment that gives the qualified name at the time of
+filing. A later rename does not change the comment. Nothing else in the
 document changes. A campaign revision expands the stored document again, so a
 revision never resolves a name a second time. Ingestion already rewrites a gated
 Hugging Face model in the same way ([plan-ingestion.md](../plan-ingestion.md)).
@@ -553,12 +621,14 @@ make the evidence ambiguous again. If a later version needs classes, the flags
 that each finished run held (`submission_outcomes.run_flags`) are the input.
 
 **The evidence comes from the result rows.** A warehouse row carries the
-`client_id`, the `runtime_descriptor_sha256`, `failed`, the `client_version` and
-the times. A member matches a row through its digest or a verified alias. The
-evidence is either a query of the warehouse, or a small index that the scorer
-keeps current. The index has one row for each digest and `client_id`: the last
-success, the last failure and the client version. A rebuild from the warehouse
-can make it again, as a backfill makes `submission_outcomes`.
+`client_id`, the `runtime_descriptor_sha256`, the `model_descriptor_sha256`,
+`failed`, the `client_version` and the times. A member matches a row through
+its digest or a verified alias. A small index that the scorer keeps current
+holds the evidence ([storage.md](../storage.md#46-the-run-evidence-index)). The
+index has one row for each digest and `client_id`: the last success, the last
+failure and the client version of each. `db backfill-run-evidence` makes it
+again from the warehouse. Runtime members and model members both have
+evidence.
 
 **A broken build becomes visible, and an operator acts on it.** If all the
 recent daily builds fail on a platform, the evidence shows the failures. An
@@ -600,9 +670,10 @@ its result and the assets that it did not classify.
   catalog offers it to, its run evidence on all devices (labeled as such), and
   its descriptor with a "copy as plan TOML" control;
 - the other names of the same descriptors, each with its scope and kind badges;
-- for an org entry and a reader who holds `edit_any_catalog`, or `edit_catalog`
-  in the organization of the entry, the controls to pin, unpin, hide, unhide
-  and tombstone the entry. Tombstone asks the reader to type the name again.
+- for an org entry, controls to pin, unpin, hide, unhide, rename, and tombstone
+  it. Show a control to change a model member's label ([below](#renames)). Show
+  these controls to a reader with `edit_any_catalog` or the organization's
+  `edit_catalog` permission. Tombstone asks the reader to type the name again.
 
 The entry page has no form to add a member. The campaign page adds a runtime
 or a model to an org entry that already exists
@@ -653,8 +724,9 @@ refuses a model whose format and quantization match those of a member
 fails, the dialog can only create an entry.
 
 The console shows the button only for a
-descriptor that has no name in that organization. It shows the button only to
-one of these readers:
+descriptor that has no name in that organization: no org name and no global
+name. An org name that shadows a global name comes from the HTTP API or the
+CLI. The console shows the button only to one of these readers:
 
 - a member of that organization that holds `edit_catalog`;
 - a reader in no organization that holds `edit_any_catalog`.
@@ -671,7 +743,6 @@ does not match the campaign's rows ([below](#members-never-change)).
 The console also disables the button for these descriptors, and tells the
 reader why:
 
-- a runtime descriptor with a vault source;
 - a model with one of these sources or types:
   - a URL;
   - a local file;
@@ -712,12 +783,104 @@ applies expiry when it creates an entry. So an entry whose release is already
 too old for its kind starts as hidden. A hidden entry still resolves and still
 shows, so it still names old results.
 
-**A tombstone is for a mistake,** for example a wrong descriptor or a typo in a
-name. A tombstoned name does not resolve and does not show. Nobody can create
-the same name again in the same scope.
+**A tombstone is for a wrong descriptor.** A tombstoned name does not resolve
+and does not show. Nobody can create the same name again in the same scope, and
+no rename can take it. A typo in a name or in a quantization label is a rename
+([below](#renames)), not a tombstone.
 
 **The daily importer run also applies automatic expiry.** So expiry needs no
 schedule of its own.
+
+## Renames
+
+**A hand-made entry can get a new name.** The new name passes the same checks
+as a name in `create`:
+
+- the grammar;
+- the reserved patterns of the global scope;
+- no tombstoned entry has the name in the same scope.
+
+If a live entry has the name, the rename is a merge ([below](#merges)).
+
+A change of case only is also a rename. It keeps the lookup key, so the old
+spelling still resolves.
+
+**A stable or daily entry keeps its name.** The importer makes the name from
+the upstream release, and it finds its own entries by that name. A tombstoned
+entry also keeps its name.
+
+**The old name is free at once.** Lookup no longer finds the entry by the old
+name. Any entry in the same scope can take the old name later, also the
+renamed entry. The old name does not shadow a global name. So in an
+organization that renames `acme/foo` to `acme/bar`, a bare `foo` selects the
+global `foo`, if one exists.
+
+**A rename changes no stored record:**
+
+- A stored plan holds descriptors, not names. Its comments keep the catalog
+  names from when the server stored the plan.
+- A job row or a result row finds its name by the descriptor digest when the
+  console shows it. So it shows the new name at once.
+- The audit log and the importer's run records keep the old name, because they
+  record the past.
+
+**A plan file outside the server can change meaning.** A copy kept elsewhere
+still gives the old name. After the rename, that name is
+unknown, selects the global entry of that name, or selects an entry that took
+the name later. Most plans are on the server, where ingestion stored their
+descriptors, so this risk is small.
+
+**The quantization label of a model member can change in the same way.** The
+new label must not be in use on another member of the entry with the same
+format. The old label is free at once. The label is not part of the descriptor,
+so the digest, the position and the descriptor of the member stay the same. A
+flavor comes from the descriptor, so a runtime member key cannot change.
+
+**A rename can stop a page of the full list.** The list cursor holds the
+scope and the name. If a reader pages through the list during a rename of the
+cursor's entry, the next page gives an error, and the reader starts the list
+again. Renames are rare, so the list does not prevent this.
+
+### Merges
+
+**A rename to the name of a live hand-made entry merges the two entries.** An
+operator sometimes creates an entry under a wrong name for another flavor or
+quantization of an existing entry. The rename to the name of that entry
+corrects the mistake. The catalog treats the members of the renamed entry as
+new members of the target entry, and checks them as `add-member` does:
+
+- Both entries hold runtimes, or both hold models.
+- For runtimes, all members have one runtime type and one build.
+- No two members have the same flavor, the same format and quantization, or the
+  same digest.
+
+**A member that the target already holds is skipped.** `create` and
+`add-member` only note a digest that another entry of the scope holds, so two
+entries can hold the same member. A member with the digest and the key of a
+target member is already in the target, so the merge skips it. A member with
+the same key and a different digest refuses the merge. A member with the same
+digest under a different label also refuses it. Relabel the member first.
+
+**The other members go to the end of the target entry.** They keep their order
+and the time that each was added. The target keeps its state, its release
+time, and its earlier members, so a name that resolved before resolves to the
+same member after.
+
+**The merge deletes the renamed entry.** Its name is free at once, as after a
+rename. A row of a moved member shows the name of the target entry at once,
+because the console finds names by digest. Nothing undoes a merge, because
+nothing removes a member.
+
+**A merge needs two hand-made entries.** The importer finds its entries by
+name and gives them their members, so a stable or daily entry never takes part
+in a merge. A tombstoned name refuses the rename.
+
+**The same callers rename an entry and change a label.** For a global entry,
+only the host CLI does it. For an org entry, the console, the HTTP API and the
+host CLI do it, with the permissions of the other writes
+([below](#who-changes-the-catalog)). The audit log records each rename, each
+merge, and each label change. Each one also logs the change at `info`, with the old and the new
+value.
 
 ## Who changes the catalog
 
@@ -746,7 +909,8 @@ gives its names when an operator grants the group. An account that got
 `org_member` before this permission existed needs a grant by name.
 
 The routes are under `/api/v1/orgs/{org_id}/descriptor-catalog`. They create an
-entry, add a member, change the state, and tombstone an entry. They do the same
+entry, add a member, change the state, rename an entry, change the quantization
+label of a model member, and tombstone an entry. They do the same
 checks as the CLI. An organization that the caller cannot reach answers `404`,
 as the other routes under `/api/v1/orgs` do. The organization's audit log
 records each write. Each write also logs the change at `info`, with the fields
@@ -759,11 +923,13 @@ the global entry:
 | Command | Does |
 |---|---|
 | `import` | runs the importers, and applies automatic expiry; cron runs it |
-| `create <file>` | creates a hand-made entry from a TOML file; `--dry-run` checks the file and writes nothing |
-| `add-member <name> <file>` | appends one member from `runtime = { ... }` to a hand-made entry; `--dry-run` writes nothing |
+| `create [<file>]` | creates a hand-made entry from a TOML file, or from `--name` and `--runtime` or `--model` JSON values; `--dry-run` checks the input and writes nothing |
+| `add-member <name> [<file>]` | appends one member from a TOML file, or from a `--runtime` or `--model` JSON value, to a hand-made entry; `--dry-run` writes nothing |
 | `refresh <name>` | reads an importer entry's release again, and adds the members that the entry does not have |
 | `pin`, `unpin` | moves an entry between pinned and active |
 | `hide`, `unhide` | moves an entry between active and hidden |
+| `rename <name> <new-name>` | gives a hand-made entry a new name, or merges it into the live hand-made entry with that name ([below](#renames)); `--dry-run` writes nothing |
+| `relabel <name>` | changes the quantization label of a model member, with `--format`, `--from` and `--to`; `--dry-run` writes nothing |
 | `tombstone` | tombstones an entry; it asks for the name again as confirmation, or takes `--yes` for scripts |
 | `alias --scan` | adds the verified aliases for the result rows in the warehouse; `--dry-run` writes nothing |
 | `coverage` | reports how many recent result rows get a name, and why the others do not |
@@ -810,11 +976,14 @@ If no build of the day is complete, that day gets no entry.
 2. A **known file that is not a build**, such as `cudart-*`, `ui.tar.gz`,
    `xcframework.zip` or `nightly-tag.txt`, is ignored.
 3. An **unknown asset** becomes no member. The import still creates the entry
-   from the known flavors, and then the run ends in an error state.
+   from the known flavors. The run records the asset and ends with success.
 
 On 2026-10-21, build `b11669` had 7 assets that the flavor table does not know,
 for example `ubuntu-cuda-13.4-x64` and `win-vulkan-arm64`. If an unknown asset
-stopped the import, every import would fail.
+stopped the import, every import would fail. Upstream adds build variants
+often. An unknown asset is not a fault, so it does not fail the run. If a
+variant is necessary, an operator adds its flavor to the table. Then the next
+run or a `catalog refresh` adds the member.
 
 **Each run also checks the active importer entries again.** If a release has an
 asset that is now a known flavor, the importer adds that member at the end of
@@ -845,7 +1014,8 @@ An operator pins an old entry to keep it in the short list.
 | OVMS | about monthly | a GitHub release and a flavor | the same as llama.cpp |
 | MLX on macOS, uv vLLM, uv SGLang, OpenVINO GenAI, ONNX GenAI | every 2 weeks to every few months | the full `requirements.txt` body | the importer must compile a lock for each target |
 | Docker vLLM, Docker SGLang | about every 2 weeks | an image name and a tag | later |
-| the iOS and Android app runtimes | with each app build | the build in the app | later, from the client's flags |
+| iOS app runtimes | with each app build | the full runtime descriptor, identified by its canonical digest | hand-made entries first; a shipped-app manifest importer later |
+| Android `llamacpp_cli_stock_tools` | with each CLI build | the repository version and Android flavor | existing catalog entries and offer rules |
 
 Daily entries apply only to llama.cpp. No other upstream publishes faster than
 about every two weeks.
@@ -934,7 +1104,8 @@ usually come from different repositories, for example `…-GGUF` and
 `…-MLX-4bit`, each at its own commit. No check can show that they hold the same
 model. For a runtime, the same-build check compares the repository and the tag.
 For a model, the operator who creates the entry or adds a member is
-responsible. Members are append-only, as for runtimes.
+responsible. Members are append-only, as for runtimes. Only the quantization
+label of a member can change ([below](#renames)).
 
 ### Public and private models
 

@@ -237,12 +237,13 @@ An unknown parameter gets `400`, so a misspelt `dry_run` stages nothing:
 | `note` | no | Free text on why the plan was filed. The server trims the value; an empty or whitespace-only value counts as no note. The trimmed value must be at most 4096 characters and must not contain a NUL character. To change the note after filing, use [`PATCH /api/v1/plans/{plan_id}`](plans/update_plan.md) |
 | `dry_run` | no | `true` to expand and validate the document and stage nothing. The default is `false` |
 
-The server stores a document as submitted, and
-[`GET /api/v1/plans/{plan_id}/document`](plans/get_plan_document.md) returns it to each
-caller that can read the plan at the full fleet-detail tier. A document whose
-models carry a token is the exception. The server stores it with each imported
-model replaced by its vault arm, under a header comment, and with no token. The
-stored document has a new layout and none of the original comments.
+The server stores a document after it rewrites the catalog names and the gated
+models. [`GET /api/v1/plans/{plan_id}/document`](plans/get_plan_document.md)
+returns the stored document to each caller that can read the plan at the full
+fleet-detail tier. In a document whose models carry a token, the server replaces
+each imported model with its vault arm and adds a header comment. The stored
+document holds no token. Layout and comments outside the replaced models stay
+unchanged.
 
 A model, or the draft of a speculative model, can carry an `auth_token`. The
 server imports the model ([filing a plan document](#filing-a-plan-document)). The server refuses a
@@ -480,7 +481,7 @@ errors of its campaign checks.
 | 400 | The query string carries a parameter this route does not know, such as `submitter` or a misspelt `dry_run`. Nothing is staged |
 | 400 | A plan document is not valid UTF-8, is not a valid scheduler plan, or breaks a capability rule. The message names the variant at fault |
 | 400 | A plan document sets a HuggingFace token variable to a value in `runtime_flags`. The message names the variant and never the token |
-| 400 | A plan document names `auth_token` outside the token of a model, for example in a comment. The server stores no token, so it refuses the document before an import. The message never quotes the token |
+| 400 | A plan document names `auth_token` outside the token of a model, for example in a comment. This applies also when other models of the document carry a token. The server stores no token, so it refuses the document before an import. The message never quotes the token |
 | 400 | A plan document expands to more cells than `plan_max_jobs` (default 5000). The server counts the cells before it expands the document. Nothing is staged |
 | 400 | The trimmed `note` is over 4096 characters or contains a NUL character |
 | 400 | A job failed validation ([what the server checks](#what-the-server-checks)). The plan is rejected as a unit and **nothing is staged**. Validation stops at the first offending job, so the message names that one job by its index in the expansion |
@@ -494,6 +495,7 @@ errors of its campaign checks.
 | 429 | The plan must download a gated model, and every one of the `hf_import_max_concurrent` import permits is held. Nothing is staged or downloaded. Retry later |
 | 429 | HuggingFace answered `429` while it served a job's model, because it limits the requests of the token. The message names the job and the model, and gives the wait if HuggingFace sent one. It never holds the token. Nothing is staged. Retry after the wait |
 | 500 | The store failed while reading the benchmark catalog, writing the manifest or staging a job. Nothing it staged is claimable: its `tmp/` files are reaped, and `queue-maintenance` [tears down](../plan-ingestion.md#8-ingestion-flow-atomic-ish) its manifest, stuck in `creating`, once that is older than `plan_creating_max_age_secs` (default 6 hours) |
+| 500 | The campaign write reported a failure, but the read back could not confirm that the campaign runs the new plan. The message names the campaign and the plan. Nothing is cancelled. Reconcile the write outcome before you cancel or refile ([what a failed filing leaves](#errors)) |
 | 502 | HuggingFace failed while it served a job's model: a `5xx`, a lost connection, or bytes that do not match the listing. Nothing is staged. The log names the job. Retry later |
 
 With `Accept: application/x-ndjson`, the server sends `200` after it reads the
@@ -524,9 +526,24 @@ if its owner or its current plan changed, `403` if the caller may no longer
 file into it. From then
 on the filing runs to completion, disconnect or not. The plan is written
 before the campaign moves onto it, so a failure between the two leaves a plan
-that names the campaign and never took effect: file again. A `500` leaves
-nothing a device can claim. A staged job is claimable from the next
-`queue-maintenance` run.
+that names the campaign and never took effect. Queue maintenance writes no eligible marker
+for a job that only a `creating` plan holds
+([queue.md: Committed filings](../queue.md#committed-filings)). A `500` during
+staging leaves earlier promoted jobs in `avail/`, unclaimable, until
+`queue-maintenance` cancels the `creating` plan and retires its jobs, after
+`plan_creating_max_age_secs`. A promoted job of a committed plan is claimable
+from the next `queue-maintenance` run.
+
+The route reads the campaign after its write reports a failure:
+
+- If the campaign runs the plan, or its history reaches the plan, the filing
+  succeeded.
+- If the campaign does not run the plan, or the read back fails, the route
+  answers `500` with a message that names the campaign and the plan. It cancels
+  nothing. Read the campaign again. If it runs the plan, the filing is complete.
+  A negative read does not prove that a timed-out write will never land.
+  Reconcile the outcome before cancelling or refiling
+  ([operations.md §3.5](../operations.md#35-recover-from-a-failed-campaign-filing)).
 
 ### Shared jobs
 
@@ -593,3 +610,18 @@ withholds them too, and scores a copy of each named job's record under a fresh
 job that never queues. Both file the superseded plan's own document, so each
 must place every cell again. A document that now expands differently is
 refused with `400`, and nothing is filed.
+
+### Catalog names
+
+Catalog names in `runtimes` resolve in the campaign owner's organization and the
+global catalog before expansion. A filing route answers `400` for a name that is
+unknown or tombstoned. It also answers `400` for a name with no member that the
+catalog offers to every admitted device. If the name has an explicit `::flavor`,
+the server does not check the offer rule. A hidden name adds a plan warning.
+
+For each replacement, the server writes the qualified name and the flavor in a
+`# catalog name at filing:` comment. At the full fleet-detail tier, the filing
+answer's `document` is the stored text, after the catalog-name and gated-model
+rewrites. The withheld tier omits `document`. A dry run returns
+`document` and stores nothing. The server removes the model tokens from that
+`document`.

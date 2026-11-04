@@ -15,9 +15,9 @@ use pipette_plan_types::{
 };
 use pipette_store::{CampaignBacklog, CampaignBacklogSnapshot};
 use pipette_web_testkit::{
-    approved_client, authed_get, authed_post, authed_user_get, body_json, filter_fleet, fleet_ids,
-    job, put_idle_campaign, register_and_approve, registered_user, registered_user_with_detail,
-    run_qm, seed_avail, submit_plan_as, unauthed_get,
+    QueueBackend, approved_client, approved_queue_client, authed_get, authed_post, authed_user_get,
+    body_json, filter_fleet, fleet_ids, job, put_idle_campaign, register_and_approve,
+    registered_user, registered_user_with_detail, run_qm, seed_avail, submit_plan_as, unauthed_get,
 };
 
 fn row<'a>(body: &'a Value, client_id: &str) -> anyhow::Result<&'a Value> {
@@ -681,34 +681,36 @@ async fn test_a_signed_request_sets_last_seen_at(
 }
 
 /// A device the count does not name reads zero; before the first run, `null`.
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_a_maintenance_run_sets_the_backlog() -> anyhow::Result<()> {
+async fn test_a_maintenance_run_sets_the_backlog(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _, listed) = approved_client(dir.path()).await?;
-    let (_, unlisted) = register_and_approve(&state).await?;
-    let user = registered_user(&state, &[UserPermission::ReadClients]).await?;
-    let listing = || {
-        read_conforming(
-            &state,
-            &user,
-            "/api/v1/clients?status=",
-            "ClientListRowPage",
-        )
+    let Some((queue, _, listed)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
     };
+    let state = &queue.state;
+    let (_, unlisted) = register_and_approve(state).await?;
+    let user = registered_user(state, &[UserPermission::ReadClients]).await?;
+    let listing = || read_conforming(state, &user, "/api/v1/clients?status=", "ClientListRowPage");
 
     let before = listing().await?;
     assert_eq!(row(&before, listed.as_str())?["backlog"], Value::Null);
     let record_path = format!("/api/v1/clients/{listed}");
-    let record = || read_conforming(&state, &user, &record_path, "ClientDetail");
+    let record = || read_conforming(state, &user, &record_path, "ClientDetail");
     assert_eq!(record().await?["backlog_by_campaign"], Value::Null);
 
     seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [listed.as_str()]}),
-    )?;
-    run_qm(&state).await?;
+    )
+    .await?;
+    run_qm(state).await?;
 
     let after = listing().await?;
     let backlog = &row(&after, listed.as_str())?["backlog"];
@@ -842,11 +844,12 @@ async fn test_the_backlog_counts_a_suspended_device() -> anyhow::Result<()> {
     let (state, _, client) = approved_client(dir.path()).await?;
     let user = registered_user(&state, &[UserPermission::ReadClients]).await?;
     seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     state
         .todo_store
         .write_suspension(&client, chrono::Utc::now(), &job("job-stuck")?)

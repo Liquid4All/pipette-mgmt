@@ -20,7 +20,9 @@ use pipette_core::vault::VaultOwner;
 use pipette_pipeline::hf_import::{HfImports, Progress};
 use pipette_pipeline::model_params::ModelParamTable;
 use pipette_pipeline::org_catalog::CatalogScope;
-use pipette_pipeline::plan_document::{DocumentDryRun, ExpandedDocument, index_labels};
+use pipette_pipeline::plan_document::{
+    DocumentDryRun, DocumentError, ExpandedDocument, index_labels,
+};
 use pipette_pipeline::plan_ingestion::{
     CampaignMembership, IngestContext, IngestError, IngestReport, ModelCheck, PlanSubmission,
     PreparedJobs, RejectionError, ingest_prepared, prepare_jobs,
@@ -85,15 +87,37 @@ pub async fn validate_plan(
     let scope = plan_scope(&state, &user, &rights).await?;
     let catalogs = IngestCatalogs::load_without_models(&state, &scope).await?;
     let types = plan_document::benchmark_types(&catalogs.benchmarks);
-    let stage = plan_validation::expand(state.config.plan_max_jobs, types, text)
+    let named = match pipette_pipeline::plan_names::resolve_names(
+        &catalogs.context(&state, &state.hf_imports),
+        &VaultOwner::User {
+            user_id: user.user_id.clone(),
+        },
+        text.clone(),
+    )
+    .await
+    {
+        Ok(named) => named,
+        Err(e) => {
+            return Ok(Json(
+                plan_validation::refusal(&text, e.into())
+                    .map_err(|e| AppError::internal(anyhow::Error::new(e)))?
+                    .into(),
+            ));
+        }
+    };
+    let submission = plan_validation::Submission::named(text, named);
+    let stage = plan_validation::expand(state.config.plan_max_jobs, types, submission)
         .await
         .map_err(|e| AppError::internal(anyhow::Error::new(e)))?;
     let validation = match stage {
         Stage::Refused(validation) => validation,
-        Stage::Expanded { text, expansion } => {
+        Stage::Expanded {
+            submission,
+            expansion,
+        } => {
             plan_validation::check(
                 &catalogs.context(&state, &state.hf_imports),
-                text,
+                submission,
                 expansion,
                 Utc::now(),
             )
@@ -119,21 +143,28 @@ pub async fn validate_plan(
 pub(crate) async fn expand_document(
     state: &AppState,
     scope: &FilingScope,
+    owner: &VaultOwner,
     note: Option<&NonEmptyTrimmedString>,
     text: String,
 ) -> Result<ExpandedDocument, AppError> {
-    let note = note.map(NonEmptyTrimmedString::as_str);
     let catalogs = IngestCatalogs::load_without_models(state, scope).await?;
-    let types = plan_document::benchmark_types(&catalogs.benchmarks);
-    plan_document::expand_document(state.config.plan_max_jobs, types, note, text)
-        .await
-        .map_err(|e| {
-            if e.is_caller_fault() {
-                AppError::BadRequest(format!("{:#}", anyhow::Error::new(e)))
-            } else {
-                AppError::internal(anyhow::Error::new(e))
-            }
-        })
+    plan_document::expand_named(
+        &catalogs.context(state, &state.hf_imports),
+        owner,
+        note.map(NonEmptyTrimmedString::as_str),
+        text,
+    )
+    .await
+    .map_err(|e| {
+        if !e.is_caller_fault() {
+            return AppError::internal(anyhow::Error::new(e));
+        }
+        // A name's message already carries its source.
+        if let DocumentError::Names(e) = &e {
+            return AppError::BadRequest(e.to_string());
+        }
+        AppError::BadRequest(format!("{:#}", anyhow::Error::new(e)))
+    })
 }
 
 /// Run every check a submission runs before it downloads a model, and stage
@@ -151,6 +182,7 @@ pub(crate) async fn dry_run_plan(
     Ok(plan_document::dry_run(
         &catalogs.context(state, &state.hf_imports),
         owner,
+        plan.source,
         plan.jobs,
         plan.plan_warnings,
         chrono::Utc::now(),
@@ -273,6 +305,8 @@ impl IngestCatalogs {
     /// import runs through `imports`.
     fn context<'a>(&'a self, state: &'a AppState, imports: &'a HfImports) -> IngestContext<'a> {
         IngestContext {
+            descriptor_catalog: state.descriptor_catalog_store.as_deref(),
+            descriptor_config: &state.config.descriptor_catalog,
             plans: state.plan_store.as_ref(),
             todo: state.todo_store.as_ref(),
             clients: state.client_store.as_ref(),
@@ -305,6 +339,8 @@ pub(crate) struct PreparedPlan {
     catalogs: IngestCatalogs,
     jobs: PreparedJobs,
     source: PlanSource,
+    resolved: Vec<pipette_pipeline::plan_names::ResolvedName>,
+    submitted_sha256: pipette_plan_types::Sha256,
     plan_warnings: Vec<String>,
 }
 
@@ -333,6 +369,8 @@ pub(crate) async fn prepare(
     let ExpandedDocument {
         jobs,
         source,
+        resolved,
+        submitted_sha256,
         plan_warnings,
         benchmark_types,
     } = plan;
@@ -366,6 +404,8 @@ pub(crate) async fn prepare(
         catalogs,
         jobs,
         source,
+        resolved,
+        submitted_sha256,
         plan_warnings,
     })
 }
@@ -384,6 +424,8 @@ pub(crate) async fn file_prepared(
         catalogs,
         jobs,
         source,
+        resolved,
+        submitted_sha256,
         plan_warnings,
     } = prepared;
     let submission = PlanSubmission {
@@ -393,6 +435,8 @@ pub(crate) async fn file_prepared(
         membership,
         jobs,
         source: Some(source),
+        resolved,
+        submitted_sha256: Some(submitted_sha256),
         plan_warnings,
     };
     let report = ingest_prepared(&catalogs.context(state, &state.hf_imports), submission)
@@ -432,12 +476,14 @@ mod tests {
     use super::*;
 
     /// The `201` body rewrites a fleet warning for a caller that may not read
-    /// the fleet, and passes uncatalogued-model and planner warnings through.
+    /// the fleet, drops the document, and passes uncatalogued-model and planner
+    /// warnings through.
     #[test]
     fn report_withholds_only_the_fleet_warning() {
         let model_message = "1 job names a model with no parameter-count entry".to_string();
         let planner_message = "variant 0: `exclude_clients` denies every client".to_string();
         let report = pipette_pipeline::plan_ingestion::IngestReport {
+            document: Some("clients = [\"ev1_secret\"]\n".into()),
             plan_id: pipette_plan_types::PlanId::from_uuid(uuid::Uuid::nil()),
             note: None,
             change: None,
@@ -469,5 +515,6 @@ mod tests {
             vec!["1 job matches no working client", model_message.as_str()]
         );
         assert_eq!(projected.plan_warnings, vec![planner_message]);
+        assert_eq!(projected.document, None);
     }
 }

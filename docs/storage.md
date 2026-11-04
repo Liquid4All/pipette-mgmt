@@ -49,13 +49,15 @@ The `local_fs` and S3 record stores are retiring (PIP-759) and kept for tests.
 Their keyspaces are the second tree in §2. A new record feature lands on SQL
 (and on `local_fs` where tests need it), never on the S3 record store.
 
-The object store keeps, in every deployment:
+The object store keeps:
 
-- the job queue, `todo/`, on `[todo_storage]`
+- the job queue, `todo/`, when `[todo_storage]` selects `local_fs` or `s3`
 - submissions, under `submissions/`
 - the warehouse, under `warehouse/`
 - vault blobs, under `vault-resources/` and `vault-staging/`
 - the dataset cache, under `dataset-cache/`
+- the eval corpora the scores service packs, under `scores-packages/` of
+  `[eval_packages_storage]`, which mgmt only reads
 - the public benchmark catalog, `benchmarks/`, and the batch locks, `locks/`
 
 ## 2. Logical layout and invariants
@@ -152,8 +154,11 @@ data/
 │   └── {principal_id}/blobs/{sha256}    ← one blob per owner and digest (§3.4)
 ├── vault-staging/
 │   └── {principal_id}/{uuid}            ← a blob while mgmt computes its digest; S3 only
-└── dataset-cache/
-    └── artifacts/                       ← repacked corpora (§5)
+├── dataset-cache/
+│   └── artifacts/                       ← repacked git corpora and every corpus's record (§5)
+└── scores-packages/                     ← [eval_packages_storage]; the scores service writes it
+    └── tars/
+        └── {digest}.tar                 ← an eval corpus, read by build and serve (§5)
 ```
 
 ### Record keyspaces (without `[database]`)
@@ -1070,11 +1075,13 @@ campaign leaves its plans on their own lifecycle.
 
 **The two writes, and their order.** Filing a revision writes the plan manifest
 first and advances the campaign second. A failure between them leaves a plan
-that names the campaign and never took effect, which is the direction to fail
-in; the repair is to file again. Creating a campaign keeps the same order. If
-the campaign write fails, the create writes the plan's cancel marker. A failure
-of both leaves a live plan naming a campaign that does not exist; the repair is
-to cancel that plan.
+that names the campaign. Creating a campaign keeps the same order. If the
+campaign write reports a failure, the route reads the campaign back. It treats
+a plan in the campaign's current head or history as committed. Otherwise, it
+preserves the plan: a timed-out write can still land after the read. Reconcile
+the write outcome before cancelling or refiling. For a confirmed staging
+orphan, refile first to preserve its live jobs
+([recovery](operations.md#35-recover-from-a-failed-campaign-filing)).
 
 #### 3.3.1. Ownership
 
@@ -1432,19 +1439,63 @@ Read it with `pipette-mgmt runtime-output <job_id>` ([cli.md](cli.md)).
 
 With `[database]`, the table `submission_outcomes` holds each job's outcome
 (`failed` for a `message_type: "failure"` body, `finished` for any other), so
-`queue-maintenance` reads a row rather than a body of tens of megabytes. A write
-deletes the row, writes the body, then writes the row, so a row never holds an
-older body's outcome. A row outlives a record pruned from `processed/`. A job
-with no row (a record from before the index, or a failed row write) is answered
-from `submissions/`; a failed row write fails the submission write, so the
-client resends it.
+`queue-maintenance` and plan filing read a job's outcome from a row rather than
+from a body of tens of megabytes. A row outlives a record pruned from
+`processed/`. A read of an outcome or a run uses these rules:
+
+- A job with a pending marker (see below) reads its record in `submissions/`.
+  An error from that read fails the read.
+- A job with a row gets the outcome and the run from the row. The read does not
+  read the record.
+- A job with no row and no pending marker has no record.
+
+A write that puts a body in `submissions/` uses three steps:
+
+1. In one SQL transaction, the writer increments the generation of the job in
+   `submission_outcome_repairs`, marks the job pending, and deletes the outcome
+   row.
+2. The writer writes the body.
+3. If the generation is unchanged, the writer writes the outcome row and clears
+   the pending marker. If another writer changed the generation, the writer
+   increments the generation again and keeps the job pending.
+
+If step 2 or step 3 fails, the submission write fails and the client resends
+it. A failed write leaves the job pending. If the caller is cancelled after
+step 1, the writer continues steps 2 and 3. If a conditional create finds a
+body in `incoming/`, the writer puts back the row that the body had, or keeps
+the job pending if it had none.
+
+A move of a record between `incoming/`, the `score-queue/` stages, and
+`processed/` keeps the submission body. The move leaves the row and the pending
+marker as they are.
+
+Each queue-maintenance run repairs at most 500 jobs that a writer marked pending
+at least 15 minutes before. The run reads at most four records in parallel. It
+writes the outcome row from each record and clears the pending marker. If no
+record exists, the run clears the pending marker and writes no row. An
+unreadable record keeps the job pending for a later run.
+
+The generation check applies only to the database. A write that finishes after
+repair clears an absent record publishes its row. An object-store PUT request
+that finishes after its writer process exits can leave a record without a row.
+Run `db backfill-job-cells` after every writer uses
+outcome repair, to fill the rows that older writers did not write. Until the
+command writes the row of a job, that job has no record for a read. The command
+writes rows only for jobs that have a job source. Keep migration `0023` if you
+roll back to an older build.
 
 A `finished` row also holds `run_flags`. These are the flags that the record
 proves the run held. The function `recorded_run_flags` gives them from the
 normalized `device_*` fields and from `client_version`. A `failed` row holds no
-flags. A row written before
-migration `0007` holds none until `db backfill-job-cells` fills it
-([cli.md](cli.md#pipette-mgmt-db-backfill-job-cells---dry-run)).
+flags. A row written before migration `0007` holds none until
+`db backfill-job-cells` fills it
+([cli.md](cli.md#pipette-mgmt-db-backfill-job-cells---dry-run)). A read of
+the run of a `finished` row with no `run_flags` fails, because the flags of
+that run are unknown. The error names the job and the command. If you change
+the flags that `recorded_run_flags` derives, set `run_flags` to NULL on the
+`finished` rows. Then run `db backfill-job-cells` again. Until the command
+finishes, the [job-cell lookup](#44-the-job-cell-index) skips those runs. A
+plan that you file during that time runs their cells again.
 
 ### 4.4. The job-cell index
 
@@ -1552,6 +1603,29 @@ tombstoned entry to another state.
 The store compares the digest of each member with the digest of its typed
 runtime or model. A change to the serialized form of a runtime type or a model
 type thus needs a migration of `descriptor_members`.
+
+### 4.6. The run evidence index
+
+Migration `0021` adds `run_evidence`. The table has one row for each descriptor
+digest and `client_id`. A digest is a `runtime_descriptor_sha256` or a
+`model_descriptor_sha256` of a warehouse row. The row keeps these values:
+
+- The time and the `client_version` of the last success.
+- The time and the `client_version` of the last failure.
+
+The time is the warehouse `submitted_at` of the run. A row with `failed` true
+is a failure. Any other row is a success. Rows of the `system` client and
+rescored copies (`rescored_from` set) give no index row.
+
+The scorer writes the rows of each job after it writes the job's warehouse
+rows, and before it marks the job processed. If the write fails, the scorer
+defers the job to the next run. Each side of a row keeps its newest run, so a
+replay changes nothing. `db backfill-run-evidence` makes the rows again from
+the warehouse ([cli.md](cli.md#pipette-mgmt-db-backfill-run-evidence---dry-run)).
+`db import` and `db export` do not copy these SQL-only rows.
+
+The catalog reads give each member the evidence of its digest and its verified
+alias ([the short list](api/descriptor-catalog/list_descriptor_catalog_for_device.md)).
 
 ## 5. Warehouse contract
 
@@ -2389,37 +2463,33 @@ excluding it drops every row from a client that predates the column.
 
 ### Dataset cache: `dataset-cache/artifacts/`
 
-Repacked corpora, keyed by the sha256 of the tar, under the `[storage]` root:
+Corpora and their records, keyed by the sha256 of the tar, under the `[storage]`
+root:
 
 ```
 dataset-cache/artifacts/
-├── {digest}.tar     ← the corpus archive, in its entry's `format`; written once by `dataset-cache build`, never deleted
+├── {digest}.tar     ← a git corpus's archive, in its entry's `format`; written once by `dataset-cache build`, never deleted
 └── {digest}.json    ← how it was built, and the latest upstream probe verdict
 ```
 
+An eval corpus (`vlm-eval-corpus/1`, `asr-eval-corpus/1`) has only its JSON
+here: its tar is the scores service's package,
+`scores-packages/tars/{digest}.tar` under `[eval_packages_storage]`, which
+`dataset-cache build` registers and `serve` streams; mgmt never writes it.
+
 `{digest}.json` carries `digest`, `bytes`, `format`, `adapter`, the pinned
-`upstream` table, `subset?`, `samples?` (an evals-server corpus's sample
-count, as its build counted it), `built_at`, and `probe {state, checked_at,
+`upstream` table, `subset?`, `samples?` (an eval corpus's sample count, as its
+package's manifest states it), `built_at`, and `probe {state, checked_at,
 since, observed_identity?, detail?}`. `dataset-cache probe` rewrites it every minute,
 and `serve` hands out a tar only while its probe reads `ok` and is no older than
-`dataset_probe_max_age_secs`. The build writes the tar before the JSON, so
-metadata always describes a tar that exists. Two benchmarks pinning the same
+`dataset_probe_max_age_secs`. The build writes the tar, or finds the package,
+before the JSON, so metadata always describes a tar that exists. Two benchmarks pinning the same
 corpus share one artifact. An organization's private pins share the prefix, so
 the catalog writer refuses a digest another organization's entry already pins,
 unless a public entry pins the same dataset, and any digest a public entry pins
 differently. Nothing deletes from this prefix: an artifact whose
 upstream stopped backing it stays, unserved. See
 [design/vl-spec-decode-dataset-delivery.md](design/vl-spec-decode-dataset-delivery.md).
-
-**Size the prefix for the asr_eval corpora.** An asr-eval corpus holds every
-clip of a set once as a WAV (16-bit PCM where exact, else 32-bit float):
-the largest set's is many gigabytes per prompt profile, and the full catalog's
-corpora run to well over a hundred gigabytes together. Size the
-`[storage]` volume or bucket for that beside the VL corpora. A build streams
-the evals server's body and keeps no copy of it, but its scratch (the system
-temporary directory, `TMPDIR`) holds the media and the packed tar, about twice
-the corpus being built: give it room for twice the largest. asr-eval corpora build
-one at a time, after the others, each under `dataset_asr_build_timeout_secs`.
 
 ### Schema evolution
 
@@ -2493,7 +2563,7 @@ joins prompts, completions and scored samples is
 
 ## 7. Backend configuration
 
-Four config sections choose where data lives
+Five config sections choose where data lives
 ([`crates/pipette-core/src/config.rs`](../crates/pipette-core/src/config.rs) is
 the key reference, [`examples/config.toml`](../examples/config.toml) the
 annotated example):
@@ -2503,8 +2573,12 @@ annotated example):
   the records of §2 marked `[storage]`.
 - `[auth_storage]` (required): without `[database]`, the identity records of §2
   marked `[auth_storage]`.
-- `[todo_storage]`: the job queue. Defaults to `[storage]`, which is acceptable
-  for `local_fs` only.
+- `[todo_storage]`: the job queue. Set `backend = "database"` to use
+  PostgreSQL. This choice requires `[database]`. If `[todo_storage]` is
+  absent, the queue uses `[storage]`. Use that default only for `local_fs`
+  development.
+- `[eval_packages_storage]`: the scores service's `scores-packages/`, which
+  mgmt only reads. If absent, mgmt reads them from `[storage]`.
 - `[database]`: PostgreSQL for every record (§1.1).
 
 ```toml
@@ -2533,6 +2607,10 @@ bucket = "my-todo-bucket--use1-az4--x-s3"  # must be Express One Zone
 
 # Records on PostgreSQL; the PG* environment variables fill absent keys
 [database]
+
+# Alternatively, keep the job queue in the same PostgreSQL database:
+# [todo_storage]
+# backend = "database"
 ```
 
 S3 credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
@@ -2558,6 +2636,14 @@ and heartbeat paths; that redesign is the path if Express One Zone (single-AZ,
 limited regions) is unacceptable ([queue.md](queue.md)). The rest of the data
 has no such constraint.
 
+The `aws-sdk-s3` client retries a rename that times out. If the first rename
+completed, S3 can answer the retry with `NoSuchKey`. After a `NoSuchKey`
+answer, the store reads the destination. If the destination exists, the
+rename succeeded. If the destination does not exist, the source is gone. A
+recycle destination in `avail/` is the same for every recycler of a lease. So
+a recycler that lost the race also gets a success, because the job is back in
+`avail/`.
+
 A directory bucket also restricts listing: one delimiter, `/`, only a prefix
 that ends in it (any other prefix is `InvalidRequest`), and no server-side
 `start-after`. So `avail/` gives each job its own directory and `leased/` each
@@ -2573,7 +2659,8 @@ rename, any other error, an empty destination, a source still present (a copy,
 not a move), or a failed read-back refuses the start. The claim path reads a
 failed rename as a lost race, so without the probe a misconfigured bucket would
 leave every job unclaimable and report nothing. The `clients` admin commands
-never rename and skip the probe. On `local_fs` the probe is a no-op.
+never rename and skip the probe. On `local_fs` the probe is a no-op. If
+`backend = "database"`, startup checks the PostgreSQL schema.
 
 ### `[storage]` and `[auth_storage]` require conditional PUT
 

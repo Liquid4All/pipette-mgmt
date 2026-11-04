@@ -51,6 +51,10 @@ name = "request_span"
 path = "tests/request_span.rs"
 
 [[test]]
+name = "plan_jobs_timing"
+path = "tests/plan_jobs_timing.rs"
+
+[[test]]
 name = "submissions"
 path = "tests/submissions.rs"
 

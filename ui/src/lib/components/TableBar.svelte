@@ -5,7 +5,7 @@
   // each from the first row, then how many rows they keep and the way back to all.
   // They live in the address, or where `onchange` is given, in the page.
   import { redirect } from "../route.svelte";
-  import { cleared, filtering, toggledIn, type Choice, type TableSpec, type TableState } from "../table";
+  import { cleared, filtering, rowCount, toggledIn, type Choice, type TableSpec, type TableState } from "../table";
   import { Typing } from "../typing";
   import MultiSelect from "./MultiSelect.svelte";
 
@@ -39,10 +39,11 @@
              oninput={(e) => { const value = e.currentTarget.value; typing.later(key, () => typed(key, value)); }}
              onchange={() => typing.flush(key)} /></label>
   {/each}
-  {#each spec.server ?? [] as { key, label, placeholder, wide, options } (key)}
-    <label><span>{label}</span>
+  {#each spec.server ?? [] as { key, label, placeholder, wide, options, held } (key)}
+    <label title={held?.why}><span>{label}</span>
       {#if options}
-        <select value={state.texts[key]} onchange={(e) => typed(key, e.currentTarget.value)}>
+        <select value={held?.value ?? state.texts[key]} disabled={!!held}
+                onchange={(e) => typed(key, e.currentTarget.value)}>
           {#each options as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
         </select>
       {:else}
@@ -56,7 +57,7 @@
       <MultiSelect {label} options={choices[key] ?? []} chosen={state.choices[key] ?? []} toggle={toggle(key)} />
     {/if}
   {/each}
-  <span class="muted count">{kept < total ? `${kept} of ${total}` : total} {noun}
+  <span class="muted count">{rowCount(kept, total, noun)}
     {#if filtering(state)}{#if link}<a href={link(cleared(state))}>Clear filters</a>{:else}<button type="button"
       class="again" onclick={() => apply(cleared(state))}>Clear filters</button>{/if}{/if}</span>
 </div>

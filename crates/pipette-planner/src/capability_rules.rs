@@ -410,6 +410,15 @@ fn policy_for(runtime: &Runtime) -> Policy {
             ],
         },
         // Desktop MLX (Python/uv): Apple silicon. macOS 14 floor deferred.
+        Runtime::AppleCoreAiMacosPipette(_) => Policy {
+            requires: &["os:macos"],
+            one_of: &[],
+            any_of: &[Group::AtLeast {
+                list: APPLE_SILICON,
+                floor: "chip:applem1",
+            }],
+            when: &[],
+        },
         Runtime::MlxMacosPipette(_) => Policy {
             requires: &["os:macos"],
             one_of: &[],
@@ -1922,6 +1931,8 @@ runtimes = [
     /// [`Runtime`]. The two `sample_runtimes_cover_*` tests keep it complete.
     const SAMPLE_RUNTIMES: &[&str] = &[
         r#"type = "apple_foundation""#,
+        r#"type = "core_ai_macos_pipette"
+packages = { coreai_models = { repository_url = "github.com/apple/coreai-models", repository_version = "27a66f90e7f3fd9b83a6acb7bcb0a4a5ff71fd60" }, swift_transformers = { repository_url = "github.com/huggingface/swift-transformers", repository_version = "1.2.0" }, xgrammar = { repository_url = "github.com/mlc-ai/xgrammar", repository_version = "0.2.2" }, swift_jinja = { repository_url = "github.com/huggingface/swift-jinja", repository_version = "2.3.2" } }"#,
         r#"type = "mlx_macos_pipette"
 version = "0.31.3"
 flavor = "macos-arm64"

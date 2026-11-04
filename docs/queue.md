@@ -18,7 +18,7 @@ Five actors touch the queue. All of them are `pipette-mgmt`.
 | **Management server** | `pipette-mgmt serve` | One or more | The device routes: claim, heartbeat, reclaim, and result submission |
 | **Submission processor** | `pipette-mgmt process-submissions` (cron; `score` alias) | One at a time | Routes eval submissions, scores non-evals, finalizes scored evals, writes to the warehouse |
 | **Eval scorer** | `pipette-mgmt score-eval` (cron) | One at a time | Drains `submissions/score-queue/to_do/`, calls the upstream scoring service, and stages eval scores for finalization |
-| **Queue maintenance** | `pipette-mgmt queue-maintenance` (cron) | One at a time | Recycles expired leases, retires jobs, deletes stale `todo/tmp/` files, and maintains the `eligible/` index (sole writer) |
+| **Queue maintenance** | `pipette-mgmt queue-maintenance` (cron) | One at a time | Recycles expired leases, retires jobs, deletes stale `todo/tmp/` files, maintains the `eligible/` index (sole writer), and repairs pending submission outcomes |
 
 Plan ingestion is the only writer that promotes a new job into `avail/`. The
 one other promote is teardown's restore of a job it just deleted
@@ -76,8 +76,9 @@ the matcher.
 
 - The index covers the **workers** only: approved clients that hold
   `perform_work`, the two checks `claim` makes.
-- A job promoted into `avail/` is indexed within one cron interval, whatever
-  its key order, writer or id format.
+- A job promoted into `avail/` is indexed on the first run after at least one
+  of its plans leaves `creating`. A job with no plan marker keeps the existing
+  indexing behavior.
 - A change in the workers (an approval, a grant, a revocation) reaches the index
   within one cron interval, whichever code path made it.
 - A job out on lease while a client was re-indexed is re-matched against every
@@ -154,8 +155,9 @@ two things before it selects a job.
 
 Otherwise the server selects among the client's `eligible/` markers. It skips a
 job the client denied (`denied/{job_id}.{client_id}`) and a job past its
-`expires_at`, even one `queue-maintenance` has not swept yet. It does not check
-that a job is still in `avail/`: the claim rename is the liveness test, and a
+`expires_at`, even one `queue-maintenance` has not swept yet. Queue maintenance withholds markers for jobs held only by creating or missing
+plans ([Committed filings](#committed-filings)). It
+does not check that a job is still in `avail/`: the claim rename is the liveness test, and a
 rename that finds no source moves on to the next candidate. A grant, or a lease
 already held, whose job names a vault resource the client may not fetch goes
 back to `avail/`, denied to the client, and the claim moves on; a failed check
@@ -173,6 +175,21 @@ The claim renames `avail/{job_id}/{expires_at}.json` to
 `lease_expiry` is now plus the lease length. The rename is atomic, so at most
 one claimer wins. When every candidate fails, the answer is `204`. The idle
 cadence after a `204` is the client's ([client-integration.md §5](client-integration.md#idle-polling-cadence)).
+
+### Committed filings
+
+Ingestion promotes a job into `avail/` before its plan leaves `creating`.
+`queue-maintenance` reads the plan manifests and job memberships before it
+builds the eligible index. When every membership names a plan that is still
+`creating` or whose manifest is missing, the run leaves that job out of all
+three index passes and the persisted indexed set. The first run after a plan
+leaves `creating` evaluates the job. A job also held by an active plan is
+indexed at once. Jobs without membership markers retain the existing indexing
+behavior.
+
+The run also removes any eligible markers it finds for a withheld job. A lease
+already held by a device remains valid until the usual lease or teardown path
+handles it.
 
 ### Lease naming
 

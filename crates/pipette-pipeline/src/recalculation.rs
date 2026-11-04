@@ -12,11 +12,6 @@ use pipette_store::SubmissionStore;
 
 use crate::submission::{Submission, SuccessSubmission, parse_stored_submission};
 
-/// Whether `body` is a recorded result the scorer can take again.
-pub(crate) fn rescorable(body: &Value) -> bool {
-    eval_success(body).is_some()
-}
-
 /// `body` as an eval's, vlm_eval's or asr_eval's success. A failure carries no completions, and only an
 /// eval's score is computed apart from the device.
 fn eval_success(body: &Value) -> Option<Box<SuccessSubmission>> {
@@ -129,20 +124,28 @@ mod tests {
         })
     }
 
-    #[test]
-    fn only_an_eval_success_is_rescorable() -> anyhow::Result<()> {
-        let job_id = JobId::try_new("job-a")?;
-        assert!(rescorable(&success_record(&job_id, "eval")));
-        assert!(!rescorable(&success_record(&job_id, "decode_throughput")));
-        assert!(!rescorable(&serde_json::json!({
+    fn eval_failure(job_id: &JobId) -> Value {
+        serde_json::json!({
             "message_type": "failure",
             "benchmark_type": "eval",
             "benchmark_id": "eval_ifbench_original",
             "client_id": "ev1_test",
-            "job_id": "job-a",
+            "job_id": job_id.as_str(),
             "submitted_at": "2026-05-29T14:49:43Z",
             "failure_reason": "crashed",
-        })));
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::eval_success(|id: &JobId| success_record(id, "eval"), true)]
+    #[case::throughput_success(|id: &JobId| success_record(id, "decode_throughput"), false)]
+    #[case::eval_failure(eval_failure, false)]
+    fn only_an_eval_success_is_rescorable(
+        #[case] record: fn(&JobId) -> Value,
+        #[case] rescorable: bool,
+    ) -> anyhow::Result<()> {
+        let job_id = JobId::try_new("job-a")?;
+        assert_eq!(eval_success(&record(&job_id)).is_some(), rescorable);
         Ok(())
     }
 

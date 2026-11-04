@@ -9,6 +9,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use futures::stream;
 use futures::stream::{StreamExt, TryStreamExt};
 use strum::VariantNames;
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -34,10 +35,12 @@ use pipette_core::vault::{VaultOwner, VaultResource};
 use pipette_httpapi::api_schema::openapi::OpenApi;
 use pipette_httpapi::state::AppState;
 use pipette_pipeline::audit::CommandAudit;
+use pipette_pipeline::catalog_coverage;
 use pipette_pipeline::catalog_import::{self, GitHubClient, GitHubToken};
 use pipette_pipeline::client_cli;
 use pipette_pipeline::client_cli::{CapabilityQuery, CapabilitySource};
-use pipette_pipeline::descriptor_catalog_admin::{self, CatalogTransition};
+use pipette_pipeline::descriptor_alias;
+use pipette_pipeline::descriptor_catalog_admin::{self, CatalogTransition, Document};
 use pipette_pipeline::hf_import::{HfImports, HubClient, Progress};
 use pipette_pipeline::model_params::{self, ModelParamTable};
 use pipette_pipeline::org;
@@ -49,26 +52,30 @@ use pipette_pipeline::plan_results::{ResultListView, ResultsDb};
 use pipette_pipeline::variant_edit::VariantEdit;
 use pipette_pipeline::{
     campaign_admin, campaign_chain, client_admin, dataset_cache, fix_canonical, fix_model_param,
-    fix_vault_labels, model_audit, org_catalog, queue_maintenance, record_copy, requeue_eval,
-    score, user_admin, vault_admin,
+    fix_vault_labels, model_audit, org_catalog, queue_copy, queue_maintenance, record_copy,
+    requeue_eval, score, user_admin, vault_admin,
 };
 use pipette_plan_types::{
-    AuditOutcome, BenchmarkId, CampaignId, CatalogName, CatalogScope, ClientId, ClientOwner,
-    ClientPermission, ClientPreauthKeyId, ClientPreauthUsage, ContactEmail, Counts,
-    DescriptorEntryKind, DescriptorEntryState, ExpiresAt, FleetDetail, JobCensus, JobId, ModelKey,
-    NonEmptyTrimmedString, OrgId, OrgSlug, OrgStatus, PlanId, PlanStatus, PrincipalOwner,
-    RestoredVariant, RuntimeType, SchedulingState, Tag, UserAccountType, UserId, UserKeyId,
-    UserPermission, UserPreauthKeyId, UserPreauthUsage, UserStatus, VaultResourceId, Warning,
+    AddDescriptorMemberRequest, AuditAction, AuditOutcome, AuditTarget, BenchmarkId, CampaignId,
+    CatalogName, CatalogScope, ClientId, ClientOwner, ClientPermission, ClientPreauthKeyId,
+    ClientPreauthUsage, ContactEmail, Counts, CreateDescriptorEntryRequest, DescriptorEntryKind,
+    DescriptorEntryState, ExpiresAt, FleetDetail, JobCensus, JobId, ModelFormat, ModelKey,
+    ModelMemberRequest, NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug, OrgStatus, PlanId,
+    PlanStatus, PrincipalOwner, QuantizationLabel, RestoredVariant, Runtime, RuntimeType,
+    SchedulingState, Tag, UserAccountType, UserId, UserKeyId, UserPermission, UserPreauthKeyId,
+    UserPreauthUsage, UserStatus, VaultResourceId, Warning,
 };
 use pipette_store::{
-    AuditStores, CatalogEntryKey, CatalogImportRunStore, ClientStore, CreateOutcome,
-    DescriptorCatalogStore, DescriptorEntryFilter, EmailClaim, OrgStore, STORAGE_CONCURRENCY,
-    SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore, drain_campaigns,
-    drain_clients, drain_vault_resources, warn_unreadable_clients,
+    AuditStore, AuditStores, CatalogEntryKey, CatalogImportRunStore, ClientStore, CreateOutcome,
+    DescriptorCatalogStore, DescriptorEntryFilter, EmailClaim, LivenessImport, OrgStore,
+    STORAGE_CONCURRENCY, SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore,
+    drain_campaigns, drain_clients, drain_vault_resources, warn_unreadable_clients,
 };
 use pipette_store_init::storage_lock;
 use pipette_store_init::storage_lock::StorageLock;
-use pipette_store_init::{build_object_stores, build_stores, conditional_put, database};
+use pipette_store_init::{
+    build_object_stores, build_queue_copy_stores, build_stores, conditional_put, database,
+};
 
 #[derive(Parser)]
 #[command(
@@ -326,6 +333,13 @@ enum Command {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Copy the job queue between the object-store queue of `[todo_storage]`
+    /// and `[database]`, for the cutover of the queue
+    /// (`docs/design/sql-job-queue.md`).
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
     /// Read the audit log, and prune it past its retention. Needs `[database]`.
     Audit {
         #[command(subcommand)]
@@ -376,6 +390,32 @@ enum AuditCommand {
         #[arg(long, default_value_t = pipette_core::audit::RETENTION_DAYS)]
         older_than_days: u32,
         /// Count what would be deleted, and delete nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// Make the queue in the database equal to the object-store queue.
+    ///
+    /// The command writes each entry that differs, and deletes each entry that
+    /// the object store does not hold. A rerun writes only what changed. The
+    /// command takes no lock: stop `serve` and `queue-maintenance` for an exact
+    /// copy. It exits non-zero while an unreadable entry remains.
+    Import {
+        /// Read everything, report what would change, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Make the object-store queue equal to the queue in the database.
+    ///
+    /// This is the rollback of `queue import`. The command writes each entry
+    /// that differs, and deletes each entry that the database does not hold.
+    /// The command takes no lock: stop `serve` and `queue-maintenance` for an
+    /// exact copy. It exits non-zero while an unreadable entry remains.
+    Export {
+        /// Read everything, report what would change, and change nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -433,6 +473,18 @@ enum DbAction {
     /// writes only the rows that are still missing. The command skips a job
     /// source or a record that does not parse, and reports it.
     BackfillJobCells {
+        /// Report the rows that the command would write. Write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Make the run evidence index again from every warehouse row.
+    ///
+    /// The index keeps the last success and the last failure of each
+    /// descriptor on each device. The scorer keeps it current. Run the command
+    /// once after migration `0021`. A second run changes nothing. The command
+    /// reads the whole warehouse and takes no storage lock. It is safe to run
+    /// beside `process-submissions`.
+    BackfillRunEvidence {
         /// Report the rows that the command would write. Write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -799,19 +851,80 @@ enum CatalogAction {
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
     },
-    /// Create a hand-made entry from name, release_time and runtimes or models in TOML.
+    /// Create a hand-made entry from a TOML file, or from `--name` and
+    /// `--runtime` or `--model` values.
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .args(["file", "name"])
+            .required(true)
+    ))]
+    #[command(group(
+        clap::ArgGroup::new("members")
+            .args(["runtimes", "models"])
+            .conflicts_with("file")
+    ))]
     Create {
-        file: PathBuf,
+        /// A TOML file with `name`, an optional `release_time`, and `runtimes`
+        /// or `models`.
+        file: Option<PathBuf>,
+        /// The name of the new entry.
+        #[arg(long, value_parser = parse_catalog_name, requires = "members")]
+        name: Option<CatalogName>,
+        /// The release time in RFC 3339 format, for example
+        /// `2026-10-19T22:54:49Z`. Without it, the command uses the creation
+        /// time.
+        #[arg(long, value_parser = parse_release_time, requires = "name")]
+        release_time: Option<chrono::DateTime<chrono::Utc>>,
+        /// One runtime member as a JSON object. Repeat it for each flavor, in
+        /// order of precedence.
+        #[arg(
+            long = "runtime",
+            value_name = "JSON",
+            value_parser = parse_runtime_json
+        )]
+        runtimes: Vec<Runtime>,
+        /// One model member as `<quantization>=<JSON object>`. Repeat it for
+        /// each member. Do not put an `auth_token` in the JSON: the command
+        /// refuses it, and the shell keeps the value in its history.
+        #[arg(
+            long = "model",
+            value_name = "QUANTIZATION=JSON",
+            value_parser = parse_model_member
+        )]
+        models: Vec<ModelMemberRequest>,
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
         #[arg(long)]
         dry_run: bool,
     },
-    /// Append one runtime or model from a TOML file to a hand-made entry.
+    /// Append one runtime or model to a hand-made entry, from a TOML file or
+    /// from a `--runtime` or `--model` value.
+    #[command(group(
+        clap::ArgGroup::new("member")
+            .args(["file", "runtime", "model"])
+            .required(true)
+    ))]
     AddMember {
         #[arg(value_parser = parse_catalog_name)]
         name: CatalogName,
-        file: PathBuf,
+        /// A TOML file with `runtime`, or with `model` and `quantization`.
+        file: Option<PathBuf>,
+        /// The runtime member as a JSON object.
+        #[arg(
+            long,
+            value_name = "JSON",
+            value_parser = |s: &str| parse_runtime_json(s).map(Box::new)
+        )]
+        runtime: Option<Box<Runtime>>,
+        /// The model member as `<quantization>=<JSON object>`. Do not put an
+        /// `auth_token` in the JSON: the command refuses it, and the shell
+        /// keeps the value in its history.
+        #[arg(
+            long,
+            value_name = "QUANTIZATION=JSON",
+            value_parser = |s: &str| parse_model_member(s).map(Box::new)
+        )]
+        model: Option<Box<ModelMemberRequest>>,
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
         #[arg(long)]
@@ -840,6 +953,34 @@ enum CatalogAction {
         name: CatalogName,
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
+    },
+    /// Give a hand-made entry a new name. The old name is free at once. If
+    /// another live hand-made entry has the new name, move the members of the
+    /// entry to that entry, and delete the entry.
+    Rename {
+        #[arg(value_parser = parse_catalog_name)]
+        name: CatalogName,
+        #[arg(value_parser = parse_catalog_name)]
+        new_name: CatalogName,
+        #[arg(long, value_parser = parse_org_ref)]
+        org: Option<OrgRef>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Change the quantization label of one model member. The old label is free at once.
+    Relabel {
+        #[arg(value_parser = parse_catalog_name)]
+        name: CatalogName,
+        #[arg(long, value_parser = parse_model_format)]
+        format: ModelFormat,
+        #[arg(long, value_parser = parse_quantization_label)]
+        from: QuantizationLabel,
+        #[arg(long, value_parser = parse_quantization_label)]
+        to: QuantizationLabel,
+        #[arg(long, value_parser = parse_org_ref)]
+        org: Option<OrgRef>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Permanently tombstone a name. Without --yes, type the exact name again.
     Tombstone {
@@ -874,6 +1015,16 @@ enum CatalogAction {
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
     },
+    /// Report how many recent results the catalog names, and why it does not
+    /// name the others. Read-only.
+    Coverage {
+        /// Count results with a submission date in the last N days.
+        #[arg(long, default_value = "30")]
+        days: u32,
+        /// List this many digests of each kind that have no exact match.
+        #[arg(long, default_value = "20")]
+        top: usize,
+    },
 }
 
 /// `dataset-cache` actions.
@@ -884,12 +1035,15 @@ enum DatasetCacheAction {
     /// which is all `GET /datasets/{id}` reads. Run every minute. Exits non-zero
     /// while any upstream is not `ok`.
     Probe,
-    /// Build every pinned artifact that is missing: fetch, verify the pinned
-    /// hashes, repack, store. Never rebuilds or deletes an existing artifact.
-    /// Exits non-zero if any build failed.
+    /// Build every pinned artifact that is missing: a git upstream is fetched,
+    /// verified against the pinned hashes, repacked and stored; an evals-server
+    /// one is registered from the package the scores service wrote, once its
+    /// size, manifest and upstream check out. Never rebuilds or deletes an
+    /// existing artifact. Exits non-zero if any build failed.
     Build,
-    /// Fetch and pack a benchmark's upstream without a store, and print the
-    /// hashes its catalog entry pins. Read-only.
+    /// Fetch and pack a git benchmark's upstream without a store, and print
+    /// the hashes its catalog entry pins. Read-only. An evals-server entry's
+    /// hashes are in the scores service's `scores-packages/index/`.
     Pins {
         #[arg(value_parser = parse_benchmark_id)]
         benchmark_id: BenchmarkId,
@@ -2415,9 +2569,14 @@ fn writes(command: &Command) -> bool {
         // change no records.
         Command::Config { .. } | Command::Unlock { .. } | Command::Openapi { .. } => false,
         Command::Db { action } => match action {
-            DbAction::Import { dry_run } | DbAction::BackfillJobCells { dry_run } => !dry_run,
+            DbAction::Import { dry_run }
+            | DbAction::BackfillJobCells { dry_run }
+            | DbAction::BackfillRunEvidence { dry_run } => !dry_run,
             DbAction::Check | DbAction::Migrate { .. } | DbAction::Export { .. } => false,
         },
+        Command::Queue {
+            action: QueueAction::Import { dry_run } | QueueAction::Export { dry_run },
+        } => !dry_run,
         Command::ProcessSubmissions
         | Command::ScoreEval
         | Command::QueueMaintenance
@@ -2520,11 +2679,14 @@ fn writes(command: &Command) -> bool {
             VaultAction::Delete { .. } => true,
         },
         Command::Catalog { action } => match action {
-            CatalogAction::List { .. } | CatalogAction::Show { .. } => false,
+            CatalogAction::List { .. }
+            | CatalogAction::Show { .. }
+            | CatalogAction::Coverage { .. } => false,
             CatalogAction::Import { .. } | CatalogAction::Refresh { .. } => true,
-            CatalogAction::Create { dry_run, .. } | CatalogAction::AddMember { dry_run, .. } => {
-                !dry_run
-            }
+            CatalogAction::Create { dry_run, .. }
+            | CatalogAction::AddMember { dry_run, .. }
+            | CatalogAction::Rename { dry_run, .. }
+            | CatalogAction::Relabel { dry_run, .. } => !dry_run,
             CatalogAction::Pin { .. }
             | CatalogAction::Unpin { .. }
             | CatalogAction::Hide { .. }
@@ -2721,6 +2883,7 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
         // `main` prints it before loading a config.
         Command::Openapi { site } => print_openapi(site.as_deref()),
         Command::Db { action } => run_db(action, &config).await,
+        Command::Queue { action } => run_queue(action, &config).await,
         Command::Unverified { action } => {
             let stores = build_stores(&config).await?;
             // No mutate lock, as for `users`.
@@ -2739,8 +2902,8 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
             // Worst case: every artifact at its deadline, plus a minute. Each
             // lock is its own, so neither waits on `mutate`. A crashed holder
             // keeps its lease to expiry: minutes for a probe, but up to the
-            // whole build run for a build (hours with an unbuilt asr-eval
-            // corpus), which operations.md says how to clear.
+            // whole build run for a build, which operations.md says how to
+            // clear.
             let artifacts = dataset_cache::pinned_count(&stores).await?.max(1) as u64;
             let lease = |per_artifact: std::num::NonZeroU64| {
                 std::time::Duration::from_secs(artifacts * per_artifact.get() + 60)
@@ -2759,8 +2922,8 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
                     .await
                 }
                 DatasetCacheAction::Build => {
-                    // Each artifact at its own format's deadline, an asr-eval
-                    // corpus only while unbuilt: see `build_run_deadline`.
+                    // Each artifact at the build deadline, an evals-server pin
+                    // only while unregistered: see `build_run_deadline`.
                     let build_ttl = dataset_cache::build_run_deadline(&config, &stores)
                         .await?
                         .saturating_add(std::time::Duration::from_secs(60));
@@ -2885,6 +3048,7 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
             .transpose()
             .map_err(|e| anyhow::anyhow!("failed to build the HuggingFace import client: {e}"))?;
             let settings = IngestSettings {
+                descriptor_config: &config.descriptor_catalog,
                 models,
                 max_jobs: config.plan_max_jobs,
                 creating_max_age,
@@ -2982,15 +3146,33 @@ async fn handle_catalog_action(
             .await?;
             println!("Added {} members to {name}.", result.members_added);
         }
-        CatalogAction::Create { file, org, dry_run } => {
+        CatalogAction::Create {
+            file,
+            name,
+            release_time,
+            runtimes,
+            models,
+            org,
+            dry_run,
+        } => {
             let scope = catalog_scope(stores, org.as_ref()).await?;
-            let document = std::fs::read_to_string(&file)?;
+            let text = file.map(std::fs::read_to_string).transpose()?;
+            let document = match (&text, name) {
+                (Some(text), _) => Document::Toml(text),
+                (None, Some(name)) => Document::Parsed(CreateDescriptorEntryRequest {
+                    name,
+                    release_time,
+                    runtimes: NonEmptyVec::try_new(runtimes).ok(),
+                    models: NonEmptyVec::try_new(models).ok(),
+                }),
+                (None, None) => anyhow::bail!("catalog create needs FILE or --name"),
+            };
             let preview = descriptor_catalog_admin::create_with_vault(
                 catalog,
                 &catalog_hub(config)?,
                 Some(stores.vault.as_ref()),
                 &scope,
-                &document,
+                document,
                 chrono::Utc::now(),
                 dry_run,
             )
@@ -3000,11 +3182,25 @@ async fn handle_catalog_action(
         CatalogAction::AddMember {
             name,
             file,
+            runtime,
+            model,
             org,
             dry_run,
         } => {
             let scope = catalog_scope(stores, org.as_ref()).await?;
-            let document = std::fs::read_to_string(&file)?;
+            let text = file.map(std::fs::read_to_string).transpose()?;
+            let document = match &text {
+                Some(text) => Document::Toml(text),
+                None => {
+                    let (quantization, model) =
+                        model.map(|model| (model.quantization, model.model)).unzip();
+                    Document::Parsed(AddDescriptorMemberRequest {
+                        runtime: runtime.map(|runtime| *runtime),
+                        model,
+                        quantization,
+                    })
+                }
+            };
             let preview = descriptor_catalog_admin::add_member_with_vault(
                 catalog,
                 descriptor_catalog_admin::CatalogSources {
@@ -3013,7 +3209,7 @@ async fn handle_catalog_action(
                 },
                 &scope,
                 &name,
-                &document,
+                document,
                 chrono::Utc::now(),
                 dry_run,
             )
@@ -3036,6 +3232,46 @@ async fn handle_catalog_action(
         CatalogAction::Unhide { name, org } => {
             let scope = catalog_scope(stores, org.as_ref()).await?;
             change_catalog_state(catalog, &scope, &name, CatalogTransition::Unhide).await?;
+        }
+        CatalogAction::Rename {
+            name,
+            new_name,
+            org,
+            dry_run,
+        } => {
+            let scope = catalog_scope(stores, org.as_ref()).await?;
+            let result = descriptor_catalog_admin::rename_entry_with_old_name(
+                catalog, &scope, &name, &new_name, dry_run,
+            )
+            .await?;
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+            } else {
+                record_catalog_rename(stores.audit.as_deref(), &scope, result.audit_action(&scope))
+                    .await;
+            }
+            print!("{}", rename_report(&name, &result, dry_run));
+        }
+        CatalogAction::Relabel {
+            name,
+            format,
+            from,
+            to,
+            org,
+            dry_run,
+        } => {
+            let scope = catalog_scope(stores, org.as_ref()).await?;
+            let entry = descriptor_catalog_admin::relabel_entry(
+                catalog, &scope, &name, format, &from, &to, dry_run,
+            )
+            .await?;
+            let name = entry.name;
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+                println!("Would relabel {name}::{format}::{from} to {name}::{format}::{to}");
+            } else {
+                println!("Relabeled {name}::{format}::{from} to {name}::{format}::{to}");
+            }
         }
         CatalogAction::Tombstone { name, org, yes } => {
             let scope = catalog_scope(stores, org.as_ref()).await?;
@@ -3110,8 +3346,74 @@ async fn handle_catalog_action(
                 .ok_or_else(|| anyhow::anyhow!("no catalog entry {name}"))?;
             println!("{}", serde_json::to_string_pretty(&entry)?);
         }
+        CatalogAction::Coverage { days, top } => {
+            let since = chrono::TimeDelta::try_days(i64::from(days))
+                .and_then(|window| chrono::Utc::now().checked_sub_signed(window))
+                .ok_or_else(|| anyhow::anyhow!("--days {days} is out of range"))?;
+            let (entries, unreadable) =
+                catalog_coverage::load_live_entries(catalog, &*stores.orgs).await?;
+            let index = catalog_coverage::CoverageIndex::new(&entries);
+            let report = catalog_coverage::coverage(stores, &index, since, unreadable).await?;
+            print!("{}", report.render(top));
+            report.log(days);
+        }
     }
     Ok(())
+}
+
+/// The lines that `catalog rename` prints after a rename or a merge.
+fn rename_report(
+    name: &CatalogName,
+    result: &descriptor_catalog_admin::RenameResult,
+    dry_run: bool,
+) -> String {
+    use descriptor_catalog_admin::{RenameResult, member_keys};
+    let into = &result.entry().name;
+    match (result, dry_run) {
+        (RenameResult::Renamed { .. }, true) => format!("Would rename {name} to {into}\n"),
+        (RenameResult::Renamed { .. }, false) => format!("Renamed {name} to {into}\n"),
+        (RenameResult::Merged { merge, .. }, dry_run) => {
+            let verb = if dry_run { "Would merge" } else { "Merged" };
+            let mut report = format!("{verb} {name} into {into}\n");
+            if !merge.moved.is_empty() {
+                report += &format!("Moved members: {}\n", member_keys(&merge.moved));
+            }
+            if !merge.skipped.is_empty() {
+                report += &format!(
+                    "Skipped members that {into} already holds: {}\n",
+                    member_keys(&merge.skipped)
+                );
+            }
+            report
+        }
+    }
+}
+
+/// Record a completed rename or merge: `action` is a `CatalogRename` or a
+/// `CatalogMerge`.
+async fn record_catalog_rename(
+    log: Option<&dyn AuditStore>,
+    scope: &CatalogScope,
+    action: AuditAction,
+) {
+    let Some(log) = log else {
+        return;
+    };
+    let mut event = pipette_core::audit::new_event(
+        pipette_pipeline::audit::host_actor(),
+        action,
+        AuditOutcome::Succeeded,
+    );
+    if let CatalogScope::Org(org_id) = scope {
+        event.org_ids.insert(org_id.clone());
+        event.targets.insert(AuditTarget::Org {
+            org_id: org_id.clone(),
+        });
+    }
+    if let Err(error) = log.append(&event).await {
+        tracing::error!(event_id = %event.event_id, error = %format!("{error:#}"),
+            "failed to write the catalog rename audit event");
+    }
 }
 
 async fn change_catalog_state(
@@ -3343,7 +3645,7 @@ async fn campaign_owner(
             | campaign_admin::CampaignAdminError::NoSuchOrg(_)
             | campaign_admin::CampaignAdminError::NoSuchPlan(_)
             | campaign_admin::CampaignAdminError::NotAdvanced { .. }
-            | campaign_admin::CampaignAdminError::NotCreated { .. }
+            | campaign_admin::CampaignAdminError::CommitUnknown { .. }
             | campaign_admin::CampaignAdminError::NoPlan(_)
             | campaign_admin::CampaignAdminError::Archived(_)
             | campaign_admin::CampaignAdminError::NotOnPlan { .. }
@@ -3391,20 +3693,20 @@ async fn ingest_into_campaign(
             .await
             .map_err(|e| match e {
                 // Name the staged plan: a second ingest mints another and
-                // leaves this one claimable.
+                // leaves this one in the queue.
                 campaign_admin::CampaignAdminError::NotAdvanced {
                     ref plan_id,
                     ref source,
                     ..
                 } => anyhow::anyhow!(
-                    "{e}; stop it with `plans cancel {plan_id}` before filing again: {source:#}"
+                    "{e}; preserve live jobs in {plan_id} with a successful filing before cancelling it: {source:#}"
                 ),
                 other @ (campaign_admin::CampaignAdminError::NotFound(_)
                 | campaign_admin::CampaignAdminError::NoSuchUser(_)
                 | campaign_admin::CampaignAdminError::NoSuchOrg(_)
                 | campaign_admin::CampaignAdminError::NoSuchPlan(_)
                 | campaign_admin::CampaignAdminError::NoOwnerNamed
-                | campaign_admin::CampaignAdminError::NotCreated { .. }
+                | campaign_admin::CampaignAdminError::CommitUnknown { .. }
                 | campaign_admin::CampaignAdminError::NoPlan(_)
                 | campaign_admin::CampaignAdminError::Archived(_)
                 | campaign_admin::CampaignAdminError::NotOnPlan { .. }
@@ -3523,7 +3825,9 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
             ref source,
             ..
         } => {
-            anyhow::anyhow!("{e}; stop it with `plans cancel {plan_id}`, then {retry}: {source:#}")
+            anyhow::anyhow!(
+                "{e}; preserve live jobs in {plan_id} with a successful filing, then cancel it and {retry}: {source:#}"
+            )
         }
         campaign_admin::CampaignAdminError::Overtaken {
             cancelled: true, ..
@@ -3543,7 +3847,7 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
         | campaign_admin::CampaignAdminError::NoSuchOrg(_)
         | campaign_admin::CampaignAdminError::NoSuchPlan(_)
         | campaign_admin::CampaignAdminError::NoOwnerNamed
-        | campaign_admin::CampaignAdminError::NotCreated { .. }
+        | campaign_admin::CampaignAdminError::CommitUnknown { .. }
         | campaign_admin::CampaignAdminError::NoPlan(_)
         | campaign_admin::CampaignAdminError::Archived(_)
         | campaign_admin::CampaignAdminError::NotOnPlan { .. }
@@ -3597,48 +3901,7 @@ async fn create_campaign(
 ) -> anyhow::Result<()> {
     let (campaign, report) = campaign_admin::create(stores, settings, new, plan, note)
         .await
-        .map_err(|e| match e {
-            // Only an uncancelled plan needs the operator: it stays claimable under
-            // a campaign id nothing holds, and a second run files a second plan.
-            campaign_admin::CampaignAdminError::NotCreated {
-                cancelled: true,
-                ref source,
-                ..
-            } => anyhow::anyhow!("{e}; the plan is cancelled, so create it again: {source:#}"),
-            campaign_admin::CampaignAdminError::NotCreated {
-                cancelled: false,
-                ref plan_id,
-                ref source,
-                ..
-            } => anyhow::anyhow!(
-                "{e}; stop it with `plans cancel {plan_id}` before creating it again: {source:#}"
-            ),
-            other @ (campaign_admin::CampaignAdminError::NotFound(_)
-            | campaign_admin::CampaignAdminError::NoSuchUser(_)
-            | campaign_admin::CampaignAdminError::NoSuchOrg(_)
-            | campaign_admin::CampaignAdminError::NoSuchPlan(_)
-            | campaign_admin::CampaignAdminError::NoOwnerNamed
-            | campaign_admin::CampaignAdminError::NotAdvanced { .. }
-            | campaign_admin::CampaignAdminError::NoPlan(_)
-            | campaign_admin::CampaignAdminError::Archived(_)
-            | campaign_admin::CampaignAdminError::NotOnPlan { .. }
-            | campaign_admin::CampaignAdminError::NoDocument(_)
-            | campaign_admin::CampaignAdminError::SourceMismatch(_)
-            | campaign_admin::CampaignAdminError::NotInCampaign { .. }
-            | campaign_admin::CampaignAdminError::NoSuchSourceVariant { .. }
-            | campaign_admin::CampaignAdminError::Edit(_)
-            | campaign_admin::CampaignAdminError::NothingToRerun
-            | campaign_admin::CampaignAdminError::NotInPlan { .. }
-            | campaign_admin::CampaignAdminError::Unanswered(_)
-            | campaign_admin::CampaignAdminError::NoneAnswered { .. }
-            | campaign_admin::CampaignAdminError::NotRescorable(_)
-            | campaign_admin::CampaignAdminError::NoneRescorable(_)
-            | campaign_admin::CampaignAdminError::Overtaken { .. }
-            | campaign_admin::CampaignAdminError::NotCancelled { .. }
-            | campaign_admin::CampaignAdminError::StillRunning { .. }
-            | campaign_admin::CampaignAdminError::DeletedDuringFiling { .. }
-            | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
-        })?;
+        .map_err(anyhow::Error::new)?;
 
     println!("Created campaign {}", campaign.campaign_id);
     println!("Name         {}", campaign.name);
@@ -4810,6 +5073,42 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
                     }
                 }
             };
+            // A `delete` that stopped at the claim leaves the rest of the account at its id.
+            if adopted {
+                let cleared = async {
+                    let keys = user_store.list_user_keys(&user.user_id).await?;
+                    futures::future::try_join_all(keys.iter().map(|key| {
+                        user_admin::revoke_key(
+                            &*user_store,
+                            &*stores.key_index,
+                            &user.user_id,
+                            &key.key_id,
+                        )
+                    }))
+                    .await?;
+                    let preauth = user_store.list_user_preauth_keys().await?;
+                    futures::future::try_join_all(
+                        preauth
+                            .iter()
+                            .filter(|key| key.user_id == user.user_id)
+                            .map(|key| user_store.delete_user_preauth_key(&key.key_id)),
+                    )
+                    .await?;
+                    user_store.delete_user_permissions(&user.user_id).await?;
+                    stores.orgs.delete_membership(&user.user_id).await?;
+                    user_store
+                        .delete_user_first_clerk_sign_in(&user.user_id)
+                        .await
+                }
+                .await;
+                if let Err(clear) = cleared {
+                    return Err(clear.context(format!(
+                        "could not clear what the account that stranded the claim left at {}, so \
+                         no account was created; run the same command again",
+                        user.user_id
+                    )));
+                }
+            }
             if let Err(write) = user_store.put_user(&user).await {
                 // Release only while no record answers to this id: a concurrent
                 // adopter may have written one. A failed probe still releases and
@@ -4889,16 +5188,6 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
                     user.user_id,
                     render_permissions(set.iter())
                 );
-            } else if adopted {
-                // An adopted id may still carry a dead account's grant (`delete`
-                // removes it last); clear it rather than hand those rights on.
-                if let Err(clear) = user_store.delete_user_permissions(&user.user_id).await {
-                    return Err(clear.context(format!(
-                        "user {} was created on an adopted claim but may still hold the grant of \
-                         the account that stranded it; clear it with `users permission set {}`",
-                        user.user_id, user.user_id
-                    )));
-                }
             }
             // Last: nobody has signed in as it yet, so its administrator may mint
             // the pre-auth key it registers with.
@@ -6769,6 +7058,59 @@ fn parse_catalog_name(s: &str) -> Result<CatalogName, String> {
     CatalogName::try_new(s.to_owned()).map_err(|error| error.to_string())
 }
 
+fn parse_model_format(s: &str) -> Result<ModelFormat, String> {
+    s.parse()
+        .map_err(|error: strum::ParseError| error.to_string())
+}
+
+fn parse_quantization_label(s: &str) -> Result<QuantizationLabel, String> {
+    QuantizationLabel::try_new(s).map_err(|error| error.to_string())
+}
+
+fn parse_release_time(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|time| time.with_timezone(&chrono::Utc))
+        .map_err(|error| error.to_string())
+}
+
+/// A runtime descriptor as JSON, as `catalog coverage` prints it.
+fn parse_runtime_json(s: &str) -> Result<Runtime, String> {
+    parse_descriptor_json(s, "runtime")
+}
+
+/// A descriptor as JSON. The member cannot hold a key that the typed
+/// descriptor does not know, so the member's digest would differ from the
+/// digest of the JSON. The parse refuses such a key.
+fn parse_descriptor_json<T>(s: &str, kind: &str) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let invalid = |error: serde_json::Error| format!("invalid {kind} JSON: {error}");
+    let value: serde_json::Value = serde_json::from_str(s).map_err(invalid)?;
+    let parsed = descriptor_alias::parse_strict::<T>(&value).ok_or_else(|| {
+        serde_json::from_value::<T>(value.clone())
+            .err()
+            .map_or_else(|| format!("invalid {kind} JSON"), invalid)
+    })?;
+    match parsed.unknown_key {
+        None => Ok(parsed.value),
+        Some(key) => Err(format!(
+            "{kind} JSON has a key that the typed {kind} does not know: {key}"
+        )),
+    }
+}
+
+/// `<quantization>=<JSON object>`. A label has no `=`, so the first `=` ends it.
+fn parse_model_member(s: &str) -> Result<ModelMemberRequest, String> {
+    let (quantization, model) = s
+        .split_once('=')
+        .ok_or("expected <quantization>=<JSON object>")?;
+    Ok(ModelMemberRequest {
+        quantization: parse_quantization_label(quantization)?,
+        model: parse_descriptor_json(model, "model")?,
+    })
+}
+
 fn parse_catalog_runtime_type(s: &str) -> Result<RuntimeType, String> {
     serde_json::from_value(serde_json::Value::String(s.to_owned()))
         .map_err(|error| error.to_string())
@@ -7048,6 +7390,22 @@ async fn run_db(action: DbAction, config: &Config) -> anyhow::Result<()> {
                 report.unreadable_sources, report.unreadable_records
             );
         }
+        DbAction::BackfillRunEvidence { dry_run } => {
+            database::check(config).await?;
+            let stores = build_stores(config).await?;
+            let index = stores
+                .run_evidence
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("db backfill-run-evidence needs [database]"))?;
+            let report =
+                pipette_pipeline::run_evidence::backfill(&*stores.warehouse, index, dry_run)
+                    .await?;
+            let verb = if dry_run { "would write" } else { "wrote" };
+            println!(
+                "read {} warehouse row(s); {verb} {} run evidence row(s)",
+                report.rows_read, report.rows_written
+            );
+        }
     }
     Ok(())
 }
@@ -7068,6 +7426,82 @@ async fn copy_db(
     };
     let report = record_copy::copy_records(from, to, mode, dry_run).await?;
     finish_copy(&report)
+}
+
+/// An import copies the object-store queue into the database. An export
+/// copies the database queue to the object store, the rollback.
+async fn run_queue(action: QueueAction, config: &Config) -> anyhow::Result<()> {
+    database::check(config).await?;
+    let stores = build_queue_copy_stores(config).await?;
+    let report = match action {
+        QueueAction::Import { dry_run } => {
+            let liveness: &dyn LivenessImport = &*stores.database_liveness;
+            queue_copy::copy_queue(&*stores.objects, &*stores.database, Some(liveness), dry_run)
+                .instrument(tracing::info_span!("queue_copy", direction = "import"))
+                .await?
+        }
+        QueueAction::Export { dry_run } => {
+            queue_copy::copy_queue(&*stores.database, &*stores.objects, None, dry_run)
+                .instrument(tracing::info_span!("queue_copy", direction = "export"))
+                .await?
+        }
+    };
+    print_queue_copy_report(&report);
+    let unreadable = report.unreadable();
+    anyhow::ensure!(
+        unreadable == 0,
+        "{unreadable} unreadable queue entries were not copied; resolve them and run again"
+    );
+    Ok(())
+}
+
+#[derive(tabled::Tabled)]
+struct QueueCopyRow {
+    #[tabled(rename = "Keyspace")]
+    keyspace: &'static str,
+    #[tabled(rename = "Read")]
+    read: usize,
+    #[tabled(rename = "Written")]
+    written: usize,
+    #[tabled(rename = "Unchanged")]
+    unchanged: usize,
+    #[tabled(rename = "Deleted")]
+    deleted: usize,
+    #[tabled(rename = "Skipped")]
+    skipped: usize,
+    #[tabled(rename = "Unreadable")]
+    unreadable: usize,
+    #[tabled(rename = "Elapsed")]
+    elapsed: String,
+}
+
+fn print_queue_copy_report(report: &queue_copy::QueueCopyReport) {
+    let seconds = |elapsed: std::time::Duration| format!("{:.1} s", elapsed.as_secs_f64());
+    let rows: Vec<QueueCopyRow> = report
+        .keyspaces
+        .iter()
+        .map(|k| QueueCopyRow {
+            keyspace: k.report.keyspace,
+            read: k.report.read,
+            written: k.report.written,
+            unchanged: k.report.unchanged,
+            deleted: k.report.deleted,
+            skipped: k.report.skipped.len(),
+            unreadable: k.report.unreadable.len(),
+            elapsed: seconds(k.elapsed),
+        })
+        .collect();
+    let mut table = tabled::Table::new(&rows);
+    table.with(tabled::settings::Style::psql());
+    if report.dry_run {
+        println!("Dry run: nothing changed; Written and Deleted count what would be.");
+    }
+    println!("{table}");
+    println!("Total elapsed: {}", seconds(report.elapsed));
+    report
+        .keyspaces
+        .iter()
+        .for_each(|k| print_copy_notes(&k.report));
 }
 
 fn finish_copy(report: &record_copy::CopyReport) -> anyhow::Result<()> {
@@ -7131,24 +7565,27 @@ fn print_copy_report(report: &record_copy::CopyReport) {
         println!("Dry run: nothing changed; Written and Deleted count what would be.");
     }
     println!("{table}");
-    report.keyspaces.iter().for_each(|k| {
-        let reasons = k.skipped.iter().fold(
-            std::collections::BTreeMap::<&str, usize>::new(),
-            |mut reasons, note| {
-                *reasons.entry(note.reason.as_str()).or_default() += 1;
-                reasons
-            },
-        );
-        reasons
-            .iter()
-            .for_each(|(reason, count)| println!("{}: {count} skipped: {reason}", k.keyspace));
-        k.unreadable
-            .iter()
-            .for_each(|note| println!("{}: unreadable {}: {}", k.keyspace, note.id, note.reason));
-        k.conflicts
-            .iter()
-            .for_each(|note| println!("{}: conflict {}: {}", k.keyspace, note.id, note.reason));
-    });
+    report.keyspaces.iter().for_each(print_copy_notes);
+}
+
+/// Each skip reason with its count, then each unreadable record and conflict.
+fn print_copy_notes(k: &record_copy::KeyspaceReport) {
+    let reasons = k.skipped.iter().fold(
+        std::collections::BTreeMap::<&str, usize>::new(),
+        |mut reasons, note| {
+            *reasons.entry(note.reason.as_str()).or_default() += 1;
+            reasons
+        },
+    );
+    reasons
+        .iter()
+        .for_each(|(reason, count)| println!("{}: {count} skipped: {reason}", k.keyspace));
+    k.unreadable
+        .iter()
+        .for_each(|note| println!("{}: unreadable {}: {}", k.keyspace, note.id, note.reason));
+    k.conflicts
+        .iter()
+        .for_each(|note| println!("{}: conflict {}: {}", k.keyspace, note.id, note.reason));
 }
 
 async fn serve(config: Config, stores: Stores) -> anyhow::Result<()> {
@@ -7964,12 +8401,111 @@ mod tests {
     use pipette_plan_types::{BenchmarkType, JobId, RuntimeOutput, WarningKind};
     use pipette_store::{ClaimResult, JobState};
     use pipette_store_fs::build_local_fs_stores;
+    use pipette_store_testkit::CapturingAuditStore;
     use pipette_web_testkit::{
         own_client_by_org, register_pending, registered_user, seed_org, seeded_state, set_user_org,
         signed_empty, signed_json,
     };
 
     use super::*;
+
+    #[rstest]
+    #[case::renamed(false, false, "Renamed Typo to Held\n")]
+    #[case::rename_dry_run(false, true, "Would rename Typo to Held\n")]
+    #[case::merged(
+        true,
+        false,
+        "Merged Typo into Held\nMoved members: linux-x64-vulkan\nSkipped members that Held already holds: macos-arm64\n"
+    )]
+    #[case::merge_dry_run(
+        true,
+        true,
+        "Would merge Typo into Held\nMoved members: linux-x64-vulkan\nSkipped members that Held already holds: macos-arm64\n"
+    )]
+    fn a_rename_report_names_the_moved_and_skipped_members(
+        #[case] merged: bool,
+        #[case] dry_run: bool,
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        use descriptor_catalog_admin::RenameResult;
+
+        use pipette_plan_types::DescriptorEntryKind;
+        use pipette_store_testkit::{a_descriptor_entry, a_member};
+        let held = a_member("b1", "macos-arm64")?;
+        let vulkan = a_member("b1", "linux-x64-vulkan")?;
+        let mut entry = a_descriptor_entry("Held", DescriptorEntryKind::HandMade, 1, held.clone())?;
+        let old_name = CatalogName::try_new("Typo")?;
+        let result = if merged {
+            entry.members.extend([vulkan.clone()]);
+            RenameResult::Merged {
+                old_name,
+                merge: pipette_store::MergedMembers {
+                    moved: vec![vulkan],
+                    skipped: vec![held],
+                },
+                entry,
+            }
+        } else {
+            RenameResult::Renamed { old_name, entry }
+        };
+        assert_eq!(
+            rename_report(&CatalogName::try_new("Typo")?, &result, dry_run),
+            expected
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::global(None)]
+    #[case::org(Some("org_acme"))]
+    #[tokio::test]
+    async fn a_catalog_rename_adds_an_event_with_both_stored_names(
+        #[case] org_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let scope = match org_id {
+            Some(id) => CatalogScope::Org(OrgId::try_new(id)?),
+            None => CatalogScope::Global,
+        };
+        let old_name = CatalogName::try_new("Fork")?;
+        let new_name = CatalogName::try_new("Spoon")?;
+        let log = CapturingAuditStore::default();
+        let action = AuditAction::CatalogRename {
+            scope: scope.clone(),
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        };
+        record_catalog_rename(Some(&log), &scope, action).await;
+
+        let events = log.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.action,
+            AuditAction::CatalogRename {
+                scope: scope.clone(),
+                old_name,
+                new_name,
+            }
+        );
+        assert_eq!(event.outcome, AuditOutcome::Succeeded);
+        assert!(matches!(
+            &event.actor,
+            pipette_plan_types::AuditActor::Host { .. }
+        ));
+        let expected_orgs = match &scope {
+            CatalogScope::Global => Default::default(),
+            CatalogScope::Org(id) => std::collections::BTreeSet::from([id.clone()]),
+        };
+        assert_eq!(event.org_ids, expected_orgs);
+        let expected_targets = match &scope {
+            CatalogScope::Global => Default::default(),
+            CatalogScope::Org(org_id) => std::collections::BTreeSet::from([AuditTarget::Org {
+                org_id: org_id.clone(),
+            }]),
+        };
+        assert_eq!(event.targets, expected_targets);
+        Ok(())
+    }
 
     /// A read and a dry run change nothing, so only the rest are audited.
     #[rstest]
@@ -7983,7 +8519,13 @@ mod tests {
     #[case::a_migration(&["db", "migrate"], false)]
     #[case::an_import(&["db", "import"], true)]
     #[case::an_import_dry_run(&["db", "import", "--dry-run"], false)]
+    #[case::a_queue_import(&["queue", "import"], true)]
+    #[case::a_queue_import_dry_run(&["queue", "import", "--dry-run"], false)]
+    #[case::a_queue_export(&["queue", "export"], true)]
+    #[case::a_queue_export_dry_run(&["queue", "export", "--dry-run"], false)]
     #[case::a_job_cells_backfill(&["db", "backfill-job-cells"], true)]
+    #[case::a_run_evidence_backfill(&["db", "backfill-run-evidence"], true)]
+    #[case::a_run_evidence_backfill_dry_run(&["db", "backfill-run-evidence", "--dry-run"], false)]
     #[case::a_dry_run(&["fix-canonical", "--dry-run"], false)]
     #[case::a_cancel(&["plans", "cancel", "plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"], true)]
     #[case::a_prune(&["audit", "prune"], true)]
@@ -8003,6 +8545,10 @@ mod tests {
     #[case::catalog_create_dry_run(&["catalog", "create", "entry.toml", "--dry-run"], false)]
     #[case::catalog_add(&["catalog", "add-member", "Fork", "member.toml"], true)]
     #[case::catalog_add_dry_run(&["catalog", "add-member", "Fork", "member.toml", "--dry-run"], false)]
+    #[case::catalog_create_inline(&["catalog", "create", "--name", "Fork", "--runtime", RUNTIME_JSON], true)]
+    #[case::catalog_create_inline_dry_run(&["catalog", "create", "--name", "Fork", "--model", &model_member("q4_0"), "--dry-run"], false)]
+    #[case::catalog_add_inline(&["catalog", "add-member", "Fork", "--runtime", RUNTIME_JSON], true)]
+    #[case::catalog_add_inline_dry_run(&["catalog", "add-member", "Fork", "--model", &model_member("q4_0"), "--dry-run"], false)]
     #[case::catalog_import(&["catalog", "import"], true)]
     #[case::catalog_import_since(&["catalog", "import", "--since", "2026-10-15"], true)]
     #[case::catalog_refresh(&["catalog", "refresh", "llamacpp-v0.7.0"], true)]
@@ -8013,11 +8559,20 @@ mod tests {
     #[case::catalog_tombstone(&["catalog", "tombstone", "Fork", "--yes"], true)]
     #[case::catalog_list(&["catalog", "list"], false)]
     #[case::catalog_show(&["catalog", "show", "Fork"], false)]
+    #[case::catalog_coverage(&["catalog", "coverage", "--days", "7"], false)]
     #[case::org_catalog_create(&["catalog", "create", "entry.toml", "--org", "acme"], true)]
     #[case::org_catalog_create_dry_run(&["catalog", "create", "entry.toml", "--org", "acme", "--dry-run"], false)]
     #[case::org_catalog_add(&["catalog", "add-member", "Fork", "member.toml", "--org", "acme"], true)]
     #[case::org_catalog_pin(&["catalog", "pin", "Fork", "--org", "acme"], true)]
     #[case::org_catalog_tombstone(&["catalog", "tombstone", "Fork", "--org", "acme", "--yes"], true)]
+    #[case::catalog_rename(&["catalog", "rename", "Fork", "Spoon"], true)]
+    #[case::catalog_rename_dry_run(&["catalog", "rename", "Fork", "Spoon", "--dry-run"], false)]
+    #[case::org_catalog_rename(&["catalog", "rename", "Fork", "Spoon", "--org", "acme"], true)]
+    #[case::org_catalog_rename_dry_run(&["catalog", "rename", "Fork", "Spoon", "--org", "acme", "--dry-run"], false)]
+    #[case::catalog_relabel(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0"], true)]
+    #[case::catalog_relabel_dry_run(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--dry-run"], false)]
+    #[case::org_catalog_relabel(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--org", "acme"], true)]
+    #[case::org_catalog_relabel_dry_run(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--org", "acme", "--dry-run"], false)]
     #[case::org_catalog_list(&["catalog", "list", "--org", "acme"], false)]
     #[case::org_catalog_show(&["catalog", "show", "Fork", "--org", "acme"], false)]
     fn a_command_is_audited_when_it_writes(#[case] args: &[&str], #[case] audited: bool) {
@@ -8028,6 +8583,96 @@ mod tests {
                 .is_ok_and(|cli| writes(&cli.command) == audited),
             "{args:?}"
         );
+    }
+
+    const RUNTIME_JSON: &str = r#"{"flavor":"macos-arm64","repository_url":"github.com/ggml-org/llama.cpp","repository_version":"b1","source":"github_release","type":"llamacpp_cli_stock_tools"}"#;
+    const MODEL_JSON: &str = r#"{"org":"acme","path":"AcmeLM-Q4_0.gguf","repo_name":"AcmeLM-GGUF","source":"huggingface","type":"gguf_text"}"#;
+
+    /// A `--model` value: `label`, an `=`, and `MODEL_JSON`.
+    fn model_member(label: &str) -> String {
+        format!("{label}={MODEL_JSON}")
+    }
+
+    #[rstest]
+    #[case::bad_new_name(&["catalog", "rename", "Fork", "-Spoon"])]
+    #[case::rename_without_new_name(&["catalog", "rename", "Fork"])]
+    #[case::bad_format(&["catalog", "relabel", "AcmeLM", "--format", "onnx2", "--from", "a", "--to", "b"])]
+    #[case::bad_label(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "a", "--to", "Q4"])]
+    #[case::relabel_without_to(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "a"])]
+    #[case::no_source(&["catalog", "create"])]
+    #[case::file_and_name(&["catalog", "create", "entry.toml", "--name", "Fork", "--runtime", RUNTIME_JSON])]
+    #[case::name_without_members(&["catalog", "create", "--name", "Fork"])]
+    #[case::runtime_with_file(&["catalog", "create", "entry.toml", "--runtime", RUNTIME_JSON])]
+    #[case::release_time_with_file(&["catalog", "create", "entry.toml", "--release-time", "2026-10-19T22:54:49Z"])]
+    #[case::bad_release_time(&["catalog", "create", "--name", "Fork", "--runtime", RUNTIME_JSON, "--release-time", "2026-10-19"])]
+    #[case::runtimes_and_models(&["catalog", "create", "--name", "Fork", "--runtime", RUNTIME_JSON, "--model", &model_member("q4_0")])]
+    #[case::bad_runtime_json(&["catalog", "create", "--name", "Fork", "--runtime", r#"{"type":"#])]
+    #[case::unknown_runtime_type(&["catalog", "create", "--name", "Fork", "--runtime", r#"{"type":"nope"}"#])]
+    #[case::unknown_runtime_key(&["catalog", "create", "--name", "Fork", "--runtime", &RUNTIME_JSON.replacen('{', r#"{"extra":1,"#, 1)])]
+    #[case::unknown_model_key(&["catalog", "add-member", "Fork", "--model", &model_member("q4_0").replacen('{', r#"{"extra":1,"#, 1)])]
+    #[case::model_without_label(&["catalog", "create", "--name", "Fork", "--model", MODEL_JSON])]
+    #[case::bad_model_label(&["catalog", "create", "--name", "Fork", "--model", &model_member("Q4")])]
+    #[case::member_file_and_runtime(&["catalog", "add-member", "Fork", "member.toml", "--runtime", RUNTIME_JSON])]
+    #[case::no_member(&["catalog", "add-member", "Fork"])]
+    #[case::runtime_and_model(&["catalog", "add-member", "Fork", "--runtime", RUNTIME_JSON, "--model", &model_member("q4_0")])]
+    #[case::two_runtimes(&["catalog", "add-member", "Fork", "--runtime", RUNTIME_JSON, "--runtime", RUNTIME_JSON])]
+    fn catalog_commands_refuse_bad_arguments(#[case] args: &[&str]) {
+        let argv = std::iter::once("pipette-mgmt").chain(args.iter().copied());
+        assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
+    }
+
+    #[test]
+    fn catalog_create_keeps_inline_runtimes_in_order() -> anyhow::Result<()> {
+        let second = RUNTIME_JSON.replace("macos-arm64", "windows-x64-vulkan");
+        let cli = Cli::try_parse_from([
+            "pipette-mgmt",
+            "catalog",
+            "create",
+            "--name",
+            "Fork",
+            "--release-time",
+            "2026-10-19T22:54:49Z",
+            "--runtime",
+            RUNTIME_JSON,
+            "--runtime",
+            &second,
+        ])?;
+        let Command::Catalog {
+            action:
+                CatalogAction::Create {
+                    file: None,
+                    name: Some(name),
+                    release_time: Some(release_time),
+                    runtimes,
+                    models,
+                    ..
+                },
+        } = cli.command
+        else {
+            anyhow::bail!("catalog create did not keep the inline values");
+        };
+        assert_eq!(name.to_string(), "Fork");
+        assert_eq!(release_time.to_rfc3339(), "2026-10-19T22:54:49+00:00");
+        assert_eq!(
+            runtimes,
+            [
+                serde_json::from_str::<Runtime>(RUNTIME_JSON)?,
+                serde_json::from_str::<Runtime>(&second)?,
+            ]
+        );
+        assert!(models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_member_value_splits_into_label_and_model() -> anyhow::Result<()> {
+        let member = parse_model_member(&model_member("q4_0")).map_err(anyhow::Error::msg)?;
+        assert_eq!(member.quantization.as_str(), "q4_0");
+        assert_eq!(
+            member.model,
+            serde_json::from_str::<pipette_plan_types::Model>(MODEL_JSON)?
+        );
+        Ok(())
     }
 
     #[test]
@@ -8108,6 +8753,35 @@ mod tests {
             _state: DescriptorEntryState,
         ) -> anyhow::Result<pipette_store::SetStateOutcome> {
             anyhow::bail!("dry run attempted to change entry state")
+        }
+
+        async fn rename_entry(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _new_name: &CatalogName,
+        ) -> anyhow::Result<pipette_store::RenameOutcome> {
+            anyhow::bail!("dry run attempted to rename an entry")
+        }
+
+        async fn merge_entry(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _into: &CatalogName,
+        ) -> anyhow::Result<pipette_store::MergeOutcome> {
+            anyhow::bail!("dry run attempted to merge entries")
+        }
+
+        async fn relabel_member(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _format: pipette_plan_types::ModelFormat,
+            _from: &pipette_plan_types::QuantizationLabel,
+            _to: &pipette_plan_types::QuantizationLabel,
+        ) -> anyhow::Result<pipette_store::RelabelOutcome> {
+            anyhow::bail!("dry run attempted to relabel a member")
         }
 
         async fn transition_state(
@@ -9728,6 +10402,7 @@ mod tests {
             },
             &reopen(&dir)?,
             IngestSettings {
+                descriptor_config: &pipette_core::config::DescriptorCatalogConfig::default(),
                 models: ModelCheck::none(),
                 max_jobs: std::num::NonZeroUsize::MIN,
                 creating_max_age: std::time::Duration::from_secs(60),
@@ -10040,6 +10715,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             },
             &stores,
             IngestSettings {
+                descriptor_config: &pipette_core::config::DescriptorCatalogConfig::default(),
                 models: ModelCheck::none(),
                 max_jobs: Config::default().plan_max_jobs,
                 creating_max_age: std::time::Duration::from_secs(21_600),
@@ -11124,9 +11800,9 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     }
 
     /// Adopting a claim a stopped `delete` left must not hand the new account
-    /// the dead one's grant.
+    /// anything of the dead one.
     #[tokio::test]
-    async fn adopting_a_claim_does_not_inherit_the_stranded_grant() -> anyhow::Result<()> {
+    async fn adopting_a_claim_inherits_nothing_of_the_stranded_account() -> anyhow::Result<()> {
         let (_dir, stores) = user_stores()?;
         let auth = stores.users.clone();
 
@@ -11135,6 +11811,33 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         auth.put_user_permissions(
             &stranded,
             &UserPermissionSet::from_iter([UserPermission::SubmitAnyPlans]),
+        )
+        .await?;
+        let keys = claimed_keys(&stores, &stranded, &[0x11]).await?;
+        let preauth = |user_id: &UserId| {
+            user_preauth::mint(
+                UserPreauthParams {
+                    user_id: user_id.clone(),
+                    usage: UserPreauthUsage::SingleUse,
+                    expires_at: None,
+                    note: None,
+                },
+                chrono::Utc::now(),
+            )
+        };
+        let (dead, other) = (preauth(&stranded)?, preauth(&UserId::mint())?);
+        auth.put_user_preauth_key(&dead.key).await?;
+        auth.put_user_preauth_key(&other.key).await?;
+        stores
+            .orgs
+            .set_membership(&stranded, Some(OrgId::mint()))
+            .await?;
+        auth.record_user_first_clerk_sign_in(
+            &stranded,
+            &pipette_plan_types::FirstClerkSignIn {
+                at: chrono::Utc::now(),
+                prior_keys: Vec::new(),
+            },
         )
         .await?;
 
@@ -11148,13 +11851,88 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 org: None,
                 campaigns: Vec::new(),
             },
-            stores,
+            stores.clone(),
         )
         .await?;
 
         assert!(
             auth.get_user_permissions(&stranded).await?.is_none(),
             "the adopted account must hold nothing the operator did not grant it"
+        );
+        assert!(auth.list_user_keys(&stranded).await?.is_empty());
+        let holders = futures::future::try_join_all(
+            keys.iter()
+                .map(|(_, digest)| stores.key_index.holder_of_public_key(digest)),
+        )
+        .await?;
+        assert!(holders.iter().all(Option::is_none), "{holders:?}");
+        let left: Vec<_> = auth
+            .list_user_preauth_keys()
+            .await?
+            .into_iter()
+            .map(|key| key.key_id)
+            .collect();
+        assert_eq!(left, vec![other.key.key_id]);
+        assert_eq!(stores.orgs.get_membership(&stranded).await?, None);
+        assert_eq!(auth.get_user_first_clerk_sign_in(&stranded).await?, None);
+        Ok(())
+    }
+
+    /// A create that stops at the membership reports an account that holds
+    /// nothing, so the stranded grant must already be gone.
+    #[rstest]
+    #[case::granting_nothing(&[])]
+    #[case::granting_a_name(&[UserPermission::ReadPlans])]
+    #[tokio::test]
+    async fn adopting_a_claim_clears_the_stranded_grant_before_the_membership(
+        #[case] permissions: &[UserPermission],
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        create_org(&dir, "acme").await?;
+        let stores = reopen(&dir)?;
+        let stranded = UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?;
+        stores
+            .users
+            .claim_user_email("op@example.com", &stranded)
+            .await?;
+        stores
+            .users
+            .put_user_permissions(
+                &stranded,
+                &UserPermissionSet::from_iter([UserPermission::SubmitAnyPlans]),
+            )
+            .await?;
+        // A dangling `user-orgs`: a membership write fails, a membership delete finds nothing.
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("user-orgs"))?;
+
+        let refused = handle_user_action(
+            UserAction::Create {
+                adopt_stranded_claim: true,
+                email: email("op@example.com")?,
+                permissions: permissions.to_vec(),
+                group: PermissionGroupFlags::default(),
+                account_type: UserAccountType::Human,
+                org: Some(OrgRef::Slug(slug("acme")?)),
+                campaigns: Vec::new(),
+            },
+            stores.clone(),
+        )
+        .await
+        .err()
+        .context("a failed membership write must fail the create")?;
+
+        assert!(
+            format!("{refused:#}").contains("belongs to no organization and holds nothing"),
+            "{refused:#}"
+        );
+        assert!(stores.users.get_user(&stranded).await?.is_some());
+        assert!(
+            stores
+                .users
+                .get_user_permissions(&stranded)
+                .await?
+                .is_none(),
+            "the account must hold nothing, as the error says"
         );
         Ok(())
     }

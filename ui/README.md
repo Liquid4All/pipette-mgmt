@@ -60,12 +60,12 @@ secure context.
 | `/app/plans`, `…/{plan_id}`, `…/cells`, `…/analysis`, `…/analysis/{report}`, `…/revisions`, `…/settings` | The plan listing, and a plan's Overview, Jobs, Results (one report's charts, or `swap` or `missing`), History and Settings. `…/results` and `…/reports…` redirect |
 | `/app/vault`, `…/runtimes`, `…/new`, `…/{resource_id}` | The vault resources in reach, the upload page, one resource |
 | `/app/benchmarks`, `…/new`, `…/{org}/{benchmark_id}` | The private benchmarks the reader reads, the form, one entry |
-| `/app/clients`, `…/{client_id}` | The fleet, and one device with its forms. For a fleet reader, the device page also shows the catalog short list |
+| `/app/clients`, `…/{client_id}` | The fleet, and one device with its forms. For a fleet reader, the device page also shows the catalog short list. Each member shows its last success and last failure on the device, and its successes on any device as weaker evidence |
 | `/app/users`, `…/new`, `…/{user_id}`, `…/{user_id}/plans`, `…/permissions`, `…/keys`, `…/preauth-keys`, `…/settings` | The roster, the create form, and one account's tabs |
 | `/app/orgs`, `…/new`, `…/{org}` | The organizations, the create form, one organization's overview |
 | `/app/orgs/{org}/campaigns`, `…/vault`, `…/vault/runtimes`, `…/benchmarks`, `…/members`, `…/devices` | One organization's listings; its device pre-auth keys sit on `…/devices` |
 | `/app/server/users`, `…/devices`, `…/model-params` | Accounts in no organization, devices nobody owns, and the parameter counts in the model parameter table |
-| `/app/server/catalog`, `…/catalog?kind=model`, `…/catalog/{name}` | The global catalog's runtime entries and model entries, and one entry. A model entry shows its members as a table of formats and quantizations, with their parameter counts |
+| `/app/server/catalog`, `…/catalog?kind=model`, `…/catalog/{name}` | The runtime entries and model entries of every scope that the reader can read, and one entry. Each entry has a scope badge: `global`, or the slug of its organization. `{name}` is the name as the reader sees it: bare, `global/x` or `acme/x`. The Models tab shows the formats of each entry in order, and each format has its quantizations in order. A model entry shows its members as a table of formats and quantizations, with their parameter counts. The table sorts the members by format, then by quantization. For a fleet reader, each member shows its successes on any device as weaker evidence. A reader with `edit_catalog` in the entry’s organization or `edit_any_catalog` can edit an organization entry. The reader can change its state or name and change a model member’s quantization label |
 
 `{org}` takes a handle or an id. The tree (`src/lib/tree.ts`) groups the pages
 by owner: **Me**, each **Organization**, and **Server**. A branch narrows inside
@@ -73,6 +73,29 @@ the reader's reach and never past it. The listings over the whole reach
 (`/app/campaigns`, `/app/vault`, `/app/benchmarks`, `/app/clients`,
 `/app/users`) are not in the tree, but still open. A record's page sits under
 the branch that holds it.
+
+The header box opens the page for a pasted identifier (ID). Press `/` to focus
+the box (`src/lib/jump.ts`). The ID prefix identifies the page:
+
+- `campaign_`: campaign
+- `plan-`: plan
+- `ev1_`: device
+- `vault_`: vault resource
+- `user_`: user
+- `org_`: organization
+
+That page reads the record and shows a refusal itself. A `job-` ID opens the Jobs tab of the newest plan
+that holds the job, filtered to that job
+([`GET /api/v1/jobs/{job_id}/plans`](../docs/api/plans/list_job_plans.md)). An
+ID without a prefix can identify a job or a plan. The box checks both and opens
+the page for the record that exists.
+
+A campaign listing's **job id** box keeps the campaigns whose plans asked for
+that job, and its **plan id** box the campaign of that plan. Both count
+superseded plans and archived campaigns, so the **state** select reads all
+beside either. Only a reader who may read plans gets the job id box. Beside a
+job id alone, your own and an organization's listings say how many of the job's
+campaigns sit outside them, and link to every campaign that holds it.
 
 ## Rules every page follows
 

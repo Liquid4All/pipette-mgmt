@@ -20,9 +20,7 @@ use pipette_core::matching::{
     REQUIRED_FLAGS, REQUIRED_SUFFIX, capability_clauses_malformed, describe_clauses,
     job_matches_client,
 };
-use pipette_core::plan::{
-    JobExpiry, PlanManifest, PlanNotes, PlanSource, SettledOutcome, StarvedGroup, past_gate,
-};
+use pipette_core::plan::{JobExpiry, PlanManifest, PlanNotes, PlanSource, StarvedGroup, past_gate};
 use pipette_core::todo_filename::{parse_avail_filename, parse_leased_key};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
@@ -33,8 +31,9 @@ use pipette_plan_types::{
 };
 use pipette_store::{
     CellResult, CellScope, ClientStore, ContentKeyCas, ContentKeyClaim, ContentKeyRecord,
-    ContentKeyVersion, CreateOutcome, OrgStore, PLAN_JOB_CONCURRENCY, PlanStore, Stores,
-    SubmissionStore, TagStore, TodoStore, VaultStore, drain_clients, warn_unreadable_clients,
+    ContentKeyVersion, CreateOutcome, OrgStore, PLAN_JOB_CONCURRENCY, PlanStore, RecordedRun,
+    Stores, SubmissionStore, TagStore, TodoStore, VaultStore, drain_clients,
+    warn_unreadable_clients,
 };
 
 use crate::content_key::{content_digest, merge_duplicates, mergeable};
@@ -51,6 +50,48 @@ use crate::{plan_document, recalculation, vault_alias};
 /// Ingestion's default expiry, so an omitted `expires_at` still bounds the
 /// queue lifetime. A job another planner writes keeps the never-expires default.
 const DEFAULT_EXPIRY_DAYS: i64 = 30;
+
+/// Completed promotion calls in one filing, including calls that failed.
+/// Report before propagating a staging error so a torn filing has timing data.
+#[derive(Default)]
+struct PromotionTimings(std::sync::Mutex<Vec<(u64, bool)>>);
+
+impl PromotionTimings {
+    fn record(&self, elapsed: std::time::Duration, succeeded: bool) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((elapsed_ms, succeeded));
+    }
+
+    fn report(&self, plan_id: &PlanId) {
+        let samples = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if samples.is_empty() {
+            return;
+        }
+        let failures = samples.iter().filter(|(_, succeeded)| !succeeded).count();
+        let mut elapsed_ms: Vec<u64> = samples.iter().map(|(elapsed, _)| *elapsed).collect();
+        elapsed_ms.sort_unstable();
+        let percentile = |percent: usize| -> u64 {
+            let rank = (elapsed_ms.len() * percent).div_ceil(100).saturating_sub(1);
+            elapsed_ms.get(rank).copied().unwrap_or_default()
+        };
+        tracing::info!(
+            %plan_id,
+            promotions = samples.len(),
+            failures,
+            p50_ms = percentile(50),
+            p95_ms = percentile(95),
+            p99_ms = percentile(99),
+            max_ms = elapsed_ms.last().copied().unwrap_or_default(),
+            "plan job promotion latency"
+        );
+    }
+}
 
 /// Why an ingest failed; a transport maps each arm to a status. Typed, not an
 /// `anyhow` leaf: a `match` is compiler-checked, and a `downcast_ref` breaks
@@ -445,6 +486,11 @@ impl<'a> ModelCheck<'a> {
 /// `job_ids` maps each input label to the `job_id` it landed on, in input order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IngestReport {
+    /// The document as stored. `None` for a plan filed as job bodies. The CLI
+    /// report leaves it out: the operator supplied the file, and the filing
+    /// answer over HTTP carries it ([`Self::view`]).
+    #[serde(skip_serializing)]
+    pub document: Option<String>,
     pub plan_id: PlanId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<NonEmptyTrimmedString>,
@@ -474,6 +520,7 @@ impl IngestReport {
     /// redaction: a UUIDv7 job id still shows which inputs landed on older jobs.
     pub fn view(self, detail: FleetDetail) -> pipette_plan_types::PlanFiled {
         pipette_plan_types::PlanFiled {
+            document: self.document,
             fleet_detail: FleetDetail::Full,
             plan_id: self.plan_id,
             note: self.note,
@@ -774,13 +821,6 @@ struct Candidate {
     from: Option<PlanId>,
 }
 
-/// What a job's submission record says of its run.
-struct Run {
-    succeeded: bool,
-    /// [`client::recorded_run_flags`] of the record.
-    flags: BTreeSet<String>,
-}
-
 /// What [`Unclaimed::answer`] gave the units beyond their draws.
 #[derive(Debug, Default)]
 struct Answers {
@@ -864,31 +904,13 @@ impl Unclaimed {
             })
             .collect();
         let cells: HashSet<&String> = wanted.iter().map(|(_, _, cell, _)| cell).collect();
-        // Owned ids: a stream of borrowed ones trips higher-ranked `Send`
-        // inference in the handlers that await this.
         let job_ids: Vec<JobId> = cells
             .into_iter()
             .filter_map(|cell| self.cells.get(cell))
             .flatten()
             .map(|candidate| candidate.job_id.clone())
             .collect();
-        let runs: HashMap<JobId, Run> = futures::stream::iter(job_ids)
-            .map(|job_id| async move {
-                let record = submissions.find_job(&job_id).await?;
-                anyhow::Ok(record.map(|record| {
-                    let message_type = record.body.get("message_type").and_then(Value::as_str);
-                    let run = Run {
-                        succeeded: SettledOutcome::from_message_type(message_type)
-                            == SettledOutcome::Finished,
-                        flags: client::recorded_run_flags(&record.body),
-                    };
-                    (job_id, run)
-                }))
-            })
-            .buffer_unordered(PLAN_JOB_CONCURRENCY)
-            .try_filter_map(|run| async move { Ok(run) })
-            .try_collect()
-            .await?;
+        let runs = submissions.find_runs(&job_ids).await?;
         let answers = wanted.into_iter().fold(
             Answers::default(),
             |mut answers, (index, body, cell, drew_nothing)| {
@@ -896,9 +918,11 @@ impl Unclaimed {
                     return answers;
                 };
                 let answering = candidates.iter().position(|candidate| {
-                    runs.get(&candidate.job_id).is_some_and(|run| {
-                        run.succeeded && matching::run_answers(&candidate.body, body, &run.flags)
-                    })
+                    matches!(
+                        runs.get(&candidate.job_id),
+                        Some(RecordedRun::Finished(flags))
+                            if matching::run_answers(&candidate.body, body, flags)
+                    )
                 });
                 let Some(at) = answering else {
                     // The superseded plan's own run: another plan's is not it.
@@ -1078,6 +1102,9 @@ async fn satisfy_from_earlier_runs<'u>(
 /// catalogs, and the limits the server sets. One per transport.
 #[derive(Clone, Copy)]
 pub struct IngestContext<'a> {
+    pub descriptor_catalog: Option<&'a dyn pipette_store::DescriptorCatalogStore>,
+    /// The offer rules that a bare catalog name in a plan resolves by.
+    pub descriptor_config: &'a pipette_core::config::DescriptorCatalogConfig,
     pub plans: &'a dyn PlanStore,
     pub todo: &'a dyn TodoStore,
     /// The roster that the fleet-match pass reads.
@@ -1111,11 +1138,14 @@ impl<'a> IngestContext<'a> {
     pub fn from_stores(
         stores: &'a Stores,
         catalog: &'a HashMap<BenchmarkId, Benchmark>,
+        descriptor_config: &'a pipette_core::config::DescriptorCatalogConfig,
         models: ModelCheck<'a>,
         max_jobs: NonZeroUsize,
         creating_max_age: std::time::Duration,
     ) -> Self {
         Self {
+            descriptor_catalog: stores.descriptor_catalog.as_deref(),
+            descriptor_config,
             plans: stores.plans.as_ref(),
             todo: stores.todo.as_ref(),
             clients: stores.clients.as_ref(),
@@ -1140,6 +1170,7 @@ impl<'a> IngestContext<'a> {
         settings: IngestSettings<'a>,
     ) -> Self {
         let IngestSettings {
+            descriptor_config,
             models,
             max_jobs,
             creating_max_age,
@@ -1147,15 +1178,32 @@ impl<'a> IngestContext<'a> {
         } = settings;
         Self {
             import,
-            ..Self::from_stores(stores, catalog, models, max_jobs, creating_max_age)
+            ..Self::from_stores(
+                stores,
+                catalog,
+                descriptor_config,
+                models,
+                max_jobs,
+                creating_max_age,
+            )
         }
     }
+}
+
+/// A catalog config with no offer rule, for a test that files no bare catalog
+/// name.
+#[cfg(test)]
+pub(crate) fn no_offer_rules() -> &'static pipette_core::config::DescriptorCatalogConfig {
+    static CONFIG: std::sync::LazyLock<pipette_core::config::DescriptorCatalogConfig> =
+        std::sync::LazyLock::new(Default::default);
+    &CONFIG
 }
 
 /// The parts of an [`IngestContext`] that a CLI command sets apart from its
 /// stores and its benchmark catalog, built once and passed to each ingest.
 #[derive(Clone, Copy)]
 pub struct IngestSettings<'a> {
+    pub descriptor_config: &'a pipette_core::config::DescriptorCatalogConfig,
     pub models: ModelCheck<'a>,
     pub max_jobs: NonZeroUsize,
     pub creating_max_age: std::time::Duration,
@@ -1167,6 +1215,8 @@ pub struct IngestSettings<'a> {
 /// after [`prepare_jobs`].
 #[derive(Debug)]
 pub struct PlanSubmission<J = Vec<(String, Value)>> {
+    pub resolved: Vec<crate::plan_names::ResolvedName>,
+    pub submitted_sha256: Option<pipette_plan_types::Sha256>,
     pub note: Option<NonEmptyTrimmedString>,
     /// What a campaign revision changed, as the server wrote it.
     pub change: Option<pipette_plan_types::RevisionChange>,
@@ -1408,6 +1458,8 @@ pub async fn ingest_jobs(
     submission: PlanSubmission,
 ) -> Result<IngestReport, IngestError> {
     let PlanSubmission {
+        resolved,
+        submitted_sha256,
         note,
         change,
         submitted_by,
@@ -1420,6 +1472,8 @@ pub async fn ingest_jobs(
     ingest_prepared(
         ctx,
         PlanSubmission {
+            resolved,
+            submitted_sha256,
             note,
             change,
             submitted_by,
@@ -1435,7 +1489,9 @@ pub async fn ingest_jobs(
 /// Mint and stage a job set that [`prepare_jobs`] accepted, as one plan.
 ///
 /// A failure during staging rolls nothing back: a retry mints fresh ids, and
-/// `queue-maintenance` tears down a manifest stranded in `creating`.
+/// `queue-maintenance` tears down a manifest stranded in `creating`. The claim
+/// path grants no lease on a job that this plan alone holds until the plan is
+/// final and its campaign runs it.
 pub async fn ingest_prepared(
     ctx: &IngestContext<'_>,
     submission: PlanSubmission<PreparedJobs>,
@@ -1453,6 +1509,8 @@ pub async fn ingest_prepared(
         ..
     } = *ctx;
     let PlanSubmission {
+        resolved,
+        submitted_sha256,
         note,
         change,
         submitted_by,
@@ -1500,7 +1558,8 @@ pub async fn ingest_prepared(
 
     // Before the first write, so a failure writes nothing. The submitted text's
     // digest recognizes the document when the client sends it again.
-    let submitted = source.as_ref().map(|source| source.sha256().clone());
+    let submitted =
+        submitted_sha256.or_else(|| source.as_ref().map(|source| source.sha256().clone()));
     let source = source
         .map(|source| plan_document::with_vault_arms(source, &rewrites))
         .transpose()
@@ -1696,6 +1755,9 @@ pub async fn ingest_prepared(
             );
             return Err(IngestError::Other(PlanSourceExistsError { plan_id }.into()));
         }
+        for name in &resolved {
+            tracing::info!(%plan_id, catalog_name = %name.catalog_name, flavor = %name.flavor, variant = name.variant, "catalog name resolved at filing");
+        }
     }
 
     // The `creating` manifest is the authoritative job-id list, written before
@@ -1749,11 +1811,12 @@ pub async fn ingest_prepared(
         );
     }
 
-    // Per job: the source, then the link, then for a minted job its cell, the
-    // marker and the promote into `avail/`, so no claimable job lacks its source or its
-    // minting plan's marker. A recalculated job goes to `incoming/` instead.
-    // The minter writes a marker too, so an absent marker means released or
-    // lapsed, which `expired_jobs` tells apart. Jobs run concurrently.
+    // Per job: the source, then the link, then for a minted job its cell and
+    // the marker. Jobs run concurrently. The promote into `avail/` waits for
+    // the recalculation copies, so no claimable job lacks its source or its
+    // minting plan's marker, and a failed copy leaves no job claimable. The
+    // minter writes a marker too, so an absent marker means released or
+    // lapsed, which `expired_jobs` tells apart.
     let staging: Vec<_> = distinct
         .iter()
         .map(|p| {
@@ -1784,27 +1847,16 @@ pub async fn ingest_prepared(
                         );
                     }
                 }
-                if let Some(Parent::Recalculates(source)) = &p.parent {
-                    // Answered rather than queued, so it holds no marker, as a
-                    // carried job with a result holds none.
-                    recalculation::answer_from(submissions, source, &p.job_id, now)
-                        .await
-                        .with_context(|| {
-                            format!("answering job {} from {source} for {plan_id}", p.job_id)
-                        })?;
-                } else if p.merged.is_none() {
+                // A recalculated job is answered by its copy rather than
+                // queued, so it holds no marker, as a carried job with a
+                // result holds none.
+                if !matches!(p.parent, Some(Parent::Recalculates(_))) && p.merged.is_none() {
                     plans
                         .write_job_plan_marker(&p.job_id, plan_id, p.expires_at)
                         .await
                         .with_context(|| {
                             format!("recording {plan_id} as a member of {}", p.job_id)
                         })?;
-                    todo.write_tmp(&p.job_id, &p.body)
-                        .await
-                        .with_context(|| format!("staging job {} for {plan_id}", p.job_id))?;
-                    todo.promote_avail(&p.job_id, p.expires_at)
-                        .await
-                        .with_context(|| format!("promoting job {} for {plan_id}", p.job_id))?;
                 }
                 anyhow::Ok(stored)
             }
@@ -1832,6 +1884,70 @@ pub async fn ingest_prepared(
                 .context("listing client tags for fleet match")
         },
     )?;
+    // Copies can decode tens of MB each. Finish staging and roster reads first,
+    // then bound their memory and CPU independently of the database batch.
+    // A block, so its locals do not stay alive in the future across the
+    // promote below.
+    {
+        let copy_started = std::time::Instant::now();
+        let copies: Vec<_> = distinct
+            .iter()
+            .filter_map(|p| {
+                let Some(Parent::Recalculates(source)) = &p.parent else {
+                    return None;
+                };
+                Some((source.clone(), p.job_id.clone()))
+            })
+            .collect();
+        let copied = futures::stream::iter(copies)
+            .map(|(source, job_id)| {
+                let plan_id = &plan_id;
+                async move {
+                    recalculation::answer_from(submissions, &source, &job_id, now)
+                        .await
+                        .with_context(|| {
+                            format!("answering job {job_id} from {source} for {plan_id}")
+                        })
+                }
+            })
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
+        if !copied.is_empty() {
+            tracing::info!(
+                plan_id = %plan_id,
+                copied_jobs = copied.len(),
+                elapsed_ms = copy_started.elapsed().as_millis(),
+                "recalculation copies staged"
+            );
+        }
+    }
+    // Collected first, as `staging` is: a stream over a borrowing filter is
+    // not `Send` for every lifetime, and the HTTP handlers need it to be.
+    let promotion_timings = PromotionTimings::default();
+    let promotions: Vec<_> = distinct
+        .iter()
+        .filter(|p| !matches!(p.parent, Some(Parent::Recalculates(_))) && p.merged.is_none())
+        .map(|p| {
+            let plan_id = &plan_id;
+            let promotion_timings = &promotion_timings;
+            async move {
+                todo.write_tmp(&p.job_id, &p.body)
+                    .await
+                    .with_context(|| format!("staging job {} for {plan_id}", p.job_id))?;
+                let started = std::time::Instant::now();
+                let promoted = todo.promote_avail(&p.job_id, p.expires_at).await;
+                promotion_timings.record(started.elapsed(), promoted.is_ok());
+                promoted.with_context(|| format!("promoting job {} for {plan_id}", p.job_id))
+            }
+        })
+        .collect();
+    let promotion_result = futures::stream::iter(promotions)
+        .buffer_unordered(PLAN_JOB_CONCURRENCY)
+        .try_collect::<()>()
+        .await;
+    promotion_timings.report(&plan_id);
+    promotion_result?;
     let job_sources_created = stored
         .iter()
         .filter(|outcome| **outcome == CreateOutcome::Created)
@@ -1915,6 +2031,7 @@ pub async fn ingest_prepared(
     }
 
     Ok(IngestReport {
+        document: source.as_ref().map(|s| s.text().to_owned()),
         plan_id,
         note,
         change,
@@ -2348,7 +2465,7 @@ impl MergeContext<'_> {
             // Answered at staging and never queued, so no later plan can join
             // it, and the index is left alone.
             Inherited::Recalculate(_) => return Ok(Placed::Fresh),
-            // Its record was read at the draw, and a recorded job is finished
+            // Its run was read at the draw, and a recorded job is finished
             // whatever the queue still holds of it.
             Inherited::Answered(job_id) => return Ok(self.carried(digest, job_id, *horizon, true)),
             // Finished, so it waits on no client, and no marker holds it.
@@ -2380,8 +2497,9 @@ impl MergeContext<'_> {
 
     /// Take over the superseded plan's `job_id`, or `None` to place the unit as
     /// any other. A live job is joined as [`Self::try_join`] joins one, so the
-    /// old plan's teardown releases it. The result is read first: a finished job
-    /// is the common case, and a queue miss costs a fresh `leased/` listing.
+    /// old plan's teardown releases it. The record's presence is checked first:
+    /// a finished job is the common case, and a queue miss costs a fresh
+    /// `leased/` listing.
     async fn carry(
         &self,
         digest: &str,
@@ -2389,7 +2507,7 @@ impl MergeContext<'_> {
         horizon: ExpiresAt,
     ) -> anyhow::Result<Option<Placed>> {
         let carried = |expires_at, settled| Some(self.carried(digest, job_id, expires_at, settled));
-        if self.submissions.find_job(job_id).await?.is_some() {
+        if self.submissions.has_record(job_id).await? {
             return Ok(carried(horizon, true));
         }
         match self.official_state(job_id).await? {
@@ -2417,9 +2535,10 @@ impl MergeContext<'_> {
             TargetState::Live(_) | TargetState::LiveUnreadable => Ok(None),
             // It may have finished since the first read: a submission records
             // before it leaves the queue.
-            TargetState::Absent => Ok(match self.submissions.find_job(job_id).await? {
-                Some(_) => carried(horizon, true),
-                None => None,
+            TargetState::Absent => Ok(if self.submissions.has_record(job_id).await? {
+                carried(horizon, true)
+            } else {
+                None
             }),
         }
     }
@@ -2737,7 +2856,7 @@ impl MergeContext<'_> {
         }
         // Completed inside the window: the plan reads the same submission record,
         // so the join stands.
-        Ok(self.submissions.find_job(job_id).await?.is_some())
+        self.submissions.has_record(job_id).await
     }
 
     fn record_for(&self, job_id: &JobId) -> ContentKeyRecord {
@@ -3104,7 +3223,8 @@ fn hub_repo(model: &Model) -> Option<&pipette_plan_types::HfRepo> {
         | Model::TorchSpeculative(_)
         | Model::Openvino(_)
         | Model::OnnxGenai(_)
-        | Model::AppleFoundationText => None,
+        | Model::AppleFoundationText
+        | Model::AppleCoreAi(_) => None,
     }
 }
 
@@ -3502,6 +3622,7 @@ mod tests {
     use pipette_store_testkit::{
         assert_each_job_has_its_source_and_link, finish_job, finish_job_with_failure,
         finish_job_with_success, finish_job_with_success_on_build, local_fs_job_record_count,
+        local_fs_spoil_record,
     };
 
     use super::*;
@@ -4632,6 +4753,7 @@ mod tests {
     #[test]
     fn report_serializes_job_ids_as_ordered_object_and_omits_absent_name() -> anyhow::Result<()> {
         let report = IngestReport {
+            document: Some("# the stored document\n".into()),
             plan_id: PlanId::from_uuid(uuid::Uuid::nil()),
             note: None,
             change: None,
@@ -4650,6 +4772,10 @@ mod tests {
         };
         let text = serde_json::to_string(&report)?;
         assert!(!text.contains("note"), "None note is omitted");
+        assert!(
+            !text.contains("document"),
+            "the CLI report omits the document"
+        );
         assert!(
             !text.contains("plan_warnings"),
             "empty plan_warnings are omitted"
@@ -4765,8 +4891,17 @@ mod tests {
         max_jobs: std::num::NonZeroUsize,
     ) -> Result<IngestReport, IngestError> {
         ingest_jobs(
-            &IngestContext::from_stores(stores, catalog, models, max_jobs, CREATING_MAX_AGE),
+            &IngestContext::from_stores(
+                stores,
+                catalog,
+                crate::plan_ingestion::no_offer_rules(),
+                models,
+                max_jobs,
+                CREATING_MAX_AGE,
+            ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note,
                 change: None,
                 submitted_by,
@@ -4802,11 +4937,14 @@ mod tests {
             &IngestContext::from_stores(
                 &stores,
                 &catalog,
+                crate::plan_ingestion::no_offer_rules(),
                 ModelCheck::none(),
                 MAX_JOBS,
                 CREATING_MAX_AGE,
             ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -4861,11 +4999,14 @@ mod tests {
             &IngestContext::from_stores(
                 &stores,
                 &catalog,
+                crate::plan_ingestion::no_offer_rules(),
                 ModelCheck::none(),
                 MAX_JOBS,
                 CREATING_MAX_AGE,
             ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -5149,12 +5290,15 @@ mod tests {
                 ..IngestContext::from_stores(
                     &stores,
                     &catalog,
+                    crate::plan_ingestion::no_offer_rules(),
                     ModelCheck::none(),
                     MAX_JOBS,
                     CREATING_MAX_AGE,
                 )
             },
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -5215,12 +5359,15 @@ mod tests {
                 ..IngestContext::from_stores(
                     &stores,
                     &catalog,
+                    crate::plan_ingestion::no_offer_rules(),
                     ModelCheck::none(),
                     MAX_JOBS,
                     CREATING_MAX_AGE,
                 )
             },
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -5258,12 +5405,15 @@ mod tests {
                 ..IngestContext::from_stores(
                     stores,
                     &catalog,
+                    crate::plan_ingestion::no_offer_rules(),
                     ModelCheck::none(),
                     MAX_JOBS,
                     CREATING_MAX_AGE,
                 )
             },
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -5357,12 +5507,15 @@ mod tests {
                 ..IngestContext::from_stores(
                     &stores,
                     &catalog,
+                    crate::plan_ingestion::no_offer_rules(),
                     ModelCheck::none(),
                     MAX_JOBS,
                     CREATING_MAX_AGE,
                 )
             },
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -5583,6 +5736,7 @@ mod tests {
         let ctx = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -5639,6 +5793,7 @@ mod tests {
         let ctx = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -5647,6 +5802,8 @@ mod tests {
             ingest_prepared(
                 &ctx,
                 PlanSubmission {
+                    resolved: Vec::new(),
+                    submitted_sha256: None,
                     note: None,
                     change: None,
                     submitted_by: None,
@@ -6073,6 +6230,7 @@ mod tests {
         let host = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -6470,11 +6628,14 @@ mod tests {
             &IngestContext::from_stores(
                 stores,
                 &catalog,
+                crate::plan_ingestion::no_offer_rules(),
                 ModelCheck::none(),
                 MAX_JOBS,
                 CREATING_MAX_AGE,
             ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -6879,6 +7040,33 @@ mod tests {
         Ok(())
     }
 
+    /// With the SQL index, a requirement change reads the run's outcome and
+    /// flags off its row: the record, tens of MB for an eval, stays unread.
+    #[tokio::test]
+    async fn a_requirement_change_reads_the_run_off_its_row() -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let (campaign, first) =
+            campaign_of(stores, cells(&["a"], json!({"requires": ["os:macos"]}))).await?;
+        let (_, done) = first.job_ids.first().context("one job")?.clone();
+        env.finish(&done).await?;
+        local_fs_spoil_record(env.data_dir.path(), &done)?;
+        // The recorded device is an Apple M5 MacBook Pro.
+        let jobs = cells(&["a"], json!({"requires": ["os:macos", "chip:applem5"]}));
+
+        let draw = preview_draw(stores, &campaign, &jobs).await?;
+        let revision = revise_reading_sources(stores, &campaign, jobs).await?;
+
+        assert_eq!(draw.carried, vec![done.clone()]);
+        assert_eq!(
+            revision.job_ids.first().map(|(_, job_id)| job_id),
+            Some(&done)
+        );
+        Ok(())
+    }
+
     /// Ingestion takes `:required` off a tag or a build and lists the plain flag
     /// in `required_flags`; a body that marks neither stays as it was.
     #[rstest]
@@ -7017,6 +7205,25 @@ mod tests {
             .context("manifest")?;
         assert_eq!(manifest.status, PlanStatus::Active);
         assert!(manifest.warnings.is_empty());
+        Ok(())
+    }
+
+    /// A revision carries a finished job on the presence of its record: an eval
+    /// record can be tens of MB, so the revision never reads one.
+    #[tokio::test]
+    async fn a_revision_carries_a_finished_job_without_reading_its_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path())?;
+        let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
+        let done = first.job_ids[0].1.clone();
+        finish_job(&*stores.submissions, &*stores.todo, &done).await?;
+        local_fs_spoil_record(dir.path(), &done)?;
+
+        let revision = revise(&stores, &campaign, cells(&["a"], json!({}))).await?;
+
+        assert_eq!(revision.job_ids[0].1, done);
+        assert_eq!(revision.merges[0].kind, MergeKind::Carried);
+        assert!(stores.todo.list_avail().await?.is_empty());
         Ok(())
     }
 
@@ -7360,6 +7567,52 @@ mod tests {
                 assert_eq!(drain_plans(&*stores.plans, None).await?.items.len(), 1);
             }
         }
+        Ok(())
+    }
+
+    /// If a copy fails, the manifest stays in `creating`. Ingestion writes
+    /// all the job sources and links before the copies start. No device gets
+    /// a recalculated job, or a job that the revision mints.
+    #[tokio::test]
+    async fn recalculation_copy_failure_follows_staging() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path())?;
+        let (campaign, first) = campaign_of(&stores, cells(&["a", "b", "c"], json!({}))).await?;
+        let named = first
+            .job_ids
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<BTreeSet<_>>();
+        for id in &named {
+            // A failure has an outcome, but cannot provide eval completions.
+            pipette_store_testkit::finish_job_with_failure(&*stores.submissions, &*stores.todo, id)
+                .await?;
+        }
+        // The new cell `d` mints a job beside the three recalculations.
+        let revised = cells(&["a", "b", "c", "d"], json!({}));
+        let result = revise_naming(&stores, &campaign, &BTreeSet::new(), &named, revised).await;
+        assert!(result.is_err());
+        let plans = drain_plans(&*stores.plans, None).await?.items;
+        let creating = plans
+            .iter()
+            .find(|p| p.plan_id != first.plan_id)
+            .context("creating revision")?;
+        assert_eq!(creating.status, PlanStatus::Creating);
+        assert_eq!(creating.job_ids.len(), named.len() + 1);
+        let mut marked = Vec::new();
+        for id in &creating.job_ids {
+            assert!(stores.plans.get_job_source(id).await?.is_some());
+            assert!(stores.todo.get_avail_by_job(id).await?.is_none());
+            if !members(&stores, id).await?.is_empty() {
+                marked.push(id.clone());
+            }
+        }
+        // Only the minted job holds a marker, and it is not claimable.
+        assert_eq!(marked.len(), 1);
+        assert_eq!(
+            members(&stores, &marked[0]).await?,
+            vec![creating.plan_id.clone()]
+        );
         Ok(())
     }
 
@@ -7953,8 +8206,8 @@ mod tests {
         let mut queued = body.clone();
         queued["job_id"] = json!(job_id.as_str());
         queued["expires_at"] = json!(expires_at.to_string());
-        stores.todo.write_tmp(job_id, &queued).await?;
-        stores.todo.promote_avail(job_id, expires_at).await?;
+        pipette_store_testkit::seed_avail(&*stores.todo, job_id.as_str(), expires_at, &queued)
+            .await?;
         Ok(())
     }
 
@@ -8006,11 +8259,9 @@ mod tests {
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
         seed_content_key(&stores, &digest, &target, Utc::now()).await?;
-        // The job is gone from the queue but its result is recorded.
-        stores
-            .submissions
-            .write_processed(&target, &json!({"job_id": target.as_str()}))
-            .await?;
+        // The job is gone from the queue but its result is recorded, unreadable:
+        // only its presence may be checked.
+        local_fs_spoil_record(dir.path(), &target)?;
 
         let context = merge_context(
             &stores,
@@ -8858,12 +9109,15 @@ mod tests {
                 ..IngestContext::from_stores(
                     &stores,
                     &catalog()?,
+                    crate::plan_ingestion::no_offer_rules(),
                     ModelCheck::warn(&models),
                     MAX_JOBS,
                     CREATING_MAX_AGE,
                 )
             },
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: Some(filer.clone()),
@@ -8970,7 +9224,7 @@ mod tests {
         stores: Stores,
         catalog: HashMap<BenchmarkId, Benchmark>,
         _db: pipette_store_sql::scratch::TestDb,
-        _dir: tempfile::TempDir,
+        data_dir: tempfile::TempDir,
     }
 
     impl SqlEnv {
@@ -8992,7 +9246,7 @@ mod tests {
             stores,
             catalog: catalog()?,
             _db: db,
-            _dir: dir,
+            data_dir: dir,
         }))
     }
 
@@ -9183,11 +9437,14 @@ mod tests {
             &IngestContext::from_stores(
                 &env.stores,
                 &env.catalog,
+                crate::plan_ingestion::no_offer_rules(),
                 ModelCheck::none(),
                 MAX_JOBS,
                 CREATING_MAX_AGE,
             ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,

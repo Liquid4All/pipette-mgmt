@@ -5,18 +5,20 @@ use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use pipette_plan_types::{
-    AddDescriptorMemberRequest, CatalogName, CatalogScope, CreateDescriptorEntryRequest,
-    DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind, DescriptorEntryState,
-    DescriptorKind, DescriptorMember, EntryError, GitOid, HfRevision, MemberError, Model,
-    ModelFormat, ModelMemberRequest, ModelType, NonEmptyVec, Runtime, descriptor_digest, hf_repos,
-    hf_repos_mut, names_vault_source,
+    AddDescriptorMemberRequest, AuditAction, CatalogName, CatalogScope,
+    CreateDescriptorEntryRequest, DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind,
+    DescriptorEntryState, DescriptorKind, DescriptorMember, EntryError, GitOid, HfRevision,
+    MemberError, Model, ModelFormat, ModelMemberRequest, ModelType, NonEmptyVec, QuantizationLabel,
+    Runtime, descriptor_digest, hf_repos, hf_repos_mut, names_vault_source,
 };
 use pipette_store::{
     AppendOutcome, CatalogEntryKey, CreateEntryOutcome, DescriptorCatalogStore,
-    DescriptorEntryFilter, DescriptorEntryPage, SetStateOutcome, TransitionOutcome, VaultStore,
+    DescriptorEntryFilter, DescriptorEntryPage, MergeOutcome, MergedMembers, RelabelOutcome,
+    RenameOutcome, SetStateOutcome, TransitionOutcome, VaultStore, merge_outcome,
 };
 
 use crate::hf_import::{self, HfImportError, HubClient, HubError, HubGate, ImportFault};
@@ -150,6 +152,13 @@ fn release_time<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
+/// The input of `catalog create` or `catalog add-member`: the text of a TOML
+/// file, or a request that the caller built from command-line values.
+pub enum Document<'a, T> {
+    Toml(&'a str),
+    Parsed(T),
+}
+
 /// The members from a file or a request before the command pins each model.
 enum MemberInput {
     Runtimes(NonEmptyVec<Runtime>),
@@ -199,7 +208,7 @@ pub enum CatalogWriteError {
 /// The member keys in order, joined with commas: a runtime member's flavor, or
 /// a model member's `format::quantization`. `-` marks a runtime member with no
 /// flavor.
-pub fn member_keys(members: &NonEmptyVec<DescriptorMember>) -> String {
+pub fn member_keys(members: &[DescriptorMember]) -> String {
     members.iter().map(member_key).collect::<Vec<_>>().join(",")
 }
 
@@ -224,42 +233,36 @@ pub fn member_refs(member: &DescriptorMember) -> String {
         .join(",")
 }
 
-fn build_identity(runtime: &Runtime) -> anyhow::Result<serde_json::Value> {
-    let mut value = serde_json::to_value(runtime)?;
-    value
-        .as_object_mut()
-        .context("a runtime descriptor must be an object")?
-        .remove("flavor");
-    Ok(value)
-}
-
 /// Check the invariant shared by operator appends and importer refreshes. The
 /// members of a model entry come from the operator's claim that they hold one
 /// model, so the check passes them.
 pub fn same_build(members: &NonEmptyVec<DescriptorMember>) -> anyhow::Result<()> {
-    let Some(first) = members.head().runtime() else {
-        return Ok(());
-    };
-    let first = build_identity(first)?;
-    for member in members.iter().skip(1) {
-        let runtime = member
-            .runtime()
-            .context("members of one catalog entry mix runtimes and models")?;
-        anyhow::ensure!(
-            build_identity(runtime)? == first,
-            "members of one catalog entry may differ only in flavor"
-        );
-    }
+    DescriptorEntry::validate_runtime_build(members)?;
     Ok(())
 }
 
 fn parse_create(scope: &CatalogScope, document: &str) -> anyhow::Result<CreateInput> {
     let input: CreateDocument = toml::from_str(document).context("invalid catalog create file")?;
-    check_reserved_name(scope, &input.name)?;
+    create_input(
+        scope,
+        CreateDescriptorEntryRequest {
+            name: input.name,
+            release_time: input.release_time,
+            runtimes: input.runtimes,
+            models: input.models,
+        },
+    )
+}
+
+fn create_input(
+    scope: &CatalogScope,
+    request: CreateDescriptorEntryRequest,
+) -> anyhow::Result<CreateInput> {
+    check_reserved_name(scope, &request.name)?;
     Ok(CreateInput {
-        name: input.name,
-        release_time: input.release_time,
-        members: MemberInput::of_entry(input.runtimes, input.models)?,
+        name: request.name,
+        release_time: request.release_time,
+        members: MemberInput::of_entry(request.runtimes, request.models)?,
     })
 }
 
@@ -282,14 +285,16 @@ async fn build_create(
     now: DateTime<Utc>,
     creator: DescriptorEntryCreator,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
-    check_reserved_name(scope, &input.name).map_err(CatalogWriteError::Invalid)?;
-    let (members, _) = MemberInput::of_entry(input.runtimes, input.models)
-        .map_err(CatalogWriteError::Invalid)?
+    let CreateInput {
+        name,
+        release_time,
+        members,
+    } = create_input(scope, input).map_err(CatalogWriteError::Invalid)?;
+    let (members, _) = members
         .resolve(hub, vault, scope, now)
         .await
         .map_err(resolve_error)?;
-    new_entry(scope, input.name, input.release_time, members, now, creator)
-        .map_err(CatalogWriteError::Invalid)
+    new_entry(scope, name, release_time, members, now, creator).map_err(CatalogWriteError::Invalid)
 }
 
 fn parse_member(document: &str) -> anyhow::Result<MemberInput> {
@@ -375,7 +380,20 @@ impl MemberInput {
         now: DateTime<Utc>,
     ) -> anyhow::Result<(NonEmptyVec<DescriptorMember>, Vec<CommitPin>)> {
         match self {
-            Self::Runtimes(runtimes) => Ok((runtime_members(runtimes, now)?, Vec::new())),
+            Self::Runtimes(runtimes) => {
+                let members = futures::stream::iter(runtimes.into_inner())
+                    .then(|runtime| async move {
+                        let descriptor = serde_json::to_value(&runtime)?;
+                        if names_vault_source(&descriptor) {
+                            let (org_id, vault) = org_vault(scope, vault)?;
+                            check_catalog_vault(vault, org_id, &descriptor).await?;
+                        }
+                        Ok::<_, anyhow::Error>(DescriptorMember::new(runtime, now)?)
+                    })
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok((NonEmptyVec::try_new(members)?, Vec::new()))
+            }
             Self::Models(models) => {
                 for document in models.iter() {
                     validate_model_source(scope, &document.model)?;
@@ -385,25 +403,14 @@ impl MemberInput {
                 for document in models.into_inner() {
                     let (member, member_pins) =
                         if names_vault_source(&serde_json::to_value(&document.model)?) {
-                            let CatalogScope::Org(org_id) = scope else {
-                                anyhow::bail!("a global catalog entry cannot name a vault model");
-                            };
-                            let vault =
-                                vault.context("the vault store is required for a vault model")?;
+                            let (org_id, vault) = org_vault(scope, vault)?;
                             let descriptor = serde_json::to_value(&document.model)?;
                             let member = DescriptorMember::new_model(
                                 document.model,
                                 document.quantization,
                                 now,
                             )?;
-                            vault_check::check(
-                                vault,
-                                &VaultScope::Org(org_id.clone()),
-                                &descriptor,
-                                &mut HashMap::new(),
-                            )
-                            .await
-                            .map_err(anyhow::Error::new)?;
+                            check_catalog_vault(vault, org_id, &descriptor).await?;
                             let alias = vault_alias::model_alias_within(
                                 vault,
                                 Some(&pipette_plan_types::canonical_json(&descriptor)),
@@ -450,16 +457,32 @@ fn validate_model_source(scope: &CatalogScope, model: &Model) -> anyhow::Result<
     Ok(())
 }
 
-fn runtime_members(
-    runtimes: NonEmptyVec<Runtime>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<NonEmptyVec<DescriptorMember>> {
-    let members = runtimes
-        .into_inner()
-        .into_iter()
-        .map(|runtime| DescriptorMember::new(runtime, now))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(NonEmptyVec::try_new(members)?)
+/// The organization and the vault store that check a vault descriptor of an
+/// entry in `scope`. A global entry cannot name a vault source.
+fn org_vault<'a>(
+    scope: &'a CatalogScope,
+    vault: Option<&'a dyn VaultStore>,
+) -> anyhow::Result<(&'a pipette_plan_types::OrgId, &'a dyn VaultStore)> {
+    let CatalogScope::Org(org_id) = scope else {
+        return Err(EntryError::GlobalVaultSource.into());
+    };
+    let vault = vault.context("the vault store is required for a vault source")?;
+    Ok((org_id, vault))
+}
+
+async fn check_catalog_vault(
+    vault: &dyn VaultStore,
+    org_id: &pipette_plan_types::OrgId,
+    descriptor: &serde_json::Value,
+) -> anyhow::Result<()> {
+    vault_check::check(
+        vault,
+        &VaultScope::Org(org_id.clone()),
+        descriptor,
+        &mut HashMap::new(),
+    )
+    .await
+    .map_err(anyhow::Error::new)
 }
 
 /// Pin each Hugging Face repository to the commit that its revision names now.
@@ -602,7 +625,16 @@ pub async fn create(
     now: DateTime<Utc>,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
-    create_with_vault(store, hub, None, scope, document, now, dry_run).await
+    create_with_vault(
+        store,
+        hub,
+        None,
+        scope,
+        Document::Toml(document),
+        now,
+        dry_run,
+    )
+    .await
 }
 
 /// Create an entry with access to the organization's vault records.
@@ -611,7 +643,7 @@ pub async fn create_with_vault(
     hub: &HubClient,
     vault: Option<&dyn VaultStore>,
     scope: &CatalogScope,
-    document: &str,
+    document: Document<'_, CreateDescriptorEntryRequest>,
     now: DateTime<Utc>,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
@@ -619,7 +651,10 @@ pub async fn create_with_vault(
         name,
         release_time,
         members,
-    } = parse_create(scope, document)?;
+    } = match document {
+        Document::Toml(text) => parse_create(scope, text)?,
+        Document::Parsed(request) => create_input(scope, request)?,
+    };
     if let Some(taken) = store.get_entry(scope, &name).await? {
         anyhow::bail!(
             "catalog name {} is already held by a {} entry",
@@ -758,7 +793,7 @@ pub async fn add_member(
         CatalogSources { hub, vault: None },
         scope,
         name,
-        document,
+        Document::Toml(document),
         now,
         dry_run,
     )
@@ -777,7 +812,7 @@ pub async fn add_member_with_vault(
     sources: CatalogSources<'_>,
     scope: &CatalogScope,
     name: &CatalogName,
-    document: &str,
+    document: Document<'_, AddDescriptorMemberRequest>,
     now: DateTime<Utc>,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
@@ -787,7 +822,11 @@ pub async fn add_member_with_vault(
         entry.kind == DescriptorEntryKind::HandMade,
         "only a hand-made catalog entry accepts add-member"
     );
-    let (added, pins) = parse_member(document)?
+    let input = match document {
+        Document::Toml(text) => parse_member(text)?,
+        Document::Parsed(request) => MemberInput::of_member(request)?,
+    };
+    let (added, pins) = input
         .resolve(sources.hub, sources.vault, scope, now)
         .await?;
     let member = added.head().clone();
@@ -906,8 +945,12 @@ async fn add_checked(
         | EntryError::OrgKind
         | EntryError::ModelKind
         | EntryError::CreatorScope
+        | EntryError::GlobalVaultSource
+        | EntryError::DescriptorInvalid(_)
         | EntryError::DescriptorKindMismatch
         | EntryError::RuntimeTypeMismatch
+        | EntryError::RuntimeBuildMismatch
+        | EntryError::RuntimeBuildInvalid(_)
         | EntryError::FormatTypeClash { .. }
         | EntryError::SpeculativeMix) => CatalogWriteError::Invalid(other.into()),
     })?;
@@ -1142,8 +1185,427 @@ pub async fn tombstone_entry(
     }
 }
 
+fn log_rename(scope: &CatalogScope, old: &CatalogName, new: &CatalogName) {
+    match scope {
+        CatalogScope::Global => {
+            tracing::info!(catalog_name = %new, old_catalog_name = %old, "catalog entry renamed");
+        }
+        CatalogScope::Org(org_id) => tracing::info!(
+            catalog_name = %new,
+            old_catalog_name = %old,
+            org_id = %org_id,
+            "catalog entry renamed"
+        ),
+    }
+}
+
+fn log_merge(scope: &CatalogScope, old: &CatalogName, into: &CatalogName, merge: &MergedMembers) {
+    let moved = member_keys(&merge.moved);
+    let skipped = member_keys(&merge.skipped);
+    match scope {
+        CatalogScope::Global => tracing::info!(
+            catalog_name = %into,
+            old_catalog_name = %old,
+            member_keys = %moved,
+            skipped_member_keys = %skipped,
+            "catalog entries merged"
+        ),
+        CatalogScope::Org(org_id) => tracing::info!(
+            catalog_name = %into,
+            old_catalog_name = %old,
+            org_id = %org_id,
+            member_keys = %moved,
+            skipped_member_keys = %skipped,
+            "catalog entries merged"
+        ),
+    }
+}
+
+fn log_relabel(
+    scope: &CatalogScope,
+    name: &CatalogName,
+    format: ModelFormat,
+    from: &QuantizationLabel,
+    to: &QuantizationLabel,
+) {
+    match scope {
+        CatalogScope::Global => tracing::info!(
+            catalog_name = %name,
+            format = %format,
+            quantization = %to,
+            old_quantization = %from,
+            "catalog member relabeled"
+        ),
+        CatalogScope::Org(org_id) => tracing::info!(
+            catalog_name = %name,
+            org_id = %org_id,
+            format = %format,
+            quantization = %to,
+            old_quantization = %from,
+            "catalog member relabeled"
+        ),
+    }
+}
+
+/// The outcome that [`DescriptorCatalogStore::rename_entry`] gives for the
+/// entry as it stands, without a write.
+pub async fn preview_rename(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    new_name: &CatalogName,
+) -> anyhow::Result<RenameOutcome> {
+    let Some(entry) = store.get_entry(scope, name).await? else {
+        return Ok(RenameOutcome::NoSuchEntry);
+    };
+    if entry.state == DescriptorEntryState::Tombstoned {
+        return Ok(RenameOutcome::Tombstoned);
+    }
+    if entry.kind != DescriptorEntryKind::HandMade {
+        return Ok(RenameOutcome::ImporterKind(entry.kind));
+    }
+    if entry.name == *new_name {
+        return Ok(RenameOutcome::SameName);
+    }
+    if new_name.key() != entry.name.key()
+        && let Some(holder) = store.get_entry(scope, new_name).await?
+    {
+        return Ok(RenameOutcome::NameTaken {
+            name: holder.name,
+            state: holder.state,
+        });
+    }
+    Ok(RenameOutcome::Renamed {
+        old_name: entry.name.clone(),
+        entry: DescriptorEntry {
+            name: new_name.clone(),
+            ..entry
+        },
+    })
+}
+
+/// The outcome that [`DescriptorCatalogStore::relabel_member`] gives for the
+/// entry as it stands, without a write.
+pub async fn preview_relabel(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    format: ModelFormat,
+    from: &QuantizationLabel,
+    to: &QuantizationLabel,
+) -> anyhow::Result<RelabelOutcome> {
+    let Some(entry) = store.get_entry(scope, name).await? else {
+        return Ok(RelabelOutcome::NoSuchEntry);
+    };
+    if entry.state == DescriptorEntryState::Tombstoned {
+        return Ok(RelabelOutcome::Tombstoned);
+    }
+    if entry.descriptor_kind() == DescriptorKind::Runtime {
+        return Ok(RelabelOutcome::RuntimeEntry);
+    }
+    let holds = |label: &QuantizationLabel| {
+        entry
+            .members
+            .iter()
+            .any(|member| member.model_key() == Some((format, label)))
+    };
+    if !holds(from) {
+        return Ok(RelabelOutcome::NoSuchMember);
+    }
+    if from == to {
+        return Ok(RelabelOutcome::SameLabel);
+    }
+    if holds(to) {
+        return Ok(RelabelOutcome::LabelTaken);
+    }
+    let members = entry
+        .members
+        .iter()
+        .map(|member| match member.model_key() {
+            Some(key) if key == (format, from) => member.relabeled(to.clone()),
+            _ => Some(member.clone()),
+        })
+        .collect::<Option<Vec<_>>>()
+        .context("a model entry holds a runtime member")?;
+    Ok(RelabelOutcome::Relabeled(DescriptorEntry {
+        members: NonEmptyVec::try_new(members)?,
+        ..entry
+    }))
+}
+
+/// The result of a rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameResult {
+    /// The entry has the new name.
+    Renamed {
+        /// The stored spelling of the old name.
+        old_name: CatalogName,
+        entry: DescriptorEntry,
+    },
+    /// Another live hand-made entry held the new name, so that entry got the
+    /// members of the renamed entry, and the renamed entry is gone.
+    Merged {
+        /// The stored spelling of the old name.
+        old_name: CatalogName,
+        /// The entry that holds the new name, with its new members.
+        entry: DescriptorEntry,
+        merge: MergedMembers,
+    },
+}
+
+impl RenameResult {
+    /// The entry under the new name.
+    pub fn entry(&self) -> &DescriptorEntry {
+        match self {
+            Self::Renamed { entry, .. } | Self::Merged { entry, .. } => entry,
+        }
+    }
+
+    pub fn into_entry(self) -> DescriptorEntry {
+        match self {
+            Self::Renamed { entry, .. } | Self::Merged { entry, .. } => entry,
+        }
+    }
+
+    /// The audit action that records the stored names of this result.
+    pub fn audit_action(&self, scope: &CatalogScope) -> AuditAction {
+        match self {
+            Self::Renamed { old_name, entry } => AuditAction::CatalogRename {
+                scope: scope.clone(),
+                old_name: old_name.clone(),
+                new_name: entry.name.clone(),
+            },
+            Self::Merged {
+                old_name,
+                entry,
+                merge,
+            } => AuditAction::CatalogMerge {
+                scope: scope.clone(),
+                old_name: old_name.clone(),
+                into_name: entry.name.clone(),
+                moved: merge.moved.iter().map(member_key).collect(),
+                skipped: merge.skipped.iter().map(member_key).collect(),
+            },
+        }
+    }
+}
+
+/// Give a hand-made entry the name `new_name`, and return the entry under it.
+/// If another live hand-made entry holds `new_name`, merge the entry into it
+/// ([`rename_entry_with_old_name`]). With `dry_run`, check the same things and
+/// write nothing.
+pub async fn rename_entry(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    new_name: &CatalogName,
+    dry_run: bool,
+) -> Result<DescriptorEntry, CatalogWriteError> {
+    rename_entry_with_old_name(store, scope, name, new_name, dry_run)
+        .await
+        .map(RenameResult::into_entry)
+}
+
+/// Rename an entry and return its exact stored old spelling with the result.
+/// A caller can add a new audit event without changing the request audit record.
+///
+/// If another live hand-made entry in the scope holds `new_name`, the members
+/// of the entry `name` move to the end of that entry, as `add-member` would
+/// append them, and the entry `name` is deleted. A member with the digest and
+/// the key of a member of that entry is already there, so the merge skips it.
+pub async fn rename_entry_with_old_name(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    new_name: &CatalogName,
+    dry_run: bool,
+) -> Result<RenameResult, CatalogWriteError> {
+    check_reserved_name(scope, new_name).map_err(CatalogWriteError::Invalid)?;
+    // A concurrent write can free the name between the rename and the merge.
+    // The second attempt then renames the entry.
+    for _ in 0..2 {
+        let outcome = if dry_run {
+            preview_rename(store, scope, name, new_name).await
+        } else {
+            store.rename_entry(scope, name, new_name).await
+        }
+        .map_err(CatalogWriteError::Storage)?;
+        let (old_name, entry) = match outcome {
+            RenameOutcome::Renamed { old_name, entry } => (old_name, entry),
+            RenameOutcome::NameTaken {
+                name: holder,
+                state,
+            } if state != DescriptorEntryState::Tombstoned => {
+                match merge_into(store, scope, name, &holder, dry_run).await? {
+                    Some(merged) => return Ok(merged),
+                    None => continue,
+                }
+            }
+            RenameOutcome::NoSuchEntry => {
+                return Err(CatalogWriteError::NotFound(format!(
+                    "no catalog entry {name}"
+                )));
+            }
+            RenameOutcome::Tombstoned => {
+                return Err(CatalogWriteError::Conflict(format!(
+                    "catalog entry {name} is tombstoned"
+                )));
+            }
+            RenameOutcome::ImporterKind(kind) => {
+                return Err(CatalogWriteError::Conflict(format!(
+                    "catalog entry {name} is a {kind} entry; only a hand-made entry gets a new name"
+                )));
+            }
+            RenameOutcome::SameName => {
+                return Err(CatalogWriteError::Conflict(format!(
+                    "catalog entry {name} already has the name {new_name}"
+                )));
+            }
+            RenameOutcome::NameTaken {
+                name: holder,
+                state,
+            } => {
+                return Err(CatalogWriteError::Conflict(format!(
+                    "the {state} entry already holds the catalog name {holder}"
+                )));
+            }
+        };
+        if !dry_run {
+            log_rename(scope, name, &entry.name);
+        }
+        return Ok(RenameResult::Renamed { old_name, entry });
+    }
+    Err(CatalogWriteError::Conflict(format!(
+        "concurrent writes kept changing the catalog name {new_name}; try again"
+    )))
+}
+
+/// Merge the entry `name` into the entry `into`. `None` means that no entry
+/// holds `into` any more.
+async fn merge_into(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    into: &CatalogName,
+    dry_run: bool,
+) -> Result<Option<RenameResult>, CatalogWriteError> {
+    let refused =
+        |reason: &dyn std::fmt::Display| format!("cannot merge {name} into {into}: {reason}");
+    let read = |name| async move {
+        store
+            .get_entry(scope, name)
+            .await
+            .map_err(CatalogWriteError::Storage)
+    };
+    let preview = merge_outcome(read(name).await?, read(into).await?);
+    let outcome = if dry_run {
+        preview
+    } else {
+        store
+            .merge_entry(scope, name, into)
+            .await
+            .map_err(CatalogWriteError::Storage)?
+    };
+    match outcome {
+        MergeOutcome::Merged {
+            old_name,
+            entry,
+            merge,
+        } => {
+            if !dry_run {
+                log_merge(scope, &old_name, &entry.name, &merge);
+            }
+            Ok(Some(RenameResult::Merged {
+                old_name,
+                entry,
+                merge,
+            }))
+        }
+        MergeOutcome::TargetMissing => Ok(None),
+        MergeOutcome::NoSuchEntry => Err(CatalogWriteError::NotFound(format!(
+            "no catalog entry {name}"
+        ))),
+        MergeOutcome::Tombstoned => Err(CatalogWriteError::Conflict(format!(
+            "catalog entry {name} is tombstoned"
+        ))),
+        MergeOutcome::ImporterKind(kind) => Err(CatalogWriteError::Conflict(format!(
+            "catalog entry {name} is a {kind} entry; only a hand-made entry gets a new name"
+        ))),
+        MergeOutcome::TargetTombstoned => Err(CatalogWriteError::Conflict(format!(
+            "the tombstoned entry already holds the catalog name {into}"
+        ))),
+        MergeOutcome::TargetImporterKind(kind) => Err(CatalogWriteError::Conflict(refused(
+            &format_args!("{into} is a {kind} entry, and only a hand-made entry accepts members"),
+        ))),
+        MergeOutcome::Refused(
+            error @ (EntryError::DuplicateFlavor(_)
+            | EntryError::DuplicateModelKey { .. }
+            | EntryError::DuplicateDigest(_)),
+        ) => Err(CatalogWriteError::Conflict(refused(&error))),
+        MergeOutcome::Refused(error) => {
+            Err(CatalogWriteError::Invalid(anyhow::anyhow!(refused(&error))))
+        }
+    }
+}
+
+/// Give the model member `format::from` of an entry the label `to`, and return
+/// the entry. With `dry_run`, check the same things and write nothing.
+pub async fn relabel_entry(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    format: ModelFormat,
+    from: &QuantizationLabel,
+    to: &QuantizationLabel,
+    dry_run: bool,
+) -> Result<DescriptorEntry, CatalogWriteError> {
+    let outcome = if dry_run {
+        preview_relabel(store, scope, name, format, from, to).await
+    } else {
+        store.relabel_member(scope, name, format, from, to).await
+    }
+    .map_err(CatalogWriteError::Storage)?;
+    let entry = match outcome {
+        RelabelOutcome::Relabeled(entry) => entry,
+        RelabelOutcome::NoSuchEntry => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "no catalog entry {name}"
+            )));
+        }
+        RelabelOutcome::NoSuchMember => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "catalog entry {name} has no member {format}::{from}"
+            )));
+        }
+        RelabelOutcome::Tombstoned => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} is tombstoned"
+            )));
+        }
+        RelabelOutcome::RuntimeEntry => {
+            return Err(CatalogWriteError::Invalid(anyhow::anyhow!(
+                "catalog entry {name} holds runtimes, and a runtime member has no quantization label"
+            )));
+        }
+        RelabelOutcome::SameLabel => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "member {name}::{format}::{from} already has the label {to}"
+            )));
+        }
+        RelabelOutcome::LabelTaken => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} already has a member {format}::{to}"
+            )));
+        }
+    };
+    if !dry_run {
+        log_relabel(scope, &entry.name, format, from, to);
+    }
+    Ok(entry)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
@@ -1151,7 +1613,9 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    use pipette_core::vault::VaultOwner;
     use pipette_hub_testkit::{MockFile, MockGate, MockHub, MockRepo, PR_REF};
+    use pipette_plan_types::{OrgId, UserId, VaultResourceId};
 
     use super::*;
 
@@ -1289,6 +1753,72 @@ mod tests {
         Ok(())
     }
 
+    /// A request from command-line values writes what the same TOML writes.
+    #[tokio::test]
+    async fn a_parsed_request_writes_what_its_toml_writes() -> anyhow::Result<()> {
+        let hub = no_hub()?;
+        let now = Utc::now();
+        let from_toml =
+            dry_run_entry(&format!("name = 'Fork'\nruntimes = [{RUNTIME}]"), now).await?;
+        let runtime = |flavor: &str| {
+            let mut runtime = json_runtime();
+            runtime["flavor"] = json!(flavor);
+            serde_json::from_value::<Runtime>(runtime)
+        };
+        let request = |name: &str| -> anyhow::Result<_> {
+            Ok(CreateDescriptorEntryRequest {
+                name: CatalogName::try_new(name)?,
+                release_time: None,
+                runtimes: Some(NonEmptyVec::try_new(vec![runtime("macos-arm64")?])?),
+                models: None,
+            })
+        };
+        let store = Memory::default();
+        let create = |name| -> anyhow::Result<_> {
+            Ok(create_with_vault(
+                &store,
+                &hub,
+                None,
+                &CatalogScope::Global,
+                Document::Parsed(request(name)?),
+                now,
+                false,
+            ))
+        };
+        assert!(
+            create("llamacpp-v9.0.0")?
+                .await
+                .is_err_and(|error| error.to_string().contains("reserved"))
+        );
+        assert_eq!(create("Fork")?.await?.entry, from_toml);
+
+        let appended = add_member_with_vault(
+            &store,
+            CatalogSources {
+                hub: &hub,
+                vault: None,
+            },
+            &CatalogScope::Global,
+            &from_toml.name,
+            Document::Parsed(AddDescriptorMemberRequest {
+                runtime: Some(runtime("linux-x64")?),
+                model: None,
+                quantization: None,
+            }),
+            now,
+            false,
+        )
+        .await?;
+        let flavors = appended
+            .entry
+            .members
+            .iter()
+            .map(|member| member.flavor())
+            .collect::<Vec<_>>();
+        assert_eq!(flavors, [Some("macos-arm64"), Some("linux-x64")]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_checks_the_release_time_and_builds() -> anyhow::Result<()> {
         let now = Utc::now();
@@ -1344,12 +1874,147 @@ mod tests {
         assert_eq!(change.states(), (expected, target));
     }
 
+    /// A vault runtime table that names `resource` for `principal`.
+    fn vault_runtime(resource: &VaultResourceId, principal: &str, flavor: &str) -> String {
+        format!(
+            "{{ type = 'llamacpp_cli_stock_tools', source = 'vault_remote_archive', \
+             url = '/vault/resources/{resource}/content', principal_id = '{principal}', \
+             flavor = '{flavor}' }}"
+        )
+    }
+
+    /// A vault record owned by `owner`, with its object. The record is in
+    /// `vault` only when `written`.
+    async fn vault_record(
+        vault: &dyn VaultStore,
+        owner: VaultOwner,
+        written: bool,
+    ) -> anyhow::Result<VaultResourceId> {
+        let sha256 = pipette_store_testkit::vault_blob_sha256()?;
+        let bytes = pipette_store_testkit::VAULT_BLOB;
+        let resource = pipette_store_testkit::vault_resource_for(
+            owner.clone(),
+            sha256.clone(),
+            bytes.len() as u64,
+        )?;
+        if written {
+            let key = pipette_core::vault::blob_key(&owner, &sha256)?;
+            vault
+                .put_blob(&key, &sha256, pipette_store_testkit::blob_body(bytes))
+                .await?;
+            vault.put_resource(&resource).await?;
+        }
+        Ok(resource.resource_id)
+    }
+
+    /// `catalog create --org` and `catalog add-member --org` accept the
+    /// organization's own vault runtime. They refuse a resource outside the
+    /// organization with the refusal for a resource that does not exist.
+    #[tokio::test]
+    async fn an_org_file_names_only_the_orgs_own_vault_runtime() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = pipette_core::config::Config {
+            storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
+            auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let stores = pipette_store_fs::build_local_fs_stores(&config)?;
+        let vault = &*stores.vault;
+        let org_id = OrgId::try_new("org_1")?;
+        let scope = CatalogScope::Org(org_id.clone());
+        let store = Memory::default();
+        let hub = no_hub()?;
+        let org = VaultOwner::Org { org_id };
+
+        let own = vault_record(vault, org.clone(), true).await?;
+        let created = create_with_vault(
+            &store,
+            &hub,
+            Some(vault),
+            &scope,
+            Document::Toml(&format!(
+                "name = 'Fork'\nruntimes = [{}]",
+                vault_runtime(&own, "org_1", "linux-x64-rocm")
+            )),
+            Utc::now(),
+            false,
+        )
+        .await?;
+        let name = created.entry.name;
+
+        // Both writes of `resource`, each refusal with the resource id masked.
+        let refusals = |resource: VaultResourceId, principal: &'static str| {
+            let create = format!(
+                "name = 'Other'\nruntimes = [{}]",
+                vault_runtime(&resource, principal, "linux-x64-rocm")
+            );
+            let add = format!(
+                "runtime = {}",
+                vault_runtime(&resource, principal, "macos-arm64")
+            );
+            let (store, hub, scope, name) = (&store, &hub, &scope, &name);
+            async move {
+                let created = create_with_vault(
+                    store,
+                    hub,
+                    Some(vault),
+                    scope,
+                    Document::Toml(&create),
+                    Utc::now(),
+                    true,
+                )
+                .await
+                .err()
+                .context("the create is refused")?;
+                let added = add_member_with_vault(
+                    store,
+                    CatalogSources {
+                        hub,
+                        vault: Some(vault),
+                    },
+                    scope,
+                    name,
+                    Document::Toml(&add),
+                    Utc::now(),
+                    true,
+                )
+                .await
+                .err()
+                .context("the add-member is refused")?;
+                let id = resource.to_string();
+                Ok::<_, anyhow::Error>(
+                    [created, added].map(|error| format!("{error:#}").replace(&id, "RESOURCE")),
+                )
+            }
+        };
+        let unknown = refusals(vault_record(vault, org, false).await?, "org_1").await?;
+        assert!(unknown[0].contains("does not exist"), "{unknown:?}");
+        for (owner, principal) in [
+            (
+                VaultOwner::Org {
+                    org_id: OrgId::try_new("org_2")?,
+                },
+                "org_2",
+            ),
+            (
+                VaultOwner::User {
+                    user_id: UserId::try_new("user_1")?,
+                },
+                "user_1",
+            ),
+        ] {
+            let foreign = vault_record(vault, owner, true).await?;
+            assert_eq!(refusals(foreign, principal).await?, unknown);
+        }
+        Ok(())
+    }
+
     const VAULT: &str = "runtime = { type = 'llamacpp_cli_stock_tools', source = 'vault_remote_archive', url = '/vault/resources/vault_1/content', principal_id = 'org_1', flavor = 'linux-x64-rocm' }";
 
     #[rstest]
     #[case::one_runtime(format!("runtime = {RUNTIME}"), None)]
     #[case::runtimes_array(format!("runtimes = [{RUNTIME}]"), Some("invalid catalog member file"))]
-    #[case::vault_source(VAULT.to_owned(), Some("vault source"))]
+    #[case::vault_source(VAULT.to_owned(), Some("global catalog entry cannot name a vault source"))]
     #[case::position_field(
         format!("runtime = {RUNTIME}\nposition = 0"),
         Some("invalid catalog member file")
@@ -1394,7 +2059,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Memory(
+    pub(crate) struct Memory(
         Mutex<BTreeMap<String, DescriptorEntry>>,
         AtomicBool,
         Mutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -1500,6 +2165,114 @@ mod tests {
             state: DescriptorEntryState,
         ) -> anyhow::Result<TransitionOutcome> {
             self.transition_state(scope, name, expected, state).await
+        }
+
+        async fn rename_entry(
+            &self,
+            _scope: &CatalogScope,
+            name: &CatalogName,
+            new_name: &CatalogName,
+        ) -> anyhow::Result<RenameOutcome> {
+            let mut entries = self.entries()?;
+            let Some(entry) = entries.get(&name.key()).cloned() else {
+                return Ok(RenameOutcome::NoSuchEntry);
+            };
+            if entry.state == DescriptorEntryState::Tombstoned {
+                return Ok(RenameOutcome::Tombstoned);
+            }
+            if entry.kind != DescriptorEntryKind::HandMade {
+                return Ok(RenameOutcome::ImporterKind(entry.kind));
+            }
+            if entry.name == *new_name {
+                return Ok(RenameOutcome::SameName);
+            }
+            if new_name.key() != entry.name.key()
+                && let Some(holder) = entries.get(&new_name.key())
+            {
+                return Ok(RenameOutcome::NameTaken {
+                    name: holder.name.clone(),
+                    state: holder.state,
+                });
+            }
+            let old_name = entry.name.clone();
+            let renamed = DescriptorEntry {
+                name: new_name.clone(),
+                ..entry
+            };
+            entries.remove(&name.key());
+            entries.insert(renamed.name.key(), renamed.clone());
+            Ok(RenameOutcome::Renamed {
+                old_name,
+                entry: renamed,
+            })
+        }
+
+        async fn merge_entry(
+            &self,
+            _scope: &CatalogScope,
+            name: &CatalogName,
+            into: &CatalogName,
+        ) -> anyhow::Result<MergeOutcome> {
+            let mut entries = self.entries()?;
+            let outcome = merge_outcome(
+                entries.get(&name.key()).cloned(),
+                entries.get(&into.key()).cloned(),
+            );
+            if let MergeOutcome::Merged { entry, .. } = &outcome {
+                entries.remove(&name.key());
+                entries.insert(entry.name.key(), entry.clone());
+            }
+            Ok(outcome)
+        }
+
+        async fn relabel_member(
+            &self,
+            _scope: &CatalogScope,
+            name: &CatalogName,
+            format: ModelFormat,
+            from: &QuantizationLabel,
+            to: &QuantizationLabel,
+        ) -> anyhow::Result<RelabelOutcome> {
+            let mut entries = self.entries()?;
+            let Some(entry) = entries.get(&name.key()).cloned() else {
+                return Ok(RelabelOutcome::NoSuchEntry);
+            };
+            if entry.state == DescriptorEntryState::Tombstoned {
+                return Ok(RelabelOutcome::Tombstoned);
+            }
+            if entry.descriptor_kind() == DescriptorKind::Runtime {
+                return Ok(RelabelOutcome::RuntimeEntry);
+            }
+            let holds = |label: &QuantizationLabel| {
+                entry
+                    .members
+                    .iter()
+                    .any(|member| member.model_key() == Some((format, label)))
+            };
+            if !holds(from) {
+                return Ok(RelabelOutcome::NoSuchMember);
+            }
+            if from == to {
+                return Ok(RelabelOutcome::SameLabel);
+            }
+            if holds(to) {
+                return Ok(RelabelOutcome::LabelTaken);
+            }
+            let members = entry
+                .members
+                .iter()
+                .map(|member| match member.model_key() {
+                    Some(key) if key == (format, from) => member.relabeled(to.clone()),
+                    _ => Some(member.clone()),
+                })
+                .collect::<Option<Vec<_>>>()
+                .context("a model entry holds a runtime member")?;
+            let relabeled = DescriptorEntry {
+                members: NonEmptyVec::try_new(members)?,
+                ..entry
+            };
+            entries.insert(relabeled.name.key(), relabeled.clone());
+            Ok(RelabelOutcome::Relabeled(relabeled))
         }
 
         async fn get_entry(
@@ -2221,6 +2994,472 @@ mod tests {
         )
         .await?;
         assert_eq!(synonym.synonyms, ["AcmeLM-VL-3B"]);
+
+        let mut q8_0 = json_gguf();
+        q8_0["path"] = json!("AcmeLM-Q8_0.gguf");
+        let parsed = add_member_with_vault(
+            &store,
+            CatalogSources {
+                hub: &client,
+                vault: None,
+            },
+            &scope,
+            &name,
+            Document::Parsed(AddDescriptorMemberRequest {
+                runtime: None,
+                model: Some(serde_json::from_value(q8_0)?),
+                quantization: Some(QuantizationLabel::try_new("q8_0")?),
+            }),
+            now,
+            false,
+        )
+        .await?;
+        assert_eq!(
+            member_keys(&parsed.entry.members),
+            "gguf::q4_0,mlx::4bit,gguf::q8_0"
+        );
+        Ok(())
+    }
+
+    /// A store with these entries:
+    ///
+    /// - the hand-made runtime entries `Fork` and `Held`, with the same
+    ///   member of build `b1`;
+    /// - `Vulkan`, with another flavor of build `b1`;
+    /// - `OtherBuild`, with another flavor from build `b2`;
+    /// - a tombstoned `Dead` and a stable `llamacpp-v1`;
+    /// - the model entry `AcmeLM`, with the members `gguf::q4_0` and
+    ///   `gguf::q8_0`;
+    /// - `AcmeLM-Q5`, with a new member `gguf::q5_0`;
+    /// - `AcmeLM-Clash`, with another model under the label `gguf::q4_0`;
+    /// - `AcmeLM-Q4`, with the `gguf::q4_0` model of `AcmeLM` under the label
+    ///   `gguf::q4`.
+    async fn renamable() -> anyhow::Result<Memory> {
+        use pipette_store_testkit::{a_descriptor_entry, a_member, a_model_member};
+        let store = Memory::default();
+        let runtime = || a_member("b1", "linux-x64-rocm");
+        let mut dead = a_descriptor_entry("Dead", DescriptorEntryKind::HandMade, 1, runtime()?)?;
+        dead.state = DescriptorEntryState::Tombstoned;
+        let mut model = a_descriptor_entry(
+            "AcmeLM",
+            DescriptorEntryKind::HandMade,
+            1,
+            a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?,
+        )?;
+        model.members = NonEmptyVec::try_new(vec![
+            model.members.head().clone(),
+            a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?,
+        ])?;
+        let entries = [
+            a_descriptor_entry("Fork", DescriptorEntryKind::HandMade, 1, runtime()?)?,
+            a_descriptor_entry("Held", DescriptorEntryKind::HandMade, 1, runtime()?)?,
+            dead,
+            a_descriptor_entry("llamacpp-v1", DescriptorEntryKind::Stable, 1, runtime()?)?,
+            model,
+            a_descriptor_entry(
+                "Vulkan",
+                DescriptorEntryKind::HandMade,
+                1,
+                a_member("b1", "linux-x64-vulkan")?,
+            )?,
+            a_descriptor_entry(
+                "OtherBuild",
+                DescriptorEntryKind::HandMade,
+                1,
+                a_member("b2", "linux-x64-cuda")?,
+            )?,
+            a_descriptor_entry(
+                "AcmeLM-Q5",
+                DescriptorEntryKind::HandMade,
+                1,
+                a_model_member("gguf_text", "AcmeLM-Q5-GGUF", "q5_0")?,
+            )?,
+            a_descriptor_entry(
+                "AcmeLM-Clash",
+                DescriptorEntryKind::HandMade,
+                1,
+                a_model_member("gguf_text", "Other-GGUF", "q4_0")?,
+            )?,
+            a_descriptor_entry(
+                "AcmeLM-Q4",
+                DescriptorEntryKind::HandMade,
+                1,
+                a_model_member("gguf_text", "AcmeLM-GGUF", "q4")?,
+            )?,
+        ];
+        for entry in &entries {
+            store.create_entry(entry).await?;
+        }
+        Ok(store)
+    }
+
+    #[tokio::test]
+    async fn concurrent_memory_renames_keep_both_entries() -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let fork = CatalogName::try_new("Fork")?;
+        let held = CatalogName::try_new("Held")?;
+        let spoon = CatalogName::try_new("Spoon")?;
+        let before_len = store.entries()?.len();
+        *store
+            .2
+            .lock()
+            .map_err(|_| anyhow::anyhow!("barrier lock poisoned"))? =
+            Some(Arc::new(tokio::sync::Barrier::new(2)));
+
+        let (first, second) = tokio::join!(
+            store.rename_entry(&scope, &fork, &spoon),
+            store.rename_entry(&scope, &held, &spoon),
+        );
+        let outcomes = [first?, second?];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RenameOutcome::Renamed { .. }))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RenameOutcome::NameTaken { .. }))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let entries = store.entries()?;
+        assert_eq!(entries.len(), before_len);
+        assert!(entries.contains_key(&spoon.key()));
+        assert_ne!(
+            entries.contains_key(&fork.key()),
+            entries.contains_key(&held.key())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_memory_relabels_keep_the_winner() -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let name = CatalogName::try_new("AcmeLM")?;
+        let from = QuantizationLabel::try_new("q4_0")?;
+        let q5 = QuantizationLabel::try_new("q5_0")?;
+        let q6 = QuantizationLabel::try_new("q6_0")?;
+        *store
+            .2
+            .lock()
+            .map_err(|_| anyhow::anyhow!("barrier lock poisoned"))? =
+            Some(Arc::new(tokio::sync::Barrier::new(2)));
+
+        let (first, second) = tokio::join!(
+            store.relabel_member(&scope, &name, ModelFormat::Gguf, &from, &q5),
+            store.relabel_member(&scope, &name, ModelFormat::Gguf, &from, &q6),
+        );
+        let outcomes = [first?, second?];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RelabelOutcome::Relabeled(_)))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RelabelOutcome::NoSuchMember))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let entries = store.entries()?;
+        let entry = entries.get(&name.key()).context("model entry was lost")?;
+        let labels = member_keys(&entry.members);
+        assert!(
+            labels == "gguf::q5_0,gguf::q8_0" || labels == "gguf::q6_0,gguf::q8_0",
+            "{labels}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::dry_run(true)]
+    #[case::write(false)]
+    #[tokio::test]
+    async fn rename_result_keeps_the_stored_old_spelling(
+        #[case] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let requested = CatalogName::try_new("fork")?;
+        let new_name = CatalogName::try_new("Spoon")?;
+        let result =
+            rename_entry_with_old_name(&store, &scope, &requested, &new_name, dry_run).await?;
+        let RenameResult::Renamed { old_name, entry } = result else {
+            anyhow::bail!("the rename must not merge: {result:?}");
+        };
+        assert_eq!(old_name, CatalogName::try_new("Fork")?);
+        assert_eq!(entry.name, new_name);
+        Ok(())
+    }
+
+    fn refusal(error: &CatalogWriteError) -> (&'static str, String) {
+        let variant = match error {
+            CatalogWriteError::Invalid(_) => "invalid",
+            CatalogWriteError::Conflict(_) => "conflict",
+            CatalogWriteError::NotFound(_) => "not found",
+            CatalogWriteError::Storage(_) => "storage",
+            CatalogWriteError::Upstream(_) => "upstream",
+        };
+        (variant, error.to_string())
+    }
+
+    #[rstest]
+    #[case::reserved("Fork", "llamacpp-v9", "invalid", "reserved for the llamacpp importer")]
+    #[case::missing("Missing", "Other", "not found", "no catalog entry Missing")]
+    #[case::tombstoned("Dead", "Other", "conflict", "is tombstoned")]
+    #[case::stable("llamacpp-v1", "Other", "conflict", "only a hand-made entry")]
+    #[case::same_name("Fork", "Fork", "conflict", "already has the name Fork")]
+    #[case::other_build(
+        "Fork",
+        "otherbuild",
+        "invalid",
+        "cannot merge Fork into OtherBuild: members of one catalog entry may differ only in flavor"
+    )]
+    #[case::runtime_into_model(
+        "Fork",
+        "AcmeLM",
+        "invalid",
+        "cannot merge Fork into AcmeLM: members mix runtime and model descriptors"
+    )]
+    #[case::label_clash(
+        "AcmeLM-Clash",
+        "AcmeLM",
+        "conflict",
+        "cannot merge AcmeLM-Clash into AcmeLM: duplicate member format and quantization: gguf::q4_0"
+    )]
+    #[case::same_model_new_label(
+        "AcmeLM-Q4",
+        "AcmeLM",
+        "conflict",
+        "cannot merge AcmeLM-Q4 into AcmeLM: duplicate member digest"
+    )]
+    #[case::tombstoned_holder(
+        "Fork",
+        "dead",
+        "conflict",
+        "the tombstoned entry already holds the catalog name Dead"
+    )]
+    #[tokio::test]
+    async fn a_rename_refusal_is_the_same_in_a_dry_run(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] variant: &str,
+        #[case] message: &str,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let (from, to) = (CatalogName::try_new(from)?, CatalogName::try_new(to)?);
+        let result = rename_entry(&store, &CatalogScope::Global, &from, &to, dry_run).await;
+        let (got, text) = refusal(&result.err().context("the rename must be refused")?);
+        assert_eq!(got, variant, "{text}");
+        assert!(text.contains(message), "{text}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::missing("Missing", "q4_0", "q5_0", "not found", "no catalog entry Missing")]
+    #[case::no_member("AcmeLM", "q2_k", "q5_0", "not found", "has no member gguf::q2_k")]
+    #[case::tombstoned("Dead", "q4_0", "q5_0", "conflict", "is tombstoned")]
+    #[case::runtime_entry("Fork", "q4_0", "q5_0", "invalid", "holds runtimes")]
+    #[case::same_label("AcmeLM", "q4_0", "q4_0", "conflict", "already has the label q4_0")]
+    #[case::taken(
+        "AcmeLM",
+        "q4_0",
+        "q8_0",
+        "conflict",
+        "already has a member gguf::q8_0"
+    )]
+    #[tokio::test]
+    async fn a_relabel_refusal_is_the_same_in_a_dry_run(
+        #[case] entry: &str,
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] variant: &str,
+        #[case] message: &str,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let result = relabel_entry(
+            &store,
+            &CatalogScope::Global,
+            &CatalogName::try_new(entry)?,
+            ModelFormat::Gguf,
+            &QuantizationLabel::try_new(from)?,
+            &QuantizationLabel::try_new(to)?,
+            dry_run,
+        )
+        .await;
+        let (got, text) = refusal(&result.err().context("the relabel must be refused")?);
+        assert_eq!(got, variant, "{text}");
+        assert!(text.contains(message), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_shows_the_change_and_writes_nothing() -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let (fork, spoon) = (
+            CatalogName::try_new("Fork")?,
+            CatalogName::try_new("Spoon")?,
+        );
+        let model = CatalogName::try_new("AcmeLM")?;
+        let (q4_0, q5_0) = (
+            QuantizationLabel::try_new("q4_0")?,
+            QuantizationLabel::try_new("q5_0")?,
+        );
+        let before = store
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?
+            .clone();
+
+        let preview = rename_entry(&store, &scope, &fork, &spoon, true).await?;
+        assert_eq!(preview.name, spoon);
+        let preview = relabel_entry(
+            &store,
+            &scope,
+            &model,
+            ModelFormat::Gguf,
+            &q4_0,
+            &q5_0,
+            true,
+        )
+        .await?;
+        assert_eq!(
+            preview.members.head().model_key(),
+            Some((ModelFormat::Gguf, &q5_0))
+        );
+        assert_eq!(*store.entries()?, before, "a dry run wrote");
+
+        assert_eq!(
+            rename_entry(&store, &scope, &fork, &spoon, false)
+                .await?
+                .name,
+            spoon
+        );
+        assert!(store.get_entry(&scope, &fork).await?.is_none());
+        let relabeled = relabel_entry(
+            &store,
+            &scope,
+            &model,
+            ModelFormat::Gguf,
+            &q4_0,
+            &q5_0,
+            false,
+        )
+        .await?;
+        assert_eq!(store.get_entry(&scope, &model).await?, Some(relabeled));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::runtime_flavor(
+        "Vulkan",
+        "held",
+        "Held",
+        "linux-x64-rocm,linux-x64-vulkan",
+        "linux-x64-vulkan",
+        ""
+    )]
+    #[case::model_quantization(
+        "AcmeLM-Q5",
+        "acmelm",
+        "AcmeLM",
+        "gguf::q4_0,gguf::q8_0,gguf::q5_0",
+        "gguf::q5_0",
+        ""
+    )]
+    #[case::identical_member("Fork", "Held", "Held", "linux-x64-rocm", "", "linux-x64-rocm")]
+    #[tokio::test]
+    async fn a_rename_to_a_live_name_merges_the_entries(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] into: &str,
+        #[case] members: &str,
+        #[case] moved: &str,
+        #[case] skipped: &str,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let (from, to) = (CatalogName::try_new(from)?, CatalogName::try_new(to)?);
+        let before = store.entries()?.clone();
+
+        let preview = rename_entry_with_old_name(&store, &scope, &from, &to, true).await?;
+        assert_eq!(*store.entries()?, before, "a dry run wrote");
+        let result = rename_entry_with_old_name(&store, &scope, &from, &to, false).await?;
+        assert_eq!(preview, result);
+        let RenameResult::Merged {
+            old_name,
+            entry,
+            merge,
+        } = &result
+        else {
+            anyhow::bail!("the rename must merge: {result:?}");
+        };
+        assert_eq!(*old_name, from);
+        assert_eq!(entry.name.as_str(), into);
+        assert_eq!(member_keys(&entry.members), members);
+        assert_eq!(member_keys(&merge.moved), moved);
+        assert_eq!(member_keys(&merge.skipped), skipped);
+        assert_eq!(store.get_entry(&scope, &to).await?.as_ref(), Some(entry));
+        assert_eq!(
+            result.audit_action(&scope),
+            AuditAction::CatalogMerge {
+                scope: scope.clone(),
+                old_name: from.clone(),
+                into_name: entry.name.clone(),
+                moved: merge.moved.iter().map(member_key).collect(),
+                skipped: merge.skipped.iter().map(member_key).collect(),
+            }
+        );
+
+        // The merge deleted the source entry, so its name is free.
+        assert!(store.get_entry(&scope, &from).await?.is_none());
+        let reused = DescriptorEntry {
+            name: from,
+            ..entry.clone()
+        };
+        assert_eq!(
+            store.create_entry(&reused).await?,
+            CreateEntryOutcome::Created
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_merge_keeps_the_added_time_of_each_moved_member() -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let scope = CatalogScope::Global;
+        let source = CatalogName::try_new("AcmeLM-Q5")?;
+        let added = store
+            .get_entry(&scope, &source)
+            .await?
+            .context("source entry")?
+            .members
+            .head()
+            .added_at();
+        let merged = rename_entry(
+            &store,
+            &scope,
+            &source,
+            &CatalogName::try_new("AcmeLM")?,
+            false,
+        )
+        .await?;
+        assert_eq!(merged.members.last().added_at(), added);
         Ok(())
     }
 }

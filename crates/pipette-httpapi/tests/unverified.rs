@@ -231,10 +231,16 @@ async fn test_held_echoed_job_id_binds_no_claim() -> anyhow::Result<()> {
         match case.queued {
             Queued::Nowhere => {}
             Queued::Avail => {
-                seed_avail(dir.path(), ECHOED_JOB_ID, ExpiresAt::Never, &job_body)?;
+                seed_avail(
+                    state.todo_store.as_ref(),
+                    ECHOED_JOB_ID,
+                    ExpiresAt::Never,
+                    &job_body,
+                )
+                .await?;
             }
             Queued::LeasedToOther => {
-                seed_leased(dir.path(), ECHOED_JOB_ID, &other, &job_body)?;
+                seed_leased(state.todo_store.as_ref(), ECHOED_JOB_ID, &other, &job_body).await?;
             }
         }
         let avail = state.todo_store.get_avail_by_job(&job_id).await?;

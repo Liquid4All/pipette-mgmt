@@ -224,6 +224,16 @@ mod onnx_genai_descriptor_tests {
         Ok(())
     }
 
+    /// A fixed vector that the iOS app reproduces in Swift.
+    #[test]
+    fn onnx_genai_ios_build_flag_is_the_descriptor_digest() -> anyhow::Result<()> {
+        assert_eq!(
+            crate::runtime_build_flag(&sample()?)?.map(|flag| flag.into_inner()),
+            Some(format!("runtime:descriptor:{DIGEST}"))
+        );
+        Ok(())
+    }
+
     /// Each private-API combination is its own runtime identity, so none shares a digest
     /// with the stock build or with another combination.
     #[test]

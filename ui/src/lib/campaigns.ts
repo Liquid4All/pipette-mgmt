@@ -14,8 +14,8 @@ import { campaignLink, campaignPlanLink, pathOf, type OwnedPages } from "./route
 import type { TableSpec } from "./table";
 import { percent } from "./upload";
 import type {
-  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanView, PlannedImport, PrincipalOwner,
-  RevisionDryRun, UpdateCampaignRequest,
+  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanSummary, PlanView, PlannedImport,
+  PrincipalOwner, RevisionDryRun, UpdateCampaignRequest,
 } from "./api-types";
 
 /**
@@ -146,8 +146,12 @@ export function labelScope(reader: Pick<OwnUserView, "user_id">, owner: Principa
   return owner.user_id === reader.user_id ? { kind: "me" } : null;
 }
 
-/** The campaign listing's columns and filters; `owners` where its rows name their owner. */
-export function campaignTable(names: Record<string, string>, owners: boolean): TableSpec<CampaignView> {
+/**
+ * The campaign listing's columns and filters: `owners` where its rows name their owner, `byId` beside a plan or job
+ * id, and `jobs` where the reader may read plans, through which a job id finds its campaigns.
+ */
+export function campaignTable(names: Record<string, string>, owners: boolean, byId = false,
+                              jobs = true): TableSpec<CampaignView> {
   const owner = (row: CampaignView) => ownerName(row.owner, names);
   return {
     columns: [
@@ -165,11 +169,15 @@ export function campaignTable(names: Record<string, string>, owners: boolean): T
       { key: "q", label: "search", placeholder: "campaign id, name or label", wide: true,
         texts: (row) => [row.campaign_id, row.name, ...labelPairs(row.labels).map(labelText)] },
     ],
-    // `campaignQuery` sends them; a plan id finds its campaign, superseded or archived.
+    // `campaignQuery` sends the plan id and the state; the listing reads a job id's plans itself. Either id finds
+    // its campaigns, superseded or archived, so the state is held at all beside one.
     server: [
       { key: "plan_id", label: "plan id", placeholder: "current or superseded", wide: true },
+      ...(jobs ? [{ key: "job_id", label: "job id", placeholder: "in a current or superseded plan", wide: true }] : []),
       { key: "state", label: "state",
-        options: [{ value: "", label: "active" }, { value: "archived", label: "archived" }, { value: "all", label: "all" }] },
+        options: [{ value: "", label: "active" }, { value: "archived", label: "archived" }, { value: "all", label: "all" }],
+        ...(byId ? { held: { value: "all", why: jobs ? "A plan id or a job id finds its campaigns in every state."
+                                                     : "A plan id finds its campaign in every state." } } : {}) },
     ],
     choices: [
       { key: "status", label: "status",
@@ -191,6 +199,34 @@ export const campaignQuery = (branch: OwnedBranch, cursor: string | null, limit:
                               state: CampaignState | "all" = "active"): string =>
   ownedQuery(branch, [["plan", "true"], ...(planId ? [["plan_id", planId] as [string, string]]
     : state === "all" ? [] : [["state", state] as [string, string]])], cursor, limit);
+
+/** The campaigns whose plans asked for a job, as `jobPlans` answers; none on its `404`, a job in no plan the reader reads. */
+export async function jobCampaigns(read: Promise<{ plans: Pick<PlanSummary, "campaign_id">[] }>): Promise<Set<string>> {
+  try {
+    return new Set((await read).plans.flatMap((plan) => plan.campaign_id ?? []));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return new Set();
+    throw e;
+  }
+}
+
+/** What a listing under `branch` says when it keeps no campaign for `sought`: a plan id, a job id or both. */
+export function soughtEmpty(branch: OwnedBranch, sought: string): string {
+  switch (branch.kind) {
+    case "me": return `You own no campaign that holds ${sought}.`;
+    case "org": return `${branch.slug} owns no campaign you may see that holds ${sought}.`;
+    case "all": return `No campaign you may see holds ${sought}.`;
+  }
+}
+
+/**
+ * How many of a job's campaigns, `ran`, sit outside `branch`'s listing, which kept `kept` of them. Everything's
+ * listing holds them all, and beside a plan id the listing reads that plan's campaign alone, so neither counts.
+ * shortcut: for a read_any_plans reader this also counts deleted campaigns, whose plans the jobs route still lists;
+ * read everything's listing to drop them if that misleads anyone.
+ */
+export const outsideCount = (branch: OwnedBranch, planId: string, ran: Set<string> | undefined, kept: number): number =>
+  branch.kind === "all" || planId || !ran ? 0 : ran.size - kept;
 
 /** The listing's "New campaign": an organization's opens the form with that organization as the owner. */
 export const newCampaignAction = (branch: OwnedBranch) => ({

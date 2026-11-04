@@ -86,7 +86,7 @@ pub struct RecordNote {
 }
 
 impl KeyspaceReport {
-    fn new(keyspace: &'static str) -> Self {
+    pub(crate) fn new(keyspace: &'static str) -> Self {
         Self {
             keyspace,
             read: 0,
@@ -99,7 +99,7 @@ impl KeyspaceReport {
         }
     }
 
-    fn record(&mut self, id: String, outcome: Outcome) {
+    pub(crate) fn record(&mut self, id: String, outcome: Outcome) {
         let note = |reason| RecordNote { id, reason };
         match outcome {
             Outcome::Written => self.written += 1,
@@ -127,7 +127,7 @@ impl KeyspaceReport {
     }
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
     Written,
     Unchanged,
     Skipped(String),
@@ -144,7 +144,7 @@ const SPENT_RECORD: &str = "its spent marker exists, and copying the record alon
 const SPENT_MARKER: &str = "no store method writes a spent marker; the key is not copied live";
 const NAMES_A_TOKEN: &str = "the document names `auth_token`, and a store keeps no token";
 const CHANGED_MID_COPY: &str = "the target's record changed during the copy";
-const LISTING_SKIPPED: &str =
+pub(crate) const LISTING_SKIPPED: &str =
     "the source's listing skipped a record that reads; the target's copy stays";
 
 /// Takes no lock, since no record writer takes one: stop the writers before a
@@ -1837,7 +1837,7 @@ fn one(id: String, outcome: Outcome) -> Outcomes {
     vec![(id, outcome)]
 }
 
-fn unreadable(e: &anyhow::Error) -> Outcome {
+pub(crate) fn unreadable(e: &anyhow::Error) -> Outcome {
     Outcome::Unreadable(format!("{e:#}"))
 }
 

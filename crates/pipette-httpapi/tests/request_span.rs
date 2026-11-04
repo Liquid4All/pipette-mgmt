@@ -199,7 +199,13 @@ fn a_request_names_its_identifiers_as_span_fields(#[case] route: Route) -> anyho
                     }
 
                     Route::Reclaim => {
-                        seed_leased(dir.path(), LEASED_JOB_ID, &client_id, &json!({}))?;
+                        seed_leased(
+                            state.todo_store.as_ref(),
+                            LEASED_JOB_ID,
+                            &client_id,
+                            &json!({}),
+                        )
+                        .await?;
                         let resp = authed_post(
                             &state,
                             &sk,
@@ -220,7 +226,13 @@ fn a_request_names_its_identifiers_as_span_fields(#[case] route: Route) -> anyho
 
                     Route::HeartbeatRefused => {
                         let (_, holder) = register_and_approve(&state).await?;
-                        seed_leased(dir.path(), LEASED_JOB_ID, &holder, &json!({}))?;
+                        seed_leased(
+                            state.todo_store.as_ref(),
+                            LEASED_JOB_ID,
+                            &holder,
+                            &json!({}),
+                        )
+                        .await?;
                         let resp = authed_put_empty(
                             &state,
                             &sk,

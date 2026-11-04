@@ -14,8 +14,8 @@ use pipette_httpapi::state::AppState;
 use pipette_pipeline::plan_results::JOB_RESULTS_TIMEOUT;
 use pipette_plan_types::{JobId, PlanId, PlanStatus, UserPermission};
 use pipette_web_testkit::{
-    FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner, approved_client, body_json,
-    create_org, created_campaign, created_campaign_from, file_job_bodies, json_str,
+    FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, ONE_EVAL_PLAN, UserSigner, approved_client,
+    body_json, create_org, created_campaign, created_campaign_from, file_job_bodies, json_str,
     registered_user, run_mocked, seeded_state, set_user_org, signed_empty, signed_json,
     with_duckdb,
 };
@@ -35,7 +35,13 @@ async fn campaign_with(
     owner: &UserSigner,
     recorded: Recorded,
 ) -> anyhow::Result<(String, PlanId, JobId)> {
-    let (campaign_id, first) = created_campaign(state, owner, &[("name", "Nightly")]).await?;
+    let document = if matches!(recorded, Recorded::Eval) {
+        ONE_EVAL_PLAN.to_string()
+    } else {
+        ONE_CELL_PLAN.to_string()
+    };
+    let (campaign_id, first) =
+        created_campaign_from(state, owner, &[("name", "Nightly")], &document).await?;
     let job = first_job(state, &first).await?;
     let (submissions, todo) = (state.submission_store.as_ref(), state.todo_store.as_ref());
     match recorded {
@@ -750,7 +756,7 @@ async fn assert_earlier_runs_read_in_one_query(full: bool) -> anyhow::Result<()>
     let server = MockServer::start_async().await;
     let state = with_runs(seeded_state(dir.path()).await?, &server)?;
     let owner = registered_user(&state, FULL_EDITOR).await?;
-    let document = format!("{ONE_CELL_PLAN}{MLX_700M_VARIANT}");
+    let document = format!("{ONE_EVAL_PLAN}{MLX_700M_VARIANT}");
     let (campaign_id, first) =
         created_campaign_from(&state, &owner, &[("name", "Nightly")], &document).await?;
     let jobs = state
@@ -1013,7 +1019,7 @@ async fn assert_a_page_carries_both_histories() -> anyhow::Result<()> {
     let server = MockServer::start_async().await;
     let state = with_runs(seeded_state(dir.path()).await?, &server)?;
     let owner = registered_user(&state, FULL_EDITOR).await?;
-    let document = format!("{ONE_CELL_PLAN}{MLX_700M_VARIANT}");
+    let document = format!("{ONE_EVAL_PLAN}{MLX_700M_VARIANT}");
     let (campaign_id, first) =
         created_campaign_from(&state, &owner, &[("name", "Nightly")], &document).await?;
     let jobs_in = async |plan_id: &PlanId| {

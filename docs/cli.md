@@ -52,6 +52,20 @@ with its `elapsed_ms`, row count and SQL cut to 300 characters. With
 pipette-duckdb logs the queries it serves on its own side too, at
 `RUST_LOG=pipette_duckdb=debug`.
 
+An `all=true&results=true` plan-jobs request logs `plan jobs results read timing`
+at `INFO` when it takes at least 1 s, and at `DEBUG` otherwise. Its `total_ms`
+includes JSON serialization; `plan_access_ms`, `page_build_ms`, `controls_ms`,
+`document_ms`, `rerun_grant_ms`, `cells_ms`, `results_ms`, `cache_ms`,
+`duckdb_ms`, `history_ms`, `queue_ms`, `assembly_ms`, `names_ms`, and
+`serialization_ms` locate the wait. Concurrent stages overlap, so their times
+do not add up to `total_ms`. `ok`, `cache_hit`, `jobs`, `rows`, and `results_read`
+describe the work. Set
+`RUST_LOG=info,pipette_httpapi::api_v1::plans::reads=debug,pipette::duckdb=debug`
+to see fast requests and their warehouse queries too. Compare `total_ms`
+with the browser's request duration. The difference includes authentication,
+compression, transfer, and browser overhead; the log does not measure browser
+JSON parsing or chart building.
+
 The request span's `client_id` is always the caller: the device or account that
 signed, or the one registering. A route that acts on a device, such as an
 approval, a permission write or an owner change, names the device in
@@ -112,6 +126,8 @@ Credentials stay out of the file, with one exception:
 
 If `[database]` is set, each run of a command that changes records creates an
 audit event ([Organizations: The audit log](api/orgs.md#the-audit-log)).
+`catalog rename` also creates a separate event with the old and new names.
+A rename that merges two entries creates a `catalog_merge` event in its place.
 The event contains the subcommand and its arguments, the operator and hostname
 of the host, and the outcome. The audit log keeps the arguments for two years.
 A reader with `manage_any_orgs` can read them. The audit log also records the
@@ -124,8 +140,9 @@ These commands make no audit event:
 - `serve`, because the server records its own requests.
 - `openapi`, which prints the binary's own document.
 - `unlock`, `db migrate`, `db check` and `db export`, because a storage lock,
-  the schema and an export change no records. `db import` and
-  `db backfill-job-cells` change records, so they make an event.
+  the schema and an export change no records. `db import`,
+  `db backfill-job-cells` and `db backfill-run-evidence` change records, so
+  they make an event.
 
 An event is in the log of each organization that `--org` names. It is also in
 the log of each organization that owns a record the arguments name by id.
@@ -157,8 +174,14 @@ that `serve` runs against storage and the database.
 
 `Config::load` ignores a key that no config field reads, and the default for that
 field applies. The check produces a warning for each such key, for example
-`evals_server_ur` or a section header `[storag]`. The check cannot see a key
-inside `[storage]`, `[auth_storage]`, or `[todo_storage]`.
+`evals_server_ur` or a section header `[storag]`. The check also reports
+unknown keys inside `[todo_storage]`, such as `todo_storage.data_dri`. The
+check cannot see keys inside `[storage]`, `[auth_storage]` or
+`[eval_packages_storage]`.
+
+Set `[todo_storage] backend = "database"` to use the PostgreSQL job queue.
+This choice requires `[database]`. If `[database]` is missing, `config check`
+rejects the config. If `[todo_storage]` is absent, the queue uses `[storage]`.
 
 Each known flavor without an offer rule produces a warning that names the runtime
 type and flavor. To offer that flavor, add a `[[descriptor_catalog.offer_rules]]`
@@ -532,10 +555,11 @@ A `create` that fails between claiming the address and writing the record
 releases the claim, unless a record already answers to that id. If the release
 fails too, `create` refuses and names `--adopt-stranded-claim`, which builds the
 record under the id the claim names. Adopting is never automatic, because a
-stranded claim and a create in flight look the same. Adopting also clears any
-permission object left at that id, so the account holds only what this
-`create` grants. `delete` releases a claim only when it names the account being
-deleted.
+stranded claim and a create in flight look the same. Before writing the record,
+adopting clears what a stopped `delete` left at that id: its keys, unspent
+pre-auth keys, permission object, membership and first Clerk sign-in. The
+account then holds only what this `create` grants. `delete` releases a claim only
+when it names the account being deleted.
 
 `set-org` is always an operator's assignment. The membership grants no
 permission but bounds the account's bare roster grants and `manage_clients`,
@@ -812,18 +836,20 @@ no output is an error, so a mistyped id does not read as a silent run.
 
 Keeps upstream dataset corpora servable through `GET /datasets/{benchmark_id}`
 ([design/vl-spec-decode-dataset-delivery.md](design/vl-spec-decode-dataset-delivery.md)).
-The upstream owns the data; mgmt serves its cached repack only while the latest
-probe found the upstream publishing the pinned content. The pins are every
-catalog entry's, each organization's private entries included. A git upstream
-needs `git` on `PATH`; an evals-server upstream (a `vlm_eval`'s or an
-`asr_eval`'s samples) is the configured `evals_server_url`, which `probe` asks
-for `/samples/digest` alone and `build` streams `/samples` from once, parsing it
-as it arrives. `probe` and `build` each hold their own lock
-(`dataset-cache-probe`, `dataset-cache-build`), and their schedule is
+The upstream owns the data; mgmt serves its cached repack, or an eval corpus's
+package, only while the latest probe found the upstream publishing the pinned
+content. The pins are every catalog entry's, each organization's private
+entries included. A git upstream needs `git` on `PATH`; `build` fetches and
+repacks it. An evals-server upstream (a `vlm_eval`'s or an `asr_eval`'s
+samples) is the configured `evals_server_url`, which `probe` and `build` ask
+for `/samples/digest` alone: the scores service packs the corpus into
+`[eval_packages_storage]`, and `build` registers that package. `probe` and
+`build` each hold their own lock (`dataset-cache-probe`,
+`dataset-cache-build`), and their schedule is
 [operations.md §3.0](operations.md#30-dataset-cache).
 
-`pins` fetches and packs one benchmark's upstream without a store and prints the
-hashes its catalog entry pins:
+`pins` fetches and packs one git benchmark's upstream without a store and prints
+the hashes its catalog entry pins:
 
 ```toml
 [dataset]
@@ -841,35 +867,39 @@ The trailing comment lists the subsets the corpus holds. Run `pins` on an entry
 with no `subset` to see every subset, then author one entry per subset; the
 `[dataset.upstream]` pins are the same for all of them.
 
-For a `vlm_eval` entry, write the `[dataset]` table with `format`, `adapter` and
-the upstream's `source`, `eval_id`, `dataset_version` and `prompt_profile`
-(placeholders for the hashes), and `pins` prints the rest; there is no tree
-digest, since the identity is already a digest over every sample:
+`pins` refuses a `vlm_eval` or `asr_eval` entry and names the file that holds
+its hashes: the scores service's index,
+`scores-packages/index/<scores version>/<eval_id>/<dataset_version>.json`, which
+lists each prompt profile's package. Copy the profile's `package.format`,
+`package.digest` and `package.bytes` into `[dataset]`, and its
+`samples_digest` without `sha256:` into `[dataset.upstream]` as `identity`;
+there is no tree digest, since the identity is already a digest over every
+sample:
 
 ```toml
 [dataset]
-digest = "…"
-bytes  = …
+format  = "vlm-eval-corpus/1"
+adapter = "evals-server@1"
+digest  = "…"   # package.digest
+bytes   = …     # package.bytes
 
 [dataset.upstream]
-identity = "115955fff4f95d524c81964dbe712b97ff3e8443ff180df38e4db9531aa3da72"
-
-# 1500 samples, 1430 media files; replaces a 60123456-byte /samples body
+source          = "evals_server"
+eval_id         = "mmstar"
+dataset_version = "2026.10.1"
+prompt_profile  = "qwen3_5"   # the profile's prompt_profile; omit it for null
+identity        = "115955fff4f95d524c81964dbe712b97ff3e8443ff180df38e4db9531aa3da72"
 ```
 
 An `asr_eval` entry's pin is written the same way, with `format =
-"asr-eval-corpus/1"` and the entry's `prompt_profile`, which an asr_eval's
-upstream always names; `pins` reads its task, version and profile and prints
-the rest.
+"asr-eval-corpus/1"`; its upstream always names a `prompt_profile`.
 
 Each artifact is handled on its own, four at a time, under one
 `dataset_probe_timeout_secs` / `dataset_build_timeout_secs` deadline: an error
-on one is recorded for it and the run goes on. asr-eval corpora are the
-exception for `build`: gigabytes each, they build one at a time after the
-others, each under `dataset_asr_build_timeout_secs` (default 7200), which also
-bounds `pins` for such an entry. The build lock's lease is the sum of the
-artifacts' deadlines. A benchmark that pins a digest
-another pins with different fields is skipped and reported.
+on one is recorded for it and the run goes on. The build lock's lease is the
+sum of the artifacts' deadlines, an eval corpus counted only while it is
+unregistered. A benchmark that pins a digest another pins with different fields
+is skipped and reported.
 
 `probe` exits non-zero while any upstream is not `ok` (`unavailable`, `gone`,
 `moved`) or could not be probed, and `build` when any build failed, so a failed
@@ -1000,7 +1030,7 @@ one that blocks every outstanding job:
 
 | Gate | Meaning |
 |---|---|
-| still `creating` | The jobs sit in `todo/tmp/`. No client can see them. |
+| still `creating` | The filing is not complete, so the plan makes none of its jobs claimable, wherever they are in the queue. A lease that a client already holds stays valid. |
 | cancel pending | Teardown owns the plan. `queue-maintenance` retires the jobs. |
 | leases lapsed | Every outstanding job sits behind a lapsed lease. The holders stopped heartbeating, and a claim cannot reach a job outside `avail/`. |
 | nothing outstanding | No job is in `avail/`. Each one is held under a live lease, finished, or retired. |
@@ -1070,8 +1100,10 @@ row's value names the pass that declared it when the warehouse records one, as
 
 **`cancel`** records a cancellation and returns; `queue-maintenance` retires the
 jobs and settles the plan
-([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)). Until that
-run the jobs stay claimable and `status` reads as before, with the pending
+([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)). From the
+cancel on, the plan makes none of its jobs claimable: a job that only this plan
+holds gets no new lease. A lease that a client already holds stays valid until
+that run retires it. Until that run, `status` reads as before, with the pending
 cancel shown. A plan that stays `cancelling` across runs means teardown keeps
 failing, and each run exits non-zero. Cancelling is refused for a plan with no
 manifest and for a `complete` one; a plan already `cancelling` or `cancelled`
@@ -1149,12 +1181,13 @@ What differs from HTTP:
   unchanged document files nothing, and its dry run runs no import, so `imports`
   is empty. A `revert` to a plan with the document of the head also files
   nothing.
-- **Recovery.** If `create` fails to write the campaign after filing its plan,
-  it cancels the plan, or names it to cancel. A `variants`, `revise`, `rerun` or
-  `revert` that fails after writing the new plan leaves both running and names the one
-  to `plans cancel`; one that loses a race to another edit cancels its own.
-  `ingest` writes its plan before advancing the campaign, so a re-run repairs a
-  failure between the two.
+- **Recovery.** If a campaign write reports a failure after filing its plan,
+  the command names the campaign and plan. It cancels nothing, even if an
+  immediate read does not show the plan: the write can still land. Reconcile
+  the outcome before cancelling or refiling. For a confirmed staging orphan,
+  refile the same document before cancelling the old plan to preserve its live
+  jobs. A plan that loses an edit race cancels its own. See
+  [failed-filing recovery](operations.md#35-recover-from-a-failed-campaign-filing).
 - **Re-runnable.** A write asking for the state the record is already in prints
   `no change` and writes nothing.
 
@@ -1193,7 +1226,8 @@ id passed here is an error rather than a lookup that finds nothing.
 ### `pipette-mgmt catalog`
 
 The catalog exists only with `[database]`. Host access can change global and
-organization entries. The HTTP API and the console do not yet write it. Names
+organization entries. The HTTP API and the console write organization entries
+only. Names
 keep the creator's case, while lookup, uniqueness and importer-reserved prefixes ignore
 case within each scope. The llama.cpp importer reserves the names `llamacpp-v*`
 and `llamacpp-daily-*` in the global scope only.
@@ -1223,10 +1257,11 @@ It checks active imported entries again and adds new flavors at the end.
 pinned. It adds new flavors from the entry's current build. It does not change
 the entry's build. Refresh is global only and refuses `--org`. Both commands
 record a run in SQL. The command adds no member for an unknown asset. It
-records the asset and exits with an
-error. The command keeps the valid entries and members that it already added.
-If one stable release or one imported entry fails, the command records the
-error and continues with the next one. The command then exits with an error.
+records the asset in the run and logs it at `INFO`. An unknown asset does not
+make the command fail. If one stable release or one imported entry fails, the
+command keeps the valid entries and members that it already added. It records
+the error and continues with the next one. The command then exits with an
+error.
 
 `catalog import` also applies automatic expiry to the global llama.cpp entries.
 Expiry moves an active entry to hidden by the release time of the entry:
@@ -1259,7 +1294,8 @@ RFC 3339 string or a native TOML datetime, and it cannot be in the future. If
 the file omits `release_time`, the command uses the creation time.
 
 The `runtimes` list is in order of precedence. Each runtime uses the inline
-runtime table from a plan:
+runtime table from a plan. A runtime of an organization entry can come from a
+vault resource that the organization owns:
 
 ```toml
 name = "Fork-2026-10"
@@ -1282,21 +1318,48 @@ models = [
 ]
 ```
 
-A model member must come from a public, ungated Hugging Face repository. The
-command asks the Hugging Face API at `hf_import_endpoint` about each
-repository, and it sends no token. It refuses these sources:
+A model member can come from a public, ungated Hugging Face repository or from
+vault resources owned by the entry's organization. For Hugging Face sources,
+the command asks the API at `hf_import_endpoint` about each repository and
+sends no token. It refuses these sources:
 
 - a private repository
 - a gated repository
 - a repository that the API does not report as public and ungated
-- a URL, a local file, a local directory, or the vault
+- a URL, a local file, a local directory, or a vault resource outside the entry's organization
 - a model table that has an `auth_token`
 
-Each model member pins one commit. The command resolves the `revision` of each
-repository to its current commit, and stores the commit. If the table has no
-`revision`, the command resolves `main`. The command prints each commit, also
-in a dry run. Each file that the table names must exist at that commit, as a
+Each Hugging Face model member pins one commit. The command resolves the
+`revision` of each repository to its current commit, and stores the commit. If
+the table has no `revision`, the command resolves `main`. The command prints
+each commit, also in a dry run. Each file that the table names must exist at that commit, as a
 plan import needs it. A changed model needs a new entry under a new name.
+
+`catalog create --name NAME --runtime JSON [--runtime JSON ...]` creates an
+entry from command-line values. FILE and `--name` are alternatives. Each
+`--runtime` value is one runtime descriptor as a JSON object. Give the values
+in order of precedence. Each `--model QUANTIZATION=JSON` value is one model
+member: the quantization label, an `=`, and the model descriptor as a JSON
+object. An entry has `--runtime` values or `--model` values, not both.
+
+`--release-time` takes an RFC 3339 time. The command applies the same checks
+as for a file. Do not put an `auth_token` in a `--model` value: the command
+refuses it, and the shell keeps the value in its history.
+
+Each descriptor line in the `catalog coverage` report is a JSON object. Use a
+copy of that line as a `--runtime` value:
+
+```sh
+pipette-mgmt catalog create --name llamacpp-b11744 \
+  --release-time 2026-10-19T22:54:49Z \
+  --runtime '{"flavor":"macos-arm64","repository_url":"github.com/ggml-org/llama.cpp","repository_version":"b11744","source":"github_release","type":"llamacpp_cli_stock_tools"}' \
+  --runtime '{"flavor":"windows-x64-vulkan","repository_url":"github.com/ggml-org/llama.cpp","repository_version":"b11744","source":"github_release","type":"llamacpp_cli_stock_tools"}'
+```
+
+The command prints the digest of each member. A member names the results of a
+coverage line only if its digest is the digest on that line. The command
+refuses a descriptor that has a key that the typed descriptor does not know.
+The member cannot hold that key, so its digest would differ.
 
 `catalog add-member NAME FILE [--dry-run]` appends one member. The optional
 `--org <org>` selects an existing organization. A runtime file has one
@@ -1314,19 +1377,70 @@ can show that two repositories hold the same model, so the operator makes that
 claim. For a model member, the command prints the repository and commit of
 each existing member and of the new member.
 
-The CLI cannot remove or reorder members. The command refuses vault sources.
-It accepts a member that another live entry also holds, and it prints the name
-of that entry. A dry run checks the file and prints the proposed entry. It
-writes nothing and makes no audit event.
+`catalog add-member NAME --runtime JSON` appends a runtime member from a
+command-line value. `catalog add-member NAME --model QUANTIZATION=JSON` appends
+a model member. Both values have the same form as in `create`. Give one of
+these: FILE, `--runtime`, or `--model`.
+
+The CLI cannot remove or reorder members. An organization entry can name vault
+resources that the organization owns. A global entry cannot name a vault
+resource. A resource that a user owns does not count as a resource that the
+organization owns. The command refuses a resource outside the organization
+with the same message as a resource that does not exist.
+
+The command checks the resource record and blob before a write, including a
+dry run. It accepts a member that another live entry also holds, and it prints
+the name of that entry. A dry run checks the input and prints the proposed
+entry. It writes nothing and makes no audit event.
 
 `catalog pin NAME` and `catalog hide NAME` require an active entry.
 `catalog unpin NAME` requires a pinned entry. `catalog unhide NAME` requires a
 hidden entry. A hidden entry still shows and resolves.
 
+`catalog rename NAME NEW_NAME [--dry-run]` gives a hand-made entry a new name.
+The optional `--org <org>` selects an existing organization. The new name
+passes the same checks as a name in `create`. No tombstoned entry in the scope
+can hold it. A change of letter case only is also a rename, and the old
+spelling still finds the entry. A stable or daily entry keeps its name,
+because the importer finds its entries by name.
+
+If another live hand-made entry in the scope holds the new name, the command
+merges the entry into that entry. The members must pass the checks of
+`add-member`: one kind of descriptor, and for runtimes one runtime type and one
+build. A member with the digest and the key of a member of the target entry is
+already there, so the merge skips it. The other members go to the end of the
+target entry, in their order. The command then deletes the entry, and prints
+the moved and the skipped member keys. Nothing undoes a merge.
+
+The old name is free at once. In an organization, a bare old name then selects
+the global entry of that name, if one exists. A stored plan holds descriptors,
+so a rename does not change it. A plan file outside the server that gives the
+old name can fail or select a different entry.
+
+A successful rename adds a `catalog_rename` audit event with the stored old
+name and the new name, beside the command's audit event. A merge adds a
+`catalog_merge` audit event with the stored old name, the target name, and the
+moved and the skipped member keys. A dry run adds none.
+
+`catalog relabel NAME --format <format> --from <label> --to <label> [--dry-run]`
+changes the quantization label of one model member. The optional
+`--org <org>` selects an existing organization. No other member of the entry
+with the same format can hold the new label. The old label is free at once.
+The label is not part of the digest, so the member keeps its digest, its
+position and its descriptor.
+
+A dry run of `rename` or `relabel` makes every check and prints the change. It
+writes nothing and makes no audit event.
+
 `catalog tombstone NAME` permanently removes a name from reads and resolution.
-The name stays unavailable for reuse. The command asks for the exact stored
-name, and the prompt needs a terminal. In a script, pass `--yes` to skip the
-prompt. A mismatched confirmation changes nothing.
+The name stays unavailable for reuse. A tombstone is for a wrong descriptor.
+For a typo in a name or in a quantization label, use `rename` or `relabel`.
+For an entry that holds another flavor or quantization of an entry, rename it
+to the name of that entry.
+
+The command asks for the exact stored name, and the prompt needs a terminal.
+In a script, pass `--yes` to skip the prompt. A mismatched confirmation changes
+nothing.
 
 `catalog list` shows active, pinned and hidden entries. It shows the newest
 release first. Repeat `--kind`, `--state` or `--runtime-type` to filter.
@@ -1348,6 +1462,45 @@ these fields:
 The JSON includes its scope. `--org <org>` selects an organization entry.
 `catalog list` and `catalog show` do not return tombstoned entries. `catalog list`
 refuses `--state tombstoned`.
+
+`catalog coverage [--days N] [--top N]` reports how many recent results the
+catalog names. It reads the warehouse and the catalog, and it writes nothing.
+So it is safe to run while `process-submissions` scores. It counts each result
+once, because all metric rows of one result have the same descriptors.
+`--days` selects results with a submission date in the last N days. The
+default is 30.
+
+The report has one section for runtimes and one for models. Each section puts
+each result into one class. The first class that applies is the result's class:
+
+1. **Named by an exact match:** the stored digest matches a member's digest.
+   The entry can be pinned, active or hidden, in any scope. For a model, the digest can
+   also be the Hugging Face alias digest of a vault member.
+2. **An alias would name:** the stored descriptor parses as the typed runtime
+   or model. The parse ignores no key. The typed value equals a member.
+   The comparison ignores vault `custom_label` values.
+3. **Unnamed**, with the first cause that applies:
+   - no descriptor: the result has no descriptor of this kind;
+   - synthetic failure: the server retired the job with no client run;
+   - does not parse: the descriptor is not a known runtime or model;
+   - unknown key blocks the alias: the typed value equals a member. The
+     descriptor has a key that the typed descriptor does not know;
+   - no member has this build.
+
+Each section then lists the `--top` digests (default 20) that have no exact
+match, with the most results first. Each line shows these fields:
+
+- the number of results;
+- the short digest;
+- the date of the newest result;
+- each cause and its result count, and any member that an alias would name;
+- the stored descriptor.
+
+Use this list to select the builds that need a hand-made entry. Pass each
+stored descriptor of a build, unchanged, as a `--runtime` value of
+`catalog create`. If the store
+cannot read a catalog entry, the report prints a warning. The results that the
+entry names then count as unnamed.
 
 ### `pipette-mgmt vault list|show|delete|prune`
 
@@ -1479,6 +1632,78 @@ A second run writes and deletes nothing. It takes no lock: stop `serve` and the
 commands that write records, and the copy is exact. The table adds a Deleted
 column to `db import`'s.
 
+### `pipette-mgmt queue import [--dry-run]`
+
+Makes the job queue in `[database]` equal to the object-store queue that
+`[todo_storage]` names (or `[storage]`, if the config has no `[todo_storage]`).
+This command is the cutover of the queue
+([design/sql-job-queue.md](design/sql-job-queue.md#the-cutover)). It requires
+`[database]` and runs `db check` first. It refuses a config with
+`[todo_storage] backend = "database"`, because that config names no object-store
+queue. So run the cold pass before the switch of the config.
+
+The copy goes through the two `TodoStore` implementations, so the server reads
+each copied entry as any other. It copies these keyspaces:
+
+- `avail/` and `leased/` with their bodies, deadlines, holders and lease
+  expiries.
+- `denied/` with the denial records, and `suspended/` with the suspension
+  records.
+- `eligible/`, `lost/`, `pending-reindex/` and `pending-reindex-jobs/`.
+- `liveness/`, with the last-seen time of each device, to the second.
+- The five blobs of `queue-maintenance`: `.eligible-indexed`,
+  `.eligible-workers`, `.gc-candidates`, `.backlog` and `.backlog-campaigns`.
+
+The copy counts `tmp/` and does not copy it, because ingestion stages a body
+there again. The copy writes each entry that the target lacks or holds
+differently. It deletes each entry that the source does not hold. Before it
+deletes an `avail/`, `leased/`, `denied/` or `suspended/` entry, a source read
+must confirm that the entry is gone. A listing skips what it cannot read, so the
+copy keeps an entry that only the listing misses.
+
+The database holds one row for each job. A recycle race can leave a job twice
+in the object store. Then the copy keeps one entry, in this order of
+preference:
+
+1. A lease, before an `avail/` entry.
+2. Between two leases, the lease that expires later.
+3. Between two `avail/` entries, the entry with the later deadline.
+
+The copy keeps the later deadline of an `eligible/` marker that names one client
+and one job twice. It logs each dropped entry at `warn` and counts it as
+skipped. The database keeps one flag for each client in `pending-reindex/`. So
+the copy compares those flags by client, and the database gives each copied flag
+a new request id.
+
+The command refuses to run while `avail/` holds a key of the single-segment
+layout. It takes no lock: stop `serve` and the `queue-maintenance` schedule for
+an exact copy. It writes each entry with its own request, with at most 16
+requests at once. If the source has no backlog snapshot, the copy keeps the
+target's snapshot, because no store method deletes a snapshot. A second run
+writes only what changed, and writes nothing if the source did not change. The
+command exits non-zero while an unreadable entry remains; the copy keeps the
+target's entry for it.
+
+The report has one row for each keyspace. A row counts Read, Written,
+Unchanged, Deleted, Skipped and Unreadable, and gives the elapsed time. The
+report then gives the total elapsed time, each skip reason and each unreadable
+entry. On a dry run, Written and Deleted count what the run would change. A dry
+run reads everything, so its elapsed time is the minimum time of a run that
+changes little. That is the time of the cold pass of the cutover. The writes
+add to the time of a run that changes much, such as the warm pass.
+
+### `pipette-mgmt queue export [--dry-run]`
+
+Makes the object-store queue that `[todo_storage]` names equal to the queue in
+`[database]`. This command is the rollback of `queue import`. It copies the
+keyspaces of `queue import` in the other direction, with the same rules. Before
+you run it, change `[todo_storage]` back to the object-store queue, and stop
+`serve` and the `queue-maintenance` schedule.
+
+An object store cannot take a given modification time. So the export stamps the
+current time on each device that the object-store queue lacks. It counts a
+device that the object-store queue holds as unchanged, at any time.
+
 ### `pipette-mgmt db backfill-job-cells [--dry-run]`
 
 The command fills the job-cell index for jobs that ingestion minted before the
@@ -1490,15 +1715,22 @@ index existed ([storage.md §4.4](storage.md#44-the-job-cell-index)). It require
    plan.
 2. It reads the submission record of each job whose outcome row is absent, or
    is `finished` with no run flags. It writes the outcome and the run flags of
-   that record. If a submission write puts a row there first, the command keeps
-   that row.
+   that record. It skips jobs with a pending outcome repair. If a submission
+   write puts a row there first, the command keeps that row.
 
 Run the command at these times:
 
 - Once after migration `0007`.
+- After every writer runs a build with outcome repair
+  ([storage.md §4.3](storage.md#43-the-outcome-index)). A job that has a
+  record and no outcome row has no record for a read until the command writes
+  its row.
 - Again after `db import`.
 - Again after ingestion logs the warning `failed to index the cell of a minted
   job`.
+- Again after a change to the flags that `recorded_run_flags` derives, once
+  `run_flags` is NULL on the `finished` rows
+  ([storage.md §4.3](storage.md#43-the-outcome-index)).
 
 Run the command only after every binary that writes records runs migration
 `0007` or later. An older binary can rewrite an outcome row and keep the run
@@ -1517,6 +1749,26 @@ A job with no submission record is unfinished, or its record was pruned. The
 command skips a job source or a record that does not parse. It logs a warning
 with the job id of the skipped item, and counts the item. If a read fails for a
 different cause, the command stops and exits non-zero. It takes no lock.
+
+### `pipette-mgmt db backfill-run-evidence [--dry-run]`
+
+The command makes the run evidence index again from every warehouse row
+([storage.md §4.6](storage.md#46-the-run-evidence-index)). It requires
+`[database]` and runs `db check` first. The command reads the whole warehouse,
+and folds the rows to one index row for each descriptor digest and device.
+Then it writes the rows.
+
+Run the command once after migration `0021`. The scorer keeps the index current
+after that. A second run changes nothing, because each side of an index row
+keeps its newest run. The command takes no lock, and is safe to run beside
+`process-submissions`.
+
+```
+read 68443 warehouse row(s); wrote 1207 run evidence row(s)
+```
+
+If a read or a write fails, the command stops and exits non-zero. A rerun
+continues safely.
 
 ### `pipette-mgmt openapi [--site <dir>]`
 

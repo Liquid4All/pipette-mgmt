@@ -71,6 +71,7 @@ impl EvalBenchmark {
             RuntimeType::LlamacppApkPipette
             | RuntimeType::LlamacppIosPipette
             | RuntimeType::MlxMacosPipette
+            | RuntimeType::AppleCoreAiMacosPipette
             | RuntimeType::MlxIosPipette
             | RuntimeType::DockerSglang
             | RuntimeType::UvSglang

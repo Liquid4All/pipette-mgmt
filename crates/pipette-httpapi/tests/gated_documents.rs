@@ -774,16 +774,19 @@ async fn test_a_delegate_imports_for_another_owner_only_with_submit_any_plans() 
     Ok(())
 }
 
-/// A document with no model token is stored as it is sent. One that names
-/// `auth_token` anyway, here in a comment, is refused with `400`. The answer
-/// quotes no token, and nothing is stored.
+/// A document that names `auth_token` outside a model's token, here in a
+/// comment, is refused with `400`, whether or not a model also holds a token.
+/// The answer quotes no token, and nothing is stored.
+#[rstest]
+#[case::no_model_token(ONE_CELL_PLAN.to_owned())]
+#[case::beside_a_model_token(gated_document(&[gated_macos_variant(GatedModel::Gguf, GOOD_TOKEN)]))]
 #[tokio::test]
-async fn test_a_token_in_a_comment_is_refused() -> anyhow::Result<()> {
+async fn test_a_token_in_a_comment_is_refused(#[case] plan: String) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let hub = gated_hub().await?;
     let (state, signer) = import_state(dir.path(), &hub).await?;
     let (campaign_id, first) = created_campaign(&state, &signer, &[("name", "Head")]).await?;
-    let document = format!("# auth_token = \"{GOOD_TOKEN}\"\n{ONE_CELL_PLAN}");
+    let document = format!("# auth_token = \"{GOOD_TOKEN}\"\n{plan}");
     let calls = (hub.revision_requests(), hub.downloads());
 
     let uri = own_campaign_plans_uri(&state, &signer.1).await?;

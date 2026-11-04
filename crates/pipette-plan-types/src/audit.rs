@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuditEventId, CampaignId, ClientId, JobId, OrgId, PlanId, UserId, UserKey, UserKeyId,
-    VaultResourceId, empty_as_none,
+    AuditEventId, CampaignId, CatalogName, CatalogScope, ClientId, JobId, OrgId, PlanId, UserId,
+    UserKey, UserKeyId, VaultResourceId, empty_as_none,
 };
 
 /// Who acted.
@@ -92,6 +92,27 @@ pub enum AuditAction {
     },
     /// A `pipette-mgmt` command, such as `users create`, and its arguments.
     Cli { command: String, args: Vec<String> },
+    /// A catalog rename that completed. The request or command has its own
+    /// audit event; this one records the two stored names.
+    CatalogRename {
+        scope: CatalogScope,
+        old_name: CatalogName,
+        new_name: CatalogName,
+    },
+    /// A rename to the name of another live hand-made entry, which merged the
+    /// renamed entry into that entry. The request or command has its own audit
+    /// event; this one records the two stored names and the member keys.
+    CatalogMerge {
+        scope: CatalogScope,
+        /// The stored name of the entry that the merge deleted.
+        old_name: CatalogName,
+        /// The stored name of the entry that got the members.
+        into_name: CatalogName,
+        /// The keys of the members that moved, in their new order.
+        moved: Vec<String>,
+        /// The keys of the members that the target entry already held.
+        skipped: Vec<String>,
+    },
     /// An account's first Clerk sign-in, when it already held keys: each was
     /// registered before its owner signed in.
     FirstClerkSignIn { prior_keys: Vec<UserKey> },
@@ -236,6 +257,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_catalog_rename_action_keeps_both_stored_names() -> anyhow::Result<()> {
+        let action = AuditAction::CatalogRename {
+            scope: CatalogScope::Org(OrgId::try_new("org_acme")?),
+            old_name: CatalogName::try_new("Fork")?,
+            new_name: CatalogName::try_new("Spoon")?,
+        };
+        let wire = serde_json::to_value(&action)?;
+        assert_eq!(
+            wire,
+            json!({
+                "type": "catalog_rename",
+                "scope": "org_acme",
+                "old_name": "Fork",
+                "new_name": "Spoon"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AuditAction>(wire)?, action);
+        Ok(())
+    }
+
+    #[test]
+    fn a_catalog_merge_action_keeps_both_names_and_the_member_keys() -> anyhow::Result<()> {
+        let action = AuditAction::CatalogMerge {
+            scope: CatalogScope::Global,
+            old_name: CatalogName::try_new("AcmeLM-Typo")?,
+            into_name: CatalogName::try_new("AcmeLM")?,
+            moved: vec!["gguf::q8_0".to_owned()],
+            skipped: vec!["gguf::q4_0".to_owned()],
+        };
+        let wire = serde_json::to_value(&action)?;
+        assert_eq!(
+            wire,
+            json!({
+                "type": "catalog_merge",
+                "scope": "global",
+                "old_name": "AcmeLM-Typo",
+                "into_name": "AcmeLM",
+                "moved": ["gguf::q8_0"],
+                "skipped": ["gguf::q4_0"]
+            })
+        );
+        assert_eq!(serde_json::from_value::<AuditAction>(wire)?, action);
+        Ok(())
+    }
 
     /// The tags the app and `pipette-ctl` switch on.
     #[test]

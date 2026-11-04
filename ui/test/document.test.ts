@@ -8,7 +8,7 @@ import type { PlanIssue, PlanValidation } from "../src/lib/api-types";
 const issue = (severity: PlanIssue["severity"], line: number | null = null): PlanIssue =>
   ({ severity, message: `${severity} here`, line, column: line === null ? null : 1 });
 const verdict = (job_count: number | null, ...issues: PlanIssue[]): PlanValidation =>
-  ({ job_count, gated_model_count: 0, issues });
+  ({ document: null, job_count, gated_model_count: 0, issues });
 
 describe("the editor", () => {
   test("grows with the document between 14 and 40 rows", () => {

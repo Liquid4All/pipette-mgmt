@@ -168,6 +168,35 @@ impl DescriptorCatalogStore for Memory {
         self.transition_state_inner(name, expected, state)
     }
 
+    async fn rename_entry(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _new_name: &CatalogName,
+    ) -> anyhow::Result<pipette_store::RenameOutcome> {
+        anyhow::bail!("the importer never renames an entry")
+    }
+
+    async fn merge_entry(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _into: &CatalogName,
+    ) -> anyhow::Result<pipette_store::MergeOutcome> {
+        anyhow::bail!("the importer never merges entries")
+    }
+
+    async fn relabel_member(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _format: pipette_plan_types::ModelFormat,
+        _from: &pipette_plan_types::QuantizationLabel,
+        _to: &pipette_plan_types::QuantizationLabel,
+    ) -> anyhow::Result<pipette_store::RelabelOutcome> {
+        anyhow::bail!("the importer never relabels a member")
+    }
+
     async fn get_entry(
         &self,
         _scope: &pipette_plan_types::CatalogScope,
@@ -532,21 +561,46 @@ async fn default_since_uses_the_newest_llamacpp_daily_entry() -> anyhow::Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn an_unclassified_asset_is_recorded_and_the_import_succeeds() -> anyhow::Result<()> {
+    let server = upstream(Faults {
+        unknown: true,
+        ..Faults::default()
+    })
+    .await?;
+    let store = Memory::default();
+    let runs = Runs::default();
+    let finish = import(
+        &api(&server)?,
+        &store,
+        &runs,
+        &DescriptorCatalogConfig::default(),
+        None,
+        now()?,
+    )
+    .await?;
+    ["llamacpp-v0.7.0", "llamacpp-daily-2026-10-15"]
+        .into_iter()
+        .try_for_each(|name| -> anyhow::Result<()> {
+            assert_eq!(store.entry(name)?.members.len(), 28, "{name}");
+            Ok(())
+        })?;
+    assert_eq!(finish, runs.last()?);
+    assert_eq!((finish.entries_created, finish.members_added), (2, 56));
+    assert_eq!(
+        finish.unclassified_assets,
+        ["b11669/llama-b11669-bin-new-flavor.tar.gz"]
+    );
+    assert_eq!(finish.error_summary, None);
+    Ok(())
+}
+
 #[rstest]
-#[case::unknown_asset(
-    Faults { unknown: true, ..Faults::default() },
-    (2, 56),
-    &[("llamacpp-v0.7.0", 28), ("llamacpp-daily-2026-10-15", 28)],
-    &[],
-    &["b11669/llama-b11669-bin-new-flavor.tar.gz"],
-    "1 unclassified assets",
-)]
 #[case::later_build_fails(
     Faults { fail_later: true, ..Faults::default() },
     (1, 28),
     &[("llamacpp-v0.7.0", 28)],
     &["llamacpp-daily-2026-10-15"],
-    &[],
     "401",
 )]
 #[case::no_nightly_tag(
@@ -554,7 +608,6 @@ async fn default_since_uses_the_newest_llamacpp_daily_entry() -> anyhow::Result<
     (1, 28),
     &[("llamacpp-daily-2026-10-15", 28)],
     &["llamacpp-v0.7.0"],
-    &[],
     "v0.7.0: v0.7.0 has no uploaded nightly-tag.txt",
 )]
 #[tokio::test]
@@ -563,7 +616,6 @@ async fn a_failed_import_keeps_what_it_created(
     #[case] counts: (i32, i32),
     #[case] present: &[(&str, usize)],
     #[case] absent: &[&str],
-    #[case] unclassified: &[&str],
     #[case] error: &str,
 ) -> anyhow::Result<()> {
     let server = upstream(faults).await?;
@@ -598,7 +650,7 @@ async fn a_failed_import_keeps_what_it_created(
     }
     let finish = runs.last()?;
     assert_eq!((finish.entries_created, finish.members_added), counts);
-    assert_eq!(finish.unclassified_assets, unclassified);
+    assert!(finish.unclassified_assets.is_empty());
     assert!(
         finish
             .error_summary

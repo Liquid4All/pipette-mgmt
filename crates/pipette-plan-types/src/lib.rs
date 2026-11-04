@@ -103,7 +103,7 @@ pub use dataset::{
 
 mod model;
 pub use model::{
-    GgufText, GgufTextSource, GgufVision, GgufVisionAbsoluteFiles, GgufVisionHfFiles,
+    AppleCoreAi, GgufText, GgufTextSource, GgufVision, GgufVisionAbsoluteFiles, GgufVisionHfFiles,
     GgufVisionRelativeFiles, GgufVisionSource, GgufVisionSpeculative, GgufVisionSpeculativeSource,
     GgufVisionUrlFiles, GgufVisionVaultUrlFiles, Mlx, MlxSpeculative, Model, ModelSource,
     ModelType, OnnxGenai, Openvino, SpeculativePair, Torch, TorchSpeculative, inject_hf_auth_token,
@@ -111,19 +111,20 @@ pub use model::{
 
 mod runtime;
 pub use runtime::{
-    AppleFoundation, DockerIpcMode, DockerSglang, DockerShmSize, DockerShmSizeError, DockerVllm,
-    EnvForward, EnvForwardError, LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor,
-    LlamacppCliStockTools, LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource,
-    LlamacppFlashAttention, LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
-    MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
+    AppleCoreAiMacosPipette, AppleFoundation, CoreAiSwiftStack, DockerIpcMode, DockerSglang,
+    DockerShmSize, DockerShmSizeError, DockerVllm, EnvForward, EnvForwardError, LlamaCppFlavor,
+    LlamacppApkPipette, LlamacppApkPipetteFlavor, LlamacppCliStockTools,
+    LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource, LlamacppFlashAttention,
+    LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode, MlxIosPipette,
+    MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
     OnnxExecutionProvider, OnnxGenaiIosPipette, OnnxGenaiIosPipetteFlavor, OnnxGenaiStack,
     OpenvinoDevice, OpenvinoGenerateHint, Ovms, OvmsFlavor, OvmsSource, OvmsSourceRepository,
-    PrivateApis, RepositoryUrl, Runtime, RuntimeType, SemverWithBuild, SemverWithBuildError,
-    SglangFlavor, SourceRepository, TrtEdgellm, TrtEdgellmFlavor, TrtEdgellmPrecision,
-    TrtEdgellmSource, UvBuild, UvBuildError, UvOnnxGenai, UvOpenvino, UvPythonVersion,
-    UvPythonVersionError, UvRuntimeSource, UvServerVersion, UvServerVersionError, UvSglang, UvVllm,
-    VllmDtype, VllmFlavor, VllmRepetitionDetection, cli_ref_from_runtime_arg, flavor_from_uv_build,
-    uv_runtime_version,
+    PrivateApis, RepositoryUrl, Runtime, RuntimeBuildFlagError, RuntimeType, SemverWithBuild,
+    SemverWithBuildError, SglangFlavor, SourceRepository, TrtEdgellm, TrtEdgellmFlavor,
+    TrtEdgellmPrecision, TrtEdgellmSource, UvBuild, UvBuildError, UvOnnxGenai, UvOpenvino,
+    UvPythonVersion, UvPythonVersionError, UvRuntimeSource, UvServerVersion, UvServerVersionError,
+    UvSglang, UvVllm, VllmDtype, VllmFlavor, VllmRepetitionDetection, cli_ref_from_runtime_arg,
+    flavor_from_uv_build, runtime_build_flag, uv_runtime_version,
 };
 
 mod descriptor_catalog;
@@ -137,7 +138,8 @@ pub use descriptor_catalog::{
 };
 pub use descriptor_catalog_write::{
     AddDescriptorMemberRequest, ChangeDescriptorEntryStateRequest, CreateDescriptorEntryRequest,
-    DescriptorEntryAction, ModelMemberRequest,
+    DescriptorEntryAction, ModelMemberRequest, RelabelDescriptorMemberRequest,
+    RenameDescriptorEntryRequest,
 };
 
 mod vault_artifact;
@@ -265,18 +267,19 @@ pub use catalog::{CatalogEntry, CatalogQuery, OrgBenchmarks};
 
 mod descriptor_catalog_view;
 pub use descriptor_catalog_view::{
-    DescriptorCatalogQuery, DescriptorCatalogShortList, DescriptorCatalogShortListItem,
-    DescriptorDigestNames, DescriptorDigestQuery, DescriptorEntryListRow, DescriptorEntryLookup,
-    DescriptorMemberCoverage, DescriptorMemberParameters, DescriptorMemberSummary,
+    AnyClientRunEvidence, ClientRunEvidence, DescriptorCatalogQuery, DescriptorCatalogShortList,
+    DescriptorCatalogShortListItem, DescriptorDigestNames, DescriptorDigestQuery,
+    DescriptorEntryListRow, DescriptorEntryLookup, DescriptorMemberCoverage,
+    DescriptorMemberEvidence, DescriptorMemberParameters, DescriptorMemberSummary,
     DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery, DescriptorWithheldMember,
     DescriptorWithheldReasonCode, DescriptorWithheldReport, MemberSelector, RequestedCatalogName,
-    SelectorError,
+    RunMark, SelectorError,
 };
 
 mod catalog_import_run;
 pub use catalog_import_run::{
     CatalogImportCommand, CatalogImportOutcome, CatalogImportResult, CatalogImportRun,
-    CatalogImportRuns, CatalogImportRunsQuery, unclassified_summary,
+    CatalogImportRuns, CatalogImportRunsQuery,
 };
 
 mod results;

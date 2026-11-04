@@ -97,6 +97,8 @@ pub enum ExtraRuntimeConfigurationError {
          its processes are not this client's to configure"
     )]
     OnDeviceRuntime { runtime_type: RuntimeType },
+    #[error("[[runtimes]] {runtime_type} has no client runtime configuration fields")]
+    NoRuntimeConfiguration { runtime_type: RuntimeType },
     /// A cell forwards a variable this client's entry sets. Refused rather than
     /// run with one side silently overriding the other.
     #[error(
@@ -161,6 +163,11 @@ impl TryFrom<ExtraRuntimeConfigurationRef> for ExtraRuntimeConfiguration {
             R::UvOnnxGenai => Self::UvOnnxGenai(envs.into()),
             R::Ovms => Self::Ovms(envs.into()),
             R::TrtEdgellm => Self::TrtEdgellm(envs.into()),
+            R::AppleCoreAiMacosPipette => {
+                return Err(ExtraRuntimeConfigurationError::NoRuntimeConfiguration {
+                    runtime_type,
+                });
+            }
             R::LlamacppApkPipette
             | R::LlamacppIosPipette
             | R::MlxIosPipette

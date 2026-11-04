@@ -29,8 +29,9 @@ read, which costs that row and not the page. A campaign that does not read
 fails the page with `500`.
 
 Without `state`, archived campaigns are listed like any other, each row
-carrying `"state": "archived"`. The console's listings read every state and
-hide archived rows themselves, so they can count what they hide.
+carrying `"state": "archived"`. The console's listings send `state=active`
+unless the reader picks archived or all, and no `state` beside a plan id or a
+job id.
 
 ## Statuses
 

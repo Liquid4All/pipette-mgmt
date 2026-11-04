@@ -1,6 +1,3 @@
-//! Tests for the `queue-maintenance` passes. Jobs are seeded into `avail/` by
-//! writing the file directly: `TodoStore` has no `write_avail`.
-
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,11 +16,12 @@ use pipette_plan_types::{
     ClientId, ClientPermission, DeviceProfile, ExpiresAt, JobId, NonEmptyTrimmedString, PlanId,
     PlanStatus, Tag, UserPermission,
 };
-use pipette_store::{ClaimResult, JobState, RecycleResult, ScoreQueueStage};
+use pipette_store::{ClaimResult, JobState, RecycleResult, RenewLeaseResult, ScoreQueueStage};
+use pipette_store_testkit::todo_job_body;
 use pipette_web_testkit::{
-    approved_client, authed_post, denied_clients, grant, job, make_state, register_and_approve,
-    registered_user, run_qm, run_qm_full, run_qm_with_tmp_age, seed_avail, setup_benchmarks,
-    submit_plan_as, valid_submission,
+    QueueBackend, approved_client, approved_queue_client, authed_post, denied_clients, grant, job,
+    make_state, register_and_approve, registered_user, run_qm, run_qm_full, run_qm_with_tmp_age,
+    seed_avail, setup_benchmarks, submit_plan_as, valid_submission,
 };
 
 /// Runs once so the client is already a worker: the run that sees a client join
@@ -37,15 +35,11 @@ async fn register_indexed_worker(state: &AppState) -> anyhow::Result<ClientId> {
 /// A job body carrying every field `system_failure_from_job_body` requires,
 /// with a `spec.benchmark` the `setup_benchmarks` catalog resolves.
 fn expirable_body(job_id: &str, clients: &[&ClientId]) -> Value {
-    json!({
-        "job_id": job_id,
-        "clients": clients.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-        "spec": {
-            "benchmark": "prefill_throughput_256",
-            "model": {"type": "gguf_text", "source": "huggingface", "org": "LiquidAI", "repo_name": "LFM2-700M-GGUF", "path": "LFM2-700M-Q4_0.gguf"},
-            "runtime": {"type": "llamacpp_cli_stock_tools", "source": "github_release", "repository_url": "github.com/ggml-org/llama.cpp", "repository_version": "b1000", "flavor": "macos-arm64"},
-        },
-    })
+    let client_ids = clients
+        .iter()
+        .map(|client| client.as_str())
+        .collect::<Vec<_>>();
+    todo_job_body(job_id, &client_ids, "prefill_throughput_256")
 }
 
 async fn set_profile(
@@ -131,11 +125,12 @@ async fn test_new_job_indexed_only_for_matching_clients(
     by.set(&state, &other, false).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"requires": by.requires()}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
 
@@ -195,11 +190,12 @@ async fn test_eligible_index_follows_the_workers(#[case] gate: Gate) -> anyhow::
     let (_, outsider) = register_and_approve(&state).await?;
     gate.set(&state, &outsider, false).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [worker.as_str(), outsider.as_str()]}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &worker).await?, vec![job.clone()]);
@@ -230,14 +226,15 @@ async fn test_any_of_job_indexed_only_for_group_matching_clients() -> anyhow::Re
     // Both clients satisfy `requires`; only the one in the device family
     // satisfies the `any_of` group.
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({
             "requires": ["os:ios"],
             "any_of": [["device:iphone17pro", "device:iphone18"]],
         }),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
 
@@ -257,11 +254,12 @@ async fn test_clients_array_job_indexed() -> anyhow::Result<()> {
 
     // No device profiles set — eligibility is purely the explicit list.
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [listed.as_str()]}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
 
@@ -280,11 +278,12 @@ async fn test_a_failed_backlog_write_does_not_fail_the_run() -> anyhow::Result<(
     let (_, client) = register_and_approve(&state).await?;
     std::fs::create_dir_all(dir.path().join("todo").join(".backlog"))?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
 
@@ -305,12 +304,12 @@ async fn test_out_of_order_promotion_is_indexed() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
     let body = json!({"clients": [client.as_str()]});
 
-    let job_b = seed_avail(dir.path(), "job-b", ExpiresAt::Never, &body)?;
+    let job_b = seed_avail(state.todo_store.as_ref(), "job-b", ExpiresAt::Never, &body).await?;
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &client).await?, vec![job_b.clone()]);
 
     // `job-a` sorts below `job-b`, so an order-based pass would never see it.
-    let job_a = seed_avail(dir.path(), "job-a", ExpiresAt::Never, &body)?;
+    let job_a = seed_avail(state.todo_store.as_ref(), "job-a", ExpiresAt::Never, &body).await?;
     run_qm(&state).await?;
 
     let mut eligible = eligible_jobs(&state, &client).await?;
@@ -327,11 +326,12 @@ async fn test_already_indexed_jobs_are_skipped() -> anyhow::Result<()> {
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &client).await?, vec![job.clone()]);
@@ -347,6 +347,90 @@ async fn test_already_indexed_jobs_are_skipped() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Creating jobs stay out of every index until a final plan holds them.
+#[tokio::test]
+async fn test_creating_jobs_wait_for_a_committed_plan_before_indexing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let state = make_state(dir.path()).await?;
+    let (_, client) = register_and_approve(&state).await?;
+    run_qm(&state).await?;
+
+    let held = seed_avail(
+        state.todo_store.as_ref(),
+        "job-held-creating",
+        ExpiresAt::Never,
+        &expirable_body("job-held-creating", &[&client]),
+    )
+    .await?;
+    let shared = seed_avail(
+        state.todo_store.as_ref(),
+        "job-shared-active",
+        ExpiresAt::Never,
+        &expirable_body("job-shared-active", &[&client]),
+    )
+    .await?;
+    let creating = test_plan_id();
+    seed_plan(
+        &state,
+        &plan_manifest(&creating, PlanStatus::Creating, &[&held, &shared]),
+        false,
+    )
+    .await?;
+    for job in [&held, &shared] {
+        state
+            .plan_store
+            .write_job_plan_marker(job, &creating, ExpiresAt::Never)
+            .await?;
+    }
+    let active = other_plan_id();
+    seed_plan(
+        &state,
+        &plan_manifest(&active, PlanStatus::Active, &[&shared]),
+        false,
+    )
+    .await?;
+    state
+        .plan_store
+        .write_job_plan_marker(&shared, &active, ExpiresAt::Never)
+        .await?;
+
+    run_qm(&state).await?;
+    assert_eq!(eligible_jobs(&state, &client).await?, vec![shared.clone()]);
+    let indexed = state.todo_store.read_eligible_indexed().await?;
+    assert!(!indexed.contains(&avail_filename(&held, ExpiresAt::Never)));
+
+    state.todo_store.write_pending_reindex(&client).await?;
+    state.todo_store.write_pending_reindex_job(&held).await?;
+    run_qm(&state).await?;
+    assert_eq!(eligible_jobs(&state, &client).await?, vec![shared.clone()]);
+    assert!(
+        !state
+            .todo_store
+            .read_eligible_indexed()
+            .await?
+            .contains(&avail_filename(&held, ExpiresAt::Never))
+    );
+
+    let mut manifest = read_plan(&state, &creating).await?;
+    manifest.status = PlanStatus::Active;
+    state.plan_store.put_plan(&manifest).await?;
+    run_qm(&state).await?;
+    let mut eligible = eligible_jobs(&state, &client).await?;
+    eligible.sort();
+    let mut expected = vec![held.clone(), shared];
+    expected.sort();
+    assert_eq!(eligible, expected);
+    assert!(
+        state
+            .todo_store
+            .read_eligible_indexed()
+            .await?
+            .contains(&avail_filename(&held, ExpiresAt::Never))
+    );
+    Ok(())
+}
+
 /// The run's snapshot omits a departed key, which bounds the set's growth.
 #[tokio::test]
 async fn test_departed_job_is_pruned_from_the_indexed_set() -> anyhow::Result<()> {
@@ -356,18 +440,22 @@ async fn test_departed_job_is_pruned_from_the_indexed_set() -> anyhow::Result<()
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     let key = avail_filename(&job, ExpiresAt::Never);
 
     run_qm(&state).await?;
     let indexed = state.todo_store.read_eligible_indexed().await?;
     assert!(indexed.contains(&key));
 
-    std::fs::remove_file(dir.path().join("todo").join("avail").join(&key))?;
+    state
+        .todo_store
+        .delete_avail(&job, ExpiresAt::Never)
+        .await?;
     run_qm(&state).await?;
     let indexed = state.todo_store.read_eligible_indexed().await?;
     assert!(!indexed.contains(&key));
@@ -385,11 +473,12 @@ async fn test_recycled_lease_is_not_reindexed() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
     let (_, holder) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"job_id": "job-1", "clients": [client.as_str(), holder.as_str()]}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &client).await?, vec![job.clone()]);
@@ -433,11 +522,12 @@ async fn test_pending_reindex_reevaluates_after_a_profile_or_tag_change(
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"requires": by.requires()}),
-    )?;
+    )
+    .await?;
 
     // Not matched yet, and the job's key joins the indexed set.
     run_qm(&state).await?;
@@ -471,14 +561,17 @@ async fn test_foreign_flag_files_do_not_wedge_the_run() -> anyhow::Result<()> {
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"requires": ["os:macos"]}),
-    )?;
+    )
+    .await?;
     set_profile(&state, &client, os_profile("macOS")?).await?;
     state.todo_store.write_pending_reindex(&client).await?;
 
+    // This test writes stray files in the `local_fs` layout because no `TodoStore` call
+    // writes them.
     let cruft_client = dir
         .path()
         .join("todo")
@@ -510,11 +603,12 @@ async fn test_reindex_consumes_all_flag_keys_in_one_rebuild() -> anyhow::Result<
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"requires": ["os:macos"]}),
-    )?;
+    )
+    .await?;
     set_profile(&state, &client, os_profile("macOS")?).await?;
     state.todo_store.write_pending_reindex(&client).await?;
     state.todo_store.write_pending_reindex(&client).await?;
@@ -534,11 +628,12 @@ async fn test_reindex_cleans_up_deleted_client() -> anyhow::Result<()> {
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     state
         .todo_store
         .write_eligible(&client, &job, ExpiresAt::Never)
@@ -577,11 +672,12 @@ async fn test_deferred_reindex_settles_when_leased_job_recycles(
     let (_, other) = register_and_approve(&state).await?;
     by.set(&state, &client, true).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"job_id": "job-1", "requires": by.requires()}),
-    )?;
+    )
+    .await?;
 
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &client).await?, vec![job.clone()]);
@@ -671,11 +767,12 @@ async fn test_gc_removes_orphan_markers_but_keeps_live_ones() -> anyhow::Result<
     let client = register_indexed_worker(&state).await?;
 
     let live = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-live",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     let orphan = job("job-orphan")?;
     state
         .todo_store
@@ -730,11 +827,12 @@ async fn assert_candidate_resets(
     );
 
     seed_avail(
-        dir,
+        state.todo_store.as_ref(),
         job_name,
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     match run2 {
         Run2::Succeeds => run_qm(state).await?,
         Run2::FailsFatally => {
@@ -756,9 +854,10 @@ async fn assert_candidate_resets(
         "live job's marker must be kept"
     );
 
-    std::fs::remove_file(dir.join("todo").join("avail").join(
-        pipette_core::todo_filename::avail_filename(&job, ExpiresAt::Never),
-    ))?;
+    state
+        .todo_store
+        .delete_avail(&job, ExpiresAt::Never)
+        .await?;
     run_qm(state).await?;
     assert!(
         eligible_jobs(state, &client).await?.contains(&job),
@@ -802,7 +901,8 @@ async fn test_a_single_segment_avail_key_stops_the_run() -> anyhow::Result<()> {
     let state = make_state(dir.path()).await?;
     let (_, client) = register_and_approve(&state).await?;
 
-    // Written directly: `seed_avail` builds the per-job form.
+    // The `seed_avail` helper builds a per-job key. This test writes the flat key
+    // directly in the `local_fs` layout.
     let avail = dir.path().join("todo").join("avail");
     std::fs::create_dir_all(&avail)?;
     std::fs::write(
@@ -839,11 +939,12 @@ async fn test_leased_job_survives_sweep_and_recycles_on_expiry(
 
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str()]}),
-    )?;
+    )
+    .await?;
     run_qm(&state).await?;
     assert_eq!(eligible_jobs(&state, &client).await?, vec![job.clone()]);
 
@@ -888,7 +989,13 @@ async fn test_expired_job_with_unrecordable_body_is_deleted(
         .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
         .single()
         .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::At(deadline), &body)?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-1",
+        ExpiresAt::At(deadline),
+        &body,
+    )
+    .await?;
     state
         .todo_store
         .write_denied(&job, &client, &DenialRecord::default())
@@ -937,7 +1044,13 @@ async fn test_expired_job_teardown(
     if let Some(benchmark_id) = benchmark_override {
         body["spec"]["benchmark"] = json!(benchmark_id);
     }
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::At(deadline), &body)?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-1",
+        ExpiresAt::At(deadline),
+        &body,
+    )
+    .await?;
     state
         .todo_store
         .write_denied(&job, &client, &DenialRecord::default())
@@ -998,7 +1111,13 @@ async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
     let mut body = expirable_body("job-1", &[&client]);
     body["expires_at"] = json!(ExpiresAt::At(deadline).to_string());
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::At(deadline), &body)?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-1",
+        ExpiresAt::At(deadline),
+        &body,
+    )
+    .await?;
 
     let claimed = state
         .todo_store
@@ -1055,11 +1174,12 @@ async fn test_stale_lease_for_recorded_job_deleted_not_recycled() -> anyhow::Res
     let (_, client) = register_and_approve(&state).await?;
     let other = ClientId::try_new("never-denied")?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &expirable_body("job-1", &[&client, &other]),
-    )?;
+    )
+    .await?;
     let claimed = state
         .todo_store
         .claim_job(
@@ -1138,11 +1258,12 @@ async fn test_job_retired_once_its_lost_leases_reach_the_limit() -> anyhow::Resu
     let state = make_state(dir.path()).await?;
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &expirable_body("job-1", &[&client]),
-    )?;
+    )
+    .await?;
     run_qm(&state).await?;
 
     for (loss, minutes_ago) in [(1, 30), (2, 20)] {
@@ -1189,11 +1310,12 @@ async fn test_lost_lease_limit_zero_always_recycles() -> anyhow::Result<()> {
     .await?;
     let (_, client) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &expirable_body("job-1", &[&client]),
-    )?;
+    )
+    .await?;
     run_qm(&state).await?;
 
     for minutes_ago in [40, 30, 20, 10] {
@@ -1214,11 +1336,12 @@ async fn test_lost_lease_markers_swept_with_their_job() -> anyhow::Result<()> {
     let state = make_state(dir.path()).await?;
     let (_, client) = register_and_approve(&state).await?;
     let live = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-live",
         ExpiresAt::Never,
         &expirable_body("job-live", &[&client]),
-    )?;
+    )
+    .await?;
     let done = job("job-done")?;
     let lapsed = Utc::now() - chrono::Duration::hours(1);
     for job_id in [&live, &done] {
@@ -1259,12 +1382,14 @@ async fn test_expired_duplicate_avail_entry_keeps_leased_jobs_markers() -> anyho
         .single()
         .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::At(deadline),
         &expirable_body("job-1", &[&client, &holder]),
-    )?;
-    // Written directly: no valid transition produces this state.
+    )
+    .await?;
+    // No valid `TodoStore` transition produces this state, so this test writes it in
+    // the `local_fs` layout.
     let lease_path = dir.path().join("todo").join("leased").join(leased_key(
         &job,
         ExpiresAt::At(deadline),
@@ -1315,11 +1440,12 @@ async fn test_expired_job_with_existing_record_not_overwritten(
         .single()
         .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::At(deadline),
         &expirable_body("job-1", &[&client]),
-    )?;
+    )
+    .await?;
 
     let real_record = json!({
         "job_id": "job-1",
@@ -1365,7 +1491,7 @@ async fn test_qm_escalates_all_denied_clients_only_job() -> anyhow::Result<()> {
     let c2 = ClientId::try_new("ev1_other")?;
     let mut body = expirable_body("job-1", &[&c1]);
     body["clients"] = json!([c1.as_str(), c2.as_str(), c1.as_str()]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
 
     state
         .todo_store
@@ -1435,7 +1561,7 @@ async fn test_qm_all_denied_escalation_skips(
     if let Some(requires) = roster.get("requires") {
         body["requires"] = requires.clone();
     }
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
     for c in denied {
         state
             .todo_store
@@ -1467,7 +1593,7 @@ async fn test_qm_escalates_when_an_exclusion_closes_the_roster() -> anyhow::Resu
     let mut body = expirable_body("job-1", &[]);
     body["clients"] = json!(["ev1_a", "ev1_b", "ev1_reserved"]);
     body["exclude_clients"] = json!(["ev1_reserved"]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
     for id in ["ev1_a", "ev1_b"] {
         state
             .todo_store
@@ -1501,13 +1627,15 @@ async fn test_qm_escalates_past_an_unreadable_denied_marker() -> anyhow::Result<
 
     let mut body = expirable_body("job-1", &[]);
     body["clients"] = json!(["ev1_a", "ev1_b"]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
     let readable = DenialRecord::new(Utc::now(), "runtime OOM", None, None);
     state
         .todo_store
         .write_denied(&job, &ClientId::try_new("ev1_a")?, &readable)
         .await?;
     let unreadable = denied_marker_filename(&job, &ClientId::try_new("ev1_b")?);
+    // No `TodoStore` call writes a corrupt denied body, so this test writes it in the
+    // `local_fs` layout.
     std::fs::write(
         dir.path().join("todo").join("denied").join(unreadable),
         b"{",
@@ -1544,7 +1672,7 @@ async fn test_qm_capability_exclusion_does_not_close_the_roster() -> anyhow::Res
     let mut body = expirable_body("job-1", &[]);
     body["clients"] = json!([excluded.as_str(), denier.as_str()]);
     body["excludes"] = json!(["os:ios"]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
     state
         .todo_store
         .write_denied(&job, &denier, &DenialRecord::default())
@@ -1598,7 +1726,7 @@ async fn test_qm_retires_a_job_no_client_can_match(
         .ok_or_else(|| anyhow::anyhow!("eligibility is an object"))?
         .iter()
         .for_each(|(field, value)| body[field] = value.clone());
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
 
     run_qm(&state).await?;
 
@@ -1637,7 +1765,7 @@ async fn test_qm_keeps_a_job_only_the_fleet_cannot_match() -> anyhow::Result<()>
     body["clients"] = json!([]);
     body["requires"] = json!(["os:ios"]);
     body["exclude_clients"] = json!([client.as_str()]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
 
     run_qm(&state).await?;
 
@@ -1664,7 +1792,7 @@ async fn test_qm_keeps_a_job_whose_exclusion_group_is_vacuous() -> anyhow::Resul
     body["clients"] = json!([]);
     body["requires"] = json!(["os:ios"]);
     body["not_all_of"] = json!([["os:ios", "os:android"]]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
 
     run_qm(&state).await?;
 
@@ -1690,7 +1818,7 @@ async fn test_qm_excluded_client_is_indexed_out_and_claims_nothing() -> anyhow::
     let mut body = expirable_body("job-1", &[&excluded]);
     body["requires"] = json!(["os:ios"]);
     body["not_all_of"] = json!([["os:ios", "device:iphone17pro"]]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
 
     run_qm(&state).await?;
 
@@ -1718,7 +1846,7 @@ async fn test_qm_all_denied_escalation_preserves_existing_record() -> anyhow::Re
     let c1 = ClientId::try_new("ev1_a")?;
     let mut body = expirable_body("job-1", &[&c1]);
     body["clients"] = json!([c1.as_str()]);
-    let job = seed_avail(dir.path(), "job-1", ExpiresAt::Never, &body)?;
+    let job = seed_avail(state.todo_store.as_ref(), "job-1", ExpiresAt::Never, &body).await?;
     state
         .todo_store
         .write_denied(&job, &c1, &DenialRecord::default())
@@ -1757,11 +1885,12 @@ async fn test_denied_gc_sweeps_terminal_jobs_only() -> anyhow::Result<()> {
     // A second roster member keeps the job short of all-denied, which the
     // reconciliation pass would escalate.
     let live = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-live",
         ExpiresAt::Never,
         &json!({"clients": [client.as_str(), "ev1_other"]}),
-    )?;
+    )
+    .await?;
     let terminal = job("job-terminal")?;
     state
         .todo_store
@@ -1792,6 +1921,7 @@ async fn test_stale_tmp_deleted_only_past_max_age() -> anyhow::Result<()> {
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
+    // A crash can leave a body that no TodoStore call can write.
     let tmp_file = dir.path().join("todo").join("tmp").join("partial.json");
     std::fs::write(&tmp_file, b"{")?;
 
@@ -1874,17 +2004,19 @@ async fn test_cancel_marker_tears_down_avail_and_leased_jobs() -> anyhow::Result
     let (_, client) = register_and_approve(&state).await?;
 
     let queued = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-queued",
         ExpiresAt::Never,
         &expirable_body("job-queued", &[&client]),
-    )?;
+    )
+    .await?;
     let running = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-running",
         ExpiresAt::Never,
         &expirable_body("job-running", &[&client]),
-    )?;
+    )
+    .await?;
     // Index the queued job so the run has an eligible marker to collect.
     run_qm(&state).await?;
     assert!(eligible_jobs(&state, &client).await?.contains(&queued));
@@ -1965,11 +2097,12 @@ async fn test_teardown_makes_the_holders_next_heartbeat_404() -> anyhow::Result<
     let (key, client) = register_and_approve(&state).await?;
 
     let running = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-running",
         ExpiresAt::Never,
         &expirable_body("job-running", &[&client]),
-    )?;
+    )
+    .await?;
     state
         .todo_store
         .claim_job(
@@ -2024,11 +2157,12 @@ async fn test_a_result_submitted_before_teardown_lands() -> anyhow::Result<()> {
     let (key, client) = register_and_approve(&state).await?;
 
     let running = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-early",
         ExpiresAt::Never,
         &expirable_body("job-early", &[&client]),
-    )?;
+    )
+    .await?;
     state
         .todo_store
         .claim_job(
@@ -2086,11 +2220,12 @@ async fn test_a_result_submitted_after_teardown_404s_and_writes_nothing() -> any
     let (key, client) = register_and_approve(&state).await?;
 
     let running = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-late",
         ExpiresAt::Never,
         &expirable_body("job-late", &[&client]),
-    )?;
+    )
+    .await?;
     state
         .todo_store
         .claim_job(
@@ -2151,11 +2286,12 @@ async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-back",
         ExpiresAt::Never,
         &expirable_body("job-back", &[&client]),
-    )?;
+    )
+    .await?;
     let plan_id = test_plan_id();
     seed_plan(
         &state,
@@ -2173,11 +2309,12 @@ async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
 
     // The lease recycler returns the job to `avail/` after teardown ran.
     seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-back",
         ExpiresAt::Never,
         &expirable_body("job-back", &[&client]),
-    )?;
+    )
+    .await?;
     run_qm(&state).await?;
 
     assert!(
@@ -2202,11 +2339,12 @@ async fn test_plan_stays_cancelling_until_teardown_finishes() -> anyhow::Result<
     let (_, client) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-stuck",
         ExpiresAt::Never,
         &expirable_body("job-stuck", &[&client]),
-    )?;
+    )
+    .await?;
     let lease_expiry = Utc::now() + chrono::Duration::hours(1);
     state
         .todo_store
@@ -2285,11 +2423,12 @@ async fn test_the_settle_is_decided_per_plan() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
 
     let live = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-live",
         ExpiresAt::Never,
         &expirable_body("job-live", &[&client]),
-    )?;
+    )
+    .await?;
     let retiring = test_plan_id();
     seed_plan(
         &state,
@@ -2526,11 +2665,12 @@ async fn test_an_old_live_plan_is_kept() -> anyhow::Result<()> {
     let ancient = Utc::now() - chrono::Duration::days(365);
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-ancient",
         ExpiresAt::Never,
         &expirable_body("job-ancient", &[&client]),
-    )?;
+    )
+    .await?;
     let live_id = test_plan_id();
     seed_plan(
         &state,
@@ -2600,7 +2740,13 @@ async fn test_plan_status_follows_the_fleet(
 
     let mut body = expirable_body("job-fleet", &[]);
     body["requires"] = by.requires();
-    let job = seed_avail(dir.path(), "job-fleet", ExpiresAt::Never, &body)?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-fleet",
+        ExpiresAt::Never,
+        &body,
+    )
+    .await?;
 
     let plan_id = test_plan_id();
     seed_plan(
@@ -2727,11 +2873,12 @@ async fn test_stranded_creating_plan_is_torn_down() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-stranded",
         ExpiresAt::Never,
         &expirable_body("job-stranded", &[&client]),
-    )?;
+    )
+    .await?;
     let plan_id = test_plan_id();
     seed_plan(
         &state,
@@ -2778,11 +2925,12 @@ async fn test_young_creating_plan_is_left_alone() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-staging",
         ExpiresAt::Never,
         &expirable_body("job-staging", &[&client]),
-    )?;
+    )
+    .await?;
     let plan_id = test_plan_id();
     seed_plan(
         &state,
@@ -2816,11 +2964,12 @@ async fn test_cancelling_a_creating_plan_keeps_its_marker_while_its_ingest_could
     let (_, client) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-midingest",
         ExpiresAt::Never,
         &expirable_body("job-midingest", &[&client]),
-    )?;
+    )
+    .await?;
     let plan_id = test_plan_id();
     seed_plan(
         &state,
@@ -2880,11 +3029,23 @@ async fn test_partial_starvation_stays_active_and_reports_starved() -> anyhow::R
 
     let mut matched_body = expirable_body("job-macos", &[]);
     matched_body["requires"] = json!(["os:macos"]);
-    let matched = seed_avail(dir.path(), "job-macos", ExpiresAt::Never, &matched_body)?;
+    let matched = seed_avail(
+        state.todo_store.as_ref(),
+        "job-macos",
+        ExpiresAt::Never,
+        &matched_body,
+    )
+    .await?;
 
     let mut starved_body = expirable_body("job-ios", &[]);
     starved_body["requires"] = json!(["os:ios"]);
-    let starved = seed_avail(dir.path(), "job-ios", ExpiresAt::Never, &starved_body)?;
+    let starved = seed_avail(
+        state.todo_store.as_ref(),
+        "job-ios",
+        ExpiresAt::Never,
+        &starved_body,
+    )
+    .await?;
 
     let plan_id = test_plan_id();
     seed_plan(
@@ -2970,18 +3131,21 @@ async fn test_starved_jobs_group_by_shared_eligibility(
     let (_, client) = register_and_approve(&state).await?;
     set_profile(&state, &client, os_profile("Windows")?).await?;
 
-    let seeded: Vec<JobId> = jobs
-        .iter()
-        .map(|(name, eligibility)| {
+    let seeded: Vec<JobId> = futures::future::try_join_all(jobs.iter().map(
+        |(name, eligibility)| {
             let mut body = expirable_body(name, &[]);
             eligibility
                 .as_object()
                 .into_iter()
                 .flatten()
                 .for_each(|(field, value)| body[field] = value.clone());
-            seed_avail(dir.path(), name, ExpiresAt::Never, &body)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+            let state = &state;
+            async move {
+                seed_avail(state.todo_store.as_ref(), name, ExpiresAt::Never, &body).await
+            }
+        },
+    ))
+    .await?;
 
     let plan_id = test_plan_id();
     let refs: Vec<&JobId> = seeded.iter().collect();
@@ -3012,7 +3176,13 @@ async fn test_leased_job_keeps_plan_active_without_a_matching_client() -> anyhow
 
     let mut body = expirable_body("job-leased", &[]);
     body["requires"] = json!(["os:ios"]);
-    let job = seed_avail(dir.path(), "job-leased", ExpiresAt::Never, &body)?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-leased",
+        ExpiresAt::Never,
+        &body,
+    )
+    .await?;
     state
         .todo_store
         .claim_job(
@@ -3105,15 +3275,15 @@ async fn seed_membership(
 /// One `avail/` job held by two active plans, with a cancel on the first.
 async fn seed_shared_job(
     state: &AppState,
-    dir: &std::path::Path,
     client: &ClientId,
 ) -> anyhow::Result<(JobId, PlanId, PlanId)> {
     let shared = seed_avail(
-        dir,
+        state.todo_store.as_ref(),
         "job-shared",
         ExpiresAt::Never,
         &expirable_body("job-shared", &[client]),
-    )?;
+    )
+    .await?;
     let cancelling = test_plan_id();
     let surviving = other_plan_id();
     seed_membership(state, &shared, &cancelling, ExpiresAt::Never).await?;
@@ -3155,7 +3325,7 @@ async fn test_cancel_of_one_member_releases_a_shared_job() -> anyhow::Result<()>
     let state = make_state(dir.path()).await?;
     let (_, client) = register_and_approve(&state).await?;
 
-    let (shared, cancelling, surviving) = seed_shared_job(&state, dir.path(), &client).await?;
+    let (shared, cancelling, surviving) = seed_shared_job(&state, &client).await?;
 
     run_qm(&state).await?;
 
@@ -3218,11 +3388,12 @@ async fn test_active_plan_keeps_a_job_whose_membership_marker_is_missing() -> an
     let (_, client) = register_and_approve(&state).await?;
 
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         ExpiresAt::Never,
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let forgotten = test_plan_id();
     let co_owner = other_plan_id();
 
@@ -3265,7 +3436,7 @@ async fn test_cancel_of_the_last_member_retires_the_shared_job() -> anyhow::Resu
     let state = make_state(dir.path()).await?;
     let (_, client) = register_and_approve(&state).await?;
 
-    let (shared, _first, last) = seed_shared_job(&state, dir.path(), &client).await?;
+    let (shared, _first, last) = seed_shared_job(&state, &client).await?;
 
     run_qm(&state).await?;
     assert!(state.todo_store.get_avail_by_job(&shared).await?.is_some());
@@ -3311,11 +3482,12 @@ async fn test_a_job_with_no_membership_marker_still_retires() -> anyhow::Result<
     let (_, client) = register_and_approve(&state).await?;
 
     let legacy = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-legacy",
         ExpiresAt::Never,
         &expirable_body("job-legacy", &[&client]),
-    )?;
+    )
+    .await?;
     let plan_id = test_plan_id();
     seed_plan(
         &state,
@@ -3414,11 +3586,12 @@ async fn test_plan_index_gc_collects_a_marker_whose_manifest_is_gone() -> anyhow
     let (_, client) = register_and_approve(&state).await?;
 
     let live = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-live",
         ExpiresAt::Never,
         &expirable_body("job-live", &[&client]),
-    )?;
+    )
+    .await?;
     let kept = test_plan_id();
     let forgotten = other_plan_id();
     seed_membership(&state, &live, &kept, ExpiresAt::Never).await?;
@@ -3456,17 +3629,19 @@ async fn test_plan_index_gc_collects_a_marker_whose_plan_omits_the_job() -> anyh
     let (_, client) = register_and_approve(&state).await?;
 
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         ExpiresAt::Never,
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let fresh = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-fresh",
         ExpiresAt::Never,
         &expirable_body("job-fresh", &[&client]),
-    )?;
+    )
+    .await?;
     // The abandoner lost the target inside the merge window and failed its marker
     // delete, so its manifest lists only its own job.
     let owner = test_plan_id();
@@ -3515,11 +3690,12 @@ async fn test_one_result_advances_both_plans_holding_the_job() -> anyhow::Result
     let (key, client) = register_and_approve(&state).await?;
 
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         ExpiresAt::Never,
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let first = test_plan_id();
     let second = other_plan_id();
     for plan_id in [&first, &second] {
@@ -3601,19 +3777,21 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
 
     // The sooner plan minted the job, so the queue carries its horizon.
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         lapsed(),
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     // A second job keeps the sooner plan non-terminal, so the reconciliation
     // pass rewrites its manifest rather than returning early.
     let solo = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-solo",
         distant(),
         &expirable_body("job-solo", &[&client]),
-    )?;
+    )
+    .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
     seed_membership(&state, &shared, &sooner, lapsed()).await?;
@@ -3688,11 +3866,12 @@ async fn test_the_last_member_horizon_lapsing_retires_the_job() -> anyhow::Resul
     let (_, client) = register_and_approve(&state).await?;
 
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         lapsed(),
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let first = test_plan_id();
     let second = other_plan_id();
     for plan_id in [&first, &second] {
@@ -3742,11 +3921,12 @@ async fn test_a_plan_completes_when_its_last_job_lapses() -> anyhow::Result<()> 
     let (_, client) = register_and_approve(&state).await?;
 
     let shared = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         lapsed(),
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
     seed_membership(&state, &shared, &sooner, lapsed()).await?;
@@ -3791,11 +3971,12 @@ async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
     let (_, client) = register_and_approve(&state).await?;
 
     let shared = pipette_web_testkit::seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-shared",
         &client,
         &expirable_body("job-shared", &[&client]),
-    )?;
+    )
+    .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
     seed_membership(&state, &shared, &sooner, lapsed()).await?;
@@ -3845,11 +4026,12 @@ async fn test_a_recorded_job_is_never_recorded_as_lapsed() -> anyhow::Result<()>
     let (key, client) = register_and_approve(&state).await?;
 
     let done = pipette_web_testkit::seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-done",
         &client,
         &expirable_body("job-done", &[&client]),
-    )?;
+    )
+    .await?;
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!("job-done");
     let resp = authed_post(&state, &key, &client, "/benchmarks", &body).await?;
@@ -3890,11 +4072,12 @@ async fn test_a_marker_naming_a_superseded_deadline_is_collected_at_once() -> an
     let client = register_indexed_worker(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         distant(),
         &expirable_body("job-1", &[&client]),
-    )?;
+    )
+    .await?;
     // The residue of a re-date whose run died before the index passes ran.
     state
         .todo_store
@@ -3908,5 +4091,35 @@ async fn test_a_marker_naming_a_superseded_deadline_is_collected_at_once() -> an
         vec![(job, distant())],
         "only the marker naming the job's current key survives"
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
+#[tokio::test]
+async fn queue_register_claim_and_recycle(#[case] backend: QueueBackend) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((queue, key, client)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    run_qm(state).await?;
+    let body = expirable_body("sql-job", &[&client]);
+    let job = seed_avail(&*state.todo_store, "sql-job", ExpiresAt::Never, &body).await?;
+    run_qm(state).await?;
+    let response = authed_post(state, &key, &client, "/plans/claim", &json!({})).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let claimed: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(claimed["job_id"], job.as_str());
+    let expired = Utc::now() - chrono::Duration::hours(1);
+    assert_eq!(
+        state.todo_store.renew_lease(&job, &client, expired).await?,
+        RenewLeaseResult::Renewed(ExpiresAt::Never)
+    );
+    run_qm(state).await?;
+    assert!(state.todo_store.get_avail_by_job(&job).await?.is_some());
+    assert_eq!(state.todo_store.list_lost_leases(&job).await?.len(), 1);
     Ok(())
 }

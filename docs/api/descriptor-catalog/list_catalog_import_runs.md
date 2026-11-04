@@ -14,15 +14,15 @@ Each run in `items` has these fields:
 - the command: `import` or `refresh`
 - the source, and an optional refresh target
 - the stored result: `running`, `success`, or `error`
-- the outcome: `running`, `success`, `unclassified`, or `failed`
+- the outcome: `running`, `success`, or `failed`
 - the counts of entries created, entries hidden, and members added
 - the names of the unclassified assets
 - an optional error summary
 
-A `running` run has no finish time. The outcome `unclassified` is an `error`
-run with only unclassified assets. The importer finished its catalog work but
-found assets that it could not classify. The outcome `failed` is any other
-`error` run, for example an upstream failure or a storage failure.
+A `running` run has no finish time. The outcome `failed` is an `error` run,
+for example an upstream failure or a storage failure. A run of any result can
+list unclassified assets. Each one is an asset that the flavor table does not
+know, and the run added no member for it.
 
 `last_successful_import_at` is the latest finish time of an `import` run with
 `result=success`. That run can be older than every run in `items`. A

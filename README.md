@@ -84,6 +84,7 @@ Eval methodology ([docs/methodology/](docs/methodology/)):
 Design notes, the why behind decisions ([docs/design/](docs/design/)):
 [the vault](docs/design/vault-resources.md),
 [records on PostgreSQL](docs/design/sql-record-store.md),
+[the job queue on PostgreSQL](docs/design/sql-job-queue.md),
 [device telemetry](docs/design/device-telemetry.md),
 [the descriptor catalog](docs/design/descriptor-catalog.md),
 [vl_spec_decode](docs/design/vl-spec-decode.md) and its

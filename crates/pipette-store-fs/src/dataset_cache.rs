@@ -1,4 +1,5 @@
-//! [`DatasetCacheStore`] over `{data_dir}/dataset-cache/artifacts/`.
+//! [`DatasetCacheStore`] over `{data_dir}/dataset-cache/artifacts/`, and
+//! [`EvalPackageStore`] over `{data_dir}/scores-packages/tars/`.
 
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,7 @@ use tokio::io::AsyncReadExt;
 
 use pipette_core::dataset::DatasetArtifact;
 use pipette_plan_types::Sha256;
-use pipette_store::{ArtifactBody, DatasetCacheStore};
+use pipette_store::{ArtifactBody, DatasetCacheStore, EvalPackageStore};
 
 use crate::run_blocking;
 use crate::storage::replace_atomically;
@@ -71,23 +72,56 @@ impl DatasetCacheStore for LocalFsDatasetCacheStore {
     }
 
     async fn open_tar(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>> {
-        let file = match tokio::fs::File::open(self.tar_path(digest)).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let bytes = file.metadata().await?.len();
-        let stream = futures::stream::try_unfold(file, |mut file| async move {
-            let mut buf = vec![0_u8; CHUNK];
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            buf.truncate(n);
-            Ok(Some((bytes::Bytes::from(buf), file)))
-        })
-        .boxed();
-        Ok(Some(ArtifactBody { bytes, stream }))
+        open(&self.tar_path(digest)).await
+    }
+}
+
+async fn open(path: &Path) -> anyhow::Result<Option<ArtifactBody>> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = file.metadata().await?.len();
+    let stream = futures::stream::try_unfold(file, |mut file| async move {
+        let mut buf = vec![0_u8; CHUNK];
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some((bytes::Bytes::from(buf), file)))
+    })
+    .boxed();
+    Ok(Some(ArtifactBody { bytes, stream }))
+}
+
+pub(crate) struct LocalFsEvalPackageStore {
+    base_dir: PathBuf,
+}
+
+impl LocalFsEvalPackageStore {
+    pub(crate) fn new(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
+    fn tar_path(&self, digest: &Sha256) -> PathBuf {
+        self.base_dir.join(format!("{digest}.tar"))
+    }
+}
+
+#[async_trait]
+impl EvalPackageStore for LocalFsEvalPackageStore {
+    async fn package_bytes(&self, digest: &Sha256) -> anyhow::Result<Option<u64>> {
+        match tokio::fs::metadata(self.tar_path(digest)).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn open_package(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>> {
+        open(&self.tar_path(digest)).await
     }
 }
 
@@ -100,5 +134,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = LocalFsDatasetCacheStore::new(dir.path().join("dataset-cache/artifacts"));
         pipette_store_testkit::assert_dataset_cache_store_roundtrip(&store, dir.path()).await
+    }
+
+    #[tokio::test]
+    async fn eval_package_store_contract() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = LocalFsEvalPackageStore::new(dir.path().join("scores-packages/tars"));
+        pipette_store_testkit::assert_eval_package_store_contract(&store, |key, body| {
+            let path = dir.path().join(key);
+            async move {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&path, body).await?;
+                Ok(())
+            }
+        })
+        .await
     }
 }

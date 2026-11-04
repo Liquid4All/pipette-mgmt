@@ -136,6 +136,7 @@ fn types_compatible(model: ModelType, runtime: RuntimeType) -> bool {
         // Not the apk: its engine has no drafter and no vision tower.
         (GgufVisionSpeculative, LlamacppCliStockTools | LlamacppIosPipette) => true,
         (Mlx, MlxMacosPipette | MlxIosPipette) => true,
+        (AppleCoreAi, AppleCoreAiMacosPipette) => true,
         // macOS only: the iOS MLX engine loads one bundle and has no drafter.
         (MlxSpeculative, MlxMacosPipette) => true,
         (Torch, DockerVllm | DockerSglang | UvVllm | UvSglang) => true,
@@ -1372,6 +1373,34 @@ draft = { source = "huggingface", org = "o", repo_name = "draft", auth_token = "
         };
         let json = serde_json::to_string(&spec)?;
         assert_eq!(serde_json::from_str::<ClientRunSpec>(&json)?, spec);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod core_ai_port_tests {
+    use super::*;
+    use crate::{AppleCoreAiMacosPipette, Model};
+
+    #[test]
+    fn core_ai_wire_identity_and_pairing() -> anyhow::Result<()> {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "type": "core_ai", "source": "absolute_dir", "dir": "/tmp/core-ai-model"
+        }))?;
+        let runtime = Runtime::AppleCoreAiMacosPipette(AppleCoreAiMacosPipette::bundled());
+        assert_eq!(
+            serde_json::to_value(&runtime)?
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("core_ai_macos_pipette")
+        );
+        assert!(is_compatible(&model, &runtime));
+        assert!(!is_compatible(&Model::AppleFoundationText, &runtime));
+        assert_eq!(ModelType::of(&model).to_string(), "core_ai");
+        assert_eq!(
+            RuntimeType::of(&runtime).to_string(),
+            "core_ai_macos_pipette"
+        );
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
-//! A benchmark's corpus, streamed from the cache only on a fresh probe `ok`.
-//! No request contacts an upstream.
+//! A benchmark's corpus, streamed only on a fresh probe `ok`: a git corpus
+//! from the cache, an evals-server one from the scores service's packages. No
+//! request contacts an upstream.
 
 use axum::body::Body;
 use axum::extract::State;
@@ -8,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 
 use pipette_core::dataset::{ProbeState, ServeRefusal};
-use pipette_plan_types::{BenchmarkId, ErrorBody};
+use pipette_plan_types::{BenchmarkId, DatasetUpstream, ErrorBody};
 
 use crate::auth::{WorkingClient, client_catalog_org};
 use crate::error::AppError;
@@ -157,11 +158,14 @@ pub async fn get_dataset(
         }
     }
 
-    let Some(body) = state
-        .dataset_cache_store
-        .open_tar(&dataset.digest)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to open dataset artifact: {e:#}")))?
+    let tar = match &artifact.upstream {
+        DatasetUpstream::Git { .. } => state.dataset_cache_store.open_tar(&dataset.digest).await,
+        DatasetUpstream::EvalsServer { .. } => {
+            state.eval_packages.open_package(&dataset.digest).await
+        }
+    };
+    let Some(body) =
+        tar.map_err(|e| AppError::Internal(format!("failed to open dataset artifact: {e:#}")))?
     else {
         tracing::error!(
             event = "dataset_cache_missing",

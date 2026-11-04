@@ -104,6 +104,27 @@
       ],
       "type": "string"
     },
+    "AnyClientRunEvidence": {
+      "properties": {
+        "devices_with_success": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_success_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "last_success_at",
+        "devices_with_success"
+      ],
+      "type": "object"
+    },
     "AnyValueIngestEvent": {
       "oneOf": [
         {
@@ -196,6 +217,118 @@
         }
       ]
     },
+    "AppleCoreAi": {
+      "oneOf": [
+        {
+          "properties": {
+            "org": {
+              "type": "string"
+            },
+            "prefix": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repo_name": {
+              "type": "string"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "const": "huggingface",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "org",
+            "repo_name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "custom_label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "principal_id": {
+              "$ref": "#/$defs/VaultPrincipalId"
+            },
+            "sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "const": "vault_archive",
+              "type": "string"
+            },
+            "url": {
+              "$ref": "#/$defs/VaultPath"
+            }
+          },
+          "required": [
+            "source",
+            "url",
+            "principal_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "source": {
+              "const": "relative_dir",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "dir"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "source": {
+              "const": "absolute_dir",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "dir"
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    },
+    "AppleCoreAiMacosPipette": {
+      "properties": {
+        "packages": {
+          "$ref": "#/$defs/CoreAiSwiftStack"
+        }
+      },
+      "required": [
+        "packages"
+      ],
+      "type": "object"
+    },
     "AppleFoundation": {
       "properties": {
         "private_memory": {
@@ -263,6 +396,76 @@
             "type",
             "command",
             "args"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "new_name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "old_name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "type": {
+              "const": "catalog_rename",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "scope",
+            "old_name",
+            "new_name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "into_name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "moved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old_name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "skipped": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "catalog_merge",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "scope",
+            "old_name",
+            "into_name",
+            "moved",
+            "skipped"
           ],
           "type": "object"
         },
@@ -3476,7 +3679,6 @@
       "enum": [
         "running",
         "success",
-        "unclassified",
         "failed"
       ],
       "type": "string"
@@ -4711,12 +4913,64 @@
         }
       ]
     },
+    "ClientRunEvidence": {
+      "properties": {
+        "last_failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunMark"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_success": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunMark"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "last_success",
+        "last_failure"
+      ],
+      "type": "object"
+    },
     "ClientStatus": {
       "enum": [
         "pending",
         "approved"
       ],
       "type": "string"
+    },
+    "CoreAiSwiftStack": {
+      "properties": {
+        "coreai_models": {
+          "$ref": "#/$defs/SourceRepository"
+        },
+        "swift_jinja": {
+          "$ref": "#/$defs/SourceRepository"
+        },
+        "swift_transformers": {
+          "$ref": "#/$defs/SourceRepository"
+        },
+        "xgrammar": {
+          "$ref": "#/$defs/SourceRepository"
+        }
+      },
+      "required": [
+        "coreai_models",
+        "swift_transformers",
+        "xgrammar",
+        "swift_jinja"
+      ],
+      "type": "object"
     },
     "Counts": {
       "properties": {
@@ -5271,6 +5525,27 @@
         }
       ]
     },
+    "DescriptorMemberEvidence": {
+      "properties": {
+        "any_device": {
+          "$ref": "#/$defs/AnyClientRunEvidence"
+        },
+        "this_device": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientRunEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "any_device"
+      ],
+      "type": "object"
+    },
     "DescriptorMemberKey": {
       "oneOf": [
         {
@@ -5377,6 +5652,16 @@
         },
         "digest": {
           "type": "string"
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DescriptorMemberEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "member_key": {
           "$ref": "#/$defs/DescriptorMemberKey"
@@ -5493,6 +5778,7 @@
         "no_rule",
         "unsupported",
         "not_met",
+        "no_build",
         "no_runtime"
       ],
       "type": "string"
@@ -6338,6 +6624,26 @@
       ],
       "type": "object"
     },
+    "JobPlans": {
+      "properties": {
+        "body": {},
+        "fleet_detail": {
+          "$ref": "#/$defs/FleetDetail"
+        },
+        "plans": {
+          "items": {
+            "$ref": "#/$defs/PlanSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fleet_detail",
+        "plans",
+        "body"
+      ],
+      "type": "object"
+    },
     "JobQueue": {
       "properties": {
         "expires_at": {
@@ -7033,6 +7339,23 @@
         {
           "allOf": [
             {
+              "$ref": "#/$defs/AppleCoreAi"
+            }
+          ],
+          "properties": {
+            "type": {
+              "const": "core_ai",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
               "$ref": "#/$defs/SpeculativePair"
             }
           ],
@@ -7349,6 +7672,7 @@
       "enum": [
         "gguf",
         "mlx",
+        "core_ai",
         "torch",
         "openvino",
         "onnx"
@@ -9151,6 +9475,9 @@
           "items": true,
           "type": "array"
         },
+        "document": {
+          "type": "string"
+        },
         "imports": {
           "default": [],
           "items": {
@@ -9166,6 +9493,7 @@
         }
       },
       "required": [
+        "document",
         "bodies",
         "plan_warnings",
         "imports"
@@ -9182,6 +9510,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "document": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "fleet_detail": {
@@ -9424,6 +9758,12 @@
     },
     "PlanValidation": {
       "properties": {
+        "document": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "gated_model_count": {
           "format": "uint",
           "minimum": 0,
@@ -9448,6 +9788,7 @@
         }
       },
       "required": [
+        "document",
         "job_count",
         "gated_model_count",
         "issues"
@@ -9831,6 +10172,40 @@
       "required": [
         "public_key",
         "key_details"
+      ],
+      "type": "object"
+    },
+    "RelabelDescriptorMemberRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/ModelFormat"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "format",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "RenameDescriptorEntryRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 200,
+          "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
       ],
       "type": "object"
     },
@@ -10567,6 +10942,25 @@
       ],
       "type": "object"
     },
+    "RunMark": {
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "client_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "at",
+        "client_version"
+      ],
+      "type": "object"
+    },
     "Runtime": {
       "oneOf": [
         {
@@ -10629,6 +11023,23 @@
           "properties": {
             "type": {
               "const": "mlx_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/AppleCoreAiMacosPipette"
+            }
+          ],
+          "properties": {
+            "type": {
+              "const": "core_ai_macos_pipette",
               "type": "string"
             }
           },

@@ -33,6 +33,10 @@ so the full tier gets them and the withheld tier does not
 fields for every job source, so a plan that joined under the v1 merge rule
 cannot read top-level data only the first submitter supplied.
 
+The [console app](../../../ui/README.md#pages) opens a job from its header box
+on the Jobs tab of the newest of these plans, and a campaign listing's job id
+box keeps the campaigns these plans were filed into.
+
 Each error answers in the JSON `{"error"}` envelope. A `500` answers when the
 store failed to list links, a linked manifest cannot be read after another
 linked plan establishes scope, the job source is not JSON, or the pending

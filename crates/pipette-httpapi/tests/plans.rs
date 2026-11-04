@@ -198,6 +198,7 @@ async fn test_an_excluded_client_warns_and_still_stages(
         assert!(message.contains("excluding clients") && message.contains(client_id.as_str()));
     } else {
         assert_eq!(message, "1 job matches no working client");
+        assert!(report.get("document").is_none(), "{report}");
         assert!(!report.to_string().contains(client_id.as_str()));
     }
 
@@ -1261,6 +1262,7 @@ async fn test_a_shared_job_lists_its_plans_oldest_first() -> anyhow::Result<()> 
         .try_for_each(|job_id| async move {
             let (status, view) = plans_by_job(state, signer, &job_id).await?;
             assert_eq!(status, StatusCode::OK, "{view}");
+            crate::api_schema::assert_conforms("JobPlans", &view)?;
             assert_eq!(
                 listed_plan_ids(&view)?,
                 vec![

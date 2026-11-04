@@ -1,19 +1,55 @@
-//! The `todo/` tree: seeding it by hand, reading it back, and running the
-//! maintenance passes over it. `TodoStore` has no writer for `avail/` or
-//! `leased/`, so the seeds write the stable local_fs layout directly.
+//! This module seeds the `todo/` tree through `TodoStore`. It reads the tree and runs
+//! the maintenance passes.
 
 use anyhow::Context;
 use serde_json::{Value, json};
 
-use pipette_core::todo_filename::{avail_filename, leased_key};
+use pipette_core::plan::PlanManifest;
 use pipette_httpapi::state::AppState;
-use pipette_plan_types::{ClientId, DeviceProfile, ExpiresAt, JobId, Tag};
+use pipette_plan_types::{ClientId, DeviceProfile, ExpiresAt, JobId, PlanId, PlanStatus, Tag};
 use pipette_store::{TodoStore, drain_plans};
+pub use pipette_store_testkit::{seed_avail, seed_leased, seed_leased_until};
 
 /// Build a validated [`JobId`] from a test literal (`new_unchecked` is
 /// `#[cfg(test)]`-only). Fallible because the panic ban covers tests too.
 pub fn job(s: impl Into<String>) -> anyhow::Result<JobId> {
     JobId::try_new(s).context("valid test job id")
+}
+
+/// Record `job_id` as the one job of an `active` plan filed outside any
+/// campaign, so queue maintenance can index the job. A job seeded straight
+/// into `avail/` without a plan keeps the legacy indexing behavior.
+pub async fn commit_job(state: &AppState, job_id: &JobId) -> anyhow::Result<PlanId> {
+    let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
+    state
+        .plan_store
+        .put_plan(&PlanManifest {
+            plan_id: plan_id.clone(),
+            status: PlanStatus::Active,
+            created_at: chrono::Utc::now(),
+            submitted_by: None,
+            campaign_id: None,
+            previous_plan_id: None,
+            source_sha256: None,
+            submitted_sha256: None,
+            plan_warnings: Vec::new(),
+            benchmark_types: Default::default(),
+            job_ids: vec![job_id.clone()],
+            content_keys: Default::default(),
+            rerun_of: Default::default(),
+            warnings: Vec::new(),
+            job_expiry: None,
+            expired_jobs: Default::default(),
+            settled_jobs: Default::default(),
+            progress_snapshot: None,
+            terminal_at: None,
+        })
+        .await?;
+    state
+        .plan_store
+        .write_job_plan_marker(job_id, &plan_id, ExpiresAt::Never)
+        .await?;
+    Ok(plan_id)
 }
 
 /// Every client that holds a `denied/` marker for one job, sorted so the
@@ -62,45 +98,6 @@ pub async fn assert_nothing_staged(state: &AppState) -> anyhow::Result<()> {
         "a refused submission staged a job"
     );
     Ok(())
-}
-
-/// Write a job body straight into `todo/avail/`, bypassing the server.
-pub fn seed_avail(
-    dir: &std::path::Path,
-    job_id: &str,
-    expires_at: ExpiresAt,
-    body: &Value,
-) -> anyhow::Result<JobId> {
-    let job = job(job_id)?;
-    let path = dir
-        .join("todo")
-        .join("avail")
-        .join(avail_filename(&job, expires_at));
-    std::fs::create_dir_all(path.parent().context("an avail key has a job directory")?)?;
-    std::fs::write(path, serde_json::to_vec(body)?)?;
-    Ok(job)
-}
-
-/// Plant an active lease, as `POST /plans/claim` would, so a submission that
-/// echoes `job_id` passes the claim-binding check.
-pub fn seed_leased(
-    dir: &std::path::Path,
-    job_id: &str,
-    client_id: &ClientId,
-    body: &Value,
-) -> anyhow::Result<JobId> {
-    let job = job(job_id)?;
-    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-    let path =
-        dir.join("todo")
-            .join("leased")
-            .join(leased_key(&job, ExpiresAt::Never, client_id, expiry));
-    std::fs::create_dir_all(
-        path.parent()
-            .ok_or_else(|| anyhow::anyhow!("lease path has no parent"))?,
-    )?;
-    std::fs::write(path, serde_json::to_vec(body)?)?;
-    Ok(job)
 }
 
 /// Overwrite what a registered client is matched by: its device profile, the

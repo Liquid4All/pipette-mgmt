@@ -167,11 +167,10 @@ what to complete.
 | `prompt_profile` | string, optional | Sent for a `vlm_eval` entry that sets `parameter_prompt_profile`, and always for an `asr_eval`. The service rebuilds each prompt's text the way VLMEvalKit prompts that model family ([benchmarks.md](benchmarks.md#29-vlm-eval-accuracy)), or builds each clip's request in that family's shape, and answers `400` for a profile it does not build |
 
 Only a text eval's samples are spliced into `GET /benchmarks/{benchmark_id}`.
-A `vlm_eval`'s and an `asr_eval`'s are read only by `pipette-mgmt
-dataset-cache`, which builds the entry's corpus from one `/samples` stream
-(with `X-Samples-Digest`) and probes `GET …/samples/digest`
-([benchmarks.md](benchmarks.md#the-samples-a-device-runs-the-corpus)). An
-`asr_eval`'s samples are never paged: the whole set streams in one body.
+mgmt never reads a `vlm_eval`'s or an `asr_eval`'s: the scoring service packs
+them into the corpus the entry pins, and `pipette-mgmt dataset-cache` asks only
+`GET …/samples/digest`
+([benchmarks.md](benchmarks.md#the-samples-a-device-runs-the-corpus)).
 
 Both callers percent-encode `eval_id` and the dataset name as one path segment
 each, and refuse an empty, `.` or `..` value, or one with a control character,

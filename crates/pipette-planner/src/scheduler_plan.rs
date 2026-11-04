@@ -183,6 +183,7 @@ pub struct SchedulerVariant {
     /// Crossed with `runtimes`; each model must pair with one of them.
     pub models: NonEmptyVec<Model>,
     /// Crossed with `models`; each runtime must load one of them.
+    #[cfg_attr(feature = "schemars", schemars(with = "NonEmptyVec<RuntimeInput>"))]
     pub runtimes: NonEmptyVec<Runtime>,
     /// Canonical capability flags every eligible client must satisfy. Optional
     /// on its own, but a variant must set at least one of `requires`/`clients`.
@@ -590,6 +591,20 @@ pub struct SchedulerCell {
     /// The model as authored, token included.
     pub spec: ClientRunSpec,
     pub eligibility: Eligibility,
+}
+
+/// The published schema accepts a runtime name. Ingestion replaces each name
+/// with a runtime table before the planner parses the document.
+#[cfg(feature = "schemars")]
+struct RuntimeInput;
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for RuntimeInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RuntimeInput".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"anyOf": [generator.subschema_for::<Runtime>(), {"type": "string"}]})
+    }
 }
 
 #[cfg(test)]

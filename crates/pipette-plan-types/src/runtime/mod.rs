@@ -1,6 +1,8 @@
 //! [`Runtime`], its per-kind variant structs, source coordinates and build
-//! flavors: one submodule per engine; `uv` is the shared venv source.
+//! flavors: one submodule per engine; `uv` is the shared venv source, and
+//! `build_flag` is the capability flag of an iOS app runtime build.
 
+mod build_flag;
 mod llamacpp;
 mod mlx;
 mod onnx_genai;
@@ -10,6 +12,7 @@ mod torch_oai;
 mod trt_edgellm;
 mod uv;
 
+pub use build_flag::{RuntimeBuildFlagError, runtime_build_flag};
 pub use llamacpp::{
     LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor, LlamacppCliStockTools,
     LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource, LlamacppFlashAttention,
@@ -53,6 +56,8 @@ pub enum Runtime {
     /// llama.cpp running in-process inside the iOS pipette app.
     LlamacppIosPipette(LlamacppIosPipette),
     MlxMacosPipette(MlxMacosPipette),
+    #[serde(rename = "core_ai_macos_pipette")]
+    AppleCoreAiMacosPipette(AppleCoreAiMacosPipette),
     /// MLX running in-process inside the iOS pipette app (mlx-swift).
     MlxIosPipette(MlxIosPipette),
     DockerVllm(DockerVllm),
@@ -193,6 +198,72 @@ pub struct SourceRepository {
     pub repository_version: NonEmptyString,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct AppleCoreAiMacosPipette {
+    pub packages: CoreAiSwiftStack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CoreAiSwiftStack {
+    pub coreai_models: SourceRepository,
+    pub swift_transformers: SourceRepository,
+    pub xgrammar: SourceRepository,
+    pub swift_jinja: SourceRepository,
+}
+
+impl AppleCoreAiMacosPipette {
+    #[expect(clippy::expect_used, reason = "static nonempty package pin literal")]
+    fn const_pin(value: &'static str) -> NonEmptyString {
+        NonEmptyString::try_new(value.to_owned()).expect("static package pin")
+    }
+    pub fn bundled() -> Self {
+        Self {
+            packages: CoreAiSwiftStack {
+                coreai_models: SourceRepository {
+                    repository_url: RepositoryUrl::new("github.com/apple/coreai-models"),
+                    repository_version: Self::const_pin("27a66f90e7f3fd9b83a6acb7bcb0a4a5ff71fd60"),
+                },
+                swift_transformers: SourceRepository {
+                    repository_url: RepositoryUrl::new("github.com/huggingface/swift-transformers"),
+                    repository_version: Self::const_pin("1.2.0"),
+                },
+                xgrammar: SourceRepository {
+                    repository_url: RepositoryUrl::new("github.com/mlc-ai/xgrammar"),
+                    repository_version: Self::const_pin("0.2.2"),
+                },
+                swift_jinja: SourceRepository {
+                    repository_url: RepositoryUrl::new("github.com/huggingface/swift-jinja"),
+                    repository_version: Self::const_pin("2.3.2"),
+                },
+            },
+        }
+    }
+    pub fn is_bundled(&self) -> bool {
+        *self == Self::bundled()
+    }
+}
+impl Default for AppleCoreAiMacosPipette {
+    fn default() -> Self {
+        Self::bundled()
+    }
+}
+impl std::fmt::Display for AppleCoreAiMacosPipette {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.packages.fmt(f)
+    }
+}
+impl std::fmt::Display for CoreAiSwiftStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "coreai-models={} swift-transformers={} xgrammar={} swift-jinja={}",
+            self.coreai_models, self.swift_transformers, self.xgrammar, self.swift_jinja
+        )
+    }
+}
+
 impl Runtime {
     /// The iOS `headlessrun runtime=<token>` value: the plan's `type` tag.
     pub fn headless_token(&self) -> &'static str {
@@ -201,6 +272,7 @@ impl Runtime {
             Runtime::LlamacppApkPipette(_) => "llamacpp_apk_pipette",
             Runtime::LlamacppIosPipette(_) => "llamacpp_ios_pipette",
             Runtime::MlxMacosPipette(_) => "mlx_macos_pipette",
+            Runtime::AppleCoreAiMacosPipette(_) => "core_ai_macos_pipette",
             Runtime::MlxIosPipette(_) => "mlx_ios_pipette",
             Runtime::DockerVllm(_) => "docker_vllm",
             Runtime::DockerSglang(_) => "docker_sglang",
@@ -230,7 +302,8 @@ impl Runtime {
                 format!("{}:{}", rt.source.repository_version, rt.flavor)
             }
             // The remaining variants' `Display` already is the binary ref form.
-            other @ (Runtime::MlxMacosPipette(_)
+            other @ (Runtime::AppleCoreAiMacosPipette(_)
+            | Runtime::MlxMacosPipette(_)
             | Runtime::MlxIosPipette(_)
             | Runtime::DockerVllm(_)
             | Runtime::DockerSglang(_)
@@ -282,6 +355,7 @@ impl Runtime {
             | Runtime::DockerSglang(_)
             | Runtime::Ovms(_)
             | Runtime::AppleFoundation(_)
+            | Runtime::AppleCoreAiMacosPipette(_)
             | Runtime::TrtEdgellm(_) => None,
         }
     }
@@ -296,6 +370,7 @@ impl std::fmt::Display for Runtime {
             Runtime::LlamacppApkPipette(rt) => rt.fmt(f),
             Runtime::LlamacppIosPipette(rt) => rt.fmt(f),
             Runtime::MlxMacosPipette(rt) => rt.fmt(f),
+            Runtime::AppleCoreAiMacosPipette(rt) => rt.fmt(f),
             Runtime::MlxIosPipette(rt) => rt.fmt(f),
             Runtime::DockerVllm(rt) => rt.fmt(f),
             Runtime::DockerSglang(rt) => rt.fmt(f),
@@ -333,6 +408,9 @@ pub enum RuntimeType {
     LlamacppApkPipette,
     LlamacppIosPipette,
     MlxMacosPipette,
+    #[serde(rename = "core_ai_macos_pipette")]
+    #[strum(serialize = "core_ai_macos_pipette")]
+    AppleCoreAiMacosPipette,
     MlxIosPipette,
     DockerVllm,
     DockerSglang,
@@ -354,6 +432,7 @@ impl RuntimeType {
             Runtime::LlamacppApkPipette(_) => Self::LlamacppApkPipette,
             Runtime::LlamacppIosPipette(_) => Self::LlamacppIosPipette,
             Runtime::MlxMacosPipette(_) => Self::MlxMacosPipette,
+            Runtime::AppleCoreAiMacosPipette(_) => Self::AppleCoreAiMacosPipette,
             Runtime::MlxIosPipette(_) => Self::MlxIosPipette,
             Runtime::DockerVllm(_) => Self::DockerVllm,
             Runtime::DockerSglang(_) => Self::DockerSglang,
@@ -713,6 +792,7 @@ mod tests {
                 flavor: MlxMacosPipetteFlavor::MacosArm64,
                 source: sample_catalog_source()?,
             }),
+            Runtime::AppleCoreAiMacosPipette(AppleCoreAiMacosPipette::bundled()),
             Runtime::MlxIosPipette(MlxIosPipette {
                 packages: MlxSwiftStack {
                     mlx_swift: source_repo("github.com/ml-explore/mlx-swift", "0.25.6")?,
@@ -842,6 +922,7 @@ mod tests {
                 RuntimeType::LlamacppApkPipette => "b1:android-arm64-v8".to_owned(),
                 RuntimeType::LlamacppIosPipette => "b1:ios-arm64".to_owned(),
                 RuntimeType::MlxMacosPipette
+                | RuntimeType::AppleCoreAiMacosPipette
                 | RuntimeType::MlxIosPipette
                 | RuntimeType::DockerVllm
                 | RuntimeType::DockerSglang

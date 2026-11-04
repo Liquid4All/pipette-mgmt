@@ -2,10 +2,12 @@
   // The Overview's Progress (`GET /api/v1/plans/{id}/jobs?all=true`): the cells as
   // `cells.ts` groups them, each row with its jobs by state and their results,
   // under a header that totals them. On a campaign's page, a reader who may name its runtimes and models in the
-  // campaign's organization gets a button under each runtime and model that the organization does not name yet.
+  // campaign's organization gets a button under each runtime and model that has no name in the organization yet: no
+  // name of the organization, and no global name.
   import { untrack, type Snippet } from "svelte";
   import { descriptorNamesByDigest } from "../api";
   import { digestBatches, displayOf, entryOffer, offerReason, type CatalogOrg, type DigestNames } from "../catalog-entry";
+  import { byCatalogName } from "../descriptor-names";
   import { doneOf } from "../format";
   import { cellsWith } from "../jobs";
   import { shortLabel } from "../report";
@@ -24,7 +26,7 @@
   import DescriptorNames from "./DescriptorNames.svelte";
   import TabBar from "./TabBar.svelte";
 
-  let { base, cells, results, again, counted = null, devices = [], ranOn = null, catalogOrg = null }: {
+  let { base, cells, results, again, counted = null, devices = [], ranOn = null, catalogOrg = null, onnamed }: {
     base: TabBase;
     /** The cells to draw: the plan's, or those of the device type picked. */
     cells: { data: Cells | null; error: string };
@@ -40,6 +42,8 @@
     ranOn?: string | null;
     /** The organization where the reader may name the runtimes and models (`catalog_org_id`), with its label. */
     catalogOrg?: CatalogOrg | null;
+    /** After an entry is created or a member is added: read the jobs again, so the other tabs show the new name. */
+    onnamed?: () => void;
   } = $props();
 
   const drawn = $derived(cells.data);
@@ -75,6 +79,18 @@
     const wanted = digests;
     untrack(() => void readNames(org, wanted));
   });
+  /** After a catalog write: the buttons' names at once, and the jobs again for the other tabs. */
+  const afterWrite = async () => {
+    onnamed?.();
+    if (catalogOrg) await readNames(catalogOrg.id, digests);
+  };
+  /** A drawn descriptor's catalog names: the live read's, else the names that came with the jobs. */
+  const nameOf = (descriptor: string, catalog: ReadonlyMap<string, DescriptorDisplay> | undefined,
+                  digestOf: ReadonlyMap<string, string>): DescriptorDisplay | null => {
+    const digest = digestOf.get(descriptor);
+    const live = digest ? digestNames?.get(digest) : undefined;
+    return (live && displayOf(live)) || (catalog?.get(descriptor) ?? null);
+  };
   let entries = $state<ReturnType<typeof CatalogEntryAction>>();
   // The type picked, which the failed jobs' link carries to Jobs, so it lists what the count counts.
   const picked = $derived(devices.find((tab) => tab.current)?.key ?? "");
@@ -96,25 +112,46 @@
   };
 </script>
 
-<!-- Models or runtimes as stored, every one shown: the table ends the page, so it runs its length. What a
-     descriptor reads as goes over it. A model or a runtime with a catalog name shows the name; its descriptor opens
-     in a balloon by it. A runtime or a model that the reader may name has its button under it. -->
+<!-- One model or runtime. A descriptor with a catalog name shows the name, or under its entry's name the member key
+     alone; its descriptor opens in a balloon by it. A descriptor with no name shows as stored, under what it reads as.
+     A runtime or a model that the reader may name has its button under it. -->
+{#snippet label(descriptor: string, kind: DescriptorKind, name: DescriptorDisplay | null, digest: string | undefined,
+                member = false)}
+  {@const offer = catalogOrg ? entryOffer(descriptor, kind, digest, digestNames, catalogOrg.id, drawn?.names ?? {})
+    : null}
+  <CatalogName {name} {member}><DescriptorNames {descriptor} names={drawn?.names ?? {}} /><code
+    class="descriptor">{descriptor}</code></CatalogName>
+  {#if offer === "create"}
+    <div class="entry"><button type="button" aria-haspopup="dialog"
+                               onclick={() => entries?.create(descriptor, kind)}>Create a catalog entry</button></div>
+  {:else if offer}
+    <div class="entry"><button type="button" disabled>Create a catalog entry</button>
+      <span class="muted">{offerReason(offer)}</span></div>
+  {/if}
+{/snippet}
+
+<!-- Models or runtimes, every one shown: the table ends the page, so it runs its length. The named ones come first,
+     by entry name, an entry of several members as its name over their member keys; the unnamed ones follow. -->
 {#snippet labels(list: string[], kind: DescriptorKind, catalog: ReadonlyMap<string, DescriptorDisplay> | undefined,
                  digestOf: ReadonlyMap<string, string>)}
-  {#each list as descriptor (descriptor)}
-    {@const digest = digestOf.get(descriptor)}
-    {@const live = digest ? digestNames?.get(digest) : undefined}
-    {@const offer = catalogOrg ? entryOffer(descriptor, kind, digest, digestNames, catalogOrg.id) : null}
-    <div><CatalogName name={(live && displayOf(live)) || (catalog?.get(descriptor) ?? null)}><DescriptorNames
-      {descriptor} names={drawn?.names ?? {}} /><code class="descriptor">{descriptor}</code></CatalogName>
-      {#if offer === "create"}
-        <div class="entry"><button type="button" aria-haspopup="dialog"
-                                   onclick={() => entries?.create(descriptor, kind)}>Create a catalog entry</button></div>
-      {:else if offer}
-        <div class="entry"><button type="button" disabled>Create a catalog entry</button>
-          <span class="muted">{offerReason(offer, kind)}</span></div>
-      {/if}
-    </div>
+  {@const sorted = byCatalogName(list, (descriptor) => nameOf(descriptor, catalog, digestOf))}
+  {#each sorted.named as group (group.name)}
+    {#if group.members.length > 1}
+      <div><div class="entry-name">{group.name}</div>
+        <ul class="members">
+          {#each group.members as { descriptor, display } (descriptor)}
+            <li>{@render label(descriptor, kind, display, digestOf.get(descriptor), true)}</li>
+          {/each}
+        </ul>
+      </div>
+    {:else}
+      {#each group.members as { descriptor, display } (descriptor)}
+        <div>{@render label(descriptor, kind, display, digestOf.get(descriptor))}</div>
+      {/each}
+    {/if}
+  {/each}
+  {#each sorted.unnamed as descriptor (descriptor)}
+    <div>{@render label(descriptor, kind, null, digestOf.get(descriptor))}</div>
   {/each}
 {/snippet}
 
@@ -198,7 +235,7 @@
 
 <!-- Not "Cells": Jobs lists them one by one. -->
 <h2>Progress</h2>
-{#if catalogOrg}<CatalogEntryAction org={catalogOrg} onnamed={() => readNames(catalogOrg.id, digests)}
+{#if catalogOrg}<CatalogEntryAction org={catalogOrg} onnamed={afterWrite}
                                     bind:this={entries} />{/if}
 {#if devices.length}<TabBar label="Device type" items={devices} sub />{/if}
 {#if ranOn}<p class="muted">{ranOn}</p>{/if}
@@ -282,9 +319,13 @@
   .wide td { white-space: normal; }
   /* Each column as wide as what it holds, the table scrolling sideways. */
   table { width: max-content; min-width: 100%; }
-  /* One whole line per descriptor, so a list of them reads one per line. A named descriptor's balloon wraps it. */
-  .named .list > div > code.descriptor { width: auto; white-space: nowrap; word-break: normal; }
+  /* A descriptor with no name is as wide as its text, and wraps at 44em, so the column holds it. */
+  .named .list > div > code.descriptor { width: max-content; max-width: 44em; }
   .named .list > div + div { margin-top: 2px; }
+  /* An entry's members under its name, with a rule down their left side. */
+  .entry-name { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .members { margin: 1px 0 0 4px; padding: 0 0 0 14px; list-style: none; border-left: 1px solid var(--border-strong); }
+  .members li + li { margin-top: 2px; }
   /* A compact button, so it fits the cell under its runtime or model. */
   .named .entry { margin: 4px 0 2px; font-size: 12px; }
   .named .entry button { padding: 2px 8px; font-size: 11px; }

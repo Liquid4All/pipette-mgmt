@@ -1,0 +1,10 @@
+DROP TABLE queue_maintenance_state;
+DROP TABLE client_liveness;
+DROP TABLE queue_suspensions;
+DROP TABLE queue_reindex_jobs;
+DROP TABLE queue_reindex_requests;
+DROP TABLE queue_lost_leases;
+DROP TABLE queue_denials;
+DROP TABLE queue_eligibility;
+DROP TABLE queue_tmp;
+DROP TABLE queue_jobs;

@@ -61,6 +61,8 @@ main { flex: 1; min-width: 0; padding: 16px 20px 40px; }
   .tree { position: static; max-height: none; border-bottom: 1px solid var(--border); }
   .tree + main { border-left: 0; }
   .tree.folded { display: none; }
+  /* Beside the ID box the email has no room; the menu links the account. */
+  header .jump ~ .who { display: none; }
 }
 footer { padding: 10px 20px; border-top: 1px solid var(--border); color: var(--text-muted);
          font-size: 11px; }
@@ -160,7 +162,7 @@ main [tabindex="-1"]:focus, main[tabindex="-1"]:focus { outline: none; }
 button { padding: 5px 12px; border: 1px solid var(--border); border-radius: var(--radius);
          background: var(--bg); font-size: 12px; cursor: pointer; }
 button:hover { background: var(--hover); border-color: var(--border-strong); }
-button:disabled, button[aria-disabled="true"] { opacity: .55; cursor: default; }
+button:disabled, button[aria-disabled="true"], select:disabled { opacity: .55; cursor: default; }
 /* Its own rule: a selector list fails whole on a browser without it. */
 ::file-selector-button { margin-right: 8px; padding: 5px 12px; border: 1px solid var(--border);
                          border-radius: var(--radius); background: var(--bg); font: inherit;

@@ -47,6 +47,7 @@ pub fn app_responses(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::PlanView>();
     generator.subschema_for::<crate::Named<crate::PlanView>>();
     generator.subschema_for::<crate::Named<crate::PlanJobs>>();
+    generator.subschema_for::<crate::JobPlans>();
     generator.subschema_for::<crate::PlanCancelRequested>();
     generator.subschema_for::<crate::Changed<crate::PlanView>>();
     generator.subschema_for::<crate::Named<crate::ListPage<crate::CampaignView>>>();
@@ -76,6 +77,8 @@ pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::CreateDescriptorEntryRequest>();
     generator.subschema_for::<crate::AddDescriptorMemberRequest>();
     generator.subschema_for::<crate::ChangeDescriptorEntryStateRequest>();
+    generator.subschema_for::<crate::RenameDescriptorEntryRequest>();
+    generator.subschema_for::<crate::RelabelDescriptorMemberRequest>();
     generator.subschema_for::<crate::RegisterUserKeyRequest>();
     generator.subschema_for::<crate::AddUserKeyRequest>();
     generator.subschema_for::<crate::RegisterClerkUserKeyRequest>();

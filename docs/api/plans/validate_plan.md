@@ -86,3 +86,10 @@ the benchmark catalog or the vault answers `500`, its message redacted.
 | 403 | `X-Client-Id` names a device, the user is pending or disabled, or the user holds no `submit_plans`. Before the body is read |
 | 413 | The body is over `plan_body_limit_bytes`. The body is never parsed |
 | 415 | The `Content-Type` is not `application/toml` |
+
+The answer includes `document`: the rewritten plan with the model tokens
+removed, or `null` if expansion fails. Catalog names in `runtimes` resolve in
+the filer's organization and the global catalog. The answer holds an error issue
+for each name that is unknown, tombstoned, or not offered to every admitted
+device. Each such issue gives the line and column if they are known. A hidden
+name adds a warning issue. Validation stores nothing.

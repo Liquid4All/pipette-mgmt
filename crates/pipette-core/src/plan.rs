@@ -164,8 +164,9 @@ pub struct PlanManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sha256: Option<Sha256>,
     /// The digest of the document as submitted, when the store keeps another
-    /// text (a model carried a token, stored as its vault arm). A resend matches
-    /// it; the submitted text is not stored, because it holds the token.
+    /// text: a model carried a token, stored as its vault arm, or a catalog name
+    /// was rewritten to its descriptor. A resend matches it. The submitted text
+    /// is not stored, because it can hold a token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_sha256: Option<Sha256>,
     /// The planner's warnings on the plan document, in order. Empty for a plan
@@ -622,10 +623,18 @@ impl PlanExplanation {
     pub fn headline(&self, detail: FleetDetail) -> String {
         let c = &self.census;
         match self.verdict {
-            SchedulingState::StillCreating => format!(
-                "the plan is still `creating`, so its {} job(s) sit in `todo/tmp/` and no client can see them",
-                c.total
-            ),
+            // The census says where the jobs are: a filing that stopped can
+            // leave them staged, promoted, or leased from before the gate.
+            SchedulingState::StillCreating => {
+                let held = match c.leased {
+                    0 => String::new(),
+                    n => format!(". {n} job(s) hold a lease, which stays valid until it ends"),
+                };
+                format!(
+                    "the plan is still `creating`: its filing is not complete, so this plan makes none of its {} job(s) claimable{held}",
+                    c.total
+                )
+            }
             SchedulingState::CancelPending => {
                 "teardown owns the plan; `queue-maintenance` retires its jobs".to_string()
             }
@@ -1019,6 +1028,35 @@ mod tests {
             report.headline(FleetDetail::Withheld),
             "no client can take a claimable job. Which fleet gate blocks them is withheld: reading it needs read_clients or read_any_clients"
         );
+    }
+
+    /// A filing that stopped partway can leave its jobs staged, in `avail/`,
+    /// and leased. The headline names no queue location, and counts the leases
+    /// that stay valid.
+    #[rstest]
+    #[case::nothing_promoted(0, 0, "this plan makes none of its 5 job(s) claimable")]
+    #[case::mixed(
+        3,
+        2,
+        "this plan makes none of its 5 job(s) claimable. 2 job(s) hold a lease"
+    )]
+    fn creating_headline_agrees_with_the_census(
+        #[case] available: usize,
+        #[case] leased: usize,
+        #[case] expected: &str,
+    ) {
+        let mut report = starved_report(&[], 0);
+        report.verdict = SchedulingState::StillCreating;
+        report.census.total = 5;
+        report.census.available = available;
+        report.census.claimable = available;
+        report.census.indexed = available;
+        report.census.leased = leased;
+        let headline = report.headline(FleetDetail::Full);
+        assert!(headline.contains(expected), "{headline}");
+        assert!(headline.contains("filing is not complete"), "{headline}");
+        assert!(!headline.contains("todo/tmp"), "{headline}");
+        assert_eq!(headline.contains("lease"), leased > 0, "{headline}");
     }
 
     /// A scan that read no body says so and asks for a re-run, rather than state

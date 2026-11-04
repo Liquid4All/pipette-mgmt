@@ -118,6 +118,7 @@ fn vault_resource_ids(model: &Model) -> Vec<&VaultResourceId> {
             | GgufVisionSpeculativeSource::Url { .. } => vec![],
         },
         Model::Mlx(m) => archive_path(&m.source).into_iter().collect(),
+        Model::AppleCoreAi(m) => archive_path(&m.source).into_iter().collect(),
         Model::Torch(m) => archive_path(&m.source).into_iter().collect(),
         Model::Openvino(m) => archive_path(&m.source).into_iter().collect(),
         Model::OnnxGenai(m) => archive_path(&m.source).into_iter().collect(),
@@ -176,6 +177,10 @@ fn aliased(model: Model, origins: &HashMap<VaultResourceId, VaultOrigin>) -> Opt
                 };
             }
             Model::GgufVisionSpeculative(m)
+        }
+        Model::AppleCoreAi(mut m) => {
+            m.source = aliased_source(origins, &m.source)?;
+            Model::AppleCoreAi(m)
         }
         Model::Mlx(mut m) => {
             m.source = aliased_source(origins, &m.source)?;

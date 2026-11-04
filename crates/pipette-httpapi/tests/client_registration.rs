@@ -878,11 +878,12 @@ async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()>
     // Indexed before either client exists, so only the reindex a registration
     // flags can offer it.
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"requires": ["tag:lab"]}),
-    )?;
+    )
+    .await?;
     run_qm(&state).await?;
 
     let mut p = key_params(ClientPreauthUsage::SingleUse);

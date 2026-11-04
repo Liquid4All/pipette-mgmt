@@ -825,7 +825,10 @@ async fn test_the_first_sign_in_surfaces_the_keys_held_before_it(
                     prior_keys.into_iter().map(|key| key.key_id).collect(),
                     event.targets,
                 )),
-                AuditAction::Http { .. } | AuditAction::Cli { .. } => None,
+                AuditAction::Http { .. }
+                | AuditAction::Cli { .. }
+                | AuditAction::CatalogRename { .. }
+                | AuditAction::CatalogMerge { .. } => None,
             })
             .collect()
     };
