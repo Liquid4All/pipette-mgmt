@@ -12,9 +12,10 @@ use pipette_core::client::{Client, ClientStatus};
 use pipette_plan_types::{ClientId, ExpiresAt, NonEmptyTrimmedString, Tag, UserPermission};
 use pipette_store::{ClaimResult, drain_clients, purge_client_todo_state};
 use pipette_web_testkit::{
-    auth_headers, authed_get, authed_patch, authed_post, authed_user_get, body_json,
-    denied_clients, job, json_str, make_state, raw_request, register_and_approve, register_pending,
-    registered_user, seed_avail, setup_benchmarks, signed_empty, signed_json, unauthed_post,
+    QueueBackend, approved_queue_client, auth_headers, authed_get, authed_patch, authed_post,
+    authed_user_get, body_json, denied_clients, job, json_str, make_state, raw_request,
+    register_and_approve, register_pending, registered_user, seed_avail, setup_benchmarks,
+    signed_empty, signed_json, unauthed_post,
 };
 
 #[tokio::test]
@@ -299,15 +300,21 @@ async fn test_get_me_returns_every_field_registration_stored() -> anyhow::Result
     Ok(())
 }
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_patch_device_field_queues_reindex() -> anyhow::Result<()> {
+async fn test_patch_device_field_queues_reindex(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (sk, client_id) = register_and_approve(&state).await?;
+    let Some((queue, sk, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
     let resp = authed_patch(
-        &state,
+        state,
         &sk,
         &client_id,
         "/clients/me",
@@ -335,7 +342,7 @@ async fn test_patch_device_field_queues_reindex() -> anyhow::Result<()> {
     assert_ne!(keys[0], keys[1]);
 
     // GET /clients/me surfaces the same signal while the flag is up.
-    let resp = authed_get(&state, &sk, &client_id, "/clients/me").await?;
+    let resp = authed_get(state, &sk, &client_id, "/clients/me").await?;
     assert_eq!(body_json(resp).await?["reindex_pending"], true);
     Ok(())
 }
@@ -350,11 +357,12 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"job_id": "job-1"}),
-    )?;
+    )
+    .await?;
     let claimed = state
         .todo_store
         .claim_job(
@@ -366,7 +374,7 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
 
-    // A regular file where the flag directory belongs fails the flag write.
+    // A regular file at the flag directory path makes the `local_fs` flag write fail.
     let flags = dir.path().join("todo").join("pending-reindex");
     std::fs::remove_dir_all(&flags)?;
     std::fs::write(&flags, b"not a directory")?;
@@ -1142,11 +1150,12 @@ async fn test_patch_profile_relinquishes_leases(
     let (sk, client_id) = register_and_approve(&state).await?;
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"job_id": "job-1"}),
-    )?;
+    )
+    .await?;
     let claimed = state
         .todo_store
         .claim_job(
@@ -1231,11 +1240,12 @@ async fn test_patch_resending_the_stored_profile_keeps_leases_and_queues_nothing
     }
 
     let job = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"job_id": "job-1"}),
-    )?;
+    )
+    .await?;
     let claimed = state
         .todo_store
         .claim_job(

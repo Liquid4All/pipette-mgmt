@@ -41,6 +41,9 @@ files nothing**, unless `carry_earlier` or `inherit_from` is set. The route answ
 campaign record and `"changed": false`, as a rename to the current name does
 ([`PATCH /api/v1/campaigns/{campaign_id}`](update_campaign.md)). The campaign stays on its plan, and
 the plan is not cancelled. To run jobs again, use a [re-run](rerun_jobs.md).
+A catalog name in the document keeps the meaning that it had at filing. To use
+a changed catalog entry, change the name in the text, for example add a
+`::flavor`.
 
 **A retry is safe.** If the campaign has moved off `base_plan_id` onto the
 revision of that plan filed from this very document, the request is a retry
@@ -60,7 +63,9 @@ what became of the replaced
 plan's jobs, and the report on the revision. A dry run answers `200` with the
 dry-run body of a variant edit: the jobs, the `document`, and which of the
 replaced plan's jobs it would keep and stop. It files nothing, and neither
-moves the campaign nor cancels its plan. To check a document as it is edited,
+moves the campaign nor cancels its plan. A dry run of the document the plan was
+filed from expands the stored document, as filing it files nothing. It resolves
+no catalog name again. To check a document as it is edited,
 without a base plan, use [`POST /api/v1/plans/validate`](../plans/validate_plan.md).
 
 The [console app](../../../ui/README.md#pages) draws the same revision as a
@@ -94,3 +99,7 @@ The route also answers the errors every filing answers
 | 415 | The `Content-Type` is not `application/toml` |
 | 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |
 | 502 | HuggingFace failed during an import, as [the filing errors](../campaigns.md#errors) describe |
+
+A `runtimes` entry can be a catalog name.
+[Catalog names](../campaigns.md#catalog-names) describes how the server resolves
+it, and what the `document` of the answer holds.

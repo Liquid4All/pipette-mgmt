@@ -345,8 +345,14 @@ impl CampaignCreator {
         note: Option<NonEmptyTrimmedString>,
         text: String,
     ) -> Result<DryRunReport, AppError> {
-        let plan =
-            crate::api_v1::plans::expand_document(state, &self.scope, note.as_ref(), text).await?;
+        let plan = crate::api_v1::plans::expand_document(
+            state,
+            &self.scope,
+            self.new.owner(),
+            note.as_ref(),
+            text,
+        )
+        .await?;
         let dry_run =
             crate::api_v1::plans::dry_run_plan(state, &self.scope, self.new.owner(), note, plan)
                 .await?;
@@ -362,8 +368,14 @@ impl CampaignCreator {
         text: String,
         progress: Progress,
     ) -> Result<(Campaign, PlanFiled), AppError> {
-        let plan =
-            crate::api_v1::plans::expand_document(state, &self.scope, note.as_ref(), text).await?;
+        let plan = crate::api_v1::plans::expand_document(
+            state,
+            &self.scope,
+            self.new.owner(),
+            note.as_ref(),
+            text,
+        )
+        .await?;
         let Self {
             user,
             new,
@@ -549,8 +561,14 @@ pub async fn file_plan(
     let held = audit.clone();
     let file = move |progress: Progress| async move {
         let scope = crate::api_v1::plans::plan_scope(&state, &user, &rights).await?;
-        let plan =
-            crate::api_v1::plans::expand_document(&state, &scope, note.as_ref(), text).await?;
+        let plan = crate::api_v1::plans::expand_document(
+            &state,
+            &scope,
+            &campaign.owner,
+            note.as_ref(),
+            text,
+        )
+        .await?;
         if dry_run {
             let dry_run =
                 crate::api_v1::plans::dry_run_plan(&state, &scope, &campaign.owner, note, plan)
@@ -743,7 +761,7 @@ pub async fn revise_document(
         };
         Ok::<_, AppError>((StatusCode::CREATED, RevisionAnswer::Revised(revised)))
     };
-    progress_stream::answer(stream, held, revise).await
+    Box::pin(progress_stream::answer(stream, held, revise)).await
 }
 
 /// What a revision offers beside the head: the campaign's earlier plans and each
@@ -1266,16 +1284,28 @@ impl Filer {
         revision: Revision,
         note: Option<NonEmptyTrimmedString>,
     ) -> Result<RevisionDryRun, AppError> {
+        // Filing the head's own document files nothing, so its dry run expands
+        // the stored document, which resolves no catalog name again.
+        let unchanged = revision.changes_nothing();
+        let document = if unchanged {
+            revision.head_document()
+        } else {
+            revision.document()
+        };
         let plan = crate::api_v1::plans::expand_document(
             state,
             &self.scope,
+            revision.owner(),
             note.as_ref(),
-            revision.document().into(),
+            document.into(),
         )
         .await?;
-        if revision.changes_nothing() {
-            return RevisionDryRun::unchanged(revision.document(), &plan.jobs, plan.plan_warnings)
-                .map_err(|e| AppError::internal(anyhow::Error::new(e)));
+        if unchanged {
+            return Ok(RevisionDryRun::unchanged(
+                plan.source.text().to_owned(),
+                &plan.jobs,
+                plan.plan_warnings,
+            ));
         }
         let membership = revision
             .membership(state.plan_store.as_ref())
@@ -1295,8 +1325,7 @@ impl Filer {
                 state.org_store.as_ref(),
             )
             .await?;
-        RevisionDryRun::new(revision.document(), report, preview)
-            .map_err(|e| AppError::internal(anyhow::Error::new(e)))
+        Ok(RevisionDryRun::new(report, preview))
     }
 
     /// File `revision`, advance the campaign onto it, and cancel the head.
@@ -1310,6 +1339,7 @@ impl Filer {
         let plan = crate::api_v1::plans::expand_document(
             state,
             &self.scope,
+            revision.owner(),
             note.as_ref(),
             revision.document().into(),
         )

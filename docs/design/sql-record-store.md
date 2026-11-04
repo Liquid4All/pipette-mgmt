@@ -1,12 +1,14 @@
-# Design: records on PostgreSQL, the queue and the results on S3
+# Design: records on PostgreSQL, the results on S3
 
 The records that mgmt keeps (identities, organizations, tags, plans, campaigns,
 vault records) live on PostgreSQL, not on the object store. Production uses a
 managed PostgreSQL instance, and development and tests use any PostgreSQL.
 
-The job queue, the submissions, the warehouse that pipette-duckdb queries, and
-every blob stay in the object store. The store traits do not change, so nothing
-above `pipette-store-init` knows which backend a record came from.
+The submissions, the warehouse that pipette-duckdb queries, and every blob stay
+in the object store. The job queue is on the object store until the cutover in
+[sql-job-queue.md](sql-job-queue.md) moves it to `[database]`. The store traits
+do not change, so nothing above `pipette-store-init` knows which backend a
+record came from.
 [storage.md §2](../storage.md#2-logical-layout-and-invariants) describes the
 keyspaces that this design replaces. `Config::database` in
 [`crates/pipette-core/src/config.rs`](../../crates/pipette-core/src/config.rs)
@@ -35,23 +37,29 @@ is the cost of that work. The contract has these costs:
 - **A listing costs one HTTP GET request for each record.** The command
   `queue-maintenance` reads every plan manifest each minute.
 
-None of that is true of the queue or the results. The claim of the queue is an
-atomic rename that S3 Express does well. The warehouse is append-only Parquet
-that DuckDB scans in place. Those are object-store workloads, and they stay in
-the object store.
+None of that is true of the results. The warehouse is append-only Parquet that
+DuckDB scans in place. That is an object-store workload, and it stays in the
+object store.
+
+The job queue has every cost above. The claim of a job is an atomic rename, and
+S3 Express does a rename well. But each claim and each `queue-maintenance` run
+lists whole keyspaces. Nothing in `todo/` names a plan. Each transition that
+touches more than one key needs a manual crash-safe order. So the queue moves
+too, and [sql-job-queue.md](sql-job-queue.md) is that design.
 
 ## The split
 
 | Stays on object storage | Moves to `[database]` |
 |---|---|
-| `todo/`, the job queue (`[todo_storage]`) | clients, their permissions, pre-auth keys, signature migrations |
-| `submissions/`: incoming, score queue, processed archive, runtime output, unverified | users, email claims, user keys, permissions, pre-auth keys, awaiting-sign-in |
-| `warehouse/results/` and `warehouse/eval_sample_results/` (Parquet, read by pipette-duckdb) | `public-key-index/` |
-| `vault-resources/` and `vault-staging/` (blobs) | orgs, slug claims, memberships, ownerships, tags |
-| `dataset-cache/` | `org-benchmarks/` |
-| `benchmarks/` (deployed with the server) | plans, cancel markers, plan sources, content keys, job-plan markers, job sources, job-plan links |
-| `locks/` (the mutate and score-eval leases) | campaigns, vault records, vault imports |
+| `submissions/`: incoming, score queue, processed archive, runtime output, unverified | clients, their permissions, pre-auth keys, signature migrations |
+| `warehouse/results/` and `warehouse/eval_sample_results/` (Parquet, read by pipette-duckdb) | users, email claims, user keys, permissions, pre-auth keys, awaiting-sign-in |
+| `vault-resources/` and `vault-staging/` (blobs) | `public-key-index/` |
+| `dataset-cache/` | orgs, slug claims, memberships, ownerships, tags |
+| `benchmarks/` (deployed with the server) | `org-benchmarks/` |
+| `locks/` (the mutate and score-eval leases) | plans, cancel markers, plan sources, content keys, job-plan markers, job sources, job-plan links |
+| | campaigns, vault records, vault imports |
 | | an index of the outcome of each submission |
+| | `todo/`, the job queue (`[todo_storage]`), at the cutover in [sql-job-queue.md](sql-job-queue.md) |
 
 Submissions stay because they are bodies and not records. The completions of an
 eval submission reach megabytes in size. The state of a submission is the queue

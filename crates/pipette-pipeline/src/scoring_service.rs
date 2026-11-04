@@ -206,8 +206,8 @@ pub async fn score(
 }
 
 /// `GET /evals/{eval_id}/datasets/{dataset_name}/samples`: a text eval's
-/// prompts. A vlm_eval's reach a client as a corpus, packed by
-/// `dataset-cache` from the same route with its prompt profile.
+/// prompts. A vlm_eval's reach a client as a corpus, which the scoring
+/// service packs itself.
 pub async fn fetch_samples(
     http_client: &reqwest::Client,
     base_url: &str,

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
-  ApiError, STREAM_CUT, addOrgDescriptorMember, createCampaign, createModelParams, deleteModelParams, onUnauthorized,
-  deviceCatalog, globalCatalog, globalCatalogEntry, orgDescriptorEntries, orgs, revokeUserKey, updateModelParams,
+  ApiError, STREAM_CUT, addOrgDescriptorMember, catalogEntries, catalogEntry, changeOrgDescriptorEntryState,
+  createCampaign, createModelParams, deleteModelParams, deviceCatalog, jobPlans, onUnauthorized, orgDescriptorEntries, orgs,
+  relabelOrgDescriptorMember, renameOrgDescriptorEntry, revokeUserKey, updateModelParams,
   type IngestProgress, type Signer,
 } from "../src/lib/api";
 import { generateKey } from "../src/lib/keys";
@@ -48,6 +49,20 @@ describe("a model-params row", () => {
   });
 });
 
+describe("a job's plans", () => {
+  test("a dot segment, which the URL parser would drop from the path, is refused as the route refuses a bad id, unsent", async () => {
+    const key = await generateKey();
+    const signer: Signer = { key_id: key.key_id, privateKey: key.privateKey, user_id: "user_x" };
+    const fetched = vi.fn(async () => new Response(JSON.stringify({ fleet_detail: "full", plans: [], body: null }), { status: 200 }));
+    vi.stubGlobal("fetch", fetched);
+
+    await jobPlans(signer, "job-1");
+    await expect(jobPlans(signer, "..")).rejects.toThrow("400: job_id contains invalid character '.'");
+    await expect(jobPlans(signer, ".")).rejects.toThrow("400: job_id contains invalid character '.'");
+    expect(fetched.mock.calls.map((call: unknown[]) => call[0])).toEqual(["/api/v1/jobs/job-1/plans"]);
+  });
+});
+
 describe("an org catalog entry", () => {
   test("the entries of an organization are read page by page, and a member is added at the entry's path", async () => {
     const key = await generateKey();
@@ -79,7 +94,7 @@ describe("an org catalog entry", () => {
   });
 });
 
-describe("the global catalog", () => {
+describe("the catalog pages", () => {
   test("the list and name lookup use read routes, with counts only on the name lookup", async () => {
     const key = await generateKey();
     const signer: Signer = { key_id: key.key_id, privateKey: key.privateKey, user_id: "user_x" };
@@ -87,14 +102,36 @@ describe("the global catalog", () => {
       next_cursor: null, unreadable: 0 }), { status: 200 }));
     vi.stubGlobal("fetch", fetched);
 
-    await globalCatalog(signer, "scope=global&descriptor_kind=runtime&state=active%2Cpinned");
-    await globalCatalogEntry(signer, "My.Build-1", false);
-    await globalCatalogEntry(signer, "My.Build-1", true);
+    await catalogEntries(signer, "descriptor_kind=runtime&state=active%2Cpinned");
+    await catalogEntry(signer, "My.Build-1", false);
+    await catalogEntry(signer, "global/My.Build-1", true);
     expect(fetched.mock.calls.map((call: unknown[]) => call[0])).toEqual([
-      "/api/v1/descriptor-catalog?scope=global&descriptor_kind=runtime&state=active%2Cpinned",
-      "/api/v1/descriptor-catalog/names?names=global%2FMy.Build-1",
-      "/api/v1/descriptor-catalog/names?names=global%2FMy.Build-1&offer_counts=true",
+      "/api/v1/descriptor-catalog?descriptor_kind=runtime&state=active%2Cpinned",
+      "/api/v1/descriptor-catalog/names?names=My.Build-1",
+      "/api/v1/descriptor-catalog/names?names=global%2FMy.Build-1&offer_counts=true&evidence=true",
     ]);
+  });
+
+  test("the org entry writes post to the entry's routes with the stored name", async () => {
+    const key = await generateKey();
+    const signer: Signer = { key_id: key.key_id, privateKey: key.privateKey, user_id: "user_x" };
+    const fetched = vi.fn(async (path: string, _init: RequestInit) => path.endsWith("/rename")
+      ? new Response(JSON.stringify({ name: "AcmeLM", display_name: "AcmeLM", scope: "org_acme" }),
+          { status: 200, headers: { "content-type": "application/json" } })
+      : new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetched);
+
+    await changeOrgDescriptorEntryState(signer, "org_acme", "acme lm", { action: "tombstone", confirmation: "acme lm" });
+    expect((await renameOrgDescriptorEntry(signer, "org_acme", "acme lm", { name: "AcmeLM" }))
+      .display_name).toBe("AcmeLM");
+    await relabelOrgDescriptorMember(signer, "org_acme", "acme lm", { format: "gguf", from: "f16_q4_0", to: "q4_0" });
+    expect(fetched.mock.calls.map(([path, init]) => [`${init.method} ${path}`, JSON.parse(String(init.body))]))
+      .toEqual([
+        ["POST /api/v1/orgs/org_acme/descriptor-catalog/acme%20lm/state", { action: "tombstone", confirmation: "acme lm" }],
+        ["POST /api/v1/orgs/org_acme/descriptor-catalog/acme%20lm/rename", { name: "AcmeLM" }],
+        ["POST /api/v1/orgs/org_acme/descriptor-catalog/acme%20lm/members/relabel",
+         { format: "gguf", from: "f16_q4_0", to: "q4_0" }],
+      ]);
   });
 
   test("a device's short list reads the device route", async () => {

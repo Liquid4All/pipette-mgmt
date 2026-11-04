@@ -1,0 +1,6 @@
+# Requires an existing global catalog member with this name and flavor.
+benchmarks = ["decode_throughput_512_100"]
+[[variants]]
+requires = ["os:macos"]
+models = [{ type = "gguf_text", source = "huggingface", org = "acme", repo_name = "example", path = "example.gguf" }]
+runtimes = ["global/llamacpp-example::macos-arm64"]

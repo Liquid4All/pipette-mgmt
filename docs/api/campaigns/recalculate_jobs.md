@@ -26,7 +26,7 @@ recalculate: the copy is scored by the scorer that runs now.
 | Field | Required | Description |
 |---|---|---|
 | `job_ids` | one of the two | Jobs of the plan the campaign runs, as [`GET /api/v1/plans/{plan_id}/jobs`](../plans/list_plan_jobs.md) lists them. Each must be an eval that **finished**. A job named twice is recalculated once |
-| `all_evals` | one of the two | `true` recalculates every job of the plan whose record holds completions to score again; `false` is no selector. Needs `base_plan_id` |
+| `all_evals` | one of the two | `true` recalculates every finished job of the plan whose benchmark the server scores (an eval, a VLM eval or an ASR eval); `false` is no selector. Needs `base_plan_id` |
 | `note` | no | The note for the revision, as [the request body of a filing](../campaigns.md#request-body) describes. The server records the change that the revision makes in `change` |
 
 | Query parameter | Required | Description |
@@ -35,7 +35,11 @@ recalculate: the copy is scored by the scorer that runs now.
 | `dry_run` | no | `true` runs every check below and expands the document, and files nothing. Not with `all_evals` |
 
 A job that failed is refused, and so is one of a benchmark other than an eval:
-neither recorded completions to score again. A job with no result yet is
+neither recorded completions to score again. The check reads the job's outcome
+and the benchmark it was filed under, not its record. A finished job whose
+record is not an eval's success passes the check, and its copy fails: the
+request answers `500` and leaves a revision in `creating` that maintenance tears
+down. A job with no result yet is
 refused as a re-run refuses it. The rest of the rules are the re-run's:
 `base_plan_id` as there, a job the plan does not hold is refused, and a
 document that now expands to other cells is refused.

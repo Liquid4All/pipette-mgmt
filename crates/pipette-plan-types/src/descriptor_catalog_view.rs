@@ -160,6 +160,52 @@ pub struct DescriptorMemberView {
     /// when the table has no such row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<DescriptorMemberParameters>,
+    /// What happened when this member ran. The evidence never selects an
+    /// entry. The server includes it on the short list, and on a name lookup
+    /// that asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<DescriptorMemberEvidence>,
+}
+
+/// The run evidence of one member. A run can fail because of the model or the
+/// benchmark, so a success suggests that a build works and does not prove it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct DescriptorMemberEvidence {
+    /// The runs on the device that the short list names. The field is absent
+    /// outside the short list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub this_device: Option<ClientRunEvidence>,
+    /// Weaker evidence: the runs on every device. A success on other hardware
+    /// says little about this device.
+    pub any_device: AnyClientRunEvidence,
+}
+
+/// The last success and the last failure of a member on one device.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct ClientRunEvidence {
+    pub last_success: Option<RunMark>,
+    pub last_failure: Option<RunMark>,
+}
+
+/// Weaker evidence: the successes of a member on every device.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct AnyClientRunEvidence {
+    /// The time of the last success on any device.
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// The number of devices with at least one success.
+    pub devices_with_success: usize,
+}
+
+/// One run: the time that the device submitted it, and the client version that
+/// ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct RunMark {
+    pub at: DateTime<Utc>,
+    pub client_version: Option<String>,
 }
 
 /// A model member's parameter counts, in millions.
@@ -197,8 +243,8 @@ pub struct DescriptorEntryListRow {
     pub members: Option<Vec<DescriptorMemberView>>,
 }
 
-/// One catalog entry offered to a named device. Run evidence can be added to
-/// this item without changing the full catalog's entry view.
+/// One catalog entry offered to a named device. Each member carries its run
+/// evidence on this device.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DescriptorCatalogShortListItem {
@@ -213,6 +259,8 @@ pub struct DescriptorCatalogShortListItem {
 }
 
 /// Why one member of a pinned or active entry was not offered to the device.
+/// `no_build` applies to a runtime that the iOS app builds in: the device
+/// meets the offer rule but does not report the member's build flag.
 /// `no_runtime` applies to a model member: no runtime member offered to the
 /// device can load it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +270,7 @@ pub enum DescriptorWithheldReasonCode {
     NoRule,
     Unsupported,
     NotMet,
+    NoBuild,
     NoRuntime,
 }
 
@@ -379,6 +428,11 @@ pub struct DescriptorNameQuery {
     /// only when this option is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offer_counts: Option<bool>,
+    /// Give each member its run evidence on every device. The server reads
+    /// the evidence only when this option is true, and only for a caller who
+    /// can read the fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<bool>,
 }
 
 /// One name of a name lookup, with the text that the caller wrote.

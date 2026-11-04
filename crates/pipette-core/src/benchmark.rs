@@ -1802,8 +1802,8 @@ parameter_sample_count = 1500
 parameter_max_tokens = 8192
 "#;
 
-    /// The evals server's MMStar samples for `profile`, as `dataset-cache pins`
-    /// prints them.
+    /// The evals server's MMStar samples for `profile`, as an operator pins
+    /// them from the scores service's index.
     fn vlm_eval_dataset(profile: Option<&str>) -> String {
         let profile = profile.map_or(String::new(), |p| format!("prompt_profile = \"{p}\"\n"));
         format!(

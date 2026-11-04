@@ -38,7 +38,8 @@ const CLAIMED: &str = "0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e";
 /// The public example catalog, `acme` keeping [`PRIVATE`], and `labs`
 /// keeping nothing.
 struct World {
-    dir: TempDir,
+    /// Owns the directory the state's stores use, so it outlives the test.
+    _dir: TempDir,
     state: AppState,
     acme: OrgId,
     labs: OrgId,
@@ -61,7 +62,7 @@ async fn world_holding(holding: bool) -> anyhow::Result<World> {
         .put_org_benchmark(&acme, &an_org_benchmark()?)
         .await?;
     Ok(World {
-        dir,
+        _dir: dir,
         state,
         acme,
         labs,
@@ -116,14 +117,14 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 }
 
 /// Plant a live lease for `client_id` on a job that runs `benchmark_id`.
-fn lease(world: &World, client_id: &ClientId, benchmark_id: &str) -> anyhow::Result<JobId> {
+async fn lease(world: &World, client_id: &ClientId, benchmark_id: &str) -> anyhow::Result<JobId> {
     let body = json!({
         "job_id": CLAIMED,
         "expires_at": "never",
         "clients": [client_id.as_str(), "ev1_member"],
         "spec": spec(benchmark_id),
     });
-    seed_leased(world.dir.path(), CLAIMED, client_id, &body)
+    seed_leased(world.state.todo_store.as_ref(), CLAIMED, client_id, &body).await
 }
 
 fn failure(retriable: bool) -> Value {
@@ -316,7 +317,7 @@ async fn an_outsider_hands_back_a_claimed_private_job(
 ) -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, owner).await?;
-    let job = lease(&world, &client_id, PRIVATE)?;
+    let job = lease(&world, &client_id, PRIVATE).await?;
 
     let refused = submit(&world.state, &key, &client_id, route, failure(true)).await?;
     assert_eq!(refused, None);
@@ -345,7 +346,7 @@ async fn an_outsider_cannot_report_a_result_on_its_private_claim(
 ) -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, owner).await?;
-    let job = lease(&world, &client_id, PRIVATE)?;
+    let job = lease(&world, &client_id, PRIVATE).await?;
     let mut body = valid_submission(PRIVATE);
     body["job_id"] = json!(CLAIMED);
 
@@ -379,7 +380,7 @@ async fn a_claimant_records_a_terminal_failure(
 ) -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, owner).await?;
-    let job = lease(&world, &client_id, PRIVATE)?;
+    let job = lease(&world, &client_id, PRIVATE).await?;
 
     let refused = submit(&world.state, &key, &client_id, route, failure(false)).await?;
     assert_eq!(refused, None);
@@ -423,7 +424,7 @@ async fn an_outsider_declaring_params_learns_nothing(
 ) -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, owner).await?;
-    let job = lease(&world, &client_id, PRIVATE)?;
+    let job = lease(&world, &client_id, PRIVATE).await?;
     let mut failure = failure_declaring_wrong_params(true);
     failure["benchmark_params"] = benchmark_params;
 
@@ -461,7 +462,7 @@ async fn a_member_declares_the_pair_v2_serves_it(
 async fn a_member_declaring_wrong_params_is_refused() -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, Owner::Acme).await?;
-    let job = lease(&world, &client_id, PRIVATE)?;
+    let job = lease(&world, &client_id, PRIVATE).await?;
 
     let refused = submit(
         &world.state,
@@ -494,7 +495,7 @@ async fn an_outsider_without_the_claim_learns_nothing(
     let world = world().await?;
     let (key, client_id) = device(&world, Owner::Nobody).await?;
     if let Some(benchmark_id) = leased {
-        lease(&world, &client_id, benchmark_id)?;
+        lease(&world, &client_id, benchmark_id).await?;
     }
 
     let refused = submit(&world.state, &key, &client_id, route, failure(true)).await?;
@@ -732,7 +733,7 @@ async fn private_results_are_scored() -> anyhow::Result<()> {
     let world = world().await?;
     let (key, client_id) = device(&world, Owner::Acme).await?;
     let (outsider_key, outsider) = device(&world, Owner::Nobody).await?;
-    let failed = lease(&world, &outsider, PRIVATE)?;
+    let failed = lease(&world, &outsider, PRIVATE).await?;
 
     let resp = authed_post(
         &world.state,
@@ -778,7 +779,13 @@ async fn an_expired_private_job_gets_a_synthetic_failure() -> anyhow::Result<()>
         .single()
         .context("a valid date")?;
     let body = json!({"job_id": "job-1", "clients": ["ev1_member"], "spec": spec(PRIVATE)});
-    let expired = seed_avail(world.dir.path(), "job-1", ExpiresAt::At(deadline), &body)?;
+    let expired = seed_avail(
+        world.state.todo_store.as_ref(),
+        "job-1",
+        ExpiresAt::At(deadline),
+        &body,
+    )
+    .await?;
 
     run_qm(&world.state).await?;
 

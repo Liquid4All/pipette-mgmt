@@ -26,6 +26,8 @@ use crate::submission::without_auth_tokens;
 /// the planner's warnings.
 #[derive(Debug)]
 pub struct ExpandedDocument {
+    pub submitted_sha256: pipette_plan_types::Sha256,
+    pub resolved: Vec<crate::plan_names::ResolvedName>,
     /// The job bodies, in the planner's order.
     pub jobs: Vec<Value>,
     /// The document as submitted, with its digest. Ingestion stores it through
@@ -42,6 +44,8 @@ pub struct ExpandedDocument {
 /// tells the author's faults from the server's.
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
+    #[error(transparent)]
+    Names(#[from] crate::plan_names::PlanNameError),
     /// The document is not a valid scheduler plan, or a `runtime_flags` entry
     /// sets a HuggingFace token variable to a value.
     #[error(transparent)]
@@ -70,6 +74,7 @@ pub enum DocumentError {
 impl DocumentError {
     pub fn is_caller_fault(&self) -> bool {
         match self {
+            Self::Names(e) => e.is_caller_fault(),
             Self::Parse(_)
             | Self::Count(_)
             | Self::TooManyJobs { .. }
@@ -100,6 +105,26 @@ pub fn retyped<'a>(
         let loaded = catalog.get(id).map(|b| b.def.benchmark_type());
         (loaded != Some(*expanded)).then_some(id)
     })
+}
+
+/// Resolve the catalog names of a plan document for `owner`, then expand it as
+/// [`expand_document`] does. The planner's warnings and the warnings of the
+/// names are both the plan's.
+pub async fn expand_named(
+    ctx: &IngestContext<'_>,
+    owner: &VaultOwner,
+    note: Option<&str>,
+    text: String,
+) -> Result<ExpandedDocument, DocumentError> {
+    let named = Box::pin(crate::plan_names::resolve_names(ctx, owner, text)).await?;
+    let types = benchmark_types(ctx.catalog);
+    let mut expanded = expand_document(ctx.max_jobs, types, note, named.text).await?;
+    expanded
+        .plan_warnings
+        .extend(named.warnings.into_iter().map(|warning| warning.message));
+    expanded.resolved = named.resolved;
+    expanded.submitted_sha256 = named.submitted_sha256;
+    Ok(expanded)
 }
 
 /// Parse and expand a plan document. A few KB can expand to thousands of
@@ -142,6 +167,8 @@ fn expand_document_blocking(
         .filter_map(|id| Some((id.clone(), *types.get(&id)?)))
         .collect();
     Ok(ExpandedDocument {
+        submitted_sha256: source.sha256().clone(),
+        resolved: Vec::new(),
         jobs: expansion.bodies,
         source,
         benchmark_types,
@@ -179,7 +206,10 @@ fn log_refusal(error: &DocumentError) {
         DocumentError::Expand(_) => {
             tracing::warn!(error = %chain(error), "plan document rejected: expansion failed");
         }
-        DocumentError::Stored(_) | DocumentError::Digest(_) | DocumentError::Join(_) => {}
+        DocumentError::Names(_)
+        | DocumentError::Stored(_)
+        | DocumentError::Digest(_)
+        | DocumentError::Join(_) => {}
     }
 }
 
@@ -232,6 +262,7 @@ pub fn index_labels(jobs: Vec<Value>) -> Vec<(String, Value)> {
 /// The answer to a dry run of a plan document.
 #[derive(Debug, serde::Serialize)]
 pub struct DryRunReport {
+    pub document: String,
     /// The job bodies, each without any `auth_token`. A gated model is its
     /// HuggingFace form.
     pub bodies: Vec<Value>,
@@ -243,6 +274,7 @@ pub struct DryRunReport {
 impl From<DryRunReport> for pipette_plan_types::PlanDryRun {
     fn from(report: DryRunReport) -> Self {
         Self {
+            document: report.document,
             bodies: report.bodies,
             plan_warnings: report.plan_warnings,
             imports: report.imports,
@@ -251,9 +283,11 @@ impl From<DryRunReport> for pipette_plan_types::PlanDryRun {
 }
 
 impl DryRunReport {
-    /// The report on `jobs` with no checks and no import.
-    pub fn unchecked(jobs: &[Value], plan_warnings: Vec<String>) -> Self {
+    /// The report on `document`, which holds no token and expands to `jobs`,
+    /// with no checks and no import.
+    pub fn unchecked(document: String, jobs: &[Value], plan_warnings: Vec<String>) -> Self {
         Self {
+            document,
             bodies: jobs.iter().map(without_auth_tokens).collect(),
             plan_warnings,
             imports: Vec::new(),
@@ -275,6 +309,7 @@ pub struct DocumentDryRun {
 pub async fn dry_run(
     ctx: &IngestContext<'_>,
     owner: &VaultOwner,
+    source: PlanSource,
     jobs: Vec<Value>,
     plan_warnings: Vec<String>,
     now: DateTime<Utc>,
@@ -308,8 +343,14 @@ pub async fn dry_run(
         );
     }
     tracing::info!(cells, "plan document dry run passed validation");
+    // Removing the tokens parses the whole document, so it runs off the executor.
+    let document = tokio::task::spawn_blocking(move || without_model_tokens(source.text()))
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::new)?;
     Ok(DocumentDryRun {
         report: DryRunReport {
+            document,
             bodies,
             plan_warnings,
             imports,
@@ -343,7 +384,8 @@ pub enum StoredDocumentError {
 /// any other model stripped of its token. The import step sees only models that
 /// reach a job body; a variant that runs no cell can still hold a token. A
 /// tokenless `source` is kept byte for byte; any other is rewritten from its
-/// TOML values, losing its comments.
+/// TOML syntax tree. Layout and comments outside the replaced models stay
+/// unchanged.
 pub fn with_vault_arms(
     source: PlanSource,
     rewrites: &HashMap<Model, Model>,
@@ -406,47 +448,70 @@ fn rewrite_gated_models(
     document: &str,
     mut rewrite: impl FnMut(usize, Model) -> Model,
 ) -> Result<Option<String>, StoredDocumentError> {
-    let mut table: toml::Table = document
+    use serde::de::IntoDeserializer;
+    use serde::{Deserialize, Serialize};
+
+    let mut doc: toml_edit::DocumentMut = document
         .parse()
         .map_err(|_| StoredDocumentError::Unparsable)?;
-    let variants = match table.get_mut(crate::variant_edit::VARIANTS) {
-        Some(toml::Value::Array(variants)) => variants.as_mut_slice(),
-        _ => &mut [],
-    };
-    // A model that does not parse is an error, not a model to skip: a skipped
-    // model could keep its token in the stored document.
-    let gated = variants.iter_mut().enumerate().try_fold(
-        false,
-        |gated, (variant, entry)| -> Result<bool, StoredDocumentError> {
-            let Some(toml::Value::Array(models)) = entry.get_mut(MODELS) else {
-                return Ok(gated);
-            };
-            models
-                .iter_mut()
-                .enumerate()
-                .try_fold(gated, |gated, (index, slot)| {
-                    let model: Model =
-                        slot.clone()
-                            .try_into()
-                            .map_err(|_| StoredDocumentError::NotAModel {
-                                variant,
-                                model: index,
-                            })?;
-                    if model.auth_token().is_none() {
-                        return Ok(gated);
-                    }
-                    *slot = toml::Value::try_from(rewrite(variant, model))
+    let mut gated = false;
+    let mut variant = 0;
+    while let Some(entry) = doc
+        .get_mut(crate::variant_edit::VARIANTS)
+        .and_then(|v| v.get_mut(variant))
+    {
+        let mut index = 0;
+        // A model that does not parse is an error, not a model to skip: a
+        // skipped model could keep its token in the stored document.
+        while let Some(slot) = entry.get_mut(MODELS).and_then(|m| m.get_mut(index)) {
+            let value = slot
+                .clone()
+                .into_value()
+                .map_err(|_| StoredDocumentError::NotAModel {
+                    variant,
+                    model: index,
+                })?;
+            let model = Model::deserialize(value.into_deserializer()).map_err(|_| {
+                StoredDocumentError::NotAModel {
+                    variant,
+                    model: index,
+                }
+            })?;
+            if model.auth_token().is_some() {
+                let replacement = toml_edit::Item::Value(
+                    rewrite(variant, model)
+                        .serialize(toml_edit::ser::ValueSerializer::new())
+                        .map_err(|_| StoredDocumentError::Unwritable)?,
+                );
+                if slot.is_table() {
+                    let position = slot.as_table().and_then(|t| t.position());
+                    let decor = slot.as_table().map(|t| t.decor().clone());
+                    let mut table = replacement
+                        .into_table()
                         .map_err(|_| StoredDocumentError::Unwritable)?;
-                    Ok(true)
-                })
-        },
-    )?;
-    if !gated {
-        return Ok(None);
+                    table.set_implicit(false);
+                    table.set_position(position);
+                    if let Some(decor) = decor {
+                        *table.decor_mut() = decor;
+                    }
+                    *slot = toml_edit::Item::Table(table);
+                } else {
+                    let decor = slot.as_value().map(|v| v.decor().clone());
+                    let mut inline = replacement
+                        .into_value()
+                        .map_err(|_| StoredDocumentError::Unwritable)?;
+                    if let Some(decor) = decor {
+                        *inline.decor_mut() = decor;
+                    }
+                    *slot = toml_edit::Item::Value(inline);
+                }
+                gated = true;
+            }
+            index += 1;
+        }
+        variant += 1;
     }
-    toml::to_string(&table)
-        .map(Some)
-        .map_err(|_| StoredDocumentError::Unwritable)
+    Ok(gated.then(|| doc.to_string()))
 }
 
 /// What the store holds for the plan document a manifest names.
@@ -564,6 +629,48 @@ mod tests {
                 .map(|variant| variant.models.iter().cloned().collect())
                 .collect(),
         )
+    }
+
+    /// An inline model's rewrite keeps the comments around it and the order of
+    /// the variant's keys.
+    #[test]
+    fn gated_rewrite_preserves_comments_and_key_order() -> anyhow::Result<()> {
+        let source = document(&[(&gguf(r#", auth_token = "hf_one""#), LLAMACPP)])?;
+        let text = source.text().replace(
+            "models   =",
+            "# catalog name at filing: global/example::macos-arm64\nmodels   =",
+        );
+        let rewritten = with_vault_arms(
+            PlanSource::new(text)?,
+            &HashMap::from([(model(&gguf(""))?, arm(GGUF_ARM)?)]),
+        )?;
+        assert!(
+            rewritten
+                .text()
+                .contains("# A comment.\n[[variants]]\nrequires =")
+        );
+        assert!(
+            rewritten
+                .text()
+                .contains("# catalog name at filing: global/example::macos-arm64\nmodels   =")
+        );
+        assert!(rewritten.text().find("models   =") < rewritten.text().find("runtimes ="));
+        Ok(())
+    }
+
+    /// A model written as a `[[variants.models]]` table keeps the comment above
+    /// its header, and its rewrite still parses.
+    #[test]
+    fn gated_rewrite_keeps_a_model_table_header() -> anyhow::Result<()> {
+        let text = format!(
+            "benchmarks = [\"decode_throughput_512_100\"]\n[[variants]]\nrequires = [\"os:macos\"]\n{LLAMACPP}\n# model header\n[[variants.models]]\ntype = \"gguf_text\"\nsource = \"huggingface\"\norg = \"o\"\nrepo_name = \"gated\"\npath = \"a.gguf\"\nauth_token = \"hf_one\"\n"
+        );
+        let tokenless = without_model_tokens(&text)?;
+        pipette_planner::parse(&tokenless, &BTreeMap::new()).with_context(|| tokenless.clone())?;
+        let rewritten = with_vault_arms(PlanSource::new(text)?, &HashMap::new())?;
+        assert!(rewritten.text().contains("# model header"));
+        assert!(!rewritten.text().contains("hf_one"));
+        Ok(())
     }
 
     #[test]

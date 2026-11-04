@@ -93,7 +93,10 @@ fn route_of(event: &AuditEvent) -> (&str, &str, u16) {
             status,
             ..
         } => (method.as_str(), route.as_str(), *status),
-        AuditAction::Cli { .. } | AuditAction::FirstClerkSignIn { .. } => ("", "", 0),
+        AuditAction::Cli { .. }
+        | AuditAction::FirstClerkSignIn { .. }
+        | AuditAction::CatalogRename { .. }
+        | AuditAction::CatalogMerge { .. } => ("", "", 0),
     }
 }
 

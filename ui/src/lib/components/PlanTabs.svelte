@@ -125,7 +125,7 @@
   {/if}
   {#if read && jobs.data}<PlanSummary {base} results={read} jobs={jobs.data} />{/if}
   <PlanCells {base} cells={progressCells} results={read} {again} {devices} {ranOn} {catalogOrg}
-             counted={plan.progress_snapshot ? progress(plan) : null} />
+             onnamed={() => results.read(planId)} counted={plan.progress_snapshot ? progress(plan) : null} />
   {#if !record}
     <h2>Plan</h2>
     {@render facts()}

@@ -9,13 +9,15 @@ use chrono::{DateTime, Utc};
 use sqlx::{Connection, FromRow, PgConnection};
 
 use pipette_plan_types::{
-    CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryState, DescriptorMember,
-    DescriptorMemberDescriptor, DescriptorMemberKey, NonEmptyVec, OrgId, QuantizationLabel,
+    CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind, DescriptorEntryState,
+    DescriptorMember, DescriptorMemberDescriptor, DescriptorMemberKey, ModelFormat, NonEmptyVec,
+    OrgId, QuantizationLabel,
 };
 use pipette_store::{
     AppendOutcome, CatalogEntryKey, CatalogEntryLock, CreateEntryOutcome, DescriptorCatalogStore,
-    DescriptorEntryFilter, DescriptorEntryPage, DigestHit, SetStateOutcome, TransitionOutcome,
-    UnknownCursorError, UnreadableObjectError,
+    DescriptorEntryFilter, DescriptorEntryPage, DigestHit, MergeOutcome, RelabelOutcome,
+    RenameOutcome, SetStateOutcome, TransitionOutcome, UnknownCursorError, UnreadableObjectError,
+    merge_outcome,
 };
 
 use crate::db::SqlDatabase;
@@ -30,6 +32,17 @@ const MEMBERS_OF: &str = "SELECT m.scope, m.name_key, m.descriptor_type, m.descr
      ORDER BY m.scope, m.name_key, m.position";
 
 const IMPORTER_ENTRIES_LOCK_KEY: i64 = 0x6c6c616d61636370;
+
+/// The entry row, locked so that the write that follows serializes with
+/// appends and state changes to the same entry.
+const LOCK_ENTRY: &str =
+    "SELECT scope, name_key, name, kind, state, descriptor_kind, descriptor_type,
+     release_time, created_at, created_by
+     FROM descriptor_entries WHERE scope = $1 AND name_key = $2 FOR UPDATE";
+
+/// If another write takes the new name first, retry the rename. The new check
+/// then finds that entry. Each new conflict requires another concurrent write.
+const RENAME_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub(crate) struct SqlDescriptorCatalogStore {
@@ -251,6 +264,7 @@ impl EntryRow {
             &entry.created_by,
             entry.descriptor_kind(),
         )?;
+        DescriptorEntry::validate_scope_members(&entry.scope, &entry.members)?;
         anyhow::ensure!(
             entry.descriptor_kind().as_ref() == self.descriptor_kind,
             "entry descriptor kind mismatch"
@@ -276,7 +290,7 @@ struct NewMember<'a> {
     added_at: DateTime<Utc>,
 }
 
-fn new_members(members: &NonEmptyVec<DescriptorMember>) -> anyhow::Result<Vec<NewMember<'_>>> {
+fn new_members(members: &[DescriptorMember]) -> anyhow::Result<Vec<NewMember<'_>>> {
     members
         .iter()
         .enumerate()
@@ -331,6 +345,13 @@ async fn insert_members(
     Ok(())
 }
 
+fn name_taken(name: String, state: String) -> anyhow::Result<RenameOutcome> {
+    Ok(RenameOutcome::NameTaken {
+        name: CatalogName::try_new(name)?,
+        state: state.parse()?,
+    })
+}
+
 /// The refusal of `new` after the `existing` member rows, or `None` if every
 /// member can share the entry.
 fn append_refusal(
@@ -366,6 +387,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
             "cannot create a tombstoned entry"
         );
         DescriptorEntry::validate_members(&entry.members)?;
+        DescriptorEntry::validate_scope_members(&entry.scope, &entry.members)?;
         DescriptorEntry::validate_identity(
             &entry.scope,
             entry.kind,
@@ -546,6 +568,250 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
     ) -> anyhow::Result<TransitionOutcome> {
         self.transition_state_inner(scope, name, expected, state, false)
             .await
+    }
+
+    async fn rename_entry(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        new_name: &CatalogName,
+    ) -> anyhow::Result<RenameOutcome> {
+        let scopes = [scope.sql_key()];
+        let old_key = name.key();
+        let new_keys = [new_name.key()];
+        for _ in 0..RENAME_ATTEMPTS {
+            // `None` is a lost race for the new name.
+            let attempt: Option<RenameOutcome> = retry("rename_descriptor_entry", || {
+                Box::pin(async {
+                    let mut tx = self.db.begin().await?;
+                    let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                        .bind(scopes[0])
+                        .bind(&old_key)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                    let Some(row) = row else {
+                        return Ok(Ok(Some(RenameOutcome::NoSuchEntry)));
+                    };
+                    if row.state == DescriptorEntryState::Tombstoned.as_ref() {
+                        return Ok(Ok(Some(RenameOutcome::Tombstoned)));
+                    }
+                    if row.kind != DescriptorEntryKind::HandMade.as_ref() {
+                        return Ok(row
+                            .kind
+                            .parse()
+                            .map(|kind| Some(RenameOutcome::ImporterKind(kind)))
+                            .map_err(Into::into));
+                    }
+                    if row.name == new_name.as_str() {
+                        return Ok(Ok(Some(RenameOutcome::SameName)));
+                    }
+                    let holder: Option<(String, String)> = sqlx::query_as(
+                        "SELECT name, state FROM descriptor_entries
+                         WHERE scope = $1 AND name_key = $2 AND name_key <> $3",
+                    )
+                    .bind(scopes[0])
+                    .bind(&new_keys[0])
+                    .bind(&old_key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some((name, state)) = holder {
+                        return Ok(name_taken(name, state).map(Some));
+                    }
+                    let renamed = sqlx::query(
+                        "UPDATE descriptor_entries SET name = $3, name_key = $4
+                         WHERE scope = $1 AND name_key = $2",
+                    )
+                    .bind(scopes[0])
+                    .bind(&old_key)
+                    .bind(new_name.as_str())
+                    .bind(&new_keys[0])
+                    .execute(&mut *tx)
+                    .await;
+                    match renamed {
+                        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                            return Ok(Ok(None));
+                        }
+                        renamed => renamed?,
+                    };
+                    let members: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                        .bind(&scopes[..])
+                        .bind(&new_keys[..])
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    let old_name = match CatalogName::try_new(row.name.clone()) {
+                        Ok(name) => name,
+                        Err(error) => return Ok(Err(error.into())),
+                    };
+                    let row = EntryRow {
+                        name_key: new_keys[0].clone(),
+                        name: new_name.as_str().to_owned(),
+                        ..row
+                    };
+                    let entry = match row.parse(members) {
+                        Ok(entry) => entry,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    tx.commit().await?;
+                    Ok(Ok(Some(RenameOutcome::Renamed { old_name, entry })))
+                })
+            })
+            .await??;
+            if let Some(outcome) = attempt {
+                return Ok(outcome);
+            }
+        }
+        anyhow::bail!("rename_descriptor_entry: racing writes kept taking the new name")
+    }
+
+    async fn merge_entry(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        into: &CatalogName,
+    ) -> anyhow::Result<MergeOutcome> {
+        let scopes = [scope.sql_key(); 2];
+        let keys = [name.key(), into.key()];
+        let [source_key, target_key] = &keys;
+        anyhow::ensure!(
+            source_key != target_key,
+            "an entry cannot merge into itself"
+        );
+        let mut lock_order = [source_key, target_key];
+        lock_order.sort();
+        retry("merge_descriptor_entries", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                // Lock the two rows in key order, so two opposite merges cannot deadlock.
+                let mut source = None;
+                let mut target = None;
+                for key in lock_order {
+                    let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                        .bind(scopes[0])
+                        .bind(key)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                    if key == source_key {
+                        source = row;
+                    } else {
+                        target = row;
+                    }
+                }
+                let rows: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                    .bind(&scopes[..])
+                    .bind(&keys[..])
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let (target_rows, source_rows): (Vec<_>, Vec<_>) = rows
+                    .into_iter()
+                    .partition(|row| &row.name_key == target_key);
+                let source = source.map(|row| row.parse(source_rows)).transpose();
+                let target = target.map(|row| row.parse(target_rows)).transpose();
+                let (source, target) = match (source, target) {
+                    (Ok(source), Ok(target)) => (source, target),
+                    (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
+                };
+                let outcome = merge_outcome(source, target);
+                let MergeOutcome::Merged { merge, .. } = &outcome else {
+                    return Ok(Ok(outcome));
+                };
+                let moved = match new_members(&merge.moved) {
+                    Ok(moved) => moved,
+                    Err(error) => return Ok(Err(error)),
+                };
+                sqlx::query("DELETE FROM descriptor_entries WHERE scope = $1 AND name_key = $2")
+                    .bind(scopes[0])
+                    .bind(source_key)
+                    .execute(&mut *tx)
+                    .await?;
+                let (start,): (i32,) = sqlx::query_as(
+                    "SELECT COALESCE(MAX(position) + 1, 0) FROM descriptor_members
+                     WHERE scope = $1 AND name_key = $2",
+                )
+                .bind(scopes[0])
+                .bind(target_key)
+                .fetch_one(&mut *tx)
+                .await?;
+                insert_members(&mut tx, scopes[0], target_key, start, &moved).await?;
+                tx.commit().await?;
+                Ok(Ok(outcome))
+            })
+        })
+        .await?
+    }
+
+    async fn relabel_member(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        format: ModelFormat,
+        from: &QuantizationLabel,
+        to: &QuantizationLabel,
+    ) -> anyhow::Result<RelabelOutcome> {
+        let keys = [name.key()];
+        let scopes = [scope.sql_key()];
+        let format = format.to_string();
+        retry("relabel_descriptor_member", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                    .bind(scopes[0])
+                    .bind(&keys[0])
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let Some(row) = row else {
+                    return Ok(Ok(RelabelOutcome::NoSuchEntry));
+                };
+                if row.state == DescriptorEntryState::Tombstoned.as_ref() {
+                    return Ok(Ok(RelabelOutcome::Tombstoned));
+                }
+                if row.descriptor_kind != "model" {
+                    return Ok(Ok(RelabelOutcome::RuntimeEntry));
+                }
+                // The row lock above serializes this with appends and other relabels.
+                let labels: Vec<String> = sqlx::query_scalar(
+                    "SELECT quantization FROM descriptor_members
+                     WHERE scope = $1 AND name_key = $2 AND format = $3",
+                )
+                .bind(scopes[0])
+                .bind(&keys[0])
+                .bind(&format)
+                .fetch_all(&mut *tx)
+                .await?;
+                let holds = |label: &QuantizationLabel| labels.iter().any(|l| l == label.as_str());
+                if !holds(from) {
+                    return Ok(Ok(RelabelOutcome::NoSuchMember));
+                }
+                if from == to {
+                    return Ok(Ok(RelabelOutcome::SameLabel));
+                }
+                if holds(to) {
+                    return Ok(Ok(RelabelOutcome::LabelTaken));
+                }
+                sqlx::query(
+                    "UPDATE descriptor_members SET quantization = $5
+                     WHERE scope = $1 AND name_key = $2 AND format = $3 AND quantization = $4",
+                )
+                .bind(scopes[0])
+                .bind(&keys[0])
+                .bind(&format)
+                .bind(from.as_str())
+                .bind(to.as_str())
+                .execute(&mut *tx)
+                .await?;
+                let members: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                    .bind(&scopes[..])
+                    .bind(&keys[..])
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let entry = match row.parse(members) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(Err(error)),
+                };
+                tx.commit().await?;
+                Ok(Ok(RelabelOutcome::Relabeled(entry)))
+            })
+        })
+        .await?
     }
 
     async fn get_entry(
@@ -993,6 +1259,118 @@ mod tests {
         let test_db = test_db_or_skip!();
         let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
         pipette_store_testkit::assert_descriptor_catalog_model_contract(&store).await
+    }
+
+    #[tokio::test]
+    async fn meets_the_rename_contract() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        pipette_store_testkit::assert_descriptor_catalog_rename_contract(&store).await
+    }
+
+    #[tokio::test]
+    async fn meets_the_merge_contract() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        pipette_store_testkit::assert_descriptor_catalog_merge_contract(&store).await
+    }
+
+    /// Two merges in opposite directions lock the rows in one order, so one
+    /// merges and the other finds its source gone.
+    #[tokio::test]
+    async fn opposite_merges_do_not_deadlock() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let names = ["East", "West"];
+        for (name, flavor) in names.iter().zip(["linux-x64-rocm", "linux-x64-vulkan"]) {
+            let entry = pipette_store_testkit::a_descriptor_entry(
+                name,
+                pipette_plan_types::DescriptorEntryKind::HandMade,
+                100,
+                pipette_store_testkit::a_member("b1", flavor)?,
+            )?;
+            assert_eq!(
+                store.create_entry(&entry).await?,
+                CreateEntryOutcome::Created
+            );
+        }
+        let outcomes = crate::testing::race(|n| {
+            let store = store.clone();
+            let (from, into) = if n % 2 == 0 {
+                (names[0], names[1])
+            } else {
+                (names[1], names[0])
+            };
+            async move {
+                store
+                    .merge_entry(
+                        &CatalogScope::Global,
+                        &CatalogName::try_new(from)?,
+                        &CatalogName::try_new(into)?,
+                    )
+                    .await
+            }
+        })
+        .await?;
+        let merged = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, MergeOutcome::Merged { .. }))
+            .count();
+        assert_eq!(merged, 1, "{outcomes:?}");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                MergeOutcome::Merged { .. }
+                    | MergeOutcome::NoSuchEntry
+                    | MergeOutcome::TargetMissing
+            )),
+            "{outcomes:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn racing_renames_to_one_name_leave_one_holder() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        for n in 0..crate::testing::RACERS {
+            let entry = pipette_store_testkit::a_descriptor_entry(
+                &format!("racer-{n}"),
+                pipette_plan_types::DescriptorEntryKind::HandMade,
+                100,
+                pipette_store_testkit::a_member("b1", "linux-x64-rocm")?,
+            )?;
+            assert_eq!(
+                store.create_entry(&entry).await?,
+                CreateEntryOutcome::Created
+            );
+        }
+        let outcomes = crate::testing::race(|n| {
+            let store = store.clone();
+            async move {
+                store
+                    .rename_entry(
+                        &CatalogScope::Global,
+                        &CatalogName::try_new(format!("racer-{n}"))?,
+                        &CatalogName::try_new("Winner")?,
+                    )
+                    .await
+            }
+        })
+        .await?;
+        let renamed = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RenameOutcome::Renamed { .. }))
+            .count();
+        assert_eq!(renamed, 1, "{outcomes:?}");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                RenameOutcome::Renamed { .. } | RenameOutcome::NameTaken { .. }
+            )),
+            "{outcomes:?}"
+        );
+        Ok(())
     }
 
     /// Write a global runtime entry with one member in the columns that

@@ -1,5 +1,5 @@
 //! A benchmark's corpus as only the server handles it: the upstream pin, the
-//! artifact mgmt repacks it into, and the probe verdict that gates serving
+//! artifact it is packed into, and the probe verdict that gates serving
 //! (`docs/design/vl-spec-decode-dataset-delivery.md`).
 
 use chrono::{DateTime, Utc};
@@ -36,12 +36,12 @@ pub enum DatasetError {
     },
     #[error(
         "a vlm_eval entry must pin the samples it runs: a `[dataset]` of format \
-         vlm-eval-corpus/1 (`pipette-mgmt dataset-cache pins` prints one)"
+         vlm-eval-corpus/1 (the scores service's scores-packages/index/ holds its hashes)"
     )]
     VlmEvalUnpinned,
     #[error(
         "an asr_eval entry must pin the samples it runs: a `[dataset]` of format \
-         asr-eval-corpus/1 (`pipette-mgmt dataset-cache pins` prints one)"
+         asr-eval-corpus/1 (the scores service's scores-packages/index/ holds its hashes)"
     )]
     AsrEvalUnpinned,
     #[error(
@@ -377,9 +377,10 @@ pub struct DatasetArtifact {
     /// artifact recorded before this was, which is then not checked on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subset: Option<String>,
-    /// The samples an evals-server corpus holds, as its build counted them;
-    /// absent on a git corpus, and on a vlm-eval corpus recorded before this
-    /// was. An asr_eval entry is built and served only at the count it states.
+    /// The samples an evals-server corpus holds, as its package's manifest
+    /// counts them; absent on a git corpus, and on a vlm-eval corpus recorded
+    /// before this was. An asr_eval entry is built and served only at the
+    /// count it states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samples: Option<u32>,
     pub built_at: DateTime<Utc>,

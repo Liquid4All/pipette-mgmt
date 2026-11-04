@@ -86,3 +86,7 @@ The route also answers the errors every filing answers
 | 415 | The `Content-Type` is missing, or is not `application/toml`: `send the plan as an application/toml plan document` |
 | 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |
 | 502 | HuggingFace failed during an import, as [the filing errors](../campaigns.md#errors) describe |
+
+A `runtimes` entry can be a catalog name.
+[Catalog names](../campaigns.md#catalog-names) describes how the server resolves
+it, and what the `document` of the answer holds.

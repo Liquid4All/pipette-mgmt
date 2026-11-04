@@ -73,9 +73,12 @@ Every error response carries the same envelope, a single `error` string:
 For a `4xx`, that string describes what the caller got wrong and is safe to
 surface to a user. For a `5xx` it is a fixed string: `"internal server error"`
 (`500`) or `"upstream request failed"` (`502`), carrying no detail about the
-failure. Diagnosing a `5xx` requires the server log, which records the error in
-full; the per-endpoint error tables below list the conditions each status
-covers.
+failure. One `500` is different: a campaign write whose outcome the server
+cannot confirm. Its message names the campaign and the plan to check, and
+holds no storage detail
+([Campaigns](api/campaigns.md#filing-a-plan-document)). To diagnose a `5xx`, read
+the server log. It records the full error. The endpoint error tables list the
+conditions for each status.
 
 A `412` answers a precondition the request set that does not hold:
 `If-None-Match: *` on a write that must create, or `If-Match: *` on one that
@@ -1373,6 +1376,9 @@ Returned when no job is currently available for this client. Possible reasons:
 
 - No jobs in the queue list this client as eligible.
 - All eligible jobs are currently leased to other clients.
+- A job in `avail/` is held only by `creating` or missing plans. Queue
+  maintenance leaves it out of the eligible index until a plan becomes final
+  ([queue.md](queue.md#committed-filings)).
 - All eligible jobs have passed their `expires_at`. An expired job is never
   handed out, even if `queue-maintenance` has not yet removed it from the queue
   (see [queue.md](queue.md#expiration)).
@@ -1671,11 +1677,12 @@ a `vlm_eval`'s `vlm-eval-corpus/1`
 ([§2.12](benchmarks.md#the-samples-a-device-runs-the-asr-eval-corpus)). Requires an
 approved client holding `perform_work`: a corpus is work input.
 
-The upstream owns the corpus. The response is served from mgmt's cache **only
-while the latest upstream probe, at most `dataset_probe_max_age_secs` old
-(default 180), found the upstream publishing the pinned content**. The request
-never contacts the upstream: the `dataset-cache probe` task records a verdict on
-the cached artifact every minute and this route reads it
+The upstream owns the corpus. The response is served from mgmt's cache, an
+eval corpus from the package the scores service packed, **only while the latest
+upstream probe, at most `dataset_probe_max_age_secs` old (default 180), found
+the upstream publishing the pinned content**. The request never contacts the
+upstream: the `dataset-cache probe` task records a verdict on the cached
+artifact every minute and this route reads it
 ([design](design/vl-spec-decode-dataset-delivery.md)).
 
 #### 2.15.1. Response `200 OK`
@@ -1704,7 +1711,7 @@ detail goes to the server log. A `503` is transient and carries
 | 403 | standard auth error | Client not approved, or lacks `perform_work` |
 | 404 | `{"error": "benchmark not found"}` | Unknown `benchmark_id`, or one private to an organization the client is not in ([§2.6](#26-get-benchmarksbenchmark_id)) |
 | 404 | `{"error": "benchmark has no dataset"}` | The benchmark serves no corpus |
-| 503 | `{"error": "dataset not built"}` | No cached artifact for the pinned digest yet |
+| 503 | `{"error": "dataset not built"}` | No cached artifact for the pinned digest yet, or for an eval corpus no package |
 | 503 | `{"error": "upstream check stale"}` | The probe verdict is older than `dataset_probe_max_age_secs` |
 | 503 | `{"error": "upstream unavailable"}` | The probe could not reach the upstream |
 | 502 | `{"error": "upstream no longer backs the pin"}` | The upstream no longer publishes the pinned revision (or, for the evals server, those samples), or publishes different content under it |

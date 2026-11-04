@@ -91,6 +91,7 @@ async fn overlay_replaces_the_record_stores_only() -> anyhow::Result<()> {
             Arc::as_ptr(&a.warehouse).cast(),
             Arc::as_ptr(&a.eval_sample_results).cast(),
             Arc::as_ptr(&a.dataset_cache).cast(),
+            Arc::as_ptr(&a.eval_packages).cast(),
         ]
     };
     assert_eq!(kept(&stores), kept(&object));

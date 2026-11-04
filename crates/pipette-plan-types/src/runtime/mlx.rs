@@ -40,6 +40,7 @@ pub struct MlxSwiftStack {
     Deserialize,
     strum::Display,
     strum::EnumString,
+    strum::EnumIter,
 )]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]

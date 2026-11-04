@@ -120,6 +120,14 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         ),
         (
             "POST",
+            format!("/api/v1/orgs/{ORG}/descriptor-catalog/{CATALOG_NAME}/rename"),
+        ),
+        (
+            "POST",
+            format!("/api/v1/orgs/{ORG}/descriptor-catalog/{CATALOG_NAME}/members/relabel"),
+        ),
+        (
+            "POST",
             format!("/api/v1/orgs/{ORG}/descriptor-catalog/{CATALOG_NAME}/state"),
         ),
         ("GET", format!("/api/v1/orgs/{ORG}/clients")),
@@ -281,6 +289,11 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("POST", "/api/v1/orgs/{}/descriptor-catalog"),
             ("POST", "/api/v1/orgs/{}/descriptor-catalog/{}/members"),
+            ("POST", "/api/v1/orgs/{}/descriptor-catalog/{}/rename"),
+            (
+                "POST",
+                "/api/v1/orgs/{}/descriptor-catalog/{}/members/relabel",
+            ),
             ("POST", "/api/v1/orgs/{}/descriptor-catalog/{}/state"),
         ],
     ),

@@ -27,7 +27,6 @@ describe("catalog importer status", () => {
   });
 
   test("passes a finished run's outcome through", () => {
-    expect(importResult(run({ result: "error", outcome: "unclassified" }), NOW)).toBe("unclassified");
     expect(importResult(run({ result: "error", outcome: "failed" }), NOW)).toBe("failed");
   });
 
@@ -39,7 +38,7 @@ describe("catalog importer status", () => {
     expect(attention({ result: "running", outcome: "running", finished_at: null })).toBe(false);
     expect(attention({ result: "running", outcome: "running", finished_at: null,
       started_at: new Date(NOW - IMPORT_INTERRUPTED_MS - 1).toISOString() })).toBe(true);
-    expect(attention({ result: "error", outcome: "unclassified" })).toBe(true);
+    expect(attention({ unclassified_assets: ["b1/llama-b1-bin-new-flavor.tar.gz"] })).toBe(false);
     expect(attention({ result: "error", outcome: "failed" })).toBe(true);
     expect(attention({}, null)).toBe(true);
   });

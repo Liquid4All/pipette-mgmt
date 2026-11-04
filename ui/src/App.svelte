@@ -5,6 +5,7 @@
   // with the console: `git log --diff-filter=D -- crates/pipette-console/static` names the commit.
   import type { Component } from "svelte";
   import { settings as clerkSettings } from "./lib/clerk";
+  import JumpBox from "./lib/components/JumpBox.svelte";
   import LegacyKey from "./lib/components/LegacyKey.svelte";
   import { pageStorage } from "./lib/legacy";
   import { Busy } from "./lib/components/work.svelte";
@@ -145,13 +146,13 @@
     folded = !folded;
     try { storage?.setItem(FOLDED_ENTRY, folded ? "1" : "0"); } catch { /* kept for this page only */ }
   }
-  // `[` folds it too, as in Linear, unless the reader is typing.
   function key(event: KeyboardEvent) {
     const target = event.target instanceof HTMLElement ? event.target : null;
-    if (event.key !== "[" || event.ctrlKey || event.metaKey || event.altKey || !treed
+    if (!["[", "/"].includes(event.key) || event.ctrlKey || event.metaKey || event.altKey || !treed
         || target?.isContentEditable || target?.closest("input, textarea, select")) return;
     event.preventDefault();
-    fold();
+    if (event.key === "[") fold();
+    else document.getElementById("jump")?.focus();
   }
 
   $effect(() => {
@@ -179,6 +180,7 @@
     </button>
   {/if}
   <a class="brand" href="/app/">Pipette Console</a>
+  {#if treed}<JumpBox />{/if}
   {#if session.account}
     <a class="who" href="/app/account" title={session.account.user_id}>{session.account.contact_email}</a>
   {/if}

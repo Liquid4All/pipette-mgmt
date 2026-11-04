@@ -768,8 +768,8 @@ async fn reconcile_one_plan(
     let is_ending =
         ending.requested || ending.stranded || manifest.status == PlanStatus::Cancelling;
 
-    // Ingestion owns a live `creating` manifest: nothing is promoted yet, so it
-    // would read `complete`.
+    // Ingestion owns a live `creating` manifest. Some jobs can already be
+    // promoted, so settling it here could mistake a partial filing for complete.
     if manifest.status == PlanStatus::Creating && !is_ending {
         return Ok(());
     }
@@ -2602,6 +2602,12 @@ mod tests {
         }
         async fn has_record(&self, _: &JobId) -> anyhow::Result<bool> {
             Err(self.unexpected.record("has_record"))
+        }
+        async fn find_runs(
+            &self,
+            _: &[JobId],
+        ) -> anyhow::Result<HashMap<JobId, pipette_store::RecordedRun>> {
+            Err(self.unexpected.record("find_runs"))
         }
         async fn find_in_score_queue(
             &self,

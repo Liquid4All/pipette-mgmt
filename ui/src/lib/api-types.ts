@@ -17,6 +17,9 @@ export type Model =
   | (Mlx & {
       type: "mlx";
     })
+  | (AppleCoreAi & {
+      type: "core_ai";
+    })
   | (SpeculativePair & {
       type: "mlx_speculative";
     })
@@ -176,6 +179,33 @@ export type Mlx =
     };
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "AppleCoreAi".
+ */
+export type AppleCoreAi =
+  | {
+      org: string;
+      prefix?: string | null;
+      repo_name: string;
+      revision?: string | null;
+      source: "huggingface";
+    }
+  | {
+      custom_label?: string | null;
+      principal_id: VaultPrincipalId;
+      sha256?: string | null;
+      source: "vault_archive";
+      url: VaultPath;
+    }
+  | {
+      dir: string;
+      source: "relative_dir";
+    }
+  | {
+      dir: string;
+      source: "absolute_dir";
+    };
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "ModelSource".
  */
 export type ModelSource =
@@ -298,6 +328,9 @@ export type Runtime =
     })
   | (MlxMacosPipette & {
       type: "mlx_macos_pipette";
+    })
+  | (AppleCoreAiMacosPipette & {
+      type: "core_ai_macos_pipette";
     })
   | (MlxIosPipette & {
       type: "mlx_ios_pipette";
@@ -558,6 +591,20 @@ export type AuditAction =
       args: string[];
       command: string;
       type: "cli";
+    }
+  | {
+      new_name: string;
+      old_name: string;
+      scope: string;
+      type: "catalog_rename";
+    }
+  | {
+      into_name: string;
+      moved: string[];
+      old_name: string;
+      scope: string;
+      skipped: string[];
+      type: "catalog_merge";
     }
   | {
       prior_keys: UserKey[];
@@ -1188,7 +1235,7 @@ export type CatalogImportCommand = "import" | "refresh";
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CatalogImportOutcome".
  */
-export type CatalogImportOutcome = "running" | "success" | "unclassified" | "failed";
+export type CatalogImportOutcome = "running" | "success" | "failed";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CatalogImportResult".
@@ -1280,12 +1327,12 @@ export type DescriptorMemberKey =
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "ModelFormat".
  */
-export type ModelFormat = "gguf" | "mlx" | "torch" | "openvino" | "onnx";
+export type ModelFormat = "gguf" | "mlx" | "core_ai" | "torch" | "openvino" | "onnx";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "DescriptorWithheldReasonCode".
  */
-export type DescriptorWithheldReasonCode = "no_rule" | "unsupported" | "not_met" | "no_runtime";
+export type DescriptorWithheldReasonCode = "no_rule" | "unsupported" | "not_met" | "no_build" | "no_runtime";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "DescriptorEntryKind".
@@ -2449,6 +2496,31 @@ export interface MlxMacosPipette {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "AppleCoreAiMacosPipette".
+ */
+export interface AppleCoreAiMacosPipette {
+  packages: CoreAiSwiftStack;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CoreAiSwiftStack".
+ */
+export interface CoreAiSwiftStack {
+  coreai_models: SourceRepository;
+  swift_jinja: SourceRepository;
+  swift_transformers: SourceRepository;
+  xgrammar: SourceRepository;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "SourceRepository".
+ */
+export interface SourceRepository {
+  repository_url: string;
+  repository_version: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "MlxIosPipette".
  */
 export interface MlxIosPipette {
@@ -2465,14 +2537,6 @@ export interface MlxSwiftStack {
   mlx_swift: SourceRepository;
   mlx_swift_lm: SourceRepository;
   swift_transformers: SourceRepository;
-}
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "SourceRepository".
- */
-export interface SourceRepository {
-  repository_url: string;
-  repository_version: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -2565,6 +2629,14 @@ export interface AmendUserPermissionsRequest {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "AnyClientRunEvidence".
+ */
+export interface AnyClientRunEvidence {
+  devices_with_success: number;
+  last_success_at: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "UserKey".
  */
 export interface UserKey {
@@ -2647,6 +2719,7 @@ export interface CampaignCreated {
  */
 export interface PlanFiled {
   change?: RevisionChange | null;
+  document?: string | null;
   fleet_detail: FleetDetail;
   job_count: number;
   job_ids: {
@@ -3077,6 +3150,22 @@ export interface ClientPreauthKeyViewPage {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ClientRunEvidence".
+ */
+export interface ClientRunEvidence {
+  last_failure: RunMark | null;
+  last_success: RunMark | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "RunMark".
+ */
+export interface RunMark {
+  at: string;
+  client_version: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CreateDescriptorEntryRequest".
  */
 export interface CreateDescriptorEntryRequest {
@@ -3157,12 +3246,21 @@ export interface DescriptorMemberView {
   coverage?: DescriptorMemberCoverage | null;
   descriptor: DescriptorMemberDescriptor;
   digest: string;
+  evidence?: DescriptorMemberEvidence | null;
   member_key: DescriptorMemberKey;
   model_key?: string | null;
   offered_device_count?: number | null;
   parameters?: DescriptorMemberParameters | null;
   plan_toml: string;
   selector: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "DescriptorMemberEvidence".
+ */
+export interface DescriptorMemberEvidence {
+  any_device: AnyClientRunEvidence;
+  this_device?: ClientRunEvidence | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3335,6 +3433,15 @@ export interface JobInPlan {
 export interface ParentJob {
   job_id: string;
   plan_id: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "JobPlans".
+ */
+export interface JobPlans {
+  body: unknown;
+  fleet_detail: FleetDetail;
+  plans: PlanSummary[];
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3900,6 +4007,7 @@ export interface PlanCancelRequested {
  */
 export interface PlanDryRun {
   bodies: unknown[];
+  document: string;
   imports: PlannedImport[];
   plan_warnings: string[];
 }
@@ -3918,6 +4026,7 @@ export interface PlanIssue {
  * via the `definition` "PlanValidation".
  */
 export interface PlanValidation {
+  document: string | null;
   gated_model_count: number | null;
   issues: PlanIssue[];
   job_count: number | null;
@@ -3964,6 +4073,22 @@ export interface RegisterUserKeyRequest {
   key_details: string;
   public_key: string;
   user_preauth_key?: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "RelabelDescriptorMemberRequest".
+ */
+export interface RelabelDescriptorMemberRequest {
+  format: ModelFormat;
+  from: string;
+  to: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "RenameDescriptorEntryRequest".
+ */
+export interface RenameDescriptorEntryRequest {
+  name: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema

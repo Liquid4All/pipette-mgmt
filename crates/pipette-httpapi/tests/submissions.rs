@@ -9,8 +9,6 @@
     reason = "tests build the requests a client sends, so they keep `json!` (see clippy.toml)"
 )]
 
-use std::path::Path;
-
 use anyhow::Context;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
@@ -31,8 +29,8 @@ const CLAIMED_JOB_ID: &str = "job-550e8400-e29b-41d4-a716-446655440000";
 
 /// Plant a lease with an empty job body, for the tests that only need the
 /// claim-binding check to pass.
-fn seed_lease(dir: &Path, job_id: &str, client_id: &ClientId) -> anyhow::Result<()> {
-    seed_leased(dir, job_id, client_id, &json!({}))?;
+async fn seed_lease(state: &AppState, job_id: &str, client_id: &ClientId) -> anyhow::Result<()> {
+    seed_leased(state.todo_store.as_ref(), job_id, client_id, &json!({})).await?;
     Ok(())
 }
 
@@ -144,7 +142,7 @@ async fn test_submit_with_client_supplied_job_id_is_echoed() -> anyhow::Result<(
     let (sk, client_id) = register_and_approve(&state).await?;
 
     let claimed = CLAIMED_JOB_ID;
-    seed_lease(dir.path(), claimed, &client_id)?;
+    seed_lease(&state, claimed, &client_id).await?;
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(claimed);
     let job_id = submit_benchmark(&state, &sk, &client_id, &body).await?;
@@ -183,7 +181,7 @@ async fn test_submit_requires_the_permission_the_body_names(
     let mut body = valid_submission("prefill_throughput_256");
     if client_supplied_job_id {
         // Seeded so the refusal cannot be the claim-binding check instead.
-        seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+        seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
         body["job_id"] = json!(CLAIMED_JOB_ID);
     }
 
@@ -273,7 +271,7 @@ async fn test_batch_judges_each_item_against_its_own_operation() -> anyhow::Resu
         )
         .await?;
 
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     let mut claimed = valid_submission("prefill_throughput_256");
     claimed["job_id"] = json!(CLAIMED_JOB_ID);
 
@@ -333,10 +331,10 @@ async fn test_batch_item_without_a_live_claim_is_a_per_item_error(
     match claim {
         UnboundClaim::Unleased => {}
         UnboundClaim::LeasedElsewhere => {
-            seed_lease(dir.path(), CLAIMED_JOB_ID, &ClientId::try_new("ev1_other")?)?;
+            seed_lease(&state, CLAIMED_JOB_ID, &ClientId::try_new("ev1_other")?).await?;
         }
         UnboundClaim::PendingReindex => {
-            seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+            seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
             state.todo_store.write_pending_reindex(&client_id).await?;
         }
     }
@@ -522,7 +520,7 @@ fn accepted_submission_is_logged_only_once_the_claim_holds(
             let state = make_state(dir.path()).await?;
             let (sk, client_id) = register_and_approve(&state).await?;
             if seed_the_lease {
-                seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+                seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
             }
             let mut body = valid_submission("prefill_throughput_256");
             body["job_id"] = json!(CLAIMED_JOB_ID);
@@ -551,7 +549,7 @@ async fn test_submit_gated_while_pending_reindex() -> anyhow::Result<()> {
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     state.todo_store.write_pending_reindex(&client_id).await?;
     let leases_before = state.todo_store.list_leased().await?;
 
@@ -594,7 +592,7 @@ async fn test_submit_job_id_leased_to_other_client_returns_409() -> anyhow::Resu
     let (sk, client_id) = register_and_approve(&state).await?;
 
     let other = ClientId::try_new("ev1_other")?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &other)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &other).await?;
     let leases_before = state.todo_store.list_leased().await?;
 
     let mut body = valid_submission("prefill_throughput_256");
@@ -626,7 +624,7 @@ async fn test_resubmitting_a_completed_job_id_returns_404() -> anyhow::Result<()
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(CLAIMED_JOB_ID);
 
@@ -662,12 +660,12 @@ async fn test_resubmitting_under_a_live_lease_supersedes() -> anyhow::Result<()>
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(CLAIMED_JOB_ID);
     submit_benchmark(&state, &sk, &client_id, &body).await?;
 
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     body["runtime_version"] = json!("b6000");
     submit_benchmark(&state, &sk, &client_id, &body).await?;
 
@@ -718,7 +716,7 @@ async fn test_failure_body_with_device_and_metric_fields_returns_400() -> anyhow
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let mut failure = valid_failure("prefill_throughput_256", claimed, false);
     failure["device_name"] = json!("test-device");
@@ -754,7 +752,7 @@ async fn test_failure_body_still_ignores_unknown_fields() -> anyhow::Result<()> 
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let mut failure = valid_failure("prefill_throughput_256", claimed, false);
     failure["plan_id"] = json!("release-v1-evals");
@@ -1022,7 +1020,7 @@ async fn test_failure_with_mismatched_benchmark_params_returns_400() -> anyhow::
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let mut failure = valid_failure("prefill_throughput_256", claimed, false);
     failure["benchmark_type"] = json!("prefill_throughput");
@@ -1051,7 +1049,7 @@ async fn test_failure_with_a_narrow_pair_is_recorded() -> anyhow::Result<()> {
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let mut failure = valid_failure("prefill_throughput_256", claimed, false);
     failure["benchmark_type"] = json!("prefill_throughput");
@@ -1146,7 +1144,7 @@ async fn test_submission_records_the_claimed_jobs_requested_flags(
 
     let claimed = CLAIMED_JOB_ID;
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({
@@ -1163,7 +1161,8 @@ async fn test_submission_records_the_claimed_jobs_requested_flags(
                 "benchmark_flags": serde_json::Value::Null,
             },
         }),
-    )?;
+    )
+    .await?;
 
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(claimed);
@@ -1202,7 +1201,7 @@ async fn test_client_supplied_requested_flags_are_ignored() -> anyhow::Result<()
 
     let claimed = CLAIMED_JOB_ID;
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({
@@ -1214,7 +1213,8 @@ async fn test_client_supplied_requested_flags_are_ignored() -> anyhow::Result<()
                 "model_flags": {"model_type": "gguf_text", "enable_thinking": true},
             },
         }),
-    )?;
+    )
+    .await?;
 
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(claimed);
@@ -1296,7 +1296,7 @@ async fn test_submit_retriable_failure_denies_and_recycles() -> anyhow::Result<(
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str(), "ev1_other"]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let failure = valid_failure("prefill_throughput_256", claimed, true);
     let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &failure).await?;
@@ -1339,7 +1339,7 @@ async fn test_job_reads_as_not_found_after_a_retriable_failure() -> anyhow::Resu
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str(), "ev1_other"]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
     let uri = format!("/jobs/{claimed}");
 
     let resp = authed_get(&state, &sk, &client_id, &uri).await?;
@@ -1374,7 +1374,7 @@ fn retriable_failure_logs_the_reason_at_warn(#[case] route: &str) -> anyhow::Res
                 let state = make_state(dir.path()).await?;
                 let (sk, client_id) = register_and_approve(&state).await?;
                 let body = leased_job_body(CLAIMED_JOB_ID, &[client_id.as_str(), "ev1_other"]);
-                seed_leased(dir.path(), CLAIMED_JOB_ID, &client_id, &body)?;
+                seed_leased(state.todo_store.as_ref(), CLAIMED_JOB_ID, &client_id, &body).await?;
                 let failure = valid_failure("prefill_throughput_256", CLAIMED_JOB_ID, true);
                 let payload = if route == "/benchmarks/batch" {
                     json!({ "submissions": [failure] })
@@ -1409,7 +1409,7 @@ async fn test_submit_non_retriable_failure_is_terminal() -> anyhow::Result<()> {
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let failure = valid_failure("prefill_throughput_256", claimed, false);
     let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &failure).await?;
@@ -1451,7 +1451,7 @@ async fn test_non_retriable_failure_records_the_claimed_jobs_requested_flags(
 
     let claimed = CLAIMED_JOB_ID;
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({
@@ -1468,7 +1468,8 @@ async fn test_non_retriable_failure_records_the_claimed_jobs_requested_flags(
                 "benchmark_flags": serde_json::Value::Null,
             },
         }),
-    )?;
+    )
+    .await?;
 
     let failure = valid_failure("prefill_throughput_256", claimed, false);
     submit_via(path, &state, &sk, &client_id, &failure).await?;
@@ -1510,7 +1511,7 @@ async fn test_submit_retriable_failure_all_denied_escalates_via_queue_maintenanc
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
-    seed_leased(dir.path(), claimed, &client_id, &body)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let failure = valid_failure("prefill_throughput_256", claimed, true);
     let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &failure).await?;
@@ -1735,11 +1736,12 @@ async fn test_submission_persists_client_configuration(
     let wire = r#"{"envs":["CUDA_VISIBLE_DEVICES","GGML_CUDA_ENABLE_UNIFIED_MEMORY=0","CUDA_DEVICE_ORDER"]}"#;
     let claimed = CLAIMED_JOB_ID;
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({"job_id": claimed, "spec": {"benchmark": "prefill_throughput_256"}}),
-    )?;
+    )
+    .await?;
 
     let runtime_flags = "--n-gpu-layers 999";
 
@@ -1774,7 +1776,7 @@ async fn test_submission_stores_runtime_output_apart_from_the_body(
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let claimed = CLAIMED_JOB_ID;
-    seed_lease(dir.path(), claimed, &client_id)?;
+    seed_lease(&state, claimed, &client_id).await?;
 
     let extras = r#"{ "build": "nightly" }"#;
     let mut body = valid_submission("prefill_throughput_256");
@@ -1824,7 +1826,7 @@ async fn test_retriable_failure_keeps_its_runtime_output() -> anyhow::Result<()>
     let (sk, client_id) = register_and_approve(&state).await?;
     let claimed = CLAIMED_JOB_ID;
     let leased = leased_job_body(claimed, &[client_id.as_str(), "ev1_other"]);
-    seed_leased(dir.path(), claimed, &client_id, &leased)?;
+    seed_leased(state.todo_store.as_ref(), claimed, &client_id, &leased).await?;
 
     let mut failure = valid_failure("prefill_throughput_256", claimed, true);
     failure["runtime_stderr"] = json!("CUDA error: out of memory\n");
@@ -1866,7 +1868,7 @@ async fn test_invalid_field_is_refused(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
 
     let mut body = if is_failure {
         valid_failure("prefill_throughput_256", CLAIMED_JOB_ID, false)
@@ -1904,7 +1906,7 @@ async fn test_device_time_ms_is_stored(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
 
     let mut body = if is_failure {
         valid_failure("prefill_throughput_256", CLAIMED_JOB_ID, false)
@@ -1940,11 +1942,12 @@ async fn test_submission_without_client_configuration_stores_null(
 
     let claimed = CLAIMED_JOB_ID;
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({"job_id": claimed, "spec": {"benchmark": "prefill_throughput_256"}}),
-    )?;
+    )
+    .await?;
 
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(claimed);
@@ -3013,7 +3016,7 @@ async fn test_submit_failure_routes_to_incoming_and_get_reports_failed() -> anyh
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
 
     let job_id = submit_benchmark(
         &state,
@@ -3062,7 +3065,7 @@ async fn test_submit_failure_trims_padded_fields_at_ingest() -> anyhow::Result<(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
 
     let job_id = submit_benchmark(
         &state,
@@ -3109,7 +3112,7 @@ async fn test_failure_response_echoes_client_version(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
 
     let mut body = json!({
         "message_type": "failure",
@@ -3203,7 +3206,7 @@ async fn test_submit_malformed_failure_body_returns_400(
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     // A live lease, so the refusal cannot be the claim check's `404`.
-    seed_lease(dir.path(), CLAIMED_JOB_ID, &client_id)?;
+    seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     let leases = state.todo_store.list_leased_for_client(&client_id).await?;
 
     let mut body = valid_failure("prefill_throughput_256", CLAIMED_JOB_ID, false);

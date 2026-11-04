@@ -24,6 +24,8 @@ pub enum OfferError {
     ModelMember,
     #[error("device does not meet the offer rule")]
     NotMet,
+    #[error("device does not report build flag `{flag}`")]
+    NoBuild { flag: String },
     #[error("no offered runtime loads `{model_type}`")]
     NoLoadingRuntime { model_type: ModelType },
 }
@@ -55,17 +57,21 @@ pub fn offer(
 }
 
 /// Check one member against a device's flags, as computed by
-/// [`FleetTags::capabilities_of`].
-fn offer_flags(
+/// [`FleetTags::capabilities_of`]. The device must meet the member's offer
+/// rule. For a runtime that the iOS app builds in, the device must also report
+/// the member's build flag.
+pub(crate) fn offer_flags(
     config: &DescriptorCatalogConfig,
     member: &DescriptorMember,
     flags: &BTreeSet<String>,
 ) -> Result<(), OfferError> {
     let rule = coverage(config, member)?;
-    if capabilities_satisfy(&rule.requires, &rule.any_of, flags) {
-        Ok(())
-    } else {
-        Err(OfferError::NotMet)
+    if !capabilities_satisfy(&rule.requires, &rule.any_of, flags) {
+        return Err(OfferError::NotMet);
+    }
+    match member.app_build_flag() {
+        Some(flag) if !flags.contains(&flag) => Err(OfferError::NoBuild { flag }),
+        _ => Ok(()),
     }
 }
 
@@ -142,15 +148,17 @@ mod tests {
         DescriptorEntryState, DeviceProfile, NonEmptyTrimmedString, NonEmptyVec, PublicKeyHex,
     };
 
-    use self::Runtime::{AppleFoundation, Llamacpp, Ovms};
+    use self::Runtime::{AppleFoundation, IosLlamacpp, Llamacpp, Ovms};
     use super::*;
 
-    /// A member's runtime: llama.cpp or OVMS with a flavor, or Apple Foundation.
+    /// A member's runtime: llama.cpp or OVMS with a flavor, Apple Foundation,
+    /// or the iOS app's llama.cpp at a build version.
     #[derive(Debug, Clone, Copy)]
     enum Runtime {
         Llamacpp(&'static str),
         Ovms(&'static str),
         AppleFoundation,
+        IosLlamacpp(&'static str),
     }
 
     /// The expected result of `resolve`: the offered flavor, or each reason.
@@ -173,6 +181,11 @@ mod tests {
                 "repository_version": "v2026.4.0", "flavor": flavor
             }),
             Runtime::AppleFoundation => json!({"type": "apple_foundation"}),
+            Runtime::IosLlamacpp(version) => json!({
+                "type": "llamacpp_ios_pipette",
+                "repository_url": "github.com/ggml-org/llama.cpp",
+                "repository_version": version, "flavor": "ios-arm64"
+            }),
         };
         Ok(DescriptorMember::new(
             serde_json::from_value(runtime)?,
@@ -239,6 +252,10 @@ requires = ["os:macos"]
 runtime_type = "ovms"
 flavor = "windows-x64"
 requires = ["os:windows"]
+[[offer_rules]]
+runtime_type = "llamacpp_ios_pipette"
+flavor = "ios-arm64"
+requires = ["os:ios"]
 "#,
         )?)
     }
@@ -300,21 +317,90 @@ requires = ["os:windows"]
     #[case::covered(Runtime::Llamacpp("macos-arm64"), Ok(()))]
     #[case::no_rule(Runtime::Llamacpp("linux-x64-rocm"), Err("no_rule"))]
     #[case::unsupported(Runtime::AppleFoundation, Err("unsupported"))]
+    #[case::ios_app_runtime(Runtime::IosLlamacpp("b1"), Ok(()))]
     fn coverage_cases(
         #[case] runtime: Runtime,
         #[case] expected: Result<(), &str>,
     ) -> anyhow::Result<()> {
         let member = member(runtime)?;
-        let result = coverage(&rules()?, &member)
-            .map(|_| ())
-            .map_err(|error| match error {
-                OfferError::NoRule { .. } => "no_rule",
-                OfferError::Unsupported { .. } => "unsupported",
-                OfferError::NotMet => "not_met",
-                OfferError::ModelMember => "model_member",
-                OfferError::NoLoadingRuntime { .. } => "no_loading_runtime",
-            });
+        let result = coverage(&rules()?, &member).map(|_| ()).map_err(code);
         assert_eq!(result, expected);
+        Ok(())
+    }
+
+    fn code(error: OfferError) -> &'static str {
+        match error {
+            OfferError::NoRule { .. } => "no_rule",
+            OfferError::Unsupported { .. } => "unsupported",
+            OfferError::NotMet => "not_met",
+            OfferError::NoBuild { .. } => "no_build",
+            OfferError::ModelMember => "model_member",
+            OfferError::NoLoadingRuntime { .. } => "no_loading_runtime",
+        }
+    }
+
+    /// An approved device with the profile `os` that reports the iOS app build
+    /// flag of each llama.cpp version in `builds`.
+    fn app_device(os: &str, builds: &[&'static str]) -> anyhow::Result<Client> {
+        let mut device = client(os, None)?;
+        device.capabilities = builds
+            .iter()
+            .map(|version| {
+                member(IosLlamacpp(version))?
+                    .app_build_flag()
+                    .context("an iOS app runtime has a build flag")
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(device)
+    }
+
+    #[rstest]
+    #[case::rule_and_build(IosLlamacpp("b2"), "iOS", &["b1", "b2"], Ok(()))]
+    #[case::other_build_only(IosLlamacpp("b2"), "iOS", &["b1"], Err("no_build"))]
+    #[case::no_build_flag(IosLlamacpp("b2"), "iOS", &[], Err("no_build"))]
+    #[case::rule_not_met(IosLlamacpp("b2"), "macOS", &["b2"], Err("not_met"))]
+    #[case::neither(IosLlamacpp("b2"), "macOS", &[], Err("not_met"))]
+    #[case::stock_llamacpp_needs_no_build(Llamacpp("macos-x64"), "macOS", &[], Ok(()))]
+    fn app_build_offer_cases(
+        #[case] runtime: Runtime,
+        #[case] os: &str,
+        #[case] builds: &[&'static str],
+        #[case] expected: Result<(), &str>,
+    ) -> anyhow::Result<()> {
+        let result = offer(
+            &rules()?,
+            &member(runtime)?,
+            &app_device(os, builds)?,
+            &FleetTags::default(),
+        )
+        .map_err(code);
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    /// One entry per app build: a device resolves the entry of the build that
+    /// it reports, and the other entry withholds its member for that reason.
+    #[test]
+    fn a_device_resolves_only_the_app_build_that_it_reports() -> anyhow::Result<()> {
+        let (reported, other) = (entry(&[IosLlamacpp("b2")])?, entry(&[IosLlamacpp("b1")])?);
+        let device = app_device("iOS", &["b2"])?;
+        let rules = rules()?;
+        assert_eq!(
+            resolve(&reported, &rules, &device, &FleetTags::default()),
+            Resolution::Resolved(reported.members.head())
+        );
+        let Resolution::Withheld(withheld) =
+            resolve(&other, &rules, &device, &FleetTags::default())
+        else {
+            anyhow::bail!("the entry of an unreported build resolved");
+        };
+        assert_eq!(
+            withheld
+                .into_iter()
+                .map(|item| code(item.reason))
+                .collect::<Vec<_>>(),
+            ["no_build"]
+        );
         Ok(())
     }
 

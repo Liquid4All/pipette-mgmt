@@ -117,11 +117,6 @@ pub async fn run(
     let failed_items = failed_items + teardown.failures;
     // The `avail/` keys keep a recycled lease from being re-indexed as new.
     let leased_ids: HashSet<JobId> = teardown.leased.iter().map(|l| l.job_id.clone()).collect();
-    let leased_avail_keys: HashSet<String> = teardown
-        .leased
-        .iter()
-        .map(|l| avail_filename(&l.job_id, l.expires_at))
-        .collect();
 
     // Before the expiry pass, which re-dates or retires a job from the member
     // horizons left after the lapses.
@@ -149,6 +144,31 @@ pub async fn run(
     let (all_keys, escalated_now, escalation_failures) =
         escalate_all_denied_jobs(todo, submissions, catalog, all_keys, &mut bodies, now).await?;
     let failed_items = failed_items + expiry_failures + retirement_failures + escalation_failures;
+
+    // A promoted job waits in avail/ until at least one of its plans leaves
+    // creating. Keep it out of all three index passes and the persisted set,
+    // so the next run evaluates it when its plan becomes active.
+    let index_candidates: HashSet<JobId> = all_keys
+        .iter()
+        .map(|key| key.job_id.clone())
+        .chain(teardown.leased.iter().map(|lease| lease.job_id.clone()))
+        .collect();
+    let withheld = uncommitted_jobs(&index_candidates, &job_plan_markers, &manifests);
+    let indexable_keys: Vec<AvailKey> = all_keys
+        .iter()
+        .filter(|key| !withheld.contains(&key.job_id))
+        .map(|key| AvailKey {
+            key: key.key.clone(),
+            job_id: key.job_id.clone(),
+            expires_at: key.expires_at,
+        })
+        .collect();
+    let indexable_leased_avail_keys: HashSet<String> = teardown
+        .leased
+        .iter()
+        .filter(|lease| !withheld.contains(&lease.job_id))
+        .map(|lease| avail_filename(&lease.job_id, lease.expires_at))
+        .collect();
 
     // Confirmed terminal for this run's GC sweeps.
     let mut terminal_now = expired_now;
@@ -195,8 +215,8 @@ pub async fn run(
         todo,
         &workers,
         &fleet_tags,
-        &all_keys,
-        &leased_avail_keys,
+        &indexable_keys,
+        &indexable_leased_avail_keys,
         &mut bodies,
     )
     .await?;
@@ -206,7 +226,7 @@ pub async fn run(
         tags,
         &worker_ids,
         &joined,
-        &all_keys,
+        &indexable_keys,
         &leased_ids,
         &mut bodies,
     )
@@ -221,7 +241,7 @@ pub async fn run(
         tags,
         submissions,
         &worker_ids,
-        &all_keys,
+        &indexable_keys,
         &mut bodies,
     )
     .await?;
@@ -244,7 +264,14 @@ pub async fn run(
         .into_iter()
         .filter_map(|(job_id, expiry)| expiry.map(|expiry| (job_id, expiry)))
         .collect();
-    let eligible = todo.list_all_eligible().await?;
+    let mut eligible = todo.list_all_eligible().await?;
+    for (client_id, job_id, expires_at) in eligible
+        .iter()
+        .filter(|(_, job_id, _)| withheld.contains(job_id))
+    {
+        todo.delete_eligible(client_id, job_id, *expires_at).await?;
+    }
+    eligible.retain(|(_, job_id, _)| !withheld.contains(job_id));
     let denied = todo.list_all_denied().await?;
     let mut next_candidates = reconcile_orphans(
         todo,
@@ -298,6 +325,9 @@ pub async fn run(
             error = %e,
             "queue-maintenance: campaign backlog snapshot write failed"
         ),
+    }
+    if let Err(e) = submissions.repair_outcomes().await {
+        tracing::warn!(error = %e, "queue-maintenance: submission outcome repair failed");
     }
 
     // Needs the post-teardown views and the client roster built above.
@@ -1242,6 +1272,33 @@ async fn track_worker_changes(
     Ok(joined)
 }
 
+/// Jobs whose memberships all point at creating or missing plans. A job with
+/// no membership keeps its existing queue behavior.
+fn uncommitted_jobs(
+    jobs: &HashSet<JobId>,
+    markers: &[JobPlanMarker],
+    manifests: &[PlanManifest],
+) -> HashSet<JobId> {
+    let statuses: HashMap<&PlanId, PlanStatus> = manifests
+        .iter()
+        .map(|plan| (&plan.plan_id, plan.status))
+        .collect();
+    let committed: HashSet<&JobId> = markers
+        .iter()
+        .filter(|marker| {
+            statuses
+                .get(&marker.plan_id)
+                .is_some_and(|status| *status != PlanStatus::Creating)
+        })
+        .map(|marker| &marker.job_id)
+        .collect();
+    let has_membership: HashSet<&JobId> = markers.iter().map(|marker| &marker.job_id).collect();
+    jobs.iter()
+        .filter(|job_id| has_membership.contains(job_id) && !committed.contains(job_id))
+        .cloned()
+        .collect()
+}
+
 /// Index every `avail/` key absent from the persisted indexed set against the
 /// workers, then rewrite the set; a key, once indexed, is never paid for again.
 ///
@@ -1903,20 +1960,160 @@ pub async fn client_tags(
 
 #[cfg(test)]
 mod tests {
+    use futures::stream::TryStreamExt;
     use rstest::rstest;
 
     use pipette_core::client_permission::ClientPermissionSet;
     use pipette_core::config::StorageConfig;
     use pipette_core::denial::DenialRecord;
-    use pipette_core::todo_filename::leased_key;
     use pipette_plan_types::ClientId;
     use pipette_store::ClientStore;
     use pipette_store_fs::{
         LocalFsSubmissionStore, LocalFsTagStore, build_local_fs_client_store,
         build_local_fs_todo_store,
     };
+    use pipette_store_testkit::seed_leased_until;
 
     use super::*;
+
+    #[tokio::test]
+    async fn sql_queue_runs_every_maintenance_pass() -> anyhow::Result<()> {
+        use pipette_store_testkit::seed_avail;
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let mut stores = pipette_store_sql::overlay(
+            db.db(),
+            pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..Default::default()
+            })?,
+        );
+        stores.todo = std::sync::Arc::new(pipette_store_sql::SqlTodoStore::new(db.db().clone()));
+        let worker = settle_test_client("sql-worker", "66", "chip-a")?;
+        let client = &worker.client_id;
+        stores.clients.put_client(&worker).await?;
+        stores
+            .clients
+            .put_client_permissions(
+                client,
+                &pipette_core::client_permission::ClientPermissionSet::from_iter([
+                    pipette_plan_types::ClientPermission::PerformWork,
+                ]),
+            )
+            .await?;
+        // Mark the worker as indexed. A joining worker gets a rebuild, and the
+        // rebuild deletes the sql-ghost marker before the orphan sweep sees it.
+        stores
+            .todo
+            .write_eligible_workers(&HashSet::from([client.clone()]))
+            .await?;
+        let body =
+            |id: &str| pipette_store_testkit::todo_job_body(id, &[client.as_str()], "bench-1");
+        let todo = &*stores.todo;
+        let available = seed_avail(
+            todo,
+            "sql-available",
+            ExpiresAt::Never,
+            &body("sql-available"),
+        )
+        .await?;
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let recycled = seed_leased_until(
+            todo,
+            "sql-recycled",
+            ExpiresAt::Never,
+            client,
+            past,
+            &body("sql-recycled"),
+        )
+        .await?;
+        let overdue = seed_avail(
+            todo,
+            "sql-overdue",
+            ExpiresAt::At(past),
+            &body("sql-overdue"),
+        )
+        .await?;
+        let ghost = JobId::try_new("sql-ghost")?;
+        todo.write_eligible(client, &ghost, ExpiresAt::Never)
+            .await?;
+        todo.write_denied(&ghost, client, &DenialRecord::default())
+            .await?;
+        let catalog = HashMap::from([(
+            BenchmarkId::try_new("bench-1")?,
+            Benchmark::from_toml(
+                "bench-1",
+                "benchmark_type = \"prefill_throughput\"\nparameter_prefill_tokens = 100",
+            )?,
+        )]);
+        for pass in 1..=2 {
+            run(
+                todo,
+                &*stores.clients,
+                &*stores.tags,
+                &*stores.submissions,
+                &*stores.plans,
+                &catalog,
+                MaintenanceSettings {
+                    tmp_max: Duration::from_secs(86_400),
+                    plan_creating_max: Duration::from_secs(21_600),
+                    lost_lease_limit: 3,
+                },
+            )
+            .await?;
+            assert!(
+                todo.list_eligible_for_client(client)
+                    .await?
+                    .contains(&(available.clone(), ExpiresAt::Never))
+            );
+            assert!(todo.get_avail_by_job(&recycled).await?.is_some());
+            assert_eq!(todo.list_lost_leases(&recycled).await?.len(), 1);
+            assert!(todo.get_avail_by_job(&overdue).await?.is_none());
+            assert_eq!(
+                todo.read_backlog()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("missing backlog"))?
+                    .jobs
+                    .get(client),
+                Some(&2)
+            );
+            assert_eq!(
+                todo.read_campaign_backlog()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("missing campaign backlog"))?
+                    .devices
+                    .get(client)
+                    .map(|b| b.outside_campaigns),
+                Some(2)
+            );
+            if pass == 1 {
+                let candidates = todo.read_gc_candidates().await?;
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|k| k.starts_with("eligible/") && k.contains("sql-ghost"))
+                );
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|k| k.starts_with("denied/") && k.contains("sql-ghost"))
+                );
+            } else {
+                assert!(!todo.is_denied(&ghost, client).await?);
+                assert!(
+                    !todo
+                        .list_eligible_for_client(client)
+                        .await?
+                        .iter()
+                        .any(|(j, _)| j == &ghost)
+                );
+            }
+        }
+        Ok(())
+    }
 
     /// A `list_objects_v2` rule that answers like a bucket holding `keys`.
     ///
@@ -1974,33 +2171,29 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
         })?;
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
-        let leased_dir = dir.path().join("todo").join("leased");
 
         let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
         let client = ClientId::try_new("client1")?;
-        [
-            ("job-expired", "2026-01-01T00:00:00Z"),
-            ("job-live", "2026-12-31T00:00:00Z"),
-            ("job-recorded", "2026-01-01T00:00:00Z"),
-        ]
-        .into_iter()
-        .try_for_each(|(job, expiry)| -> anyhow::Result<()> {
-            let path = leased_dir.join(leased_key(
+        let todo_ref = &*todo;
+        let client_ref = &client;
+        stream::iter(
+            [
+                ("job-expired", "2026-01-01T00:00:00Z"),
+                ("job-live", "2026-12-31T00:00:00Z"),
+                ("job-recorded", "2026-01-01T00:00:00Z"),
+            ]
+            .map(Ok::<_, anyhow::Error>),
+        )
+        .try_for_each(|(job, expiry)| async move {
+            seed_lease(
+                todo_ref,
                 &JobId::new_unchecked(job),
-                ExpiresAt::Never,
-                &client,
+                client_ref,
                 expiry.parse()?,
-            ));
-            let parent = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("leased key has no parent dir"))?;
-            std::fs::create_dir_all(parent)?;
-            std::fs::write(
-                &path,
-                serde_json::to_vec(&serde_json::json!({ "job_id": job }))?,
-            )?;
-            Ok(())
-        })?;
+            )
+            .await
+        })
+        .await?;
         let recorded = JobId::new_unchecked("job-recorded");
         submissions
             .write_processed(
@@ -2036,29 +2229,22 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
         })?;
         let submissions = pipette_store_s3::in_memory_submission_store();
-        let leased_dir = dir.path().join("todo").join("leased");
 
         let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
         let client = ClientId::try_new("client1")?;
-        ["job-unrecorded", "job-recorded"]
-            .into_iter()
-            .try_for_each(|job| -> anyhow::Result<()> {
-                let path = leased_dir.join(leased_key(
+        let todo_ref = &*todo;
+        let client_ref = &client;
+        stream::iter(["job-unrecorded", "job-recorded"].map(Ok::<_, anyhow::Error>))
+            .try_for_each(|job| async move {
+                seed_lease(
+                    todo_ref,
                     &JobId::new_unchecked(job),
-                    ExpiresAt::Never,
-                    &client,
+                    client_ref,
                     "2026-01-01T00:00:00Z".parse()?,
-                ));
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("leased key has no parent dir"))?;
-                std::fs::create_dir_all(parent)?;
-                std::fs::write(
-                    &path,
-                    serde_json::to_vec(&serde_json::json!({ "job_id": job }))?,
-                )?;
-                Ok(())
-            })?;
+                )
+                .await
+            })
+            .await?;
         let recorded = JobId::new_unchecked("job-recorded");
         submissions
             .write_processed(
@@ -2935,27 +3121,22 @@ mod tests {
         Ok((todo, submissions, dir))
     }
 
-    /// Seed one lease directly on disk under `ExpiresAt::Never`.
-    fn seed_lease(
-        data_dir: &std::path::Path,
+    /// Seed one lease of `job` under `ExpiresAt::Never`. Set the job ID in its body.
+    async fn seed_lease(
+        todo: &dyn TodoStore,
         job: &JobId,
         client: &ClientId,
         expiry: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let path = data_dir.join("todo").join("leased").join(leased_key(
-            job,
+        seed_leased_until(
+            todo,
+            job.as_str(),
             ExpiresAt::Never,
             client,
             expiry,
-        ));
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("leased key has no parent dir"))?;
-        std::fs::create_dir_all(parent)?;
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({ "job_id": job.to_string() }))?,
-        )?;
+            &serde_json::json!({ "job_id": job.as_str() }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2996,7 +3177,7 @@ mod tests {
     async fn reconcile_client_owned_markers_across_subtrees(
         #[case] client_live: bool,
     ) -> anyhow::Result<()> {
-        let (todo, submissions, dir) = recon_stores()?;
+        let (todo, submissions, _dir) = recon_stores()?;
         let client = ClientId::try_new(if client_live { "live-client" } else { "ghost" })?;
         let job = JobId::new_unchecked("job-live");
         let job_leased = JobId::new_unchecked("job-leased");
@@ -3009,11 +3190,12 @@ mod tests {
         todo.stamp_liveness(&client).await?;
         todo.write_pending_reindex(&client).await?;
         seed_lease(
-            dir.path(),
+            &*todo,
             &job_leased,
             &client,
             "2026-12-31T00:00:00Z".parse()?,
-        )?;
+        )
+        .await?;
 
         let live_jobs = HashSet::from([job.clone(), job_leased.clone()]);
         let live_clients = if client_live {
@@ -3070,11 +3252,11 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_deletes_deleted_client_lease_when_job_recorded() -> anyhow::Result<()> {
-        let (todo, submissions, dir) = recon_stores()?;
+        let (todo, submissions, _dir) = recon_stores()?;
         let ghost = ClientId::try_new("ghost")?;
         let job = JobId::new_unchecked("job-recorded");
 
-        seed_lease(dir.path(), &job, &ghost, "2026-12-31T00:00:00Z".parse()?)?;
+        seed_lease(&*todo, &job, &ghost, "2026-12-31T00:00:00Z".parse()?).await?;
         submissions
             .write_processed(
                 &job,

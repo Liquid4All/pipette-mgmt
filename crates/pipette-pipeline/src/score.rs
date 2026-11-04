@@ -297,6 +297,7 @@ async fn finalize_one(
     if let Some(esr) = &scored.eval_sample_results {
         stores.eval_sample_results.write(job_id, esr).await?;
     }
+    record_run_evidence(stores, job_id, &scored.metric_rows).await?;
     stores
         .submissions
         .write_processed(job_id, submission_body)
@@ -839,6 +840,15 @@ async fn commit_chunk(stores: &Stores, outcomes: &[ScoreOutcome]) -> anyhow::Res
                 continue;
             }
         }
+        if let Err(e) = record_run_evidence(stores, &job.job_id, &job.metric_rows).await {
+            tracing::warn!(
+                job_id = %job.job_id,
+                error = %e,
+                "run evidence write failed; deferring job to next run"
+            );
+            deferred.push(job.job_id.clone());
+            continue;
+        }
         if let Err(e) = stores.submissions.mark_processed(&job.job_id).await {
             tracing::warn!(
                 job_id = %job.job_id,
@@ -858,6 +868,26 @@ async fn commit_chunk(stores: &Stores, outcomes: &[ScoreOutcome]) -> anyhow::Res
 
     deferred.extend(rowless.iter().map(|job| job.job_id.clone()));
     Ok(deferred)
+}
+
+/// Record a scored job's device run in the run evidence index, when the
+/// stores keep one. A replay after a failure is harmless: the index keeps the
+/// newest run of each side.
+async fn record_run_evidence(
+    stores: &Stores,
+    job_id: &JobId,
+    metric_rows: &[MetricRow],
+) -> anyhow::Result<()> {
+    let Some(index) = &stores.run_evidence else {
+        return Ok(());
+    };
+    let rows = crate::run_evidence::job_rows(metric_rows);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    index.upsert(&rows).await?;
+    tracing::debug!(job_id = %job_id, rows = rows.len(), "run evidence recorded");
+    Ok(())
 }
 
 struct ScoredJob {
@@ -6340,6 +6370,97 @@ mod tests {
             .await?
             .context("poison job should still be findable")?;
         assert!(matches!(poison_rec.state, JobState::Incoming));
+        Ok(())
+    }
+
+    /// A run evidence index that keeps each upsert, and fails an upsert that
+    /// holds the digest `poison`.
+    #[derive(Default)]
+    struct RecordingIndex(std::sync::Mutex<Vec<pipette_store::RunEvidenceRow>>);
+
+    #[async_trait]
+    impl pipette_store::RunEvidenceStore for RecordingIndex {
+        async fn upsert(&self, rows: &[pipette_store::RunEvidenceRow]) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                rows.iter().all(|row| row.digest != "poison"),
+                "injected run evidence write failure"
+            );
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned lock"))?
+                .extend_from_slice(rows);
+            Ok(())
+        }
+
+        async fn find(&self, _: &[String]) -> anyhow::Result<Vec<pipette_store::RunEvidenceRow>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_chunk_records_run_evidence_and_defers_a_job_whose_write_fails()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = Arc::new(RecordingIndex::default());
+        let stores = Stores {
+            run_evidence: Some(index.clone()),
+            ..commit_test_stores(dir.path())?
+        };
+        for jid in ["good", "poison"] {
+            stores
+                .submissions
+                .write_incoming(
+                    &JobId::new_unchecked(jid),
+                    &json!({"message_type": "success"}),
+                )
+                .await?;
+        }
+        // Each job's runtime digest is its id, so only `poison` fails.
+        let outcomes = ["good", "poison"]
+            .into_iter()
+            .map(|jid| -> anyhow::Result<ScoreOutcome> {
+                let mut row = commit_metric_row(jid)?;
+                row.runtime_descriptor_sha256 = Some(jid.to_string());
+                row.client_version = Some("v1".to_string());
+                row.submitted_at = 1_000_000;
+                Ok(ScoreOutcome::Scored(ScoredJob {
+                    job_id: JobId::new_unchecked(jid),
+                    benchmark_id: BenchmarkId::try_new("bench")?,
+                    client_id: ClientId::try_new("c1")?,
+                    day_key: "2026-06-12".to_string(),
+                    metric_rows: vec![row],
+                    eval_sample_results: None,
+                }))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let deferred = commit_chunk(&stores, &outcomes).await?;
+
+        assert_eq!(deferred, vec![JobId::new_unchecked("poison")]);
+        let recorded = index
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned lock"))?
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![pipette_store::RunEvidenceRow::of_run(
+                "good".to_string(),
+                ClientId::try_new("c1")?,
+                false,
+                pipette_plan_types::RunMark {
+                    at: chrono::DateTime::from_timestamp_micros(1_000_000)
+                        .context("a valid time")?,
+                    client_version: Some("v1".to_string()),
+                },
+            )]
+        );
+        let poison = stores
+            .submissions
+            .get_submission(&JobId::new_unchecked("poison"))
+            .await?
+            .context("poison job should still be findable")?;
+        assert!(matches!(poison.state, JobState::Incoming));
         Ok(())
     }
 

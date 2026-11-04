@@ -51,11 +51,7 @@ impl RunRow {
             source: self.source,
             target_name: self.target_name,
             result,
-            outcome: CatalogImportOutcome::of(
-                result,
-                &unclassified_assets,
-                self.error_summary.as_deref(),
-            ),
+            outcome: CatalogImportOutcome::from(result),
             entries_created: self.entries_created,
             entries_hidden: self.entries_hidden,
             members_added: self.members_added,

@@ -290,6 +290,8 @@ pub async fn file_job_bodies(
         .context("the campaign to file into exists")?;
     let catalog = state.catalog_cache.get().await?;
     let ctx = IngestContext {
+        descriptor_catalog: state.descriptor_catalog_store.as_deref(),
+        descriptor_config: &state.config.descriptor_catalog,
         plans: state.plan_store.as_ref(),
         todo: state.todo_store.as_ref(),
         clients: state.client_store.as_ref(),
@@ -309,6 +311,8 @@ pub async fn file_job_bodies(
     let report = ingest_jobs(
         &ctx,
         PlanSubmission {
+            resolved: Vec::new(),
+            submitted_sha256: None,
             note: Some(NonEmptyTrimmedString::try_new(cell)?),
             change: None,
             submitted_by: Some(signer.1.clone()),
@@ -334,6 +338,17 @@ pub async fn file_job_bodies(
 /// can create a campaign without a catalog of its own.
 pub const ONE_CELL_PLAN: &str = r#"
 benchmarks = ["prefill_throughput_256"]
+
+[[variants]]
+requires = ["os:macos"]
+models   = [{ type = "mlx", source = "huggingface", org = "LiquidAI", repo_name = "LFM2.5-350M-MLX-4bit" }]
+runtimes = [{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-arm64", source = { type = "pip_requirements_text", contents = "mlx-lm==0.31.3\n" } }]
+"#;
+
+/// [`ONE_CELL_PLAN`] with its one cell on `eval_test`, an eval that
+/// [`crate::setup_benchmarks`] writes, for a test that recalculates.
+pub const ONE_EVAL_PLAN: &str = r#"
+benchmarks = ["eval_test"]
 
 [[variants]]
 requires = ["os:macos"]

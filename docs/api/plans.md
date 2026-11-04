@@ -50,7 +50,7 @@ outstanding.
 
 | `status` | Means | Moves to |
 |---|---|---|
-| `creating` | Filing is writing its jobs; each is claimable once promoted, and a joined job is already live | `active` or `pending_clients` once filed; `cancelling`, or straight to `cancelled`, if cancelled now or if it is still `creating` after `plan_creating_max_age_secs` (6 hours by default) |
+| `creating` | Filing is writing its jobs; promoted jobs wait for a final plan before queue maintenance indexes them, while a job shared with an active plan stays live | `active` or `pending_clients` once filed; `cancelling`, or straight to `cancelled`, if cancelled now or if it is still `creating` after `plan_creating_max_age_secs` (6 hours by default) |
 | `active` | At least one outstanding job matches a working client | `pending_clients`, `complete`, `cancelling`, or `cancelled` when a cancel finds nothing left to retire |
 | `pending_clients` | Jobs are outstanding, but none matches any working client: the plan is ahead of the fleet. Not an error | `active` when a matching client registers or is granted work; `complete`, `cancelling`, or `cancelled` when a cancel finds nothing left to retire |
 | `cancelling` | Teardown is retiring the plan's live jobs. One-way | `cancelled` |

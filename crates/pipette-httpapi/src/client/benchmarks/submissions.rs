@@ -1104,6 +1104,7 @@ mod tests {
 
     use pipette_plan_types::BenchmarkType;
     use pipette_store_fs::{LocalFsSubmissionStore, LocalFsTodoStore};
+    use pipette_store_testkit::{seed_avail, seed_leased_until};
 
     use super::*;
 
@@ -1242,17 +1243,15 @@ mod tests {
         let locator_expiry = Utc::now() + chrono::Duration::hours(1);
 
         if plant_lease {
-            let body = json!({"spec": {"runtime_flags": {"threads": 8}}});
-            let leased = dir.path().join("todo").join("leased").join(
-                pipette_core::todo_filename::leased_key(
-                    &job,
-                    ExpiresAt::Never,
-                    &client,
-                    locator_expiry,
-                ),
-            );
-            std::fs::create_dir_all(leased.parent().context("lease path has no parent")?)?;
-            std::fs::write(&leased, serde_json::to_vec(&body)?)?;
+            seed_leased_until(
+                &todo,
+                job.as_str(),
+                ExpiresAt::Never,
+                &client,
+                locator_expiry,
+                &json!({"spec": {"runtime_flags": {"threads": 8}}}),
+            )
+            .await?;
         }
 
         if renew_after_locator {
@@ -1286,18 +1285,15 @@ mod tests {
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
 
         let old_expiry = Utc::now() - chrono::Duration::hours(2);
-        let leased =
-            dir.path()
-                .join("todo")
-                .join("leased")
-                .join(pipette_core::todo_filename::leased_key(
-                    &job,
-                    ExpiresAt::Never,
-                    &client,
-                    old_expiry,
-                ));
-        std::fs::create_dir_all(leased.parent().context("lease path has no parent")?)?;
-        std::fs::write(&leased, b"{}")?;
+        seed_leased_until(
+            &todo,
+            job.as_str(),
+            ExpiresAt::Never,
+            &client,
+            old_expiry,
+            &json!({}),
+        )
+        .await?;
 
         let new_expiry = Utc::now() + chrono::Duration::hours(1);
         verify_claim(&todo, &job, &client, new_expiry).await?;
@@ -1330,14 +1326,13 @@ mod tests {
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
         let job = JobId::new_unchecked("job-recycled");
 
-        let avail = dir.path().join("todo").join("avail").join(
-            pipette_core::todo_filename::avail_filename(&job, pipette_plan_types::ExpiresAt::Never),
-        );
-        std::fs::create_dir_all(avail.parent().context("avail entry has a job directory")?)?;
-        std::fs::write(
-            &avail,
-            serde_json::to_vec(&json!({ "job_id": "job-recycled" }))?,
-        )?;
+        seed_avail(
+            &todo,
+            job.as_str(),
+            ExpiresAt::Never,
+            &json!({ "job_id": "job-recycled" }),
+        )
+        .await?;
         if recorded {
             submissions
                 .write_processed(

@@ -135,6 +135,7 @@ fn strict_passes_when_every_known_flavor_has_a_rule() -> anyhow::Result<()> {
     "evals_server_ur"
 )]
 #[case::section(format!("{MINIMAL_CONFIG}\n[storag]\nbackend = \"s3\"\n"), "storag")]
+#[case::todo_storage(format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"local_fs\"\ndata_dri = \"./queue\"\n"), "todo_storage.data_dri")]
 fn warns_on_an_unknown_key_and_strict_fails(
     #[case] content: String,
     #[case] key: &str,
@@ -155,6 +156,23 @@ fn warns_on_an_unknown_key_and_strict_fails(
     let message = stderr(&strict);
     assert!(!strict.status.success(), "{message}");
     assert!(message.contains("1 keys are unknown"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn database_queue_without_database_section_fails_config_check() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = write_config(
+        dir.path(),
+        &format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"database\"\n"),
+    )?;
+    let output = run(&["config", "check", "--config", &path.to_string_lossy()])?;
+    let message = stderr(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains("[todo_storage]") && message.contains("[database]"),
+        "{message}"
+    );
     Ok(())
 }
 

@@ -45,6 +45,13 @@ impl<T> NonEmptyVec<T> {
     }
 }
 
+/// Items added to a non-empty sequence keep it non-empty.
+impl<T> Extend<T> for NonEmptyVec<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
+        self.0.extend(items);
+    }
+}
+
 impl<T> AsRef<[T]> for NonEmptyVec<T> {
     fn as_ref(&self) -> &[T] {
         &self.0

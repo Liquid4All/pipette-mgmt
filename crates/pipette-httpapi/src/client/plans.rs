@@ -860,8 +860,8 @@ mod tests {
     use rstest::rstest;
 
     use pipette_core::config::StorageConfig;
-    use pipette_core::todo_filename::leased_key;
     use pipette_store_fs::{LocalFsSubmissionStore, build_local_fs_todo_store};
+    use pipette_store_testkit::seed_leased_until;
 
     use super::*;
 
@@ -893,27 +893,27 @@ mod tests {
         let client = ClientId::try_new("revert-client")?;
         let now = Utc::now();
         let lease_expiry = now + chrono::Duration::hours(1);
-        let seed = |job: &JobId, expiry: DateTime<Utc>| -> anyhow::Result<()> {
-            let path = dir.path().join("todo").join("leased").join(leased_key(
-                job,
+        let body = |job: &JobId| serde_json::json!({ "job_id": job.as_str() });
+        seed_leased_until(
+            &*todo,
+            job.as_str(),
+            ExpiresAt::Never,
+            &client,
+            lease_expiry,
+            &body(&job),
+        )
+        .await?;
+        if let Some(hours) = other_lease_hours {
+            seed_leased_until(
+                &*todo,
+                other.as_str(),
                 ExpiresAt::Never,
                 &client,
-                expiry,
-            ));
-            let parent = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("leased key has no parent dir"))?;
-            std::fs::create_dir_all(parent)?;
-            std::fs::write(
-                &path,
-                serde_json::to_vec(&serde_json::json!({ "job_id": job.as_str() }))?,
-            )?;
-            Ok(())
-        };
-        seed(&job, lease_expiry)?;
-        other_lease_hours
-            .map(|hours| seed(&other, now + chrono::Duration::hours(hours)))
-            .transpose()?;
+                now + chrono::Duration::hours(hours),
+                &body(&other),
+            )
+            .await?;
+        }
         if flagged {
             todo.write_pending_reindex(&client).await?;
         }

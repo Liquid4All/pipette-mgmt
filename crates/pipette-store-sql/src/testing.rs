@@ -349,6 +349,20 @@ mod tests {
             )
         };
 
+        let has_rename_cascade = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE connamespace = current_schema()::regnamespace
+                     AND conname = 'descriptor_members_scope_name_key_fkey' AND confupdtype = 'c')",
+            )
+        };
+
+        let has_run_evidence = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'run_evidence')",
+            )
+        };
+
         let has_first_clerk_sign_in = || {
             exists(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'user_first_clerk_sign_in')",
@@ -373,6 +387,38 @@ mod tests {
         assert!(has_catalog_scope().await?);
         assert!(has_model_members().await?);
         assert!(has_model_alias().await?);
+        assert!(has_entries_hidden().await?);
+        assert!(has_rename_cascade().await?);
+        assert!(has_run_evidence().await?);
+
+        let has_job_queue = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('queue_jobs') IS NOT NULL \
+                 AND to_regclass('queue_tmp') IS NOT NULL",
+            )
+            .fetch_one(db.pool())
+        };
+        assert!(has_job_queue().await?);
+        let has_outcome_repairs = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('submission_outcome_repairs') IS NOT NULL",
+            )
+            .fetch_one(db.pool())
+        };
+        assert!(has_outcome_repairs().await?);
+        let moved = crate::migrate::migrate(db, Some(21), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(21), vec![23, 22]));
+        assert!(!has_job_queue().await?);
+        assert!(!has_outcome_repairs().await?);
+
+        let moved = crate::migrate::migrate(db, Some(20), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(20), vec![21]));
+        assert!(!has_run_evidence().await?);
+        assert!(has_rename_cascade().await?);
+
+        let moved = crate::migrate::migrate(db, Some(19), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(19), vec![20]));
+        assert!(!has_rename_cascade().await?);
         assert!(has_entries_hidden().await?);
 
         let moved = crate::migrate::migrate(db, Some(18), false).await?;
@@ -479,8 +525,10 @@ mod tests {
         assert_eq!(
             (moved.to, moved.applied),
             (
-                Some(19),
-                vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+                Some(23),
+                vec![
+                    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+                ]
             )
         );
         assert!(has_type().await?);
@@ -500,7 +548,10 @@ mod tests {
         assert!(has_catalog_scope().await?);
         assert!(has_model_members().await?);
         assert!(has_entries_hidden().await?);
+        assert!(has_rename_cascade().await?);
         assert!(has_first_clerk_sign_in().await?);
+        assert!(has_run_evidence().await?);
+        assert!(has_job_queue().await?);
         crate::migrate::check(db).await
     }
 

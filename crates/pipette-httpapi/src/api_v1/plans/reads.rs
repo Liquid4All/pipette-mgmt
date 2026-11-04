@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -823,23 +825,137 @@ pub(crate) async fn read_source(
 }
 
 // GET /api/v1/plans/{plan_id}/jobs
+/// Wall times of work in an `all=true` results read. Concurrent stages overlap.
+#[derive(Clone, Copy, Default)]
+struct JobReadStages {
+    plan_access_ms: u64,
+    page_build_ms: u64,
+    controls_ms: u64,
+    document_ms: u64,
+    rerun_grant_ms: u64,
+    cells_ms: u64,
+    results_ms: u64,
+    cache_ms: u64,
+    duckdb_ms: u64,
+    history_ms: u64,
+    queue_ms: u64,
+    assembly_ms: u64,
+    names_ms: u64,
+    serialization_ms: u64,
+    cache_hit: bool,
+}
+
+#[derive(Default)]
+struct JobReadTiming(Mutex<JobReadStages>);
+
+impl JobReadTiming {
+    fn set(&self, update: impl FnOnce(&mut JobReadStages)) {
+        update(
+            &mut self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    fn snapshot(&self) -> JobReadStages {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn slow_job_read(elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(1)
+}
+
+fn log_job_read(
+    stages: JobReadStages,
+    elapsed: Duration,
+    jobs: usize,
+    rows: usize,
+    read: Option<ResultsRead>,
+    ok: bool,
+) {
+    let total_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                total_ms, jobs, rows, ok, results_read = ?read, cache_hit = stages.cache_hit,
+                plan_access_ms = stages.plan_access_ms, page_build_ms = stages.page_build_ms,
+                controls_ms = stages.controls_ms, document_ms = stages.document_ms,
+                rerun_grant_ms = stages.rerun_grant_ms,
+                cells_ms = stages.cells_ms,
+                results_ms = stages.results_ms, cache_ms = stages.cache_ms,
+                duckdb_ms = stages.duckdb_ms,
+                history_ms = stages.history_ms, queue_ms = stages.queue_ms,
+                assembly_ms = stages.assembly_ms, names_ms = stages.names_ms,
+                serialization_ms = stages.serialization_ms,
+                "plan jobs results read timing"
+            );
+        };
+    }
+    if slow_job_read(elapsed) {
+        emit!(tracing::Level::INFO);
+    } else {
+        emit!(tracing::Level::DEBUG);
+    }
+}
+
 pub async fn list_plan_jobs(
     State(state): State<AppState>,
     active: ActiveUser,
     ApiPath(Parsed(plan_id)): ApiPath<Parsed<PlanId>>,
     ApiQuery(query): ApiQuery<PlanJobsQuery>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let caller = active.caller();
     let window = job_window(&query);
+    let timed = query.results.unwrap_or(false) && window == JobWindow::All;
+    let started = Instant::now();
+    let timing = timed.then(JobReadTiming::default);
+    if timed {
+        tracing::Span::current().record("plan_id", tracing::field::display(&plan_id));
+    }
     let body = if query.results.unwrap_or(false) {
-        plan_jobs(&state, caller, &plan_id, window).await?
+        match plan_jobs(&state, caller, &plan_id, window, timing.as_ref()).await {
+            Ok(body) => body,
+            Err(error) => {
+                if let Some(timing) = &timing {
+                    log_job_read(timing.snapshot(), started.elapsed(), 0, 0, None, false);
+                }
+                return Err(error);
+            }
+        }
     } else {
         Named {
             body: jobs(&state, caller, &plan_id, window).await?,
             names: None,
         }
     };
-    Ok(Json(body))
+    let jobs = body.body.jobs.len();
+    let rows = body
+        .body
+        .jobs
+        .iter()
+        .map(|job| match &job.result {
+            Some(JobResult::Scored { rows, .. }) => rows.len(),
+            _ => 0,
+        })
+        .sum();
+    let read = body.body.results_read;
+    let serializing = Instant::now();
+    let response = Json(body).into_response();
+    if let Some(timing) = timing {
+        timing.set(|stages| stages.serialization_ms = elapsed_ms(serializing));
+        log_job_read(timing.snapshot(), started.elapsed(), jobs, rows, read, true);
+    }
+    Ok(response)
 }
 
 /// The plan page's jobs: [`with_results`]'s page under the plan scope alone, with
@@ -849,20 +965,43 @@ async fn plan_jobs(
     caller: Caller<'_>,
     plan_id: &PlanId,
     window: JobWindow,
+    timing: Option<&JobReadTiming>,
 ) -> Result<Named<PlanJobs>, AppError> {
     let user = caller.user;
-    let (manifest, read) = read_plan(state, caller, plan_id).await?;
-    let (mut page, (cancel, may_edit_note), document) = futures::try_join!(
-        with_results(state, caller, &manifest, window, &read),
+    let started = Instant::now();
+    let plan = read_plan(state, caller, plan_id).await;
+    if let Some(timing) = timing {
+        timing.set(|stages| stages.plan_access_ms = elapsed_ms(started));
+    }
+    let (manifest, read) = plan?;
+    let building = Instant::now();
+    let built = futures::try_join!(
+        with_results(state, caller, &manifest, window, &read, timing),
         async {
+            let started = Instant::now();
             let campaign = PlanCampaign::read(state, user, &read.rights, &manifest).await?;
-            Ok((
+            let result = Ok::<_, AppError>((
                 cancel_grant(state, user, &read.rights, &manifest, campaign.as_ref()).await?,
                 note_editable(user, &read.rights, &manifest, campaign.as_ref()),
-            ))
+            ));
+            if let Some(timing) = timing {
+                timing.set(|s| s.controls_ms = elapsed_ms(started));
+            }
+            result
         },
-        document_state(state, &manifest, read.fleet),
-    )?;
+        async {
+            let started = Instant::now();
+            let result = document_state(state, &manifest, read.fleet).await;
+            if let Some(timing) = timing {
+                timing.set(|s| s.document_ms = elapsed_ms(started));
+            }
+            result
+        },
+    );
+    if let Some(timing) = timing {
+        timing.set(|s| s.page_build_ms = elapsed_ms(building));
+    }
+    let (mut page, (cancel, may_edit_note), document) = built?;
     // Lease holders and rows name no machine below the full tier.
     let devices = match read.fleet {
         FleetDetail::Full => {
@@ -896,6 +1035,7 @@ async fn plan_jobs(
     let resources = planned_vault_ids(&page.jobs);
     with_planned_digests(&mut page.jobs);
     let digests = descriptor_digests(&page.jobs);
+    let naming = Instant::now();
     let (devices, vault, descriptor_names) = futures::join!(
         async {
             match devices {
@@ -912,6 +1052,9 @@ async fn plan_jobs(
         },
         descriptor_names(state, caller, digests),
     );
+    if let Some(timing) = timing {
+        timing.set(|stages| stages.names_ms = elapsed_ms(naming));
+    }
     let vault = vault?;
     let names = match devices {
         Some(mut names) => {
@@ -1370,6 +1513,7 @@ async fn with_results(
     manifest: &PlanManifest,
     window: JobWindow,
     read: &PlanRead,
+    timing: Option<&JobReadTiming>,
 ) -> Result<PlanJobs, AppError> {
     let fleet = read.fleet;
     let campaign_id = manifest.campaign_id.as_ref();
@@ -1379,18 +1523,28 @@ async fn with_results(
             // has expired jobs. Its manifest names every job, so the listing
             // can run beside a cold cache fill before the cells are ready.
             let (kept, early_queue) =
-                futures::try_join!(kept_results(state, manifest, window), async {
+                futures::try_join!(kept_results(state, manifest, window, timing), async {
                     if window == JobWindow::All && manifest.status == PlanStatus::Complete {
-                        queue_listings(state, manifest, &manifest.job_ids)
-                            .await
-                            .map(Some)
+                        let started = Instant::now();
+                        let answer = queue_listings(state, manifest, &manifest.job_ids).await;
+                        if let Some(timing) = timing {
+                            timing.set(|s| s.queue_ms = elapsed_ms(started));
+                        }
+                        answer.map(Some)
                     } else {
                         Ok(None)
                     }
                 })?;
             let cells = match &kept {
                 Some(kept) => kept.cells.clone(),
-                None => cells(state, manifest).await?,
+                None => {
+                    let started = Instant::now();
+                    let answer = cells(state, manifest).await;
+                    if let Some(timing) = timing {
+                        timing.set(|s| s.cells_ms = elapsed_ms(started));
+                    }
+                    answer?
+                }
             };
             let page = page_ids(&cells, window);
             let (results, queue) = futures::try_join!(
@@ -1398,20 +1552,43 @@ async fn with_results(
                     Ok(match kept {
                         Some(kept) => kept,
                         None => Arc::new(
-                            read_plan_results(state, manifest, cells.clone(), &page, window).await,
+                            read_plan_results(
+                                state,
+                                manifest,
+                                cells.clone(),
+                                &page,
+                                window,
+                                timing,
+                            )
+                            .await,
                         ),
                     })
                 },
                 async {
                     match early_queue {
                         Some(queue) => Ok(queue),
-                        None => queue_listings(state, manifest, &page).await,
+                        None => {
+                            let started = Instant::now();
+                            let answer = queue_listings(state, manifest, &page).await;
+                            if let Some(timing) = timing {
+                                timing.set(|s| s.queue_ms = elapsed_ms(started));
+                            }
+                            answer
+                        }
                     }
                 },
             )?;
             Ok::<_, AppError>((cells, page, results, queue))
         },
-        rerun_campaign(state, caller, &read.rights, campaign_id, &manifest.plan_id),
+        async {
+            let started = Instant::now();
+            let answer =
+                rerun_campaign(state, caller, &read.rights, campaign_id, &manifest.plan_id).await;
+            if let Some(timing) = timing {
+                timing.set(|s| s.rerun_grant_ms = elapsed_ms(started));
+            }
+            answer
+        },
     )?;
     // Every read is at the full tier, and a kept plan's runs are the whole
     // plan's: cut them to the page and to the caller's tier.
@@ -1433,10 +1610,15 @@ async fn with_results(
             .flatten()
             .for_each(ResultRow::withhold_fleet);
     }
+    let assembling = Instant::now();
     let jobs = jobs_of(
         state, manifest, &cells, window, fleet, results, &runs, queue,
     )
-    .await?;
+    .await;
+    if let Some(timing) = timing {
+        timing.set(|s| s.assembly_ms = elapsed_ms(assembling));
+    }
+    let jobs = jobs?;
     let mut page = with_job_results(jobs, runs, results);
     // The catalog is asked only where the page offers a recalculation, as the console's.
     let evals = match rerun_campaign_id {
@@ -1465,6 +1647,9 @@ async fn with_results(
             }
         }
     });
+    if let Some(timing) = timing {
+        timing.set(|s| s.assembly_ms = elapsed_ms(assembling));
+    }
     Ok(PlanJobs {
         rerun_campaign_id,
         ..page
@@ -1478,24 +1663,47 @@ async fn kept_results(
     state: &AppState,
     manifest: &PlanManifest,
     window: JobWindow,
+    timing: Option<&JobReadTiming>,
 ) -> Result<Option<Arc<PlanJobResults>>, AppError> {
     if manifest.status != PlanStatus::Complete || state.results_db.is_none() {
         return Ok(None);
     }
     let plan_id = &manifest.plan_id;
+    let started = Instant::now();
     match window {
-        JobWindow::Page { .. } => Ok(state.plan_results_cache.get(plan_id)),
+        JobWindow::Page { .. } => {
+            let kept = state.plan_results_cache.get(plan_id);
+            if let Some(timing) = timing {
+                timing.set(|s| {
+                    s.cache_ms = elapsed_ms(started);
+                    s.cache_hit = kept.is_some();
+                });
+            }
+            Ok(kept)
+        }
         JobWindow::All => {
+            let filled_here = std::sync::atomic::AtomicBool::new(false);
             let fill = || async {
-                let cells = cells(state, manifest).await?;
+                filled_here.store(true, std::sync::atomic::Ordering::Relaxed);
+                let started = Instant::now();
+                let cells = cells(state, manifest).await;
+                if let Some(timing) = timing {
+                    timing.set(|s| s.cells_ms = elapsed_ms(started));
+                }
+                let cells = cells?;
                 let page = page_ids(&cells, window);
-                Ok::<_, AppError>(read_plan_results(state, manifest, cells, &page, window).await)
+                Ok::<_, AppError>(
+                    read_plan_results(state, manifest, cells, &page, window, timing).await,
+                )
             };
-            state
-                .plan_results_cache
-                .get_or_fill(plan_id, fill)
-                .await
-                .map(Some)
+            let result = state.plan_results_cache.get_or_fill(plan_id, fill).await?;
+            if let Some(timing) = timing {
+                timing.set(|s| {
+                    s.cache_ms = elapsed_ms(started);
+                    s.cache_hit = !filled_here.load(std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            Ok(Some(result))
         }
     }
 }
@@ -1509,7 +1717,9 @@ async fn read_plan_results(
     cells: JobCells,
     page: &[JobId],
     window: JobWindow,
+    timing: Option<&JobReadTiming>,
 ) -> PlanJobResults {
+    let started = Instant::now();
     let campaign_id = manifest.campaign_id.as_ref();
     // One deadline for every results read of the page, so the earlier runs
     // read within the page's wait rather than after it.
@@ -1528,16 +1738,34 @@ async fn read_plan_results(
     // The runs come first: they settle the jobs that have one.
     let ((read, mut runs, rescores), mut history) = futures::join!(
         async {
+            let duckdb_started = Instant::now();
             let (read, runs) = read_results(state, manifest, page, window, FleetDetail::Full).await;
+            if let Some(timing) = timing {
+                timing.set(|s| s.duckdb_ms = elapsed_ms(duckdb_started));
+            }
             let rescored = runs.values().filter_map(|run| rescored_of(run)).collect();
+            let history_started = Instant::now();
             let rescores = runs_before(state, campaign_id, rescored, window, deadline).await;
+            if let Some(timing) = timing {
+                timing.set(|s| s.history_ms = s.history_ms.max(elapsed_ms(history_started)));
+            }
             (read, runs, rescores)
         },
-        rerun_reads(state, campaign_id, reran, window, deadline),
+        async {
+            let history_started = Instant::now();
+            let history = rerun_reads(state, campaign_id, reran, window, deadline).await;
+            if let Some(timing) = timing {
+                timing.set(|s| s.history_ms = s.history_ms.max(elapsed_ms(history_started)));
+            }
+            history
+        },
     );
     // Each history read its own parents whole, so a job both reached is the same in each.
     history.extend(rescores);
     fill_model_params(state, runs.values_mut().flatten()).await;
+    if let Some(timing) = timing {
+        timing.set(|s| s.results_ms = elapsed_ms(started));
+    }
     PlanJobResults {
         cells,
         read,

@@ -303,6 +303,7 @@ fn lookup_names(model: &pipette_plan_types::Model) -> Vec<&str> {
         // A `prefix` names a variant within a repo, not a model, and an MLX or torch
         // drafter is not a model key either.
         Model::Mlx(Mlx { source })
+        | Model::AppleCoreAi(pipette_plan_types::AppleCoreAi { source })
         | Model::Torch(Torch { source })
         | Model::Openvino(Openvino { source })
         | Model::OnnxGenai(OnnxGenai { source })

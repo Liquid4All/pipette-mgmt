@@ -14,8 +14,7 @@ use pipette_core::client::{Client, ClientStatus};
 use pipette_core::matching;
 use pipette_core::matching::{NarrowingClauses, describe_clauses};
 use pipette_core::plan::{
-    PlanExplanation, PlanLeases, PlanManifest, PlanNotes, PlanSource, StarvedExplanation,
-    StarvedGroup,
+    PlanExplanation, PlanLeases, PlanManifest, PlanNotes, StarvedExplanation, StarvedGroup,
 };
 use pipette_core::todo_filename::{Lease, parse_leased_key};
 use pipette_core::vault::VaultOwner;
@@ -66,12 +65,12 @@ pub async fn ingest(
 ) -> anyhow::Result<IngestReport> {
     let note = cli_note(note)?;
 
-    let (jobs, source, plan_warnings) = match input {
+    let expanded = match input {
         PlanInput::Document(path) => {
-            document_parts(expand_plan_file(ctx, path, note.as_ref()).await?)
+            expand_plan_file(ctx, &membership.owner, path, note.as_ref()).await?
         }
         PlanInput::Text(text) => {
-            document_parts(expand_plan_text(ctx, text.to_string(), note.as_ref()).await?)
+            expand_plan_text(ctx, &membership.owner, text.to_string(), note.as_ref()).await?
         }
     };
     ctx.todo.validate_backend().await?;
@@ -79,14 +78,16 @@ pub async fn ingest(
     Ok(ingest_jobs(
         ctx,
         PlanSubmission {
+            resolved: expanded.resolved,
+            submitted_sha256: Some(expanded.submitted_sha256),
             note,
             change,
             // Operator access on the server host authenticates nobody.
             submitted_by: None,
             membership,
-            jobs,
-            source,
-            plan_warnings,
+            jobs: index_labels(expanded.jobs),
+            source: Some(expanded.source),
+            plan_warnings: expanded.plan_warnings,
         },
     )
     .await?)
@@ -101,7 +102,7 @@ pub async fn dry_run_document(
     note: Option<String>,
 ) -> anyhow::Result<DocumentDryRun> {
     let note = cli_note(note)?;
-    let expanded = expand_plan_file(ctx, path, note.as_ref()).await?;
+    let expanded = expand_plan_file(ctx, owner, path, note.as_ref()).await?;
     dry_run_expanded(ctx, owner, expanded).await
 }
 
@@ -112,7 +113,7 @@ pub async fn dry_run_text(
     text: &str,
     note: Option<String>,
 ) -> anyhow::Result<DocumentDryRun> {
-    let expanded = expand_text(ctx, text, note).await?;
+    let expanded = expand_text(ctx, owner, text, note).await?;
     dry_run_expanded(ctx, owner, expanded).await
 }
 
@@ -124,6 +125,7 @@ async fn dry_run_expanded(
     Ok(plan_document::dry_run(
         ctx,
         owner,
+        expanded.source,
         expanded.jobs,
         expanded.plan_warnings,
         Utc::now(),
@@ -134,11 +136,12 @@ async fn dry_run_expanded(
 /// Expand a document that is in memory, with no dry-run check.
 pub async fn expand_text(
     ctx: &IngestContext<'_>,
+    owner: &VaultOwner,
     text: &str,
     note: Option<String>,
 ) -> anyhow::Result<ExpandedDocument> {
     let note = cli_note(note)?;
-    expand_plan_text(ctx, text.to_string(), note.as_ref()).await
+    expand_plan_text(ctx, owner, text.to_string(), note.as_ref()).await
 }
 
 /// An empty `--note` flag is an error, because an operator who types the flag
@@ -159,35 +162,26 @@ pub(crate) fn cli_note(note: Option<String>) -> anyhow::Result<Option<NonEmptyTr
 
 async fn expand_plan_file(
     ctx: &IngestContext<'_>,
+    owner: &VaultOwner,
     path: &Path,
     note: Option<&NonEmptyTrimmedString>,
 ) -> anyhow::Result<ExpandedDocument> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading plan document {}", path.display()))?;
-    expand_plan_text(ctx, text, note)
+    expand_plan_text(ctx, owner, text, note)
         .await
         .with_context(|| format!("expanding plan document {}", path.display()))
 }
 
 async fn expand_plan_text(
     ctx: &IngestContext<'_>,
+    owner: &VaultOwner,
     text: String,
     note: Option<&NonEmptyTrimmedString>,
 ) -> anyhow::Result<ExpandedDocument> {
-    let note = note.map(NonEmptyTrimmedString::as_str);
-    let types = plan_document::benchmark_types(ctx.catalog);
-    Ok(plan_document::expand_document(ctx.max_jobs, types, note, text).await?)
-}
-
-/// An expanded document as [`ingest`] files it: each job labelled by its index,
-/// and the source stored beside the plan.
-fn document_parts(
-    expanded: ExpandedDocument,
-) -> (Vec<(String, Value)>, Option<PlanSource>, Vec<String>) {
-    (
-        index_labels(expanded.jobs),
-        Some(expanded.source),
-        expanded.plan_warnings,
+    Ok(
+        plan_document::expand_named(ctx, owner, note.map(NonEmptyTrimmedString::as_str), text)
+            .await?,
     )
 }
 
@@ -995,6 +989,7 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
         let ctx = IngestContext::from_stores(
             stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             max_jobs,
             CREATING_MAX_AGE,
@@ -1236,6 +1231,7 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
         let ctx = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -1279,6 +1275,7 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
         let ctx = IngestContext::from_stores(
             &stores,
             &catalog,
+            crate::plan_ingestion::no_offer_rules(),
             ModelCheck::none(),
             MAX_JOBS,
             CREATING_MAX_AGE,
@@ -1612,11 +1609,14 @@ runtime_flags = [
             &IngestContext::from_stores(
                 stores,
                 &catalog,
+                crate::plan_ingestion::no_offer_rules(),
                 ModelCheck::none(),
                 MAX_JOBS,
                 CREATING_MAX_AGE,
             ),
             PlanSubmission {
+                resolved: Vec::new(),
+                submitted_sha256: None,
                 note: None,
                 change: None,
                 submitted_by: None,
@@ -1958,7 +1958,8 @@ runtime_flags = [
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         apply(&stores, &plan_id, seed).await?;
 
-        // A directory where the body belongs, so any read of it fails.
+        // A directory where the body belongs, so any read of it fails. No `TodoStore`
+        // call creates this fault in the `local_fs` layout.
         let key = collect_all_avail(stores.todo.as_ref())
             .await?
             .keys
@@ -2516,6 +2517,8 @@ runtime_flags = [
         let stores = stores_in(dir.path())?;
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
+        // No `TodoStore` call writes an invalid key, so this test writes one in the
+        // `local_fs` layout.
         match tree {
             Tree::Avail => std::fs::write(dir.path().join("todo/avail/not-a-job-key.json"), b"{}")?,
             Tree::Leased => {
@@ -2685,6 +2688,8 @@ runtime_flags = [
             .put_client(&client("ev1_alpha", "iOS")?)
             .await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
+        // No `TodoStore` call writes an invalid key, so this test writes one in the
+        // `local_fs` layout.
         let partition = dir.path().join("todo/leased/ev1_alpha");
         std::fs::create_dir_all(&partition)?;
         std::fs::write(partition.join("not-a-lease.json"), b"{}")?;

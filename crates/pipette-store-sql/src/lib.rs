@@ -17,7 +17,9 @@ mod model_params;
 mod orgs;
 mod permissions;
 mod plans;
+mod queue;
 mod retry;
+mod run_evidence;
 #[cfg(any(test, feature = "testkit"))]
 pub mod scratch;
 mod submissions;
@@ -33,6 +35,7 @@ use std::sync::Arc;
 
 pub use db::SqlDatabase;
 pub use job_cells::{JobCellBackfill, backfill_job_cells};
+pub use queue::SqlTodoStore;
 
 use pipette_store::{AuditStores, Stores};
 
@@ -66,6 +69,7 @@ pub fn overlay(db: &SqlDatabase, stores: Stores) -> Stores {
         catalog_import_runs: Some(Arc::new(
             catalog_import_runs::SqlCatalogImportRunStore::new(db.clone()),
         )),
+        run_evidence: Some(Arc::new(run_evidence::SqlRunEvidenceStore::new(db.clone()))),
         vault: Arc::new(vault::SqlVaultStore::new(db.clone(), stores.vault)),
         submissions: Arc::new(submissions::SqlSubmissionStore::new(
             db.clone(),

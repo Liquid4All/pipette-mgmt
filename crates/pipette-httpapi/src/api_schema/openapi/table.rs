@@ -660,6 +660,36 @@ pub(super) fn operations() -> Vec<Operation> {
         ),
         op(
             M::POST,
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/rename",
+            "rename_org_descriptor_entry",
+            DescriptorCatalog,
+            gated!(EDIT_ORG_CATALOG),
+        )
+        .summary("Rename a hand-made organization catalog entry, or merge it into another")
+        .errors(&[409])
+        .body(json_body::<pt::RenameDescriptorEntryRequest>())
+        .reply(
+            200,
+            "The entry under its new name",
+            [json::<pt::DescriptorEntryListRow>()],
+        ),
+        op(
+            M::POST,
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/relabel",
+            "relabel_org_descriptor_member",
+            DescriptorCatalog,
+            gated!(EDIT_ORG_CATALOG),
+        )
+        .summary("Change the quantization label of a model member")
+        .errors(&[409])
+        .body(json_body::<pt::RelabelDescriptorMemberRequest>())
+        .reply(
+            200,
+            "The updated entry",
+            [json::<pt::DescriptorEntryListRow>()],
+        ),
+        op(
+            M::POST,
             "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/state",
             "change_org_descriptor_entry_state",
             DescriptorCatalog,

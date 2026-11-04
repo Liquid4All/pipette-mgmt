@@ -2,6 +2,10 @@
 //! `*Unimplemented` fakes fill unused [`pipette_store::Stores`] fields and
 //! error on any call; [`UnexpectedCalls`] records calls code may swallow.
 
+mod queue;
+
+pub use queue::{seed_avail, seed_leased, seed_leased_until, todo_job_body};
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
@@ -9,7 +13,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use sha2::Digest;
 
 use pipette_core::audit::{RETENTION_DAYS, new_event};
@@ -22,6 +26,7 @@ use pipette_core::denial::DenialRecord;
 use pipette_core::key_index::{KeyClaim, KeyHolderPrincipalId};
 use pipette_core::model_params::ModelParams;
 use pipette_core::plan::{PlanHeader, PlanManifest, PlanSource, SettledOutcome, sample_manifest};
+use pipette_core::todo_filename::{avail_filename, leased_key, parse_avail_filename, tmp_filename};
 use pipette_core::types::Mint;
 use pipette_core::user::UserKey;
 use pipette_core::user_preauth::UserPreauthSecret;
@@ -35,15 +40,15 @@ use pipette_plan_types::{
 };
 use pipette_store::{
     ArtifactBody, AuditFilter, AuditPage, AuditStore, BacklogSnapshot, BlobBody, BlobWrite,
-    CampaignBacklogSnapshot, CampaignPage, CampaignStore, CatalogStore, CellResult, CellScope,
-    ClaimResult, ClientListing, ClientPage, ClientStore, ContentKeyCas, ContentKeyClaim,
-    ContentKeyRecord, ContentKeyVersion, CreateOutcome, DatasetCacheStore, EmailClaim,
-    JobPlanMarker, JobState, KeyIndexStore, ModelParamsPage, ModelParamsStore, OrgStore,
-    PendingSourceMarker, PlanFilter, PlanListing, PlanPage, PlanReach, PlanStore, RecycleResult,
-    RedateResult, RenewLeaseResult, ScoreQueueStage, SlugClaim, StagedWrite, SubmissionStore,
-    SuspensionRecord, TagStore, TodoStore, UnreadableObjectError, UserStore, VaultResourcePage,
-    VaultStore, drain_campaigns, drain_clients, drain_matching_plans, drain_model_params,
-    drain_vault_resources,
+    CampaignBacklog, CampaignBacklogSnapshot, CampaignPage, CampaignStore, CatalogStore,
+    CellResult, CellScope, ClaimResult, ClientListing, ClientPage, ClientStore, ContentKeyCas,
+    ContentKeyClaim, ContentKeyRecord, ContentKeyVersion, CreateOutcome, DatasetCacheStore,
+    EmailClaim, EvalPackageStore, JobPlanMarker, JobState, KeyIndexStore, ModelParamsPage,
+    ModelParamsStore, OrgStore, PendingSourceMarker, PlanFilter, PlanListing, PlanPage, PlanReach,
+    PlanStore, RecordedRun, RecycleResult, RedateResult, RenewLeaseResult, ScoreQueueStage,
+    SlugClaim, StagedWrite, SubmissionStore, SuspensionRecord, TagStore, TodoStore,
+    UnreadableObjectError, UserStore, VaultResourcePage, VaultStore, drain_campaigns,
+    drain_clients, drain_matching_plans, drain_model_params, drain_vault_resources,
 };
 
 /// A `NonZeroUsize` from a literal, without the `unwrap` the lint policy bans.
@@ -2053,6 +2058,127 @@ pub async fn assert_find_outcomes_contract(store: &dyn SubmissionStore) -> anyho
     Ok(())
 }
 
+/// One call reads every job's run: a finished one with the flags its device
+/// held, a failed one with none. A resubmission in `incoming/` wins over the
+/// older body in `processed/`. The ids share a prefix, to catch prefix matching.
+pub async fn assert_find_runs_contract(store: &dyn SubmissionStore) -> anyhow::Result<()> {
+    /// Where a case puts its job's body before the read.
+    enum Place {
+        Nowhere,
+        Incoming,
+        ToDo,
+        Parked,
+        ToFinalize,
+        Processed,
+        Unverified,
+    }
+    let success = |os: &str| {
+        serde_json::json!({
+            "message_type": "success",
+            "device_os_name": os,
+            "client_version": "2026.10.05-E925778",
+        })
+    };
+    let failure = || {
+        serde_json::json!({
+            "message_type": "failure",
+            "client_version": "2026.10.05-E925778",
+        })
+    };
+    let finished = |os: &str| {
+        RecordedRun::Finished(BTreeSet::from([
+            "client_version:2026.10.05-e925778".to_owned(),
+            format!("os:{os}"),
+        ]))
+    };
+    let cases = [
+        ("job-run-none", Place::Nowhere, success("Android"), None),
+        (
+            "job-run-incoming",
+            Place::Incoming,
+            failure(),
+            Some(RecordedRun::Failed),
+        ),
+        (
+            "job-run-to-do",
+            Place::ToDo,
+            success("Android"),
+            Some(finished("android")),
+        ),
+        (
+            "job-run-parked",
+            Place::Parked,
+            failure(),
+            Some(RecordedRun::Failed),
+        ),
+        (
+            "job-run-to-finalize",
+            Place::ToFinalize,
+            success("iOS"),
+            Some(finished("ios")),
+        ),
+        (
+            "job-run-processed",
+            Place::Processed,
+            success("Android"),
+            Some(finished("android")),
+        ),
+        (
+            "job-run-unverified",
+            Place::Unverified,
+            success("iOS"),
+            None,
+        ),
+    ];
+    for (job_id, place, body, _) in &cases {
+        let job_id = JobId::new_unchecked(*job_id);
+        match place {
+            Place::Nowhere => {}
+            Place::Incoming => store.write_incoming(&job_id, body).await?,
+            Place::ToDo => store.enqueue(ScoreQueueStage::ToDo, &job_id, body).await?,
+            Place::Parked => {
+                store
+                    .enqueue(ScoreQueueStage::Parked, &job_id, body)
+                    .await?
+            }
+            Place::ToFinalize => {
+                let payload = serde_json::json!({ "submission": body, "score": {} });
+                store
+                    .enqueue(ScoreQueueStage::ToFinalize, &job_id, &payload)
+                    .await?;
+            }
+            Place::Processed => store.write_processed(&job_id, body).await?,
+            Place::Unverified => {
+                store
+                    .write_unverified(&ClientId::try_new("ev1_held")?, &job_id, body)
+                    .await?;
+            }
+        }
+    }
+    // `job-run` is a prefix of every key above, and has no record.
+    let job_ids: Vec<JobId> = cases
+        .iter()
+        .map(|(job_id, ..)| JobId::new_unchecked(*job_id))
+        .chain([JobId::new_unchecked("job-run")])
+        .collect();
+    let expected: HashMap<JobId, RecordedRun> = cases
+        .iter()
+        .filter_map(|(job_id, _, _, run)| Some((JobId::new_unchecked(*job_id), run.clone()?)))
+        .collect();
+    assert_eq!(store.find_runs(&job_ids).await?, expected);
+    assert!(store.find_runs(&[]).await?.is_empty());
+
+    let resubmitted = JobId::new_unchecked("job-run-resubmitted");
+    store.write_processed(&resubmitted, &success("iOS")).await?;
+    store.write_incoming(&resubmitted, &failure()).await?;
+    assert_eq!(
+        store.find_runs(std::slice::from_ref(&resubmitted)).await?,
+        HashMap::from([(resubmitted, RecordedRun::Failed)]),
+        "the resubmission in incoming/ wins"
+    );
+    Ok(())
+}
+
 /// One object per client per job, a rewrite replaces its own, and the ids share
 /// a prefix to catch a backend listing by string prefix, not by directory.
 pub async fn assert_runtime_output_roundtrip(store: &dyn SubmissionStore) -> anyhow::Result<()> {
@@ -2560,6 +2686,15 @@ pub fn local_fs_job_record_count(data_dir: &std::path::Path) -> usize {
         .map(|job| entries(job.path()).count())
         .sum();
     sources + links
+}
+
+/// Write `job_id`'s processed record in a `local_fs` root at `data_dir` as bytes
+/// no read parses, so any read of the record fails.
+pub fn local_fs_spoil_record(data_dir: &std::path::Path, job_id: &JobId) -> anyhow::Result<()> {
+    let path = data_dir
+        .join("submissions/processed")
+        .join(format!("{job_id}.json.gz"));
+    std::fs::write(&path, "not gzip").with_context(|| format!("writing {}", path.display()))
 }
 
 /// Delete `plan_id`'s manifest from a `local_fs` root at `data_dir` by hand:
@@ -4688,6 +4823,38 @@ pub async fn assert_dataset_cache_store_roundtrip(
     Ok(())
 }
 
+/// An [`EvalPackageStore`] reads the package the scores service wrote at
+/// `scores-packages/tars/{digest}.tar` under its root: absent until written,
+/// then its size and every byte. `write_under_root` writes a key relative to
+/// that root.
+pub async fn assert_eval_package_store_contract<F, Fut>(
+    store: &dyn EvalPackageStore,
+    write_under_root: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let digest = Sha256::try_new("ef".repeat(32))?;
+    anyhow::ensure!(store.package_bytes(&digest).await?.is_none());
+    anyhow::ensure!(store.open_package(&digest).await?.is_none());
+
+    // Larger than one read chunk, so the stream has to join several.
+    let body: Vec<u8> = (0..700_000_u32).map(|i| (i % 241) as u8).collect();
+    write_under_root(format!("scores-packages/tars/{digest}.tar"), body.clone()).await?;
+    anyhow::ensure!(store.package_bytes(&digest).await? == Some(body.len() as u64));
+    let opened = store
+        .open_package(&digest)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a written package must open"))?;
+    anyhow::ensure!(opened.bytes == body.len() as u64);
+    anyhow::ensure!(
+        read_all(opened).await? == body,
+        "the package must stream back unchanged"
+    );
+    Ok(())
+}
+
 /// A public llama.cpp release member for descriptor catalog contracts.
 pub fn a_member(
     version: &str,
@@ -4929,6 +5096,478 @@ pub async fn assert_descriptor_catalog_model_contract(
             quantization: QuantizationLabel::try_new("4bit")?,
         }
     );
+    Ok(())
+}
+
+/// Shared contract for entry renames and member relabels in SQL descriptor
+/// catalog records. A refusal changes nothing, and a freed name or label is
+/// free at once.
+pub async fn assert_descriptor_catalog_rename_contract(
+    store: &dyn pipette_store::DescriptorCatalogStore,
+) -> anyhow::Result<()> {
+    use pipette_plan_types::{
+        CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind as Kind,
+        DescriptorEntryState as State, ModelFormat, NonEmptyVec, OrgId, QuantizationLabel,
+    };
+    use pipette_store::{AppendOutcome, CreateEntryOutcome, RelabelOutcome, RenameOutcome};
+
+    let global = CatalogScope::Global;
+    let org = CatalogScope::Org(OrgId::try_new("org_a")?);
+    let name = |s: &str| CatalogName::try_new(s);
+    let label = |s: &str| QuantizationLabel::try_new(s);
+    let hand_made =
+        |n: &str, release: i64, member| a_descriptor_entry(n, Kind::HandMade, release, member);
+    let runtime = || a_member("b1", "linux-x64-rocm");
+
+    let gguf = a_model_member("gguf_text", "AcmeLM-3B-GGUF", "f16_q4_0")?;
+    let q8_0 = a_model_member("gguf_text", "AcmeLM-3B-Q8-GGUF", "q8_0")?;
+    let mlx = a_model_member("mlx", "AcmeLM-3B-MLX", "4bit")?;
+    let model = DescriptorEntry {
+        members: NonEmptyVec::try_new(vec![gguf.clone(), q8_0.clone(), mlx.clone()])?,
+        ..hand_made("AcmeLM-3B", 300, gguf.clone())?
+    };
+    let fork = hand_made("Fork", 200, runtime()?)?;
+    let held = hand_made("Held", 190, runtime()?)?;
+    let dead = DescriptorEntry {
+        state: State::Tombstoned,
+        ..hand_made("Dead", 180, runtime()?)?
+    };
+    let dead_model = DescriptorEntry {
+        state: State::Tombstoned,
+        ..hand_made("DeadLM", 170, gguf.clone())?
+    };
+    let stable = a_descriptor_entry("llamacpp-v1", Kind::Stable, 100, runtime()?)?;
+    let daily = a_descriptor_entry("llamacpp-daily-1", Kind::Daily, 90, runtime()?)?;
+    let shared = hand_made("Shared", 80, runtime()?)?;
+    let org_shared = DescriptorEntry {
+        scope: org.clone(),
+        ..shared.clone()
+    };
+    let cup = hand_made("Cup", 70, runtime()?)?;
+    let seeded = [
+        &model,
+        &fork,
+        &held,
+        &dead,
+        &dead_model,
+        &stable,
+        &daily,
+        &shared,
+        &org_shared,
+        &cup,
+    ];
+    for entry in seeded {
+        let mut live = entry.clone();
+        live.state = State::Active;
+        assert_eq!(
+            store.create_entry(&live).await?,
+            CreateEntryOutcome::Created
+        );
+        if entry.state == State::Tombstoned {
+            store
+                .set_state(&entry.scope, &entry.name, State::Tombstoned)
+                .await?;
+        }
+    }
+
+    let renames = [
+        ("Missing", "Other", RenameOutcome::NoSuchEntry),
+        ("Dead", "Other", RenameOutcome::Tombstoned),
+        (
+            "llamacpp-v1",
+            "Other",
+            RenameOutcome::ImporterKind(Kind::Stable),
+        ),
+        (
+            "llamacpp-daily-1",
+            "Other",
+            RenameOutcome::ImporterKind(Kind::Daily),
+        ),
+        ("Fork", "Fork", RenameOutcome::SameName),
+        ("fork", "Fork", RenameOutcome::SameName),
+        (
+            "Fork",
+            "held",
+            RenameOutcome::NameTaken {
+                name: held.name.clone(),
+                state: State::Active,
+            },
+        ),
+        (
+            "Fork",
+            "DEAD",
+            RenameOutcome::NameTaken {
+                name: dead.name.clone(),
+                state: State::Tombstoned,
+            },
+        ),
+    ];
+    for (from, to, expected) in renames {
+        assert_eq!(
+            store
+                .rename_entry(&global, &name(from)?, &name(to)?)
+                .await?,
+            expected,
+            "rename {from} to {to}"
+        );
+    }
+    let gguf_format = ModelFormat::Gguf;
+    let relabels = [
+        (
+            "Missing",
+            gguf_format,
+            "f16_q4_0",
+            "q4_0",
+            RelabelOutcome::NoSuchEntry,
+        ),
+        (
+            "DeadLM",
+            gguf_format,
+            "f16_q4_0",
+            "q4_0",
+            RelabelOutcome::Tombstoned,
+        ),
+        (
+            "Fork",
+            gguf_format,
+            "f16_q4_0",
+            "q4_0",
+            RelabelOutcome::RuntimeEntry,
+        ),
+        (
+            "AcmeLM-3B",
+            gguf_format,
+            "q2_k",
+            "q4_0",
+            RelabelOutcome::NoSuchMember,
+        ),
+        (
+            "AcmeLM-3B",
+            ModelFormat::Mlx,
+            "f16_q4_0",
+            "q4_0",
+            RelabelOutcome::NoSuchMember,
+        ),
+        (
+            "AcmeLM-3B",
+            gguf_format,
+            "f16_q4_0",
+            "f16_q4_0",
+            RelabelOutcome::SameLabel,
+        ),
+        (
+            "AcmeLM-3B",
+            gguf_format,
+            "f16_q4_0",
+            "q8_0",
+            RelabelOutcome::LabelTaken,
+        ),
+    ];
+    for (entry, format, from, to, expected) in relabels {
+        assert_eq!(
+            store
+                .relabel_member(&global, &name(entry)?, format, &label(from)?, &label(to)?)
+                .await?,
+            expected,
+            "relabel {entry}::{format}::{from} to {to}"
+        );
+    }
+    for entry in seeded {
+        assert_eq!(
+            store.get_entry(&entry.scope, &entry.name).await?.as_ref(),
+            Some(entry),
+            "a refusal changed {}",
+            entry.name
+        );
+    }
+
+    // Each step renames `from` to `to` in `scope`. A case-only rename keeps the
+    // lookup key, so the old spelling still finds the entry.
+    let steps = [
+        (&global, &fork, "Fork", "fork"),
+        (&global, &fork, "fork", "Spoon"),
+        (&global, &cup, "Cup", "Mug"),
+        (&global, &cup, "Mug", "Cup"),
+        (&org, &org_shared, "Shared", "Held"),
+    ];
+    for (scope, seeded, from, to) in steps {
+        let renamed = DescriptorEntry {
+            name: name(to)?,
+            ..seeded.clone()
+        };
+        assert_eq!(
+            store.rename_entry(scope, &name(from)?, &name(to)?).await?,
+            RenameOutcome::Renamed {
+                old_name: name(from)?,
+                entry: renamed.clone(),
+            },
+            "rename {from} to {to}"
+        );
+        assert_eq!(
+            store.get_entry(scope, &name(to)?).await?,
+            Some(renamed.clone())
+        );
+        let old = store.get_entry(scope, &name(from)?).await?;
+        if name(from)?.key() == name(to)?.key() {
+            assert_eq!(old, Some(renamed), "{from} keeps its lookup key");
+        } else {
+            assert_eq!(old, None, "{from} is free after the rename");
+        }
+    }
+    // The org rename leaves the global entry of the same name in place.
+    assert_eq!(
+        store.get_entry(&global, &shared.name).await?,
+        Some(shared.clone())
+    );
+    let hits = store
+        .find_by_digests(&[fork.members.head().digest().to_owned()])
+        .await?;
+    let names: BTreeSet<String> = hits
+        .values()
+        .flatten()
+        .map(|hit| hit.name.to_string())
+        .collect();
+    assert!(
+        names.contains("Spoon") && !names.contains("Fork"),
+        "{names:?}"
+    );
+    let new_fork = hand_made("Fork", 60, a_member("b2", "linux-x64-rocm")?)?;
+    assert_eq!(
+        store.create_entry(&new_fork).await?,
+        CreateEntryOutcome::Created
+    );
+
+    // Each step relabels the member `format::from` of the model entry. The
+    // digest, the position and the descriptor stay the same.
+    let relabel_steps = [
+        (gguf_format, "f16_q4_0", "q4_0"),
+        (ModelFormat::Mlx, "4bit", "8bit"),
+        (ModelFormat::Mlx, "8bit", "4bit"),
+    ];
+    let mut expected = model.clone();
+    for (format, from, to) in relabel_steps {
+        let members = expected
+            .members
+            .iter()
+            .map(|member| match member.model_key() {
+                Some(key) if key == (format, &label(from)?) => {
+                    member.relabeled(label(to)?).context("a model member")
+                }
+                _ => Ok(member.clone()),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        expected.members = NonEmptyVec::try_new(members)?;
+        assert_eq!(
+            store
+                .relabel_member(&global, &model.name, format, &label(from)?, &label(to)?)
+                .await?,
+            RelabelOutcome::Relabeled(expected.clone()),
+            "relabel {format}::{from} to {to}"
+        );
+        assert_eq!(
+            store.get_entry(&global, &model.name).await?,
+            Some(expected.clone())
+        );
+    }
+    let freed = a_model_member("gguf_text", "AcmeLM-3B-F16-GGUF", "f16_q4_0")?;
+    expected.members = NonEmptyVec::try_new(
+        expected
+            .members
+            .iter()
+            .cloned()
+            .chain([freed.clone()])
+            .collect(),
+    )?;
+    assert_eq!(
+        store
+            .append_members(&global, &model.name, NonEmptyVec::try_new(vec![freed])?)
+            .await?,
+        AppendOutcome::Appended(expected)
+    );
+    Ok(())
+}
+
+/// Shared contract for [`pipette_store::DescriptorCatalogStore::merge_entry`].
+pub async fn assert_descriptor_catalog_merge_contract(
+    store: &dyn pipette_store::DescriptorCatalogStore,
+) -> anyhow::Result<()> {
+    use pipette_plan_types::{
+        CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind as Kind,
+        DescriptorEntryState as State, EntryError, NonEmptyVec, OrgId,
+    };
+    use pipette_store::{CreateEntryOutcome, MergeOutcome};
+
+    let global = CatalogScope::Global;
+    let org = CatalogScope::Org(OrgId::try_new("org_a")?);
+    let name = |s: &str| CatalogName::try_new(s);
+    let hand_made =
+        |n: &str, release: i64, member| a_descriptor_entry(n, Kind::HandMade, release, member);
+
+    let rocm = a_member("b1", "linux-x64-rocm")?;
+    let vulkan = a_member("b1", "linux-x64-vulkan")?;
+    let q4_0 = a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?;
+    let q8_0 = a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?;
+    let fork = hand_made("Fork", 200, rocm.clone())?;
+    let other_build = hand_made("OtherBuild", 195, a_member("b2", "linux-x64-vulkan")?)?;
+    let typo_vulkan = hand_made("Vulkn", 190, vulkan.clone())?;
+    let org_vulkan = DescriptorEntry {
+        scope: org.clone(),
+        ..typo_vulkan.clone()
+    };
+    let model = hand_made("AcmeLM", 180, q4_0.clone())?;
+    let typo_model = DescriptorEntry {
+        members: NonEmptyVec::try_new(vec![q8_0.clone(), q4_0.clone()])?,
+        ..hand_made("AcmeLM-Typo", 170, q8_0.clone())?
+    };
+    let clash = hand_made(
+        "Clash",
+        160,
+        a_model_member("gguf_text", "Other-GGUF", "q4_0")?,
+    )?;
+    let dead = DescriptorEntry {
+        state: State::Tombstoned,
+        ..hand_made("Dead", 150, a_member("b1", "linux-x64-cuda")?)?
+    };
+    let stable = a_descriptor_entry("llamacpp-v1", Kind::Stable, 100, rocm.clone())?;
+    for entry in [
+        &fork,
+        &other_build,
+        &typo_vulkan,
+        &org_vulkan,
+        &model,
+        &typo_model,
+        &clash,
+        &dead,
+        &stable,
+    ] {
+        let live = DescriptorEntry {
+            state: State::Active,
+            ..entry.clone()
+        };
+        assert_eq!(
+            store.create_entry(&live).await?,
+            CreateEntryOutcome::Created
+        );
+        if entry.state == State::Tombstoned {
+            store
+                .set_state(&entry.scope, &entry.name, State::Tombstoned)
+                .await?;
+        }
+    }
+
+    // A refusal changes neither entry.
+    let refusals = [
+        (
+            "Clash",
+            "AcmeLM",
+            MergeOutcome::Refused(EntryError::DuplicateModelKey {
+                format: pipette_plan_types::ModelFormat::Gguf,
+                quantization: pipette_plan_types::QuantizationLabel::try_new("q4_0")?,
+            }),
+        ),
+        (
+            "Fork",
+            "AcmeLM",
+            MergeOutcome::Refused(EntryError::DescriptorKindMismatch),
+        ),
+        (
+            "Fork",
+            "OtherBuild",
+            MergeOutcome::Refused(EntryError::RuntimeBuildMismatch),
+        ),
+        ("Fork", "Dead", MergeOutcome::TargetTombstoned),
+        (
+            "Fork",
+            "llamacpp-v1",
+            MergeOutcome::TargetImporterKind(Kind::Stable),
+        ),
+        ("Fork", "Missing", MergeOutcome::TargetMissing),
+        (
+            "llamacpp-v1",
+            "Fork",
+            MergeOutcome::ImporterKind(Kind::Stable),
+        ),
+        ("Dead", "Fork", MergeOutcome::Tombstoned),
+        ("Missing", "Fork", MergeOutcome::NoSuchEntry),
+    ];
+    for (from, into, expected) in refusals {
+        assert_eq!(
+            store
+                .merge_entry(&global, &name(from)?, &name(into)?)
+                .await?,
+            expected,
+            "{from} into {into}"
+        );
+    }
+    assert_eq!(
+        store.get_entry(&global, &name("Clash")?).await?,
+        Some(clash)
+    );
+    assert_eq!(
+        store.get_entry(&global, &name("Fork")?).await?,
+        Some(fork.clone())
+    );
+    assert_eq!(
+        store.get_entry(&global, &other_build.name).await?,
+        Some(other_build)
+    );
+
+    // A runtime merge appends the new flavor, and leaves the other scope alone.
+    let MergeOutcome::Merged {
+        old_name,
+        entry,
+        merge,
+    } = store
+        .merge_entry(&global, &name("VULKN")?, &name("fork")?)
+        .await?
+    else {
+        anyhow::bail!("Vulkn must merge into Fork");
+    };
+    assert_eq!(old_name, typo_vulkan.name);
+    assert_eq!(entry.name, fork.name);
+    assert_eq!(&*entry.members, [rocm.clone(), vulkan.clone()].as_slice());
+    assert_eq!(merge.moved, vec![vulkan.clone()]);
+    assert!(merge.skipped.is_empty());
+    assert_eq!(store.get_entry(&global, &fork.name).await?, Some(entry));
+    assert_eq!(store.get_entry(&global, &typo_vulkan.name).await?, None);
+    assert_eq!(
+        store.get_entry(&org, &org_vulkan.name).await?,
+        Some(org_vulkan)
+    );
+    let hits = store.find_by_digests(&[vulkan.digest().to_owned()]).await?;
+    let mut holders = hits
+        .values()
+        .flatten()
+        .map(|hit| (hit.scope.clone(), hit.name.to_string()))
+        .collect::<Vec<_>>();
+    holders.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.sql_key().cmp(b.0.sql_key())));
+    assert_eq!(
+        holders,
+        vec![
+            (global.clone(), "Fork".to_owned()),
+            (org.clone(), "Vulkn".to_owned()),
+        ]
+    );
+
+    // A model merge skips the member that the target holds already.
+    let MergeOutcome::Merged { entry, merge, .. } = store
+        .merge_entry(&global, &typo_model.name, &model.name)
+        .await?
+    else {
+        anyhow::bail!("AcmeLM-Typo must merge into AcmeLM");
+    };
+    assert_eq!(&*entry.members, [q4_0.clone(), q8_0.clone()].as_slice());
+    assert_eq!(merge.moved, vec![q8_0]);
+    assert_eq!(merge.skipped, vec![q4_0]);
+    assert_eq!(store.get_entry(&global, &model.name).await?, Some(entry));
+
+    // The names of the merged entries are free.
+    for freed in [&typo_vulkan, &typo_model] {
+        assert_eq!(
+            store.create_entry(freed).await?,
+            CreateEntryOutcome::Created
+        );
+    }
     Ok(())
 }
 
@@ -5465,5 +6104,1056 @@ pub async fn assert_descriptor_catalog_store_contract(
         .await?;
     assert!(store.get_entry(&org_b, &in_b.name).await?.is_none());
     assert!(store.get_entry(&org_a, &in_a.name).await?.is_some());
+    Ok(())
+}
+
+/// Shared contract for [`TodoStore`]. `store` must be empty. `now` sets every
+/// deadline and lease expiry. Give `now` a sub-second part, as
+/// `Config::lease_expiry_from` does. Every write goes through the trait.
+///
+/// The pieces share the one store. The state-blob piece reads store-wide
+/// state, so it runs first. Each other piece names its jobs `{piece}-…` and
+/// its clients `{piece}_…`. It reads only the keys in that namespace. A piece
+/// writes a marker only for a job that it queued first, as a SQL store with
+/// foreign keys to the job needs.
+pub async fn assert_todo_store_contract(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    assert_todo_state_blobs(store, now)
+        .await
+        .context("state blobs")?;
+    assert_todo_job_contract(store, now).await.context("jobs")?;
+    assert_todo_marker_idempotent_deletes(store)
+        .await
+        .context("marker idempotent deletes")?;
+    assert_todo_denied_round_trip(store, now)
+        .await
+        .context("denied round trip")?;
+    assert_todo_pending_reindex_round_trip(store)
+        .await
+        .context("pending-reindex round trip")?;
+    assert_todo_pending_reindex_jobs_round_trip(store, now)
+        .await
+        .context("pending-reindex-jobs round trip")?;
+    assert_todo_lost_leases_round_trip(store, now)
+        .await
+        .context("lost leases round trip")?;
+    assert_todo_suspension_round_trip(store, now)
+        .await
+        .context("suspension round trip")?;
+    assert_todo_liveness_round_trip(store)
+        .await
+        .context("liveness round trip")?;
+    assert_todo_eligible_index(store, now)
+        .await
+        .context("eligible index")?;
+    Ok(())
+}
+
+/// The job half of the queue contract. Each piece uses its own namespace.
+/// Give `now` a sub-second part to check timestamp normalization.
+pub async fn assert_todo_job_contract(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        now.timestamp_subsec_nanos() != 0,
+        "the contract needs a `now` with a sub-second part, got {now}"
+    );
+    assert_todo_tmp_and_promote(store, now)
+        .await
+        .context("tmp and promote")?;
+    assert_todo_avail_order(store, now)
+        .await
+        .context("avail order")?;
+    assert_todo_job_scoped_reads(store, now)
+        .await
+        .context("job-scoped reads")?;
+    assert_todo_claim_then_gone(store, now)
+        .await
+        .context("claim then gone")?;
+    assert_todo_renew_branches(store, now)
+        .await
+        .context("renew branches")?;
+    assert_todo_recycle(store, now).await.context("recycle")?;
+    assert_todo_lost_recycle_race(store, now)
+        .await
+        .context("lost recycle race")?;
+    assert_todo_sub_second_lease_round_trip(store, now)
+        .await
+        .context("sub-second lease round trip")?;
+    assert_todo_redate(store, now).await.context("redate")?;
+    assert_todo_job_idempotent_deletes(store, now)
+        .await
+        .context("idempotent deletes")?;
+    assert_todo_stale_tmp(store, now)
+        .await
+        .context("stale tmp")?;
+    Ok(())
+}
+
+/// The job `{piece}-{name}`.
+fn todo_job(piece: &str, name: &str) -> anyhow::Result<JobId> {
+    Ok(JobId::try_new(format!("{piece}-{name}"))?)
+}
+
+/// The client `{piece}_{name}`.
+fn todo_client(piece: &str, name: &str) -> anyhow::Result<ClientId> {
+    Ok(ClientId::try_new(format!("{piece}_{name}"))?)
+}
+
+/// Whether `id` starts with a job id of `piece`, as [`todo_job`] names it.
+fn of_job(piece: &str, id: &str) -> bool {
+    id.starts_with(&format!("{piece}-"))
+}
+
+/// Whether `id` starts with a client id of `piece`, as [`todo_client`] names it.
+fn of_client(piece: &str, id: &str) -> bool {
+    id.starts_with(&format!("{piece}_"))
+}
+
+/// `at` without its sub-second part: the precision of every queue key.
+fn whole_second(at: DateTime<Utc>) -> DateTime<Utc> {
+    chrono::SubsecRound::trunc_subsecs(at, 0)
+}
+
+/// A job deadline `days` after `now`, in whole seconds as ingestion writes it.
+fn todo_deadline(now: DateTime<Utc>, days: i64) -> ExpiresAt {
+    ExpiresAt::At(whole_second(now) + chrono::TimeDelta::days(days))
+}
+
+/// A lease that expires five minutes after `now`, with the sub-second part of `now`.
+fn todo_lease(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::TimeDelta::minutes(5)
+}
+
+fn todo_body(job_id: &JobId, expires_at: ExpiresAt) -> serde_json::Value {
+    serde_json::json!({ "job_id": job_id.as_str(), "expires_at": expires_at.to_string() })
+}
+
+/// Stage `body` and promote it, as ingestion does.
+async fn enqueue_body(
+    store: &dyn TodoStore,
+    job_id: &JobId,
+    expires_at: ExpiresAt,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    store.write_tmp(job_id, body).await?;
+    store.promote_avail(job_id, expires_at).await
+}
+
+/// Queue the job with a [`todo_body`], and return the body.
+async fn enqueue(
+    store: &dyn TodoStore,
+    job_id: &JobId,
+    expires_at: ExpiresAt,
+) -> anyhow::Result<serde_json::Value> {
+    let body = todo_body(job_id, expires_at);
+    enqueue_body(store, job_id, expires_at, &body).await?;
+    Ok(body)
+}
+
+/// Claim a job that no other caller races for, and return its body.
+async fn claim(
+    store: &dyn TodoStore,
+    job_id: &JobId,
+    expires_at: ExpiresAt,
+    client_id: &ClientId,
+    lease_expiry: DateTime<Utc>,
+) -> anyhow::Result<serde_json::Value> {
+    match store
+        .claim_job(job_id, expires_at, client_id, lease_expiry)
+        .await?
+    {
+        ClaimResult::Claimed(body) => Ok(body),
+        ClaimResult::Gone => anyhow::bail!("claim of {job_id} found no avail entry"),
+    }
+}
+
+/// The `avail/` keys of the jobs of `piece`, in the order of the listing.
+async fn avail_of(store: &dyn TodoStore, piece: &str) -> anyhow::Result<Vec<String>> {
+    Ok(store
+        .list_avail()
+        .await?
+        .into_iter()
+        .filter(|key| of_job(piece, key))
+        .collect())
+}
+
+/// The `leased/` keys of the clients of `piece`, sorted.
+async fn leased_of(store: &dyn TodoStore, piece: &str) -> anyhow::Result<Vec<String>> {
+    let mut keys: Vec<String> = store
+        .list_leased()
+        .await?
+        .into_iter()
+        .filter(|key| of_client(piece, key))
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// A staged body is not claimable until the promote. The promote consumes the
+/// staged body. A promote with no staged body is an error.
+pub async fn assert_todo_tmp_and_promote(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("promote", "job")?;
+    let exp = todo_deadline(now, 30);
+    let body = todo_body(&job, exp);
+
+    store.write_tmp(&job, &body).await?;
+    assert!(avail_of(store, "promote").await?.is_empty());
+    assert_eq!(store.get_avail_by_job(&job).await?, None);
+
+    store.promote_avail(&job, exp).await?;
+    assert_eq!(
+        avail_of(store, "promote").await?,
+        vec![avail_filename(&job, exp)]
+    );
+    assert_eq!(store.get_avail(&job, exp).await?, Some(body));
+    let staged = tmp_filename(&job);
+    assert!(
+        !store
+            .list_stale_tmp(Duration::ZERO)
+            .await?
+            .contains(&staged),
+        "the promote left {staged} staged"
+    );
+
+    let unstaged = todo_job("promote", "unstaged")?;
+    assert!(store.promote_avail(&unstaged, exp).await.is_err());
+    assert_eq!(store.get_avail_by_job(&unstaged).await?, None);
+    Ok(())
+}
+
+/// `list_avail` is in byte order of the whole `{job_id}/{expires_at}.json` key.
+/// A `-` sorts before the `/` that ends a job id, so `order-job-a/…` comes
+/// before `order-job/…`. This is the reverse of the order of the job ids.
+pub async fn assert_todo_avail_order(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let never = todo_job("order", "job")?;
+    let dated = todo_job("order", "job-a")?;
+    let first = todo_job("order", "b")?;
+    let (first_exp, dated_exp) = (todo_deadline(now, 1), todo_deadline(now, 2));
+    // Queued out of order, so the expectation pins the sort.
+    enqueue(store, &never, ExpiresAt::Never).await?;
+    enqueue(store, &first, first_exp).await?;
+    enqueue(store, &dated, dated_exp).await?;
+
+    let listed = avail_of(store, "order").await?;
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(listed, sorted, "list_avail is not in key byte order");
+    assert_eq!(
+        listed,
+        vec![
+            avail_filename(&first, first_exp),
+            avail_filename(&dated, dated_exp),
+            avail_filename(&never, ExpiresAt::Never),
+        ]
+    );
+    Ok(())
+}
+
+/// Each read by job id alone sees its own job's entry and no other. A job id
+/// that is a prefix of another does not match the longer one.
+pub async fn assert_todo_job_scoped_reads(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mine = todo_job("scope", "job")?;
+    let longer = todo_job("scope", "job1")?;
+    let prefix = todo_job("scope", "jo")?;
+    let exp = todo_deadline(now, 3);
+    let mine_body = enqueue(store, &mine, exp).await?;
+    let longer_body = enqueue(store, &longer, ExpiresAt::Never).await?;
+
+    assert_eq!(store.get_avail_by_job(&mine).await?, Some(mine_body));
+    let key = store
+        .avail_key_for_job(&mine)
+        .await?
+        .context("the queued job has an avail key")?;
+    assert_eq!(key, avail_filename(&mine, exp));
+    assert_eq!(parse_avail_filename(&key)?, (mine.clone(), exp));
+    assert_eq!(store.get_avail_by_job(&prefix).await?, None);
+    assert_eq!(store.avail_key_for_job(&prefix).await?, None);
+
+    store.delete_avail_by_job(&mine).await?;
+    assert_eq!(store.get_avail_by_job(&mine).await?, None);
+    assert_eq!(store.avail_key_for_job(&mine).await?, None);
+    assert_eq!(
+        store.get_avail_by_job(&longer).await?,
+        Some(longer_body.clone())
+    );
+    assert_eq!(
+        store.get_avail(&longer, ExpiresAt::Never).await?,
+        Some(longer_body)
+    );
+
+    store.delete_avail(&longer, ExpiresAt::Never).await?;
+    assert!(avail_of(store, "scope").await?.is_empty());
+    Ok(())
+}
+
+/// A claim moves the job from `avail/` to the client's lease and returns the
+/// body. A second claim finds nothing to move.
+pub async fn assert_todo_claim_then_gone(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("claim", "job")?;
+    let client = todo_client("claim", "c1")?;
+    let other = todo_client("claim", "c2")?;
+    let lease = todo_lease(now);
+    let body = enqueue(store, &job, ExpiresAt::Never).await?;
+
+    assert_eq!(
+        claim(store, &job, ExpiresAt::Never, &client, lease).await?,
+        body
+    );
+    assert!(avail_of(store, "claim").await?.is_empty());
+    assert_eq!(store.get_avail_by_job(&job).await?, None);
+    let key = leased_key(&job, ExpiresAt::Never, &client, lease);
+    assert_eq!(leased_of(store, "claim").await?, vec![key.clone()]);
+    assert_eq!(store.list_leased_for_client(&client).await?, vec![key]);
+    assert_eq!(
+        store
+            .get_leased(&job, ExpiresAt::Never, &client, lease)
+            .await?,
+        Some(body)
+    );
+    assert_eq!(
+        store
+            .get_leased(&job, ExpiresAt::Never, &other, lease)
+            .await?,
+        None
+    );
+    assert!(store.list_leased_for_client(&other).await?.is_empty());
+
+    // The second claim names another client. With the same client and lease,
+    // the S3 rename retry finds the first claim's lease and answers `Claimed`.
+    assert!(matches!(
+        store
+            .claim_job(&job, ExpiresAt::Never, &other, lease)
+            .await?,
+        ClaimResult::Gone
+    ));
+
+    store
+        .delete_lease(&job, ExpiresAt::Never, &client, lease)
+        .await?;
+    assert!(leased_of(store, "claim").await?.is_empty());
+    Ok(())
+}
+
+/// A renewal moves the client's own lease to the new expiry and reports the
+/// job's deadline. A lease of another client is `WrongClient`. A job with no
+/// lease is `NotFound`, whether it is queued or absent.
+pub async fn assert_todo_renew_branches(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let client = todo_client("renew", "c1")?;
+    let other = todo_client("renew", "c2")?;
+    let old = todo_lease(now);
+    let new = old + chrono::TimeDelta::minutes(5);
+
+    // The dated case catches a renewal that writes a constant `never`.
+    let mut renewed: Vec<String> = futures::stream::iter([
+        ("never", ExpiresAt::Never),
+        ("dated", todo_deadline(now, 4)),
+    ])
+    .map(anyhow::Ok)
+    .and_then(|(name, exp)| {
+        let client = &client;
+        async move {
+            let job = todo_job("renew", name)?;
+            enqueue(store, &job, exp).await?;
+            claim(store, &job, exp, client, old).await?;
+            assert_eq!(
+                store.renew_lease(&job, client, new).await?,
+                RenewLeaseResult::Renewed(exp)
+            );
+            Ok(leased_key(&job, exp, client, new))
+        }
+    })
+    .try_collect()
+    .await?;
+    renewed.sort();
+    let mut listed = store.list_leased_for_client(&client).await?;
+    listed.sort();
+    assert_eq!(listed, renewed);
+
+    let wrong = todo_job("renew", "wrong")?;
+    enqueue(store, &wrong, ExpiresAt::Never).await?;
+    claim(store, &wrong, ExpiresAt::Never, &other, old).await?;
+    assert_eq!(
+        store.renew_lease(&wrong, &client, new).await?,
+        RenewLeaseResult::WrongClient
+    );
+    assert_eq!(
+        store.list_leased_for_client(&other).await?,
+        vec![leased_key(&wrong, ExpiresAt::Never, &other, old)]
+    );
+
+    let queued = todo_job("renew", "queued")?;
+    enqueue(store, &queued, ExpiresAt::Never).await?;
+    assert_eq!(
+        store.renew_lease(&queued, &client, new).await?,
+        RenewLeaseResult::NotFound
+    );
+    assert_eq!(
+        store
+            .renew_lease(&todo_job("renew", "absent")?, &client, new)
+            .await?,
+        RenewLeaseResult::NotFound
+    );
+    Ok(())
+}
+
+/// A recycle puts the job back at the exact `avail/` key that the claim took.
+/// The deadline comes from the lease key. The body names another deadline,
+/// and the recycle ignores it. A recycle of a job that the store does not hold is `Gone`.
+pub async fn assert_todo_recycle(store: &dyn TodoStore, now: DateTime<Utc>) -> anyhow::Result<()> {
+    let client = todo_client("recycle", "c1")?;
+    let lease = todo_lease(now);
+    for (name, exp) in [
+        ("never", ExpiresAt::Never),
+        ("dated", todo_deadline(now, 5)),
+    ] {
+        let job = todo_job("recycle", name)?;
+        let body = serde_json::json!({ "job_id": job.as_str(), "expires_at": "20991231T000000Z" });
+        enqueue_body(store, &job, exp, &body).await?;
+        claim(store, &job, exp, &client, lease).await?;
+
+        assert_eq!(
+            store.recycle_lease(&job, exp, &client, lease).await?,
+            RecycleResult::Recycled
+        );
+        assert_eq!(
+            store.avail_key_for_job(&job).await?,
+            Some(avail_filename(&job, exp))
+        );
+        assert_eq!(store.get_avail(&job, exp).await?, Some(body));
+    }
+    assert!(store.list_leased_for_client(&client).await?.is_empty());
+
+    let absent = todo_job("recycle", "absent")?;
+    assert_eq!(
+        store
+            .recycle_lease(&absent, ExpiresAt::Never, &client, lease)
+            .await?,
+        RecycleResult::Gone
+    );
+    assert_eq!(store.avail_key_for_job(&absent).await?, None);
+    Ok(())
+}
+
+/// A second recycle of one lease finds the job back in `avail/`. The store
+/// answers `Recycled` or `Gone`, and callers accept both. In both cases
+/// `avail/` holds the job exactly once.
+pub async fn assert_todo_lost_recycle_race(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("race", "job")?;
+    let client = todo_client("race", "c1")?;
+    let exp = todo_deadline(now, 6);
+    let lease = todo_lease(now);
+    enqueue(store, &job, exp).await?;
+    claim(store, &job, exp, &client, lease).await?;
+
+    assert_eq!(
+        store.recycle_lease(&job, exp, &client, lease).await?,
+        RecycleResult::Recycled
+    );
+    let second = store.recycle_lease(&job, exp, &client, lease).await?;
+    assert!(
+        matches!(second, RecycleResult::Recycled | RecycleResult::Gone),
+        "{second:?}"
+    );
+    assert_eq!(
+        avail_of(store, "race").await?,
+        vec![avail_filename(&job, exp)]
+    );
+    assert!(store.list_leased_for_client(&client).await?.is_empty());
+    Ok(())
+}
+
+/// A lease expiry has a sub-second part, as `Config::lease_expiry_from` gives,
+/// and the store keeps whole seconds. Each later call with the same raw value
+/// finds the lease.
+pub async fn assert_todo_sub_second_lease_round_trip(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let client = todo_client("subsec", "c1")?;
+    // Its own sub-second part, whatever `now` holds.
+    let raw = whole_second(todo_lease(now)) + chrono::TimeDelta::nanoseconds(123_456_789);
+    let job = todo_job("subsec", "job")?;
+    let exp = todo_deadline(now, 7);
+    let body = enqueue(store, &job, exp).await?;
+
+    claim(store, &job, exp, &client, raw).await?;
+    assert_eq!(store.get_leased(&job, exp, &client, raw).await?, Some(body));
+    assert_eq!(
+        store.recycle_lease(&job, exp, &client, raw).await?,
+        RecycleResult::Recycled
+    );
+
+    claim(store, &job, exp, &client, raw).await?;
+    store.delete_lease(&job, exp, &client, raw).await?;
+    assert!(store.list_leased_for_client(&client).await?.is_empty());
+    assert_eq!(store.get_avail_by_job(&job).await?, None);
+
+    let renewed_job = todo_job("subsec", "renewed")?;
+    let renewed = raw + chrono::TimeDelta::milliseconds(150_500);
+    enqueue(store, &renewed_job, ExpiresAt::Never).await?;
+    claim(store, &renewed_job, ExpiresAt::Never, &client, raw).await?;
+    assert_eq!(
+        store.renew_lease(&renewed_job, &client, renewed).await?,
+        RenewLeaseResult::Renewed(ExpiresAt::Never)
+    );
+    assert_eq!(
+        store
+            .recycle_lease(&renewed_job, ExpiresAt::Never, &client, renewed)
+            .await?,
+        RecycleResult::Recycled
+    );
+
+    Ok(())
+}
+
+/// A redate moves the queued job to a new deadline and keeps the body. After
+/// the redate, the key and the body name different deadlines. A redate from a
+/// stale `from`, of a leased job, or of an absent job is `Gone`.
+pub async fn assert_todo_redate(store: &dyn TodoStore, now: DateTime<Utc>) -> anyhow::Result<()> {
+    let job = todo_job("redate", "job")?;
+    let from = todo_deadline(now, 7);
+    let to = todo_deadline(now, 14);
+    let body = enqueue(store, &job, from).await?;
+
+    assert_eq!(
+        store.redate_avail(&job, from, to).await?,
+        RedateResult::Redated
+    );
+    assert_eq!(
+        avail_of(store, "redate").await?,
+        vec![avail_filename(&job, to)]
+    );
+    assert_eq!(
+        store.avail_key_for_job(&job).await?,
+        Some(avail_filename(&job, to))
+    );
+    assert_eq!(store.get_avail(&job, to).await?, Some(body.clone()));
+    assert_eq!(store.get_avail(&job, from).await?, None);
+
+    assert_eq!(
+        store.redate_avail(&job, to, ExpiresAt::Never).await?,
+        RedateResult::Redated
+    );
+    assert_eq!(store.get_avail(&job, ExpiresAt::Never).await?, Some(body));
+    // `to` is empty here. If `to` held the job, the S3 rename retry would find
+    // it and answer `Redated`.
+    assert_eq!(
+        store.redate_avail(&job, from, to).await?,
+        RedateResult::Gone
+    );
+    assert_eq!(
+        store.avail_key_for_job(&job).await?,
+        Some(avail_filename(&job, ExpiresAt::Never))
+    );
+
+    // A claim moved the entry first.
+    let leased = todo_job("redate", "leased")?;
+    let client = todo_client("redate", "c1")?;
+    let lease = todo_lease(now);
+    enqueue(store, &leased, from).await?;
+    claim(store, &leased, from, &client, lease).await?;
+    assert_eq!(
+        store.redate_avail(&leased, from, to).await?,
+        RedateResult::Gone
+    );
+    assert_eq!(
+        store.list_leased_for_client(&client).await?,
+        vec![leased_key(&leased, from, &client, lease)]
+    );
+
+    let absent = todo_job("redate", "absent")?;
+    assert_eq!(
+        store.redate_avail(&absent, from, ExpiresAt::Never).await?,
+        RedateResult::Gone
+    );
+    assert_eq!(store.avail_key_for_job(&absent).await?, None);
+    Ok(())
+}
+
+/// Each delete of something the store does not hold succeeds.
+pub async fn assert_todo_job_idempotent_deletes(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("absent", "job")?;
+    let client = todo_client("absent", "c1")?;
+    let lease = todo_lease(now);
+
+    store.delete_avail(&job, ExpiresAt::Never).await?;
+    store.delete_avail_by_job(&job).await?;
+    store
+        .delete_lease(&job, ExpiresAt::Never, &client, lease)
+        .await?;
+    store.delete_tmp_object(&tmp_filename(&job)).await?;
+    Ok(())
+}
+
+/// Each delete of an absent marker succeeds.
+pub async fn assert_todo_marker_idempotent_deletes(store: &dyn TodoStore) -> anyhow::Result<()> {
+    let job = todo_job("absent", "job")?;
+    let client = todo_client("absent", "c1")?;
+    store.delete_denied(&job, &client).await?;
+    store.delete_denied_for_job(&job).await?;
+    store
+        .delete_eligible(&client, &job, ExpiresAt::Never)
+        .await?;
+    store.delete_eligible_for_client(&client).await?;
+    store
+        .delete_pending_reindex(&format!("{client}.absent-flag-key"))
+        .await?;
+    store.delete_pending_reindex_job(&job).await?;
+    store.delete_lost_leases_for_job(&job).await?;
+    store.delete_suspension(&client).await?;
+    store.delete_liveness(&client).await?;
+    Ok(())
+}
+
+/// The denials of the jobs of the `denied` piece, sorted.
+async fn denied_of(store: &dyn TodoStore) -> anyhow::Result<Vec<(JobId, ClientId)>> {
+    let mut denied: Vec<(JobId, ClientId)> = store
+        .list_all_denied()
+        .await?
+        .into_iter()
+        .filter(|(job_id, _)| of_job("denied", job_id.as_str()))
+        .collect();
+    denied.sort();
+    Ok(denied)
+}
+
+/// A denial names one (job, client) pair. A second write replaces the record.
+/// A delete by pair keeps the job's other denials, and a delete by job keeps
+/// the other jobs' denials.
+pub async fn assert_todo_denied_round_trip(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("denied", "job")?;
+    let job2 = todo_job("denied", "job2")?;
+    let (ca, cb, cc) = (
+        todo_client("denied", "a")?,
+        todo_client("denied", "b")?,
+        todo_client("denied", "c")?,
+    );
+    // The listing splits `{job_id}.{client_id}` on the `.`, so a `_` id round-trips.
+    let underscored = todo_client("denied", "ev1_abc")?;
+    enqueue(store, &job, ExpiresAt::Never).await?;
+    enqueue(store, &job2, ExpiresAt::Never).await?;
+
+    store
+        .write_denied(&job, &ca, &DenialRecord::default())
+        .await?;
+    store
+        .write_denied(&job, &cb, &DenialRecord::default())
+        .await?;
+    assert_eq!(
+        denied_of(store).await?,
+        vec![(job.clone(), ca.clone()), (job.clone(), cb.clone())]
+    );
+
+    assert!(store.is_denied(&job, &ca).await?);
+    assert!(!store.is_denied(&job, &cc).await?);
+    assert!(!store.is_denied(&job2, &ca).await?);
+    assert_eq!(store.get_denied(&job, &cc).await?, None);
+    assert_eq!(
+        store.get_denied(&job, &ca).await?,
+        Some(DenialRecord::default())
+    );
+
+    let record = DenialRecord::new(whole_second(now), "runtime OOM", Some("1.4.2"), None);
+    store.write_denied(&job, &ca, &record).await?;
+    assert_eq!(store.get_denied(&job, &ca).await?, Some(record));
+
+    store
+        .write_denied(&job2, &underscored, &DenialRecord::default())
+        .await?;
+    assert_eq!(
+        denied_of(store).await?,
+        vec![
+            (job.clone(), ca.clone()),
+            (job.clone(), cb.clone()),
+            (job2.clone(), underscored.clone()),
+        ]
+    );
+
+    store.delete_denied(&job, &cb).await?;
+    assert!(!store.is_denied(&job, &cb).await?);
+    assert!(store.is_denied(&job, &ca).await?);
+
+    store.delete_denied_for_job(&job).await?;
+    assert!(!store.is_denied(&job, &ca).await?);
+    assert_eq!(denied_of(store).await?, vec![(job2, underscored)]);
+    Ok(())
+}
+
+/// The reindex flags of the clients of the `reindex` piece.
+async fn reindex_flags_of(store: &dyn TodoStore) -> anyhow::Result<Vec<(ClientId, String)>> {
+    Ok(store
+        .list_pending_reindex()
+        .await?
+        .into_iter()
+        .filter(|(client_id, _)| of_client("reindex", client_id.as_str()))
+        .collect())
+}
+
+/// Each request writes its own flag. A delete by key removes only that flag.
+/// The reindex pass captures the flags, then deletes each one by key.
+pub async fn assert_todo_pending_reindex_round_trip(store: &dyn TodoStore) -> anyhow::Result<()> {
+    let client = todo_client("reindex", "cx_1")?;
+    // A prefix of `client`'s id.
+    let prefix = todo_client("reindex", "cx")?;
+    assert!(reindex_flags_of(store).await?.is_empty());
+    assert!(!store.has_pending_reindex(&client).await?);
+
+    store.write_pending_reindex(&client).await?;
+    store.write_pending_reindex(&client).await?;
+    let flags = reindex_flags_of(store).await?;
+    let [(first_client, first), second] = flags.as_slice() else {
+        anyhow::bail!("two requests wrote {} flags", flags.len());
+    };
+    assert_eq!(first_client, &client);
+    assert_eq!(second.0, client);
+    assert_ne!(first, &second.1);
+    assert!(store.has_pending_reindex(&client).await?);
+    assert!(!store.has_pending_reindex(&prefix).await?);
+
+    store.delete_pending_reindex(first).await?;
+    assert!(store.has_pending_reindex(&client).await?);
+    store.delete_pending_reindex(first).await?;
+    assert_eq!(reindex_flags_of(store).await?, vec![second.clone()]);
+
+    store.delete_pending_reindex(&second.1).await?;
+    assert!(reindex_flags_of(store).await?.is_empty());
+    assert!(!store.has_pending_reindex(&client).await?);
+    Ok(())
+}
+
+/// A job lists once, however many reindex flags it has.
+pub async fn assert_todo_pending_reindex_jobs_round_trip(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("rjobs", "job")?;
+    enqueue(store, &job, todo_deadline(now, 8)).await?;
+    let flagged = || async {
+        anyhow::Ok(
+            store
+                .list_pending_reindex_jobs()
+                .await?
+                .into_iter()
+                .filter(|job_id| of_job("rjobs", job_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(flagged().await?.is_empty());
+
+    store.write_pending_reindex_job(&job).await?;
+    store.write_pending_reindex_job(&job).await?;
+    assert_eq!(flagged().await?, vec![job.clone()]);
+
+    store.delete_pending_reindex_job(&job).await?;
+    assert!(flagged().await?.is_empty());
+    Ok(())
+}
+
+/// A loss names its lease, so a repeat write adds nothing. The listing is
+/// oldest first. A lost lease lists its expiry in whole seconds.
+pub async fn assert_todo_lost_leases_round_trip(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("lost", "job")?;
+    let (a, b) = (todo_client("lost", "a")?, todo_client("lost", "b")?);
+    let late = whole_second(now);
+    let early = late - chrono::TimeDelta::minutes(10);
+    enqueue(store, &job, ExpiresAt::Never).await?;
+    let lost_jobs = || async {
+        anyhow::Ok(
+            store
+                .list_lost_lease_jobs()
+                .await?
+                .into_iter()
+                .filter(|job_id| of_job("lost", job_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(store.list_lost_leases(&job).await?.is_empty());
+    assert!(lost_jobs().await?.is_empty());
+
+    store.write_lost_lease(&job, &b, now).await?;
+    store.write_lost_lease(&job, &a, early).await?;
+    store.write_lost_lease(&job, &a, early).await?;
+    assert_eq!(
+        store.list_lost_leases(&job).await?,
+        vec![(a, early), (b, late)]
+    );
+    assert_eq!(lost_jobs().await?, vec![job.clone()]);
+
+    store.delete_lost_leases_for_job(&job).await?;
+    assert!(store.list_lost_leases(&job).await?.is_empty());
+    assert!(lost_jobs().await?.is_empty());
+    Ok(())
+}
+
+/// A suspension reads back as written, and both listings report it until
+/// the delete.
+pub async fn assert_todo_suspension_round_trip(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let client = todo_client("suspend", "c1")?;
+    let conflict = todo_job("suspend", "job")?;
+    let at = whole_second(now);
+    let suspended = || async {
+        let records: Vec<ClientId> = store
+            .list_suspensions()
+            .await?
+            .into_iter()
+            .map(|(client_id, _)| client_id)
+            .filter(|client_id| of_client("suspend", client_id.as_str()))
+            .collect();
+        let ids: Vec<ClientId> = store
+            .list_suspended_ids()
+            .await?
+            .into_iter()
+            .filter(|client_id| of_client("suspend", client_id.as_str()))
+            .collect();
+        anyhow::Ok((records, ids))
+    };
+    assert!(store.read_suspension(&client).await?.is_none());
+
+    store.write_suspension(&client, at, &conflict).await?;
+    let SuspensionRecord {
+        suspended_at,
+        conflicting_job_id,
+    } = store
+        .read_suspension(&client)
+        .await?
+        .context("the written suspension reads back")?;
+    assert_eq!(suspended_at, at);
+    assert_eq!(conflicting_job_id, conflict);
+    assert_eq!(
+        suspended().await?,
+        (vec![client.clone()], vec![client.clone()])
+    );
+
+    store.delete_suspension(&client).await?;
+    assert!(store.read_suspension(&client).await?.is_none());
+    assert_eq!(suspended().await?, (Vec::new(), Vec::new()));
+    Ok(())
+}
+
+/// A stamp records the time of the backend's clock, so the check allows a
+/// second of skew. The read of the client and the listing report the same
+/// time. A second delete succeeds.
+pub async fn assert_todo_liveness_round_trip(store: &dyn TodoStore) -> anyhow::Result<()> {
+    let client = todo_client("live", "c1")?;
+    let listed = || async {
+        anyhow::Ok(
+            store
+                .list_liveness()
+                .await?
+                .into_iter()
+                .filter(|(client_id, _)| of_client("live", client_id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(store.read_liveness(&client).await?.is_none());
+
+    let before = Utc::now() - chrono::TimeDelta::seconds(1);
+    store.stamp_liveness(&client).await?;
+    let seen = store
+        .read_liveness(&client)
+        .await?
+        .context("the stamp reads back")?;
+    assert!(seen >= before, "{seen} is before {before}");
+    assert_eq!(listed().await?, vec![(client.clone(), seen)]);
+
+    store.stamp_liveness(&client).await?;
+    let restamped = store
+        .read_liveness(&client)
+        .await?
+        .context("the second stamp reads back")?;
+    assert!(restamped >= before, "{restamped} is before {before}");
+
+    store.delete_liveness(&client).await?;
+    store.delete_liveness(&client).await?;
+    assert!(store.read_liveness(&client).await?.is_none());
+    assert!(listed().await?.is_empty());
+    Ok(())
+}
+
+/// A marker carries the job's deadline. A delete by client keeps the other
+/// clients' markers, and a single delete keeps the client's other markers.
+pub async fn assert_todo_eligible_index(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let (c1, c2) = (todo_client("elig", "c1")?, todo_client("elig", "c2")?);
+    let (j1, j2) = (todo_job("elig", "j1")?, todo_job("elig", "j2")?);
+    let soon = todo_deadline(now, 9);
+    enqueue(store, &j1, ExpiresAt::Never).await?;
+    enqueue(store, &j2, soon).await?;
+    let for_client = |client_id: ClientId| async move {
+        let mut markers = store.list_eligible_for_client(&client_id).await?;
+        markers.sort();
+        anyhow::Ok(markers)
+    };
+    let all = || async {
+        let mut markers: Vec<(ClientId, JobId, ExpiresAt)> = store
+            .list_all_eligible()
+            .await?
+            .into_iter()
+            .filter(|(client_id, _, _)| of_client("elig", client_id.as_str()))
+            .collect();
+        markers.sort();
+        anyhow::Ok(markers)
+    };
+    assert!(for_client(c1.clone()).await?.is_empty());
+    assert!(all().await?.is_empty());
+
+    store.write_eligible(&c1, &j1, ExpiresAt::Never).await?;
+    store.write_eligible(&c1, &j2, soon).await?;
+    store.write_eligible(&c2, &j1, ExpiresAt::Never).await?;
+    assert_eq!(
+        for_client(c1.clone()).await?,
+        vec![(j1.clone(), ExpiresAt::Never), (j2.clone(), soon)]
+    );
+    assert_eq!(all().await?.len(), 3);
+
+    store.delete_eligible(&c2, &j1, ExpiresAt::Never).await?;
+    assert!(for_client(c2.clone()).await?.is_empty());
+    assert_eq!(for_client(c1.clone()).await?.len(), 2);
+
+    store.write_eligible(&c2, &j1, ExpiresAt::Never).await?;
+    store.delete_eligible_for_client(&c1).await?;
+    assert!(for_client(c1.clone()).await?.is_empty());
+    assert_eq!(all().await?, vec![(c2, j1, ExpiresAt::Never)]);
+    Ok(())
+}
+
+/// Missing state reads as empty, and each blob round-trips. A second write
+/// replaces the first.
+pub async fn assert_todo_state_blobs(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    fn strings(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+    assert!(store.read_eligible_indexed().await?.is_empty());
+    assert!(store.read_eligible_workers().await?.is_empty());
+    assert!(store.read_gc_candidates().await?.is_empty());
+    assert_eq!(store.read_backlog().await?, None);
+    assert_eq!(store.read_campaign_backlog().await?, None);
+
+    for indexed in [
+        strings(&["job-a/never.json", "job-b/20260801T000000Z.json"]),
+        strings(&["job-c/never.json"]),
+    ] {
+        store.write_eligible_indexed(&indexed).await?;
+        assert_eq!(store.read_eligible_indexed().await?, indexed);
+    }
+
+    for names in [&["ev1_a", "ev1_b"][..], &["ev1_c"][..]] {
+        let workers = names
+            .iter()
+            .map(|name| ClientId::try_new(*name))
+            .collect::<Result<HashSet<_>, _>>()?;
+        store.write_eligible_workers(&workers).await?;
+        assert_eq!(store.read_eligible_workers().await?, workers);
+    }
+
+    for candidates in [
+        strings(&[
+            "eligible/clients/client-a/job-a.never",
+            "denied/job-b.client-b",
+        ]),
+        strings(&["plans:job-c"]),
+    ] {
+        store.write_gc_candidates(&candidates).await?;
+        assert_eq!(store.read_gc_candidates().await?, candidates);
+    }
+
+    let counted_at = whole_second(now);
+    for count in [3, 5] {
+        let snapshot = BacklogSnapshot {
+            counted_at,
+            jobs: [(ClientId::try_new("ev1_a")?, count)].into_iter().collect(),
+        };
+        store.write_backlog(&snapshot).await?;
+        assert_eq!(store.read_backlog().await?, Some(snapshot));
+
+        let campaign = CampaignBacklogSnapshot {
+            counted_at,
+            devices: [(
+                ClientId::try_new("ev1_a")?,
+                CampaignBacklog {
+                    by_campaign: [(
+                        CampaignId::try_new("campaign_00000000-0000-0000-0000-000000000001")?,
+                        count,
+                    )]
+                    .into_iter()
+                    .collect(),
+                    outside_campaigns: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        store.write_campaign_backlog(&campaign).await?;
+        assert_eq!(store.read_campaign_backlog().await?, Some(campaign));
+    }
+    Ok(())
+}
+
+/// A staged body that no promote consumed lists as stale when it is `age` old.
+/// A delete removes the body from the listing.
+pub async fn assert_todo_stale_tmp(
+    store: &dyn TodoStore,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let job = todo_job("stale", "job")?;
+    store
+        .write_tmp(&job, &todo_body(&job, todo_deadline(now, 10)))
+        .await?;
+    let stale = |age: Duration| async move {
+        anyhow::Ok(
+            store
+                .list_stale_tmp(age)
+                .await?
+                .into_iter()
+                .filter(|key| of_job("stale", key))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let key = tmp_filename(&job);
+    assert_eq!(stale(Duration::ZERO).await?, vec![key.clone()]);
+    assert!(stale(Duration::from_secs(3600)).await?.is_empty());
+
+    store.delete_tmp_object(&key).await?;
+    assert!(stale(Duration::ZERO).await?.is_empty());
+    assert!(store.promote_avail(&job, ExpiresAt::Never).await.is_err());
     Ok(())
 }

@@ -1,14 +1,11 @@
 //! The queue protocol a client runs: claim, heartbeat, reclaim and the
-//! `POST /benchmarks` teardown, tested together as one conversation. The queue
-//! is seeded by writing `avail/` and `leased/` keys directly.
+//! `POST /benchmarks` teardown, tested together as one conversation.
 
 #![expect(
     clippy::disallowed_macros,
     clippy::disallowed_methods,
     reason = "tests build the requests a client sends, so they keep `json!` (see clippy.toml)"
 )]
-
-use std::path::Path;
 
 use anyhow::Context;
 use axum::body::Body;
@@ -19,40 +16,42 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use pipette_core::denial::DenialRecord;
-use pipette_core::todo_filename::{leased_key, parse_leased_key};
+use pipette_core::todo_filename::parse_leased_key;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientId, DeviceProfile, ExpiresAt, JobId};
 use pipette_web_testkit::{
-    approved_client, authed_post, authed_put_empty, body_json, denied_clients, job, make_state,
-    register_and_approve, register_pending, set_matching_input, setup_benchmarks, test_app,
+    QueueBackend, approved_client, approved_queue_client, authed_post, authed_put_empty, body_json,
+    commit_job, denied_clients, job, make_state, register_and_approve, register_pending,
+    set_matching_input, setup_benchmarks, test_app,
 };
 
-fn seed_avail(dir: &Path, job_id: &str, body: &Value) -> anyhow::Result<JobId> {
-    pipette_web_testkit::seed_avail(dir, job_id, ExpiresAt::Never, body)
+async fn seed_avail(state: &AppState, job_id: &str, body: &Value) -> anyhow::Result<JobId> {
+    pipette_web_testkit::seed_avail(state.todo_store.as_ref(), job_id, ExpiresAt::Never, body).await
 }
 
 /// The marker's expiry matches the `avail/` key's, as `queue-maintenance` writes
 /// it: the claim handler addresses the rename target by it.
 async fn seed_eligible(
     state: &AppState,
-    dir: &Path,
     client_id: &ClientId,
     job_id: &str,
     expires_at: ExpiresAt,
 ) -> anyhow::Result<JobId> {
-    seed_eligible_body(state, dir, client_id, job_id, expires_at, &job_body(job_id)).await
+    seed_eligible_body(state, client_id, job_id, expires_at, &job_body(job_id)).await
 }
 
-/// Like [`seed_eligible`], with a caller-supplied body.
+/// Like [`seed_eligible`], with a caller-supplied body. The job belongs to a
+/// committed plan, as a filed job does.
 async fn seed_eligible_body(
     state: &AppState,
-    dir: &Path,
     client_id: &ClientId,
     job_id: &str,
     expires_at: ExpiresAt,
     body: &Value,
 ) -> anyhow::Result<JobId> {
-    let job = pipette_web_testkit::seed_avail(dir, job_id, expires_at, body)?;
+    let job = pipette_web_testkit::seed_avail(state.todo_store.as_ref(), job_id, expires_at, body)
+        .await?;
+    commit_job(state, &job).await?;
     state
         .todo_store
         .write_eligible(client_id, &job, expires_at)
@@ -60,34 +59,34 @@ async fn seed_eligible_body(
     Ok(job)
 }
 
-fn seed_leased(
-    dir: &Path,
+async fn seed_leased(
+    state: &AppState,
     job: &JobId,
     expires_at: ExpiresAt,
     client: &ClientId,
     expiry: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
-    seed_leased_body(dir, job, expires_at, client, expiry, &json!({}))
+    seed_leased_body(state, job, expires_at, client, expiry, &json!({})).await
 }
 
 /// Like [`seed_leased`], with a caller-supplied body.
-fn seed_leased_body(
-    dir: &Path,
+async fn seed_leased_body(
+    state: &AppState,
     job: &JobId,
     expires_at: ExpiresAt,
     client: &ClientId,
     expiry: chrono::DateTime<chrono::Utc>,
     body: &Value,
 ) -> anyhow::Result<()> {
-    let path = dir
-        .join("todo")
-        .join("leased")
-        .join(leased_key(job, expires_at, client, expiry));
-    std::fs::create_dir_all(
-        path.parent()
-            .context("the fixture path has a parent directoryath")?,
-    )?;
-    std::fs::write(path, serde_json::to_vec(body)?)?;
+    pipette_web_testkit::seed_leased_until(
+        state.todo_store.as_ref(),
+        job.as_str(),
+        expires_at,
+        client,
+        expiry,
+        body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -116,14 +115,20 @@ fn window_secs(body: &Value) -> anyhow::Result<u64> {
 
 // ── claim ─────────────────────────────────────────────────────
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_claim_returns_eligible_job() -> anyhow::Result<()> {
+async fn test_claim_returns_eligible_job(#[case] backend: QueueBackend) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(state, &client_id, "job-1", ExpiresAt::Never).await?;
 
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
     assert_eq!(body["job_id"], "job-1");
@@ -178,15 +183,7 @@ async fn test_claim_response_carries_only_the_envelope_fields() -> anyhow::Resul
         "not_all_of": [["runtime:llama_cpp", "device:macbookpro14"]],
         "extra": 1,
     });
-    seed_eligible_body(
-        &state,
-        dir.path(),
-        &client_id,
-        "job-1",
-        ExpiresAt::Never,
-        &stored,
-    )
-    .await?;
+    seed_eligible_body(&state, &client_id, "job-1", ExpiresAt::Never, &stored).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -241,15 +238,7 @@ fn test_claim_answers_an_undecodable_job_with_what_it_has(
             rt.block_on(async {
                 let state = make_state(dir.path()).await?;
                 let (key, client_id) = register_and_approve(&state).await?;
-                seed_eligible_body(
-                    &state,
-                    dir.path(),
-                    &client_id,
-                    "job-1",
-                    ExpiresAt::Never,
-                    &stored,
-                )
-                .await?;
+                seed_eligible_body(&state, &client_id, "job-1", ExpiresAt::Never, &stored).await?;
 
                 let resp =
                     authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
@@ -296,7 +285,14 @@ fn test_claim_retries_under_the_key_a_stale_marker_misses() -> anyhow::Result<()
 
                 // The key carries the re-dated deadline; the marker still names the old one.
                 let job = job("job-1")?;
-                pipette_web_testkit::seed_avail(dir.path(), "job-1", current, &job_body("job-1"))?;
+                pipette_web_testkit::seed_avail(
+                    state.todo_store.as_ref(),
+                    "job-1",
+                    current,
+                    &job_body("job-1"),
+                )
+                .await?;
+                commit_job(&state, &job).await?;
                 state
                     .todo_store
                     .write_eligible(&client_id, &job, stale)
@@ -332,7 +328,9 @@ async fn test_claim_skips_a_stale_marker_whose_job_is_gone() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
+    // Committed, so the claim reaches the rename and misses there.
     let gone = job("job-gone")?;
+    commit_job(&state, &gone).await?;
     state
         .todo_store
         .write_eligible(&client_id, &gone, ExpiresAt::Never)
@@ -349,8 +347,10 @@ async fn test_claim_falls_through_a_gone_job_to_the_next_candidate() -> anyhow::
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    // A dated marker ranks ahead of a `never` one, so the gone job is tried first.
+    // A dated marker ranks ahead of a `never` one, so the gone job is tried
+    // first. Committed, so the claim reaches the rename and misses there.
     let gone = job("job-gone")?;
+    commit_job(&state, &gone).await?;
     state
         .todo_store
         .write_eligible(
@@ -359,7 +359,7 @@ async fn test_claim_falls_through_a_gone_job_to_the_next_candidate() -> anyhow::
             ExpiresAt::At(Utc::now() + chrono::Duration::hours(1)),
         )
         .await?;
-    let real = seed_eligible(&state, dir.path(), &client_id, "job-real", ExpiresAt::Never).await?;
+    let real = seed_eligible(&state, &client_id, "job-real", ExpiresAt::Never).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -380,7 +380,14 @@ async fn test_claim_204_when_the_marker_is_live_but_the_key_has_lapsed() -> anyh
     // Truncated to the second, the precision the stored spelling carries.
     let now = Utc::now().trunc_subsecs(0);
     let lapsed = ExpiresAt::At(now - chrono::Duration::hours(1));
-    let job = pipette_web_testkit::seed_avail(dir.path(), "job-1", lapsed, &job_body("job-1"))?;
+    let job = pipette_web_testkit::seed_avail(
+        state.todo_store.as_ref(),
+        "job-1",
+        lapsed,
+        &job_body("job-1"),
+    )
+    .await?;
+    commit_job(&state, &job).await?;
     state
         .todo_store
         .write_eligible(
@@ -468,7 +475,7 @@ async fn test_claim_expires_at_comes_from_the_avail_key(
         BodyExpiry::Unparseable => body["expires_at"] = json!("soon"),
         BodyExpiry::NonString => body["expires_at"] = json!(42),
     }
-    seed_eligible_body(&state, dir.path(), &client_id, "job-1", key_expiry, &body).await?;
+    seed_eligible_body(&state, &client_id, "job-1", key_expiry, &body).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -496,7 +503,7 @@ async fn test_claim_204_when_no_eligible_jobs() -> anyhow::Result<()> {
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // A job exists in avail/ but this client has no eligible marker for it.
-    seed_avail(dir.path(), "job-1", &job_body("job-1"))?;
+    seed_avail(&state, "job-1", &job_body("job-1")).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -557,7 +564,7 @@ async fn test_claim_204_when_suspended() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
     state
         .todo_store
         .write_suspension(&client_id, chrono::Utc::now(), &job)
@@ -573,21 +580,22 @@ async fn test_claim_idempotent_when_holding_single_lease() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    // Seeded directly to fix a known remaining life; 90s is not whole minutes, so
-    // the window renders as `PTnS`.
+    // The selected expiry gives the lease 90 seconds of life. The response gives the
+    // window in seconds as `PTnS`.
     let job_a = job("job-a")?;
     let expiry = Utc::now() + chrono::Duration::seconds(90);
     seed_leased_body(
-        dir.path(),
+        &state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
         expiry,
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
 
     // A second eligible job exists; a client holding a lease must not be handed it.
-    seed_eligible(&state, dir.path(), &client_id, "job-b", ExpiresAt::Never).await?;
+    seed_eligible(&state, &client_id, "job-b", ExpiresAt::Never).await?;
 
     let leased_before = state.todo_store.list_leased().await?;
 
@@ -627,13 +635,14 @@ async fn test_claim_hand_back_counts_the_held_lease_as_lost() -> anyhow::Result<
     let (state, key, client_id) = approved_client(dir.path()).await?;
     let job_a = job("job-a")?;
     seed_leased_body(
-        dir.path(),
+        &state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + chrono::Duration::seconds(90),
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
     // One loss on an earlier lease.
     state
         .todo_store
@@ -670,13 +679,14 @@ async fn test_claim_hand_back_records_no_loss_when_the_limit_is_zero() -> anyhow
     let (key, client_id) = register_and_approve(&state).await?;
     let job_a = job("job-a")?;
     seed_leased_body(
-        dir.path(),
+        &state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + chrono::Duration::seconds(90),
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -694,22 +704,24 @@ enum ClaimPath {
 async fn seed_on_path(
     path: ClaimPath,
     state: &AppState,
-    dir: &Path,
     client: &ClientId,
     body: &Value,
 ) -> anyhow::Result<()> {
     match path {
         ClaimPath::Fresh => {
-            seed_eligible_body(state, dir, client, "job-v", ExpiresAt::Never, body).await?;
+            seed_eligible_body(state, client, "job-v", ExpiresAt::Never, body).await?;
         }
-        ClaimPath::HandBack => seed_leased_body(
-            dir,
-            &job("job-v")?,
-            ExpiresAt::Never,
-            client,
-            Utc::now() + chrono::Duration::seconds(90),
-            body,
-        )?,
+        ClaimPath::HandBack => {
+            seed_leased_body(
+                state,
+                &job("job-v")?,
+                ExpiresAt::Never,
+                client,
+                Utc::now() + chrono::Duration::seconds(90),
+                body,
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -755,7 +767,7 @@ async fn test_claim_names_the_admitted_client_versions(
         tags,
     )
     .await?;
-    seed_on_path(path, &state, dir.path(), &client_id, &versioned_job_body()).await?;
+    seed_on_path(path, &state, &client_id, &versioned_job_body()).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -778,7 +790,7 @@ async fn test_claim_500_when_the_tags_cannot_be_read(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (mut state, key, client_id) = approved_client(dir.path()).await?;
-    seed_on_path(path, &state, dir.path(), &client_id, &versioned_job_body()).await?;
+    seed_on_path(path, &state, &client_id, &versioned_job_body()).await?;
     let leased_before = state.todo_store.list_leased().await?;
     state.tag_store = std::sync::Arc::new(pipette_store_testkit::TagStoreUnimplemented);
 
@@ -808,13 +820,14 @@ async fn test_claim_hand_back_carries_the_envelope_and_the_lease_keys_deadline(
         }
     };
     seed_leased_body(
-        dir.path(),
+        &state,
         &job("job-a")?,
         expires_at,
         &client_id,
         Utc::now() + chrono::Duration::seconds(90),
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
     let leased_before = state.todo_store.list_leased().await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
@@ -846,10 +859,10 @@ async fn test_claim_suspends_client_holding_multiple_leases() -> anyhow::Result<
     let future = Utc::now() + chrono::Duration::hours(1);
     let job_a = job("job-a")?;
     let job_b = job("job-b")?;
-    seed_leased(dir.path(), &job_a, ExpiresAt::Never, &client_id, future)?;
-    seed_leased(dir.path(), &job_b, ExpiresAt::Never, &client_id, future)?;
+    seed_leased(&state, &job_a, ExpiresAt::Never, &client_id, future).await?;
+    seed_leased(&state, &job_b, ExpiresAt::Never, &client_id, future).await?;
 
-    seed_eligible(&state, dir.path(), &client_id, "job-c", ExpiresAt::Never).await?;
+    seed_eligible(&state, &client_id, "job-c", ExpiresAt::Never).await?;
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
@@ -873,21 +886,23 @@ async fn test_claim_not_suspended_when_one_job_appears_under_two_lease_keys() ->
     let job_a = job("job-a")?;
     let now = Utc::now();
     seed_leased_body(
-        dir.path(),
+        &state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
         now + chrono::Duration::seconds(60),
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
     seed_leased_body(
-        dir.path(),
+        &state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
         now + chrono::Duration::seconds(120),
         &job_body("job-a"),
-    )?;
+    )
+    .await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -912,15 +927,21 @@ async fn test_claim_hand_back_reports_the_later_of_two_lease_keys() -> anyhow::R
     let now = Utc::now();
     for offset in [60, 120] {
         seed_leased_body(
-            dir.path(),
+            &state,
             &job_a,
             ExpiresAt::Never,
             &client_id,
             now + chrono::Duration::seconds(offset),
             &job_body("job-a"),
-        )?;
+        )
+        .await?;
     }
     let leased_before = state.todo_store.list_leased().await?;
+    assert_eq!(
+        leased_before.len(),
+        2,
+        "both lease keys must survive seeding"
+    );
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -941,8 +962,10 @@ async fn test_claim_hand_back_reports_the_later_of_two_lease_keys() -> anyhow::R
 async fn test_claim_passes_over_unparseable_files_in_the_lease_partition() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
 
+    // No `TodoStore` call writes an invalid key, so this test writes one in the
+    // `local_fs` layout.
     let partition = dir
         .path()
         .join("todo")
@@ -991,7 +1014,7 @@ async fn test_claim_skips_job_denied_for_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
     state
         .todo_store
         .write_denied(&job, &client_id, &DenialRecord::default())
@@ -1007,15 +1030,19 @@ async fn test_claim_skips_job_leased_to_another_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    // The lease claim removes the job from `avail/`. The next seed returns it to
+    // `avail/`, so the job has a lease and a queue entry.
+    let job = job("job-1")?;
     let other = ClientId::try_new("someone-else")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         ExpiresAt::Never,
         &other,
         chrono::Utc::now() + chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
+    seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1038,14 +1065,15 @@ async fn test_claim_succeeds_when_own_lease_is_expired() -> anyhow::Result<()> {
     // An expired own lease is a timed-out device, not a double-claim.
     let old_job = job("old-job")?;
     seed_leased(
-        dir.path(),
+        &state,
         &old_job,
         ExpiresAt::Never,
         &client_id,
         chrono::Utc::now() - chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
 
-    seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1066,7 +1094,7 @@ async fn test_claim_ignores_denial_by_another_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
     let other = ClientId::try_new("someone-else")?;
     state
         .todo_store
@@ -1085,8 +1113,8 @@ async fn test_claim_skips_denied_job_but_claims_another() -> anyhow::Result<()> 
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job_a = seed_eligible(&state, dir.path(), &client_id, "job-a", ExpiresAt::Never).await?;
-    let job_b = seed_eligible(&state, dir.path(), &client_id, "job-b", ExpiresAt::Never).await?;
+    let job_a = seed_eligible(&state, &client_id, "job-a", ExpiresAt::Never).await?;
+    let job_b = seed_eligible(&state, &client_id, "job-b", ExpiresAt::Never).await?;
     state
         .todo_store
         .write_denied(&job_a, &client_id, &DenialRecord::default())
@@ -1113,16 +1141,9 @@ async fn test_claim_prefers_soonest_expiring_job() -> anyhow::Result<()> {
     let soon = ExpiresAt::At(Utc::now() + chrono::Duration::hours(1));
     let later = ExpiresAt::At(Utc::now() + chrono::Duration::days(30));
 
-    seed_eligible(
-        &state,
-        dir.path(),
-        &client_id,
-        "job-never",
-        ExpiresAt::Never,
-    )
-    .await?;
-    seed_eligible(&state, dir.path(), &client_id, "job-later", later).await?;
-    seed_eligible(&state, dir.path(), &client_id, "job-soon", soon).await?;
+    seed_eligible(&state, &client_id, "job-never", ExpiresAt::Never).await?;
+    seed_eligible(&state, &client_id, "job-later", later).await?;
+    seed_eligible(&state, &client_id, "job-soon", soon).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1142,9 +1163,9 @@ async fn test_claim_picks_within_soonest_expiry_tier() -> anyhow::Result<()> {
 
     let mut tier: Vec<JobId> = Vec::new();
     for id in ["soon-a", "soon-b", "soon-c"] {
-        tier.push(seed_eligible(&state, dir.path(), &client_id, id, soon).await?);
+        tier.push(seed_eligible(&state, &client_id, id, soon).await?);
     }
-    seed_eligible(&state, dir.path(), &client_id, "job-later", later).await?;
+    seed_eligible(&state, &client_id, "job-later", later).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1166,7 +1187,7 @@ async fn test_claim_204_when_only_eligible_job_is_expired() -> anyhow::Result<()
 
     // Not yet swept from avail/, but an expired job is never handed out.
     let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", expired).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", expired).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1184,8 +1205,8 @@ async fn test_claim_skips_expired_job_and_claims_valid_one() -> anyhow::Result<(
     // An expired job ranks soonest, so without the expiry filter it would win.
     let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
     let valid = ExpiresAt::At(Utc::now() + chrono::Duration::days(7));
-    seed_eligible(&state, dir.path(), &client_id, "job-expired", expired).await?;
-    let good = seed_eligible(&state, dir.path(), &client_id, "job-valid", valid).await?;
+    seed_eligible(&state, &client_id, "job-expired", expired).await?;
+    let good = seed_eligible(&state, &client_id, "job-valid", valid).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1200,37 +1221,44 @@ async fn test_claim_skips_expired_job_and_claims_valid_one() -> anyhow::Result<(
 
 // ── heartbeat ────────────────────────────────────────────────
 
-fn lease_expiry(dir: &Path, job: &JobId, client: &ClientId) -> anyhow::Result<DateTime<Utc>> {
-    let part = dir.join("todo").join("leased").join(client.as_str());
-    let prefix = format!("{}.", job.as_str());
-    std::fs::read_dir(&part)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|name| name.starts_with(&prefix))
-        .map(|name| {
-            let key = format!("{}/{name}", client.as_str());
-            parse_leased_key(&key).map(|lease| lease.lease_expiry)
-        })
-        .transpose()?
+async fn lease_expiry(
+    state: &AppState,
+    job: &JobId,
+    client: &ClientId,
+) -> anyhow::Result<DateTime<Utc>> {
+    state
+        .todo_store
+        .list_leased_for_client(client)
+        .await?
+        .iter()
+        .filter_map(|key| parse_leased_key(key).ok())
+        .find(|lease| lease.job_id == *job)
+        .map(|lease| lease.lease_expiry)
         .ok_or_else(|| anyhow::anyhow!("no lease for {} held by {}", job.as_str(), client.as_str()))
 }
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_heartbeat_renews_active_lease() -> anyhow::Result<()> {
+async fn test_heartbeat_renews_active_lease(#[case] backend: QueueBackend) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
     let job = job("job-1")?;
     let old = Utc::now() + chrono::Duration::seconds(30);
-    seed_leased(dir.path(), &job, ExpiresAt::Never, &client_id, old)?;
+    seed_leased(state, &job, ExpiresAt::Never, &client_id, old).await?;
 
-    let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-1/heartbeat").await?;
+    let resp = authed_put_empty(state, &key, &client_id, "/plans/job-1/heartbeat").await?;
     assert_eq!(resp.status(), StatusCode::OK);
     // 200 carries an empty body, not the renewal's locator.
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     assert!(body.is_empty(), "heartbeat 200 body should be empty");
 
-    let renewed = lease_expiry(dir.path(), &job, &client_id)?;
+    let renewed = lease_expiry(state, &job, &client_id).await?;
     assert!(
         renewed > old,
         "lease expiry {renewed} should advance past the original {old}"
@@ -1249,7 +1277,7 @@ async fn test_heartbeat_renews_a_held_lease_past_the_jobs_deadline() -> anyhow::
     let past = ExpiresAt::At((Utc::now() - chrono::Duration::hours(1)).trunc_subsecs(0));
     let job = job("job-1")?;
     let old = Utc::now() + chrono::Duration::seconds(30);
-    seed_leased(dir.path(), &job, past, &client_id, old)?;
+    seed_leased(&state, &job, past, &client_id, old).await?;
 
     let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-1/heartbeat").await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1313,19 +1341,20 @@ async fn test_renewal_gated_while_pending_reindex(
     let (state, key, client_id) = approved_client(dir.path()).await?;
     let job = job("job-1")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + lease_offset,
-    )?;
-    let before = lease_expiry(dir.path(), &job, &client_id)?;
+    )
+    .await?;
+    let before = lease_expiry(&state, &job, &client_id).await?;
     state.todo_store.write_pending_reindex(&client_id).await?;
 
     let resp = renewal(&state, &key, &client_id, &method, path).await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        lease_expiry(dir.path(), &job, &client_id)?,
+        lease_expiry(&state, &job, &client_id).await?,
         before,
         "a gated renewal must not rename the lease"
     );
@@ -1367,12 +1396,13 @@ async fn test_heartbeat_409_when_leased_to_another_client() -> anyhow::Result<()
     let job = job("job-1")?;
     let other = ClientId::try_new("someone-else")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         ExpiresAt::Never,
         &other,
         Utc::now() + chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
 
     let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-1/heartbeat").await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1423,7 +1453,7 @@ async fn test_gated_while_pending_reindex(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
     state.todo_store.write_pending_reindex(&client_id).await?;
 
     let resp = authed_post(&state, &key, &client_id, path, &json!({})).await?;
@@ -1441,24 +1471,30 @@ async fn test_gated_while_pending_reindex(
 
 // ── reclaim ───────────────────────────────────────────────────
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_reclaim_renews_own_held_lease() -> anyhow::Result<()> {
+async fn test_reclaim_renews_own_held_lease(#[case] backend: QueueBackend) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
     // An expired but still-held lease, the canonical outage recovery: renewed
     // without an expiry check on the job.
     let job = job("job-1")?;
     let old = Utc::now() - chrono::Duration::hours(1);
-    seed_leased(dir.path(), &job, ExpiresAt::Never, &client_id, old)?;
+    seed_leased(state, &job, ExpiresAt::Never, &client_id, old).await?;
 
-    let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     // 200 carries an empty body, not the renewal's locator.
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     assert!(body.is_empty(), "reclaim 200 body should be empty");
 
-    let renewed = lease_expiry(dir.path(), &job, &client_id)?;
+    let renewed = lease_expiry(state, &job, &client_id).await?;
     assert!(
         renewed > old && renewed > Utc::now(),
         "lease expiry {renewed} should have advanced into the future"
@@ -1478,12 +1514,13 @@ async fn test_reclaim_renews_a_held_lease_past_the_jobs_deadline() -> anyhow::Re
     let past = ExpiresAt::At((Utc::now() - chrono::Duration::hours(1)).trunc_subsecs(0));
     let job = job("job-1")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         past,
         &client_id,
         Utc::now() - chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1513,7 +1550,7 @@ async fn test_reclaim_reacquires_job_from_avail() -> anyhow::Result<()> {
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // Recycled to avail/, but the client is still eligible.
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1537,12 +1574,13 @@ async fn test_reclaim_409_when_leased_to_another_client() -> anyhow::Result<()> 
     let job = job("job-1")?;
     let other = ClientId::try_new("someone-else")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         ExpiresAt::Never,
         &other,
         Utc::now() + chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
     // Even with an eligible marker, the live foreign lease wins.
     state
         .todo_store
@@ -1570,7 +1608,7 @@ async fn test_reclaim_404_when_not_eligible() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
     let (other_key, other) = register_and_approve(&state).await?;
-    let job = seed_eligible(&state, dir.path(), &other, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &other, "job-1", ExpiresAt::Never).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1618,7 +1656,7 @@ async fn test_reclaim_404_when_job_expired() -> anyhow::Result<()> {
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", expired).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", expired).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1633,7 +1671,7 @@ async fn test_reclaim_404_when_denied_for_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let job = seed_eligible(&state, dir.path(), &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
     state
         .todo_store
         .write_denied(&job, &client_id, &DenialRecord::default())
@@ -1672,13 +1710,14 @@ async fn test_renewal_403_when_suspended(
     // `403`, not the `204` a claim gets, though the client holds a lease.
     let job = job("job-1")?;
     seed_leased(
-        dir.path(),
+        &state,
         &job,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + chrono::Duration::hours(1),
-    )?;
-    let before = lease_expiry(dir.path(), &job, &client_id)?;
+    )
+    .await?;
+    let before = lease_expiry(&state, &job, &client_id).await?;
     state
         .todo_store
         .write_suspension(&client_id, Utc::now(), &job)
@@ -1691,7 +1730,7 @@ async fn test_renewal_403_when_suspended(
         json!({"error": "client is suspended"})
     );
     assert_eq!(
-        lease_expiry(dir.path(), &job, &client_id)?,
+        lease_expiry(&state, &job, &client_id).await?,
         before,
         "a refused renewal must not rename the lease"
     );
@@ -1715,24 +1754,26 @@ async fn test_a_second_live_lease_suspends_the_client(
     let (state, key, client_id) = approved_client(dir.path()).await?;
     let held = job("job-a")?;
     seed_leased(
-        dir.path(),
+        &state,
         &held,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + chrono::Duration::hours(1),
-    )?;
+    )
+    .await?;
     let second = if lapsed_lease {
         let second = job("job-b")?;
         seed_leased(
-            dir.path(),
+            &state,
             &second,
             ExpiresAt::Never,
             &client_id,
             Utc::now() - chrono::Duration::minutes(1),
-        )?;
+        )
+        .await?;
         second
     } else {
-        seed_eligible(&state, dir.path(), &client_id, "job-b", ExpiresAt::Never).await?
+        seed_eligible(&state, &client_id, "job-b", ExpiresAt::Never).await?
     };
 
     let resp = renewal(&state, &key, &client_id, &method, path).await?;
@@ -1806,21 +1847,23 @@ fn prefill_success_body(job_id: &str) -> Value {
 
 /// Else `queue-maintenance` would recycle the lease into `avail/` and hand the
 /// finished job out again.
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_submit_success_tears_down_own_lease() -> anyhow::Result<()> {
+async fn test_submit_success_tears_down_own_lease(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let job = job(TEARDOWN_JOB_ID)?;
-    seed_leased(
-        dir.path(),
-        &job,
-        ExpiresAt::Never,
-        &client_id,
-        future_expiry(),
-    )?;
+    seed_leased(state, &job, ExpiresAt::Never, &client_id, future_expiry()).await?;
 
     let resp = authed_post(
-        &state,
+        state,
         &key,
         &client_id,
         "/benchmarks",
@@ -1842,7 +1885,7 @@ async fn test_submit_success_tears_down_own_lease() -> anyhow::Result<()> {
 async fn test_submit_recycled_job_without_lease_returns_404() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
-    seed_avail(dir.path(), TEARDOWN_JOB_ID, &job_body(TEARDOWN_JOB_ID))?;
+    seed_avail(&state, TEARDOWN_JOB_ID, &job_body(TEARDOWN_JOB_ID)).await?;
 
     let resp = authed_post(
         &state,
@@ -1870,13 +1913,7 @@ async fn test_submit_success_leaves_denied_markers() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
     let job = job(TEARDOWN_JOB_ID)?;
-    seed_leased(
-        dir.path(),
-        &job,
-        ExpiresAt::Never,
-        &client_id,
-        future_expiry(),
-    )?;
+    seed_leased(&state, &job, ExpiresAt::Never, &client_id, future_expiry()).await?;
     let other = ClientId::try_new("ev1_other")?;
     state
         .todo_store

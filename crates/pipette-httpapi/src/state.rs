@@ -11,8 +11,9 @@ use pipette_pipeline::plan_cells::CellCache;
 use pipette_pipeline::plan_results::ResultsDb;
 use pipette_store::{
     AuditStore, CampaignStore, CatalogImportRunStore, CatalogStore, ClientStore, DatasetCacheStore,
-    DescriptorCatalogStore, EvalSampleResultStore, KeyIndexStore, ModelParamsStore, OrgStore,
-    PlanStore, Stores, SubmissionStore, TagStore, TodoStore, UserStore, VaultStore, WarehouseStore,
+    DescriptorCatalogStore, EvalPackageStore, EvalSampleResultStore, KeyIndexStore,
+    ModelParamsStore, OrgStore, PlanStore, RunEvidenceStore, Stores, SubmissionStore, TagStore,
+    TodoStore, UserStore, VaultStore, WarehouseStore,
 };
 
 use crate::api_schema::openapi::OpenApi;
@@ -36,6 +37,9 @@ pub struct AppState {
     /// The SQL history of importer runs. The server reads it on every request
     /// for the catalog status.
     pub catalog_import_runs: Option<Arc<dyn CatalogImportRunStore>>,
+    /// The run evidence index that the scorer keeps. `None` without a
+    /// `[database]`, and then the catalog reads give no evidence.
+    pub run_evidence: Option<Arc<dyn RunEvidenceStore>>,
     pub http_client: reqwest::Client,
     /// pipette-duckdb, which a plan's results are read from; `None` without a
     /// `[duckdb]` section.
@@ -90,9 +94,12 @@ pub struct AppState {
     /// The audit writes that run after their answer went out. `serve` waits for
     /// them before the process exits.
     pub audit_writes: tokio_util::task::TaskTracker,
-    /// `dataset-cache/artifacts/`: repacked corpora and their probe verdicts,
-    /// read by `GET /datasets/{benchmark_id}`.
+    /// `dataset-cache/artifacts/`: repacked git corpora and every artifact's
+    /// probe verdict, read by `GET /datasets/{benchmark_id}`.
     pub dataset_cache_store: Arc<dyn DatasetCacheStore>,
+    /// `scores-packages/tars/`: the evals-server corpora that
+    /// `GET /datasets/{benchmark_id}` streams.
+    pub eval_packages: Arc<dyn EvalPackageStore>,
     /// `vault/` records and the `vault-resources/` blobs beside them: the
     /// private artifacts mgmt serves to one principal
     /// (`docs/design/vault-resources.md`).
@@ -156,6 +163,7 @@ impl AppState {
             catalog_store,
             descriptor_catalog_store: stores.descriptor_catalog,
             catalog_import_runs: stores.catalog_import_runs,
+            run_evidence: stores.run_evidence,
             results_db,
             http_client,
             replay_cache: Arc::new(ReplayCache::new()),
@@ -179,6 +187,7 @@ impl AppState {
             audit_store: stores.audit,
             audit_writes: tokio_util::task::TaskTracker::new(),
             dataset_cache_store: stores.dataset_cache,
+            eval_packages: stores.eval_packages,
             vault_store: stores.vault,
             vault_uploads: Arc::new(tokio::sync::Semaphore::new(VAULT_UPLOADS_MAX)),
             submission_bodies: Arc::new(tokio::sync::Semaphore::new(SUBMISSION_SHARES)),

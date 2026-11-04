@@ -212,6 +212,14 @@ const OPERATIONS: &[Doc] = &[
         "descriptor-catalog/add_org_descriptor_member.md"
     ),
     doc!(
+        "rename_org_descriptor_entry",
+        "descriptor-catalog/rename_org_descriptor_entry.md"
+    ),
+    doc!(
+        "relabel_org_descriptor_member",
+        "descriptor-catalog/relabel_org_descriptor_member.md"
+    ),
+    doc!(
         "change_org_descriptor_entry_state",
         "descriptor-catalog/change_org_descriptor_entry_state.md"
     ),

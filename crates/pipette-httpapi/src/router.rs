@@ -422,6 +422,20 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             )),
         )
         .route(
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/rename",
+            post(gate(
+                EDIT_ORG_CATALOG,
+                api_v1::descriptor_catalog::rename_org_descriptor_entry,
+            )),
+        )
+        .route(
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/relabel",
+            post(gate(
+                EDIT_ORG_CATALOG,
+                api_v1::descriptor_catalog::relabel_org_descriptor_member,
+            )),
+        )
+        .route(
             "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/state",
             post(gate(
                 EDIT_ORG_CATALOG,

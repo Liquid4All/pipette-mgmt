@@ -30,6 +30,8 @@ pipette-store.workspace = true
 pipette-store-fs.workspace = true
 # `seeded_sql_state` puts the records on a scratch PostgreSQL database.
 pipette-store-sql = { workspace = true, features = ["testkit"] }
+# The queue seeds, which write through `TodoStore` on any backend.
+pipette-store-testkit.workspace = true
 anyhow.workspace = true
 # Signs the tokens a Clerk instance would issue.
 aws-lc-rs.workspace = true

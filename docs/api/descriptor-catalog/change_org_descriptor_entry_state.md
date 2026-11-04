@@ -15,7 +15,11 @@ Each action checks the current state before the change.
 To permanently tombstone the entry, send
 `{"action":"tombstone","confirmation":"<stored name>"}`. The confirmation
 must match the stored name exactly, including its letter case. You cannot
-recreate a tombstoned name in the same organization.
+recreate a tombstoned name in the same organization. A tombstone is for a
+wrong descriptor. For a typo in a name, use
+[`rename_org_descriptor_entry`](rename_org_descriptor_entry.md). For a typo in
+a quantization label, use
+[`relabel_org_descriptor_member`](relabel_org_descriptor_member.md).
 
 ## Statuses
 

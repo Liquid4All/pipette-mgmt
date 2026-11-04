@@ -275,6 +275,23 @@ pub async fn resolve(
     read: &CatalogReadScope,
     name: &QualifiedCatalogName,
 ) -> anyhow::Result<Option<DescriptorEntry>> {
+    Ok(resolve_for_plan(catalog, orgs, read, name)
+        .await?
+        .filter(|entry| entry.state != DescriptorEntryState::Tombstoned))
+}
+
+/// Look up a name for plan filing. A live entry takes precedence over a
+/// tombstone in an earlier scope, so a tombstoned org name falls back to a
+/// live global name. If no live entry exists, return the tombstone so plan
+/// resolution can give a distinct refusal instead of "unknown name".
+/// The plan caller supplies `CatalogReadScope::Org(plan_org)` or
+/// `Unaffiliated`, rather than the filer's broader read permissions.
+pub async fn resolve_for_plan(
+    catalog: &dyn DescriptorCatalogStore,
+    orgs: &dyn OrgStore,
+    read: &CatalogReadScope,
+    name: &QualifiedCatalogName,
+) -> anyhow::Result<Option<DescriptorEntry>> {
     let scopes = match &name.qualifier {
         None => read
             .own_org()
@@ -288,21 +305,42 @@ pub async fn resolve(
             None => Vec::new(),
         },
     };
+    let mut tombstone = None;
     for scope in scopes.iter().filter(|scope| read.can_read(scope)) {
         if let Some(entry) = catalog.get_entry(scope, &name.name).await?
-            && entry.state != DescriptorEntryState::Tombstoned
+            && let Some(live) = consider_for_plan(entry, &mut tombstone)
         {
-            return Ok(Some(entry));
+            return Ok(Some(live));
         }
     }
-    Ok(None)
+    Ok(tombstone)
+}
+
+fn consider_for_plan(
+    entry: DescriptorEntry,
+    tombstone: &mut Option<DescriptorEntry>,
+) -> Option<DescriptorEntry> {
+    if entry.state == DescriptorEntryState::Tombstoned {
+        if tombstone.is_none() {
+            *tombstone = Some(entry);
+        }
+        None
+    } else {
+        Some(entry)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
+    use pipette_core::{
+        config::{Config, StorageConfig},
+        organization::Organization,
+    };
     use pipette_plan_types::{DescriptorEntryKind as Kind, DescriptorEntryState as State};
+    use pipette_store::Stores;
+    use pipette_store_fs::build_local_fs_stores;
 
     use super::*;
 
@@ -311,6 +349,194 @@ mod tests {
 
     fn org(id: &str) -> anyhow::Result<CatalogScope> {
         Ok(CatalogScope::Org(OrgId::try_new(id)?))
+    }
+
+    fn plan_lookup_entry(scope: CatalogScope, state: State) -> anyhow::Result<DescriptorEntry> {
+        use pipette_plan_types::{DescriptorEntryCreator, DescriptorMember, NonEmptyVec};
+
+        let now = chrono::Utc::now();
+        let member = DescriptorMember::new(
+            serde_json::from_value(serde_json::json!({"type": "apple_foundation"}))?,
+            now,
+        )?;
+        let mut entry = DescriptorEntry::new(
+            scope,
+            CatalogName::try_new("x")?,
+            Kind::HandMade,
+            State::Active,
+            now,
+            now,
+            DescriptorEntryCreator::Operator,
+            NonEmptyVec::try_new(vec![member])?,
+        )?;
+        entry.state = state;
+        Ok(entry)
+    }
+
+    #[test]
+    fn plan_lookup_keeps_tombstone_only_without_a_live_fallback() -> anyhow::Result<()> {
+        let own = org(ACME)?;
+        let mut tombstone = None;
+        assert!(
+            consider_for_plan(
+                plan_lookup_entry(own.clone(), State::Tombstoned)?,
+                &mut tombstone
+            )
+            .is_none()
+        );
+        let selected = consider_for_plan(
+            plan_lookup_entry(CatalogScope::Global, State::Active)?,
+            &mut tombstone,
+        );
+        assert_eq!(
+            selected.as_ref().map(|entry| &entry.scope),
+            Some(&CatalogScope::Global)
+        );
+        assert_eq!(tombstone.as_ref().map(|entry| &entry.scope), Some(&own));
+
+        let mut tombstone = None;
+        let selected = consider_for_plan(
+            plan_lookup_entry(own.clone(), State::Active)?,
+            &mut tombstone,
+        );
+        assert_eq!(selected.as_ref().map(|entry| &entry.scope), Some(&own));
+        assert!(tombstone.is_none());
+
+        let mut tombstone = None;
+        assert!(
+            consider_for_plan(
+                plan_lookup_entry(CatalogScope::Global, State::Tombstoned)?,
+                &mut tombstone
+            )
+            .is_none()
+        );
+        assert_eq!(
+            tombstone.as_ref().map(|entry| &entry.state),
+            Some(&State::Tombstoned)
+        );
+        Ok(())
+    }
+
+    async fn plan_lookup_stores() -> anyhow::Result<
+        Option<(
+            pipette_store_sql::scratch::TestDb,
+            tempfile::TempDir,
+            Stores,
+            OrgId,
+        )>,
+    > {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(None);
+        };
+        let dir = tempfile::tempdir()?;
+        let config = Config {
+            storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+            auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let stores = pipette_store_sql::overlay(db.db(), build_local_fs_stores(&config)?);
+        let catalog = stores
+            .descriptor_catalog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
+        let org = Organization::new(
+            OrgSlug::try_new("acme")?,
+            pipette_plan_types::NonEmptyTrimmedString::try_new("Acme")?,
+            chrono::Utc::now(),
+        );
+        stores.orgs.put_org(&org).await?;
+        stores
+            .orgs
+            .claim_org_slug(org.slug.as_str(), &org.org_id)
+            .await?;
+        catalog
+            .create_entry(&plan_lookup_entry(CatalogScope::Global, State::Active)?)
+            .await?;
+        catalog
+            .create_entry(&plan_lookup_entry(
+                CatalogScope::Org(org.org_id.clone()),
+                State::Active,
+            )?)
+            .await?;
+        let beta = Organization::new(
+            OrgSlug::try_new("beta")?,
+            pipette_plan_types::NonEmptyTrimmedString::try_new("Beta")?,
+            chrono::Utc::now(),
+        );
+        stores.orgs.put_org(&beta).await?;
+        stores
+            .orgs
+            .claim_org_slug(beta.slug.as_str(), &beta.org_id)
+            .await?;
+        catalog
+            .create_entry(&plan_lookup_entry(
+                CatalogScope::Org(beta.org_id),
+                State::Active,
+            )?)
+            .await?;
+        Ok(Some((db, dir, stores, org.org_id)))
+    }
+
+    #[tokio::test]
+    async fn unaffiliated_plan_uses_global_names_only() -> anyhow::Result<()> {
+        let Some((_db, _dir, stores, _org_id)) = plan_lookup_stores().await? else {
+            return Ok(());
+        };
+        let catalog = stores
+            .descriptor_catalog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
+        let read = CatalogReadScope::Unaffiliated;
+        let bare = "x".parse()?;
+        let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &bare).await?;
+        assert_eq!(
+            found.as_ref().map(|entry| &entry.scope),
+            Some(&CatalogScope::Global)
+        );
+        let qualified = "acme/x".parse()?;
+        assert!(
+            resolve_for_plan(&**catalog, &*stores.orgs, &read, &qualified)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_org_entry_precedes_global_entry() -> anyhow::Result<()> {
+        let Some((_db, _dir, stores, org_id)) = plan_lookup_stores().await? else {
+            return Ok(());
+        };
+        let catalog = stores
+            .descriptor_catalog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
+        let name = "x".parse()?;
+        let read = CatalogReadScope::Org(org_id.clone());
+        let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &name).await?;
+        assert_eq!(
+            found.as_ref().map(|entry| &entry.scope),
+            Some(&CatalogScope::Org(org_id.clone()))
+        );
+        let global = "global/x".parse()?;
+        let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &global).await?;
+        assert_eq!(
+            found.as_ref().map(|entry| &entry.scope),
+            Some(&CatalogScope::Global)
+        );
+        let own = "acme/x".parse()?;
+        let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &own).await?;
+        assert_eq!(
+            found.as_ref().map(|entry| &entry.scope),
+            Some(&CatalogScope::Org(org_id))
+        );
+        let foreign = "beta/x".parse()?;
+        assert!(
+            resolve_for_plan(&**catalog, &*stores.orgs, &read, &foreign)
+                .await?
+                .is_none()
+        );
+        Ok(())
     }
 
     fn scope(word: &str) -> anyhow::Result<CatalogScope> {

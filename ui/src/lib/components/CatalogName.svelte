@@ -1,15 +1,18 @@
 <script lang="ts">
   // A descriptor under its catalog name (`descriptor_names`), the member key quieter. A click shows the descriptor
   // in a balloon by the name, over the cells near it, with a tail that points at the name; a click outside or Esc
-  // closes it. The tooltip lists the other names. A descriptor with no name shows as it is.
+  // closes it. The tooltip lists the other names. A descriptor with no name shows as it is. Under its entry's name,
+  // the button shows the member key alone.
   import type { Snippet } from "svelte";
   import type { DescriptorDisplay } from "../api-types";
   import { type Tail, tailOf } from "../balloon";
   import { memberKeyOf, synonymsTitle } from "../descriptor-names";
 
-  let { name, children }: {
+  let { name, children, member = false }: {
     /** The descriptor's catalog names, or null for a descriptor with none. */
     name: DescriptorDisplay | null;
+    /** Show the member key alone, for a member drawn under its entry's name. */
+    member?: boolean;
     /** The descriptor, as drawn without a name. */
     children: Snippet;
   } = $props();
@@ -41,7 +44,8 @@
 {#if name}
   <button bind:this={button} type="button" class="again catalog-name" aria-expanded={open}
           title={synonymsTitle(name) || undefined} popovertarget="{uid}-descriptor"
-          style:anchor-name="--{uid}">{name.name}<span class="member">{memberKeyOf(name)}</span></button>
+          aria-label={member ? name.display : undefined} style:anchor-name="--{uid}">{#if member && memberKeyOf(name)}{
+            memberKeyOf(name)}{:else}{name.name}<span class="member">{memberKeyOf(name)}</span>{/if}</button>
   <!-- The descriptor renders only while the balloon is open, so a closed row holds the name alone. -->
   <div bind:this={balloon} id="{uid}-descriptor" popover="auto" class="balloon" style:position-anchor="--{uid}"
        data-tail={tail?.edge} style:--tail-x={tail ? `${tail.x}px` : undefined}

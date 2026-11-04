@@ -14,7 +14,7 @@ Crates offering a choice of license are recorded under the option elected in
 
 | License | Crates |
 | --- | --- |
-| Apache License 2.0 (`Apache-2.0`) | 244 |
+| Apache License 2.0 (`Apache-2.0`) | 245 |
 | MIT License (`MIT`) | 77 |
 | Unicode License v3 (`Unicode-3.0`) | 20 |
 | BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`) | 13 |
@@ -1752,6 +1752,7 @@ Applies to:
 - serde_spanned 1.1.2 — https://github.com/toml-rs/toml
 - toml 1.1.8+spec-1.1.0 — https://github.com/toml-rs/toml
 - toml_datetime 1.1.2+spec-1.1.0 — https://github.com/toml-rs/toml
+- toml_edit 0.25.17+spec-1.1.0 — https://github.com/toml-rs/toml
 - toml_parser 1.1.5+spec-1.1.0 — https://github.com/toml-rs/toml
 - toml_writer 1.1.3+spec-1.1.0 — https://github.com/toml-rs/toml
 
@@ -9093,7 +9094,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 Applies to:
 
 - pulldown-cmark-escape 0.11.0 — https://github.com/raphlinus/pulldown-cmark
-- pulldown-cmark 0.13.5 — https://github.com/raphlinus/pulldown-cmark
+- pulldown-cmark 0.13.6 — https://github.com/raphlinus/pulldown-cmark
 
 ```text
 The MIT License

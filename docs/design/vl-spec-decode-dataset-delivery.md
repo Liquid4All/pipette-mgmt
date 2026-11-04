@@ -9,10 +9,11 @@ commands, settings and alarm events are
 
 ## Principle
 
-The upstream owns the data. mgmt keeps one repacked copy per pin, but **serves
-it only while the most recent upstream check, minutes old at most, found the
-upstream still publishing the pinned content**; otherwise it refuses with a 5xx
-and alerts. The cache is never deleted; a failing check only stops it serving.
+The upstream owns the data. mgmt keeps one repacked copy per pin (an eval
+corpus's is the scores service's package), but **serves it only while the most
+recent upstream check, minutes old at most, found the upstream still publishing
+the pinned content**; otherwise it refuses with a 5xx and alerts. The cache is
+never deleted; a failing check only stops it serving.
 
 Everything upstream-specific lives in a server-side **adapter**, so a client
 reads one format and never talks to an upstream. The format is named for the
@@ -24,7 +25,7 @@ Three moving parts, and **no request ever contacts the upstream**:
 | Part | Runs | Does |
 |---|---|---|
 | **Probe** | `pipette-mgmt dataset-cache probe`, every minute | cheap upstream check per pinned upstream; records the verdict on the metadata of every artifact built from it |
-| **Build** | `pipette-mgmt dataset-cache build`, recurring, own lock | builds an artifact only when it is missing: full fetch, verify, repack, re-verify |
+| **Build** | `pipette-mgmt dataset-cache build`, recurring, own lock | builds an artifact only when it is missing: full fetch, verify, repack, re-verify; an eval corpus is registered instead ([below](#the-evals-server-as-an-upstream-vlm_eval-asr_eval)) |
 | **Serve** | every download request | reads the artifact's metadata; streams the tar only if the recorded verdict is `ok` and fresh |
 
 The probe cadence is the throttle: N requests in a minute cost zero upstream
@@ -192,25 +193,28 @@ serves them as a corpus instead, with the evals server as the upstream:
 |---|---|---|---|
 | Pin | `url`, `revision`, `subpath` | `eval_id`, `dataset_version`, `prompt_profile` (the entry's own) | the same, `prompt_profile` required: an ASR dataset holds no prompt |
 | Identity | git tree id | the evals server's samples digest: SHA-256 over each sample's canonical JSON (keys sorted, compact, UTF-8) and a newline, in served order | the same, every clip's base64 and the template kwargs included |
-| Probe | blobless fetch, read the tree id | `GET …/samples/digest`: a few bytes, memoized by the evals server, which keeps the digest resident and not the samples | the same; a cold set's first probe may time out while the evals server learns its six profiles' digests in one pass, and reads `unavailable` until it does |
-| Build | full fetch, tree digest, adapter, pack | `GET …/samples` once, parsed one sample at a time as it streams in (the body is never stored); each `data:` image moved to `media/<sha256>.<ext>` | the same, each `input_audio` clip moved to `media/<sha256>.wav`; one at a time, after the others, under `dataset_asr_build_timeout_secs` |
+| Probe | blobless fetch, read the tree id | `GET …/samples/digest`: a few bytes, memoized by the evals server, which keeps the digest resident and not the samples | the same; a set the scores service has not packed has its digest computed in one pass over the audio, so its first probe may time out and read `unavailable` |
+| Build | full fetch, tree digest, adapter, pack | the scores service packs the corpus from the samples it serves into `scores-packages/tars/{digest}.tar`, each `data:` image moved to `media/<sha256>.<ext>`; mgmt registers that package | the same, each `input_audio` clip moved to `media/<sha256>.wav` |
 | Format | `vl-spec-decode-corpus/1` | `vlm-eval-corpus/1` | `asr-eval-corpus/1`: VL's layout, an `audio` part and a line's `chat_template_kwargs` |
 | Size | MB | tens of MB | GB per corpus; over a hundred GB for the catalog |
 
-**Lossless by construction, and proven per build.** The build hashes every
-sample as served and requires the pinned identity and the evals server's own
-`X-Samples-Digest`; it packs, reads the tar back, rebuilds every sample from it
-with the very function a client uses (`pipette-plan-types`'
-`VlmEvalCorpusSample::to_eval_sample_in`, for the entry's format) and requires
-the identity again. Each format holds its own media part alone: a vlm-eval
-corpus refuses a clip, an asr-eval one an image. An
-image whose base64 would not re-encode to the same string is refused there,
-not on a device. The evals server computes the digest in Python and mgmt and
-clients in Rust; shared test vectors (control characters, DEL, U+2028, astral
-characters) pin the two to the same bytes. The client checks the tar's digest
-and the rebuilt samples' identity before it runs, and refuses either mismatch:
-answers to prompts the scorer does not hold would be graded against the wrong
-questions.
+**Lossless by construction, and proven per package.** The scores service hashes
+every sample as it serves it, packs it, rebuilds every sample from the packed
+lines and media and requires the same digest again before it stores the
+package; it lists each package's digest, size and samples digest in its index,
+`scores-packages/index/<scores version>/<eval_id>/<dataset_version>.json`, which
+an entry's pin is copied from. mgmt never reads a sample: `dataset-cache build`
+registers a package only at the pinned size, with a manifest (its first entry,
+read alone) naming the entry's format, adapter and upstream, while the evals
+server still reports the pinned digest, and `serve` streams it from
+`[eval_packages_storage]`. Each format holds its own media part alone: a
+vlm-eval corpus holds no clip, an asr-eval one no image. The evals server
+computes the digest in Python and mgmt and clients in Rust; shared test vectors
+(control characters, DEL, U+2028, astral characters) pin the two to the same
+bytes. The client checks the tar's digest and the rebuilt samples' identity
+before it runs (`pipette-plan-types`' `VlmEvalCorpusSample::to_eval_sample_in`,
+for the entry's format), and refuses either mismatch: answers to prompts the
+scorer does not hold would be graded against the wrong questions.
 
 **One verdict per artifact.** The probe still reaches each upstream once, but
 judges every artifact against its own pin: two entries may pin the same eval,
@@ -220,11 +224,6 @@ require the cached artifact to have been built from the entry's own pin
 (upstream, format, adapter, and the subset it keeps), so an entry that copied
 another's digest is refused rather than served that corpus. An artifact
 recorded before subsets were is not checked on its subset.
-
-**The header is required.** The build refuses a `/samples` without
-`X-Samples-Digest`: the evals server's digest covers every field it sent, while
-mgmt's typed samples drop a field they do not read, so only the comparison of
-the two catches such a field.
 
 **Scoring is bound to the corpus.** A submission is scored only if it ran the
 pinned corpus (`observation_dataset_digest`), checked again when the staged
@@ -253,9 +252,6 @@ than base64.
 - **`GET /benchmarks/vlm_eval_pope`:** inline, 1.118 GB in 3.5 s, a matching
   `If-None-Match` still 3.3 s to its `304`, and mgmt peaking at 3.6 GB RSS. Now
   542 bytes in 0.5 ms: the entry and its pin.
-- **`dataset-cache pins` on POPE:** 10.5 s, peak 132 MB RSS for a 1.1 GB body,
-  since the body is parsed one sample at a time. The build of all nine
-  artifacts of the check (the seven above and two prompt profiles) took 11.4 s.
 - **Probe:** 0.1 s for those nine artifacts once the evals server's digests are
   memoized; its first digest of POPE after a restart takes about 3 s.
 - **Client:** download, digest check and rebuild of POPE's corpus in 1.9 s,

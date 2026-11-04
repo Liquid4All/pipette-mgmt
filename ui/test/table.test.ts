@@ -7,8 +7,8 @@ import { ORG_TABLE } from "../src/lib/orgs";
 import { planTable } from "../src/lib/plans";
 import { vaultTable } from "../src/lib/vault";
 import {
-  choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, sortBy, statePairs, tableState, tableView,
-  toggledIn, withCursor, type CursorPage, type Picks, type TableSpec,
+  choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, rowCount, sortBy, statePairs, tableState,
+  tableView, toggledIn, withCursor, type CursorPage, type Picks, type TableSpec,
 } from "../src/lib/table";
 import { PickedColumns } from "../src/lib/picked.svelte";
 import type { CampaignView, ClientListRow, OrgView, PlanView } from "../src/lib/api-types";
@@ -38,6 +38,12 @@ describe("a table read in the browser", () => {
     expect(tableState(SPEC, new URLSearchParams("sort=nope")).sort).toBe("");
     expect([filtering(state), filtering(cleared(state)), cleared(state).sort]).toEqual([true, false, "-size"]);
     expect(toggledIn(toggledIn(state, "tag", "b", true), "tag", "a", false).choices).toEqual({ tag: ["b"] });
+  });
+
+  test("counts what the filters keep, one row by its singular", () => {
+    expect([rowCount(3, 3, "campaigns"), rowCount(1, 3, "campaigns"), rowCount(1, 1, "campaigns"),
+            rowCount(0, 1, "campaigns"), rowCount(1, 1, "catalog entries"), rowCount(0, 0, "keys")])
+      .toEqual(["3 campaigns", "1 of 3 campaigns", "1 campaign", "0 of 1 campaign", "1 catalog entry", "0 keys"]);
   });
 
   test("keeps a row whose text holds the box's, case aside, and any of a select's choices", () => {
@@ -120,14 +126,26 @@ describe("the columns picked", () => {
 });
 
 describe("the listings' tables", () => {
-  test("a campaign's plan id and state are the server's: kept in links and cleared, never matched against a row", () => {
+  test("a campaign's plan id, job id and state are the server's: kept in links and cleared, never matched against a row", () => {
     const spec = campaignTable({}, false);
-    const state = tableState(spec, new URLSearchParams("q=nightly&plan_id=plan-1&state=archived"));
-    expect(state.texts).toEqual({ q: "nightly", plan_id: "plan-1", state: "archived" });
-    expect(statePairs(state)).toEqual(expect.arrayContaining([["plan_id", "plan-1"], ["state", "archived"]]));
-    expect(cleared(state).texts).toEqual({ q: "", plan_id: "", state: "" });
+    const state = tableState(spec, new URLSearchParams("q=nightly&plan_id=plan-1&job_id=job-1&state=archived"));
+    expect(state.texts).toEqual({ q: "nightly", plan_id: "plan-1", job_id: "job-1", state: "archived" });
+    expect(statePairs(state)).toEqual(expect.arrayContaining([["plan_id", "plan-1"], ["job_id", "job-1"], ["state", "archived"]]));
+    expect(cleared(state).texts).toEqual({ q: "", plan_id: "", job_id: "", state: "" });
     const row = { campaign_id: "campaign_1", name: "nightly" } as CampaignView;
     expect(tableView(spec, state, [row])).toEqual([row]);
+  });
+
+  test("beside a plan or job id, a campaign's state is held at all, which is what the id reads", () => {
+    const held = (byId: boolean) => campaignTable({}, false, byId).server?.find(({ key }) => key === "state")?.held?.value;
+    expect([held(false), held(true)]).toEqual([undefined, "all"]);
+  });
+
+  test("a table without plan reads has no job id box, and its held state names the plan id alone", () => {
+    const server = (jobs: boolean) => campaignTable({}, false, true, jobs).server ?? [];
+    expect([server(true), server(false)].map((filters) => filters.map(({ key }) => key)))
+      .toEqual([["plan_id", "job_id", "state"], ["plan_id", "state"]]);
+    expect(server(false).find(({ key }) => key === "state")?.held?.why).toBe("A plan id finds its campaign in every state.");
   });
 
   test("campaigns sort by progress and filter by status, a campaign not started included", () => {

@@ -119,7 +119,7 @@ async fn a_valid_document_answers_its_job_count_and_files_nothing() -> anyhow::R
 
     assert_eq!(
         verdict,
-        json!({ "job_count": 3, "gated_model_count": 0, "issues": [] })
+        json!({ "document": AFM_MLX, "job_count": 3, "gated_model_count": 0, "issues": [] })
     );
     assert_nothing_staged(&state).await?;
     assert_eq!(stored_sources(dir.path())?, 0);

@@ -2,13 +2,15 @@
   // The classic console's campaign listing (`campaigns.html`) under any branch:
   // every page of `GET /api/v1/campaigns` narrowed to the branch, newest first, each row
   // with what the plan it runs is doing where the reader may read that plan,
-  // filtered, sorted and paged in `DataTable`, the plan id and the state by the server.
-  import { campaigns } from "../api";
-  import { campaignQuery, campaignTable, labelVocabulary, mayLabel, progressText } from "../campaigns";
+  // filtered, sorted and paged in `DataTable`, the plan id and the state by the server,
+  // a job id by the campaigns of the plans that asked for it.
+  import { campaigns, jobPlans } from "../api";
+  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, progressText,
+    soughtEmpty } from "../campaigns";
   import { ownedEmpty, type OwnedBranch } from "../owned";
   import { shownStatus } from "../plans";
   import { here, href } from "../route.svelte";
-  import { campaignLink } from "../routes";
+  import { campaignLink, pathOf } from "../routes";
   import { session } from "../session.svelte";
   import { ROUTE_PAGE_MAX, everyPage, withCursor, type CursorPage } from "../table";
   import type { CampaignView } from "../api-types";
@@ -26,21 +28,35 @@
   } = $props();
 
   const planId = $derived(here.query.get("plan_id")?.trim() ?? "");
+  const jobId = $derived(here.query.get("job_id")?.trim() ?? "");
+  const sought = $derived([planId, jobId].filter(Boolean).join(" and "));
 
   // `""` for the active campaigns, `archived` or `all`; any other value is the default.
   const stateAsked = $derived((["archived", "all"] as const).find((value) => value === here.query.get("state")) ?? "");
 
-  // Read again whenever the query it sends changes, not on a filter, which applies here.
-  const asked = $derived(campaignQuery(branch, null, ROUTE_PAGE_MAX, planId, stateAsked || "active"));
-  const read = new Loader<CursorPage<CampaignView>>();
-  const load = (query: string, keep = false) =>
-    read.run(() => everyPage((cursor) => campaigns(session.signer, withCursor(query, cursor))), keep);
-  $effect(() => { void load(asked); });
+  // Read again whenever what it sends changes, not on a filter, which applies here. A job id, as a plan id does,
+  // finds its campaigns in any state.
+  const asked = $derived(campaignQuery(branch, null, ROUTE_PAGE_MAX, planId, jobId ? "all" : stateAsked || "active"));
+  const read = new Loader<CursorPage<CampaignView> & { ran?: { job: string; campaigns: Set<string> } }>();
+  const load = (query: string, job: string, keep = false) => read.run(async () => {
+    // A label edit (`keep`) reads the listing again but not the job's plans, which no label changes.
+    const known = keep && read.data?.ran?.job === job ? read.data.ran.campaigns : null;
+    const [listed, ran] = await Promise.all([
+      everyPage((cursor) => campaigns(session.signer, withCursor(query, cursor))),
+      job ? known ?? jobCampaigns(jobPlans(session.signer, job)) : null,
+    ]);
+    if (!ran) return listed;
+    return { ...listed, items: listed.items.filter((row) => ran.has(row.campaign_id)), ran: { job, campaigns: ran } };
+  }, keep);
+  $effect(() => { void load(asked, jobId); });
+  const outside = $derived(outsideCount(branch, planId, read.data?.ran?.campaigns, read.data?.items.length ?? 0));
   // The labels the branch's campaigns use, which a row's add offers.
   const vocabulary = $derived(labelVocabulary(read.data?.items ?? []));
 
   // A branch's rows share one owner, so only everything's names it per row.
-  const spec = $derived(campaignTable(read.data?.names ?? {}, branch.kind === "all"));
+  const spec = $derived(campaignTable(read.data?.names ?? {}, branch.kind === "all", !!sought,
+                                      session.account?.may.read_plans !== "none"));
+  const without = (key: string) => href(path, [...here.query].filter(([held]) => held !== key && held !== "offset"));
 </script>
 
 <!-- The name opens the campaign, as its id does where the reader shows that column. -->
@@ -55,7 +71,7 @@
 {#snippet progress(row: CampaignView)}{progressText(row)}{/snippet}
 <!-- The rows stay drawn while a new label is read back. -->
 {#snippet labels(row: CampaignView)}
-  <LabelsInline campaign={row} listing={path} {vocabulary} onchange={() => load(asked, true)}
+  <LabelsInline campaign={row} listing={path} {vocabulary} onchange={() => load(asked, jobId, true)}
                 editable={!!session.account && mayLabel(session.account, row.owner)} />
 {/snippet}
 
@@ -64,14 +80,21 @@
     {#if listed.unreadable}
       <div class="bar"><span class="err">{listed.unreadable} unreadable campaign record(s)</span></div>
     {/if}
+    {#if outside}
+      <p class="notice">{outside === 1 ? "1 campaign" : `${outside} campaigns`} outside this listing
+        {outside === 1 ? "holds" : "hold"} this job:
+        <a href={href(pathOf({ page: "campaigns" }), [["job_id", jobId]])}>see every campaign that holds it</a>.</p>
+    {/if}
     <DataTable {spec} rows={listed.items} id={(row) => row.campaign_id} noun="campaigns" {path}
-               empty={planId ? `No campaign you may see ran ${planId}.`
+               empty={sought ? soughtEmpty(branch, sought)
                  : ownedEmpty(branch, stateAsked === "all" ? "campaigns" : `${stateAsked || "active"} campaigns`)}
                columnsKey="pipette.campaigns.columns" cells={{ name, owner, status, progress, labels }} />
   {/snippet}
 </Loaded>
 <!-- A refused id draws no table, so no box to correct it in. -->
 {#if read.error && planId}
-  <p><a href={href(path, [...here.query].filter(([key]) => key !== "plan_id" && key !== "offset"))}>Read the
-    listing without this plan id</a></p>
+  <p><a href={without("plan_id")}>Read the listing without this plan id</a></p>
+{/if}
+{#if read.error && jobId}
+  <p><a href={without("job_id")}>Read the listing without this job id</a></p>
 {/if}

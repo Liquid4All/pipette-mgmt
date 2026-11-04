@@ -14,7 +14,8 @@ The JavaScript Object Notation (JSON) body is one of these:
   ungated Hugging Face repositories pinned to commits, or vault resources
   owned by the organization.
 
-Use a new member key and digest. Runtime members cannot use vault sources.
+Use a new member key and digest. A vault runtime must use resources owned by
+the organization, under the same checks as a vault model.
 
 The response is the updated entry view with its complete `members` list.
 

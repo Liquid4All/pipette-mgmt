@@ -459,6 +459,11 @@ pub struct PlanSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PlanFiled {
+    /// The document as stored, after the catalog-name and gated-model rewrites.
+    /// Absent at the withheld fleet-detail tier, which withholds the document
+    /// from its filer too, and for a plan filed as job bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
     pub fleet_detail: FleetDetail,
     pub plan_id: PlanId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,8 +495,12 @@ pub struct PlanFiled {
 }
 
 impl PlanFiled {
-    /// The report a reader at `detail` sees: its fleet warnings re-tiered.
+    /// The report a reader at `detail` sees: its fleet warnings re-tiered, and
+    /// its document only at the full tier.
     pub fn at(mut self, detail: FleetDetail) -> Self {
+        if detail != FleetDetail::Full {
+            self.document = None;
+        }
         self.fleet_detail = detail;
         self.warnings = self.warnings.into_iter().map(|w| w.at(detail)).collect();
         self
@@ -625,6 +634,8 @@ pub struct UpdatePlanRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PlanDryRun {
+    /// The document that a filing would store, with every model token removed.
+    pub document: String,
     /// The job bodies, in the order a filing would stage them.
     pub bodies: Vec<Value>,
     /// The planner's warnings, as a filing reports them.
@@ -694,6 +705,9 @@ pub struct PlanIssue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PlanValidation {
+    /// The document that a filing would store, with every model token removed;
+    /// null when the document does not expand.
+    pub document: Option<String>,
     /// The jobs the document expands to, after equal bodies merge; `null` when
     /// it does not expand.
     pub job_count: Option<usize>,
@@ -939,6 +953,7 @@ mod operator_tests {
             .map(|i| Ok((i.to_string(), JobId::try_new(format!("job-{i}"))?)))
             .collect::<Result<Vec<_>, crate::IdError>>()?;
         let filed = PlanFiled {
+            document: None,
             fleet_detail: FleetDetail::Full,
             plan_id: PlanId::try_new("plan-1")?,
             note: None,
@@ -963,6 +978,7 @@ mod operator_tests {
     #[test]
     fn an_ingest_answer_reads_back_as_its_arm() -> anyhow::Result<()> {
         let dry = PlanAnswer::DryRun(PlanDryRun {
+            document: String::new(),
             bodies: Vec::new(),
             plan_warnings: vec!["w".into()],
             imports: vec![

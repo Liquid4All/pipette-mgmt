@@ -41,7 +41,13 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
             // keeps it in `avail/`.
             let mut body = job_spec();
             body["requires"] = json!(["gpu"]);
-            let queued = seed_avail(dir.path(), "job-queued", ExpiresAt::Never, &body)?;
+            let queued = seed_avail(
+                state.todo_store.as_ref(),
+                "job-queued",
+                ExpiresAt::Never,
+                &body,
+            )
+            .await?;
             state
                 .submission_store
                 .write_incoming(
@@ -160,11 +166,12 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
             let finished = job("job-finished")?;
             let cancelled = job("job-cancelled")?;
             let queued = seed_avail(
-                dir.path(),
+                state.todo_store.as_ref(),
                 "job-queued",
                 ExpiresAt::Never,
                 &json!({"spec": job_spec(), "requires": ["os:macos"]}),
-            )?;
+            )
+            .await?;
             state
                 .submission_store
                 .write_incoming(

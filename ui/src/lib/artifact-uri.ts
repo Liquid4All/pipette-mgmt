@@ -101,6 +101,7 @@ function modelPairs(m: Model): Pairs | null {
     case "gguf_vision_speculative":
       return ggufVisionSpeculative(m);
     case "mlx":
+    case "core_ai":
     case "torch":
     case "openvino":
     case "onnx_genai":
@@ -168,6 +169,8 @@ function runtimePairs(r: Runtime): Pairs | null {
       return [...release(r, LLAMACPP_UPSTREAM), ["flavor", r.flavor], ...privateApis(r)];
     case "mlx_macos_pipette":
       return [["version", r.version], ["flavor", r.flavor]];
+    case "core_ai_macos_pipette":
+      return [["version", r.packages.coreai_models.repository_version]];
     case "mlx_ios_pipette":
       return [...pinned(r.packages, ["mlx_swift", "mlx_swift_lm", "swift_transformers"]), ["flavor", r.flavor],
               ...privateApis(r)];

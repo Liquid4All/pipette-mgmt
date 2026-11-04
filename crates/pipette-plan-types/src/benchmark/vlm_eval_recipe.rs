@@ -256,6 +256,7 @@ impl VlmEvalRecipe {
             | Model::GgufText(_)
             | Model::GgufVisionSpeculative(_)
             | Model::Mlx(_)
+            | Model::AppleCoreAi(_)
             | Model::MlxSpeculative(_)
             | Model::TorchSpeculative(_)
             | Model::Openvino(_)

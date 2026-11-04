@@ -276,9 +276,9 @@ sources = ["https://huggingface.co/org/repo"]
     )
 }
 
-/// An asr_eval entry is served its corpus only when the count the build
-/// recorded is the one the entry states: a corpus that disagrees would be
-/// downloaded and then refused on every device.
+/// An asr_eval entry is served its corpus, the scores service's package, only
+/// when the count the build recorded is the one the entry states: a corpus
+/// that disagrees would be downloaded and then refused on every device.
 #[rstest]
 #[case::matching(Some(3), StatusCode::OK)]
 #[case::disagreeing(Some(4), StatusCode::BAD_GATEWAY)]
@@ -303,12 +303,9 @@ async fn an_asr_corpus_is_served_only_at_its_entrys_count(
     let dataset = fixture
         .dataset()
         .ok_or_else(|| anyhow::anyhow!("the fixture benchmark pins a dataset"))?;
-    let source = dir.path().join("seed.tar");
-    std::fs::write(&source, TAR)?;
-    state
-        .dataset_cache_store
-        .put_tar(&dataset.digest, &source)
-        .await?;
+    let packages = dir.path().join("scores-packages/tars");
+    std::fs::create_dir_all(&packages)?;
+    std::fs::write(packages.join(format!("{}.tar", dataset.digest)), TAR)?;
     let now = Utc::now();
     state
         .dataset_cache_store

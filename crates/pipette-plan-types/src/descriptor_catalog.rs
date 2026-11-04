@@ -373,6 +373,7 @@ pub enum DescriptorKind {
 pub enum ModelFormat {
     Gguf,
     Mlx,
+    CoreAi,
     Torch,
     Openvino,
     Onnx,
@@ -387,6 +388,7 @@ impl ModelFormat {
                 Some(Self::Gguf)
             }
             ModelType::Mlx | ModelType::MlxSpeculative => Some(Self::Mlx),
+            ModelType::AppleCoreAi => Some(Self::CoreAi),
             ModelType::Torch | ModelType::TorchSpeculative => Some(Self::Torch),
             ModelType::Openvino => Some(Self::Openvino),
             ModelType::OnnxGenai => Some(Self::Onnx),
@@ -448,8 +450,6 @@ pub enum DescriptorMemberDescriptor {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemberError {
-    #[error("a descriptor catalog member cannot name a vault source")]
-    VaultSource,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("The member digest does not match its descriptor.")]
@@ -605,6 +605,20 @@ fn only_vault_sources(value: &serde_json::Value) -> bool {
     walk(value, &mut found) && found
 }
 
+/// Whether the iOS app builds in runtimes of this type.
+fn is_app_runtime(runtime_type: RuntimeType) -> bool {
+    matches!(
+        runtime_type,
+        RuntimeType::LlamacppIosPipette
+            | RuntimeType::MlxIosPipette
+            | RuntimeType::OnnxGenaiIosPipette
+    )
+}
+
+fn build_flag(digest: &str) -> String {
+    format!("runtime:descriptor:{digest}")
+}
+
 impl DescriptorMember {
     pub fn runtime(&self) -> Option<&Runtime> {
         match &self.body {
@@ -657,6 +671,14 @@ impl DescriptorMember {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+    /// The build flag that a device must report to run this member, if the
+    /// iOS app builds in its runtime. It equals
+    /// [`crate::runtime_build_flag`] of the member's runtime.
+    pub fn app_build_flag(&self) -> Option<String> {
+        self.runtime()
+            .filter(|runtime| is_app_runtime(RuntimeType::of(runtime)))
+            .map(|_| build_flag(&self.digest))
+    }
     /// The verified Hugging Face alias of a vault model, when every source has one.
     pub fn alias_digest(&self) -> Option<&str> {
         self.alias_digest.as_deref()
@@ -665,6 +687,25 @@ impl DescriptorMember {
     pub fn with_alias_digest(mut self, alias_digest: Option<String>) -> Self {
         self.alias_digest = alias_digest;
         self
+    }
+    /// The same model member with the label `quantization`. The label is not
+    /// part of the digest, so the digest stays the same. A runtime member has
+    /// no label, so the result is `None` for it.
+    pub fn relabeled(&self, quantization: QuantizationLabel) -> Option<Self> {
+        match &self.body {
+            MemberBody::Runtime { .. } => None,
+            MemberBody::Model { .. } => {
+                let mut member = self.clone();
+                if let MemberBody::Model {
+                    quantization: label,
+                    ..
+                } = &mut member.body
+                {
+                    *label = quantization;
+                }
+                Some(member)
+            }
+        }
     }
     /// The flavor of a runtime member. A model member has none.
     pub fn flavor(&self) -> Option<&str> {
@@ -689,14 +730,12 @@ impl DescriptorMember {
     }
 
     pub fn new(runtime: Runtime, added_at: DateTime<Utc>) -> Result<Self, MemberError> {
-        let value = serde_json::to_value(&runtime)?;
-        if names_vault_source(&value) {
-            return Err(MemberError::VaultSource);
-        }
+        let mut value = serde_json::to_value(&runtime)?;
         let flavor = value
             .get("flavor")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
+        drop_vault_custom_labels(&mut value);
         let digest = descriptor_digest(&value)?;
         Ok(Self {
             body: MemberBody::Runtime { runtime, flavor },
@@ -809,6 +848,7 @@ pub fn hf_repos(model: &Model) -> Option<Vec<&HfRepo>> {
             | GgufVisionSpeculativeSource::VaultUrl { .. } => None,
         },
         Model::Mlx(Mlx { source })
+        | Model::AppleCoreAi(crate::AppleCoreAi { source })
         | Model::Torch(Torch { source })
         | Model::Openvino(Openvino { source })
         | Model::OnnxGenai(OnnxGenai { source }) => directory(source).map(|repo| vec![repo]),
@@ -853,6 +893,7 @@ pub fn hf_repos_mut(model: &mut Model) -> Option<Vec<&mut HfRepo>> {
             | GgufVisionSpeculativeSource::VaultUrl { .. } => None,
         },
         Model::Mlx(Mlx { source })
+        | Model::AppleCoreAi(crate::AppleCoreAi { source })
         | Model::Torch(Torch { source })
         | Model::Openvino(Openvino { source })
         | Model::OnnxGenai(OnnxGenai { source }) => directory(source).map(|repo| vec![repo]),
@@ -863,7 +904,7 @@ pub fn hf_repos_mut(model: &mut Model) -> Option<Vec<&mut HfRepo>> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EntryError {
     #[error("a new entry must not start in the tombstoned state")]
     Tombstoned,
@@ -875,10 +916,18 @@ pub enum EntryError {
         "an importer cannot create an organization entry, and an account cannot create a global entry"
     )]
     CreatorScope,
+    #[error("a global catalog entry cannot name a vault source")]
+    GlobalVaultSource,
+    #[error("cannot inspect a member descriptor: {0}")]
+    DescriptorInvalid(String),
     #[error("members mix runtime and model descriptors")]
     DescriptorKindMismatch,
     #[error("members have different runtime types")]
     RuntimeTypeMismatch,
+    #[error("members of one catalog entry may differ only in flavor")]
+    RuntimeBuildMismatch,
+    #[error("cannot inspect a runtime build: {0}")]
+    RuntimeBuildInvalid(String),
     #[error("duplicate member flavor: {0}")]
     DuplicateFlavor(String),
     #[error("duplicate member format and quantization: {format}::{quantization}")]
@@ -940,6 +989,7 @@ impl TryFrom<EntryWire> for DescriptorEntry {
             wire.members.head().descriptor_kind(),
         )?;
         Self::validate_members(&wire.members)?;
+        Self::validate_scope_members(&wire.scope, &wire.members)?;
         Ok(Self {
             scope: wire.scope,
             name: wire.name,
@@ -973,6 +1023,7 @@ impl DescriptorEntry {
         }
         Self::validate_identity(&scope, kind, &created_by, members.head().descriptor_kind())?;
         Self::validate_members(&members)?;
+        Self::validate_scope_members(&scope, &members)?;
         Ok(Self {
             scope,
             name,
@@ -987,6 +1038,29 @@ impl DescriptorEntry {
 
     pub fn descriptor_kind(&self) -> DescriptorKind {
         self.members.head().descriptor_kind()
+    }
+
+    /// Refuse a vault source in a global entry. The writer checks the owner
+    /// of each vault resource, and a read of a stored entry does not.
+    pub fn validate_scope_members(
+        scope: &CatalogScope,
+        members: &NonEmptyVec<DescriptorMember>,
+    ) -> Result<(), EntryError> {
+        if !matches!(scope, CatalogScope::Global) {
+            return Ok(());
+        }
+        members.iter().try_for_each(|member| {
+            let value = match &member.body {
+                MemberBody::Runtime { runtime, .. } => serde_json::to_value(runtime),
+                MemberBody::Model { model, .. } => serde_json::to_value(model),
+            }
+            .map_err(|error| EntryError::DescriptorInvalid(error.to_string()))?;
+            if names_vault_source(&value) {
+                Err(EntryError::GlobalVaultSource)
+            } else {
+                Ok(())
+            }
+        })
     }
 
     /// The descriptor types of the members, each once, in member order. A
@@ -1025,6 +1099,37 @@ impl DescriptorEntry {
             return Err(EntryError::CreatorScope);
         }
         Ok(())
+    }
+
+    /// Check that runtime members describe one build, allowing different flavors.
+    /// Model members have no runtime build to compare.
+    pub fn validate_runtime_build(
+        members: &NonEmptyVec<DescriptorMember>,
+    ) -> Result<(), EntryError> {
+        let Some(first) = members.head().runtime() else {
+            return Ok(());
+        };
+        let identity = |runtime: &Runtime| {
+            let mut value = serde_json::to_value(runtime)
+                .map_err(|error| EntryError::RuntimeBuildInvalid(error.to_string()))?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| {
+                    EntryError::RuntimeBuildInvalid("descriptor is not an object".into())
+                })?
+                .remove("flavor");
+            drop_vault_custom_labels(&mut value);
+            Ok::<_, EntryError>(value)
+        };
+        let first = identity(first)?;
+        members.iter().skip(1).try_for_each(|member| {
+            let runtime = member.runtime().ok_or(EntryError::DescriptorKindMismatch)?;
+            if identity(runtime)? == first {
+                Ok(())
+            } else {
+                Err(EntryError::RuntimeBuildMismatch)
+            }
+        })
     }
 
     /// Check that the members can share one entry:
@@ -1389,7 +1494,7 @@ mod tests {
     #[case::model_dialect(json!({
         "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
         "url": "/vault/resources/vault_1/content", "principal_id": "org_1",
-        "flavor": "linux-x64-rocm"
+        "custom_label": "nightly", "flavor": "linux-x64-rocm"
     }))]
     #[case::uv_wheelhouse(json!({
         "type": "uv_vllm", "server_version": "0.31.0", "build": "cu128",
@@ -1399,11 +1504,43 @@ mod tests {
             "contents": "x", "principal_id": "user_1"
         }
     }))]
-    fn vault_member_is_refused(#[case] runtime: Value) -> anyhow::Result<()> {
-        assert!(matches!(
-            DescriptorMember::new(serde_json::from_value(runtime)?, Utc::now()),
-            Err(MemberError::VaultSource)
-        ));
+    fn vault_member_requires_org_scope(#[case] runtime: Value) -> anyhow::Result<()> {
+        let member = DescriptorMember::new(serde_json::from_value(runtime.clone())?, Utc::now())?;
+        let members = NonEmptyVec::try_new(vec![member.clone()])?;
+        assert_eq!(
+            DescriptorEntry::validate_scope_members(&CatalogScope::Global, &members),
+            Err(EntryError::GlobalVaultSource)
+        );
+        DescriptorEntry::validate_scope_members(
+            &CatalogScope::Org(OrgId::try_new("org_1")?),
+            &members,
+        )?;
+        let mut unlabelled = runtime;
+        drop_vault_custom_labels(&mut unlabelled);
+        assert_eq!(member.digest(), descriptor_digest(&unlabelled)?);
+        let read: DescriptorMember = serde_json::from_value(serde_json::to_value(member.clone())?)?;
+        assert_eq!(read, member);
+        Ok(())
+    }
+
+    #[test]
+    fn a_vault_label_is_not_part_of_the_runtime_build() -> anyhow::Result<()> {
+        let member = |label: &str, flavor: &str| -> anyhow::Result<DescriptorMember> {
+            let runtime = json!({
+                "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
+                "url": "/vault/resources/vault_1/content", "principal_id": "org_1",
+                "custom_label": label, "flavor": flavor
+            });
+            Ok(DescriptorMember::new(
+                serde_json::from_value(runtime)?,
+                Utc::now(),
+            )?)
+        };
+        let members = NonEmptyVec::try_new(vec![
+            member("nightly", "linux-x64-rocm")?,
+            member("release", "macos-arm64")?,
+        ])?;
+        DescriptorEntry::validate_runtime_build(&members)?;
         Ok(())
     }
 
@@ -1695,6 +1832,42 @@ mod tests {
             .err()
             .context("the members must be refused")?;
         assert!(expected(&error), "{error:?}");
+        Ok(())
+    }
+
+    /// A catalog member stores the digest that the build flag carries, so the
+    /// server's check and a client's report agree.
+    #[rstest]
+    #[case::llamacpp_ios(json!({
+        "type": "llamacpp_ios_pipette", "repository_url": "github.com/ggml-org/llama.cpp",
+        "repository_version": "b11988", "flavor": "ios-arm64"
+    }), true)]
+    #[case::mlx_ios(json!({
+        "type": "mlx_ios_pipette", "flavor": "ios-arm64", "private_thermal": true,
+        "packages": {
+            "mlx_swift": {"repository_url": "github.com/ml-explore/mlx-swift",
+                          "repository_version": "0.25.6"},
+            "mlx_swift_lm": {"repository_url": "github.com/ml-explore/mlx-swift-examples",
+                             "repository_version": "2.25.6"},
+            "swift_transformers": {"repository_url": "github.com/huggingface/swift-transformers",
+                                   "repository_version": "0.1.22"}
+        }
+    }), true)]
+    #[case::stock(json!({
+        "type": "llamacpp_cli_stock_tools", "source": "github_release",
+        "repository_url": "github.com/ggml-org/llama.cpp", "repository_version": "b1",
+        "flavor": "macos-arm64"
+    }), false)]
+    fn runtime_build_flag_matches_the_member_digest(
+        #[case] runtime: Value,
+        #[case] is_app: bool,
+    ) -> anyhow::Result<()> {
+        let runtime: Runtime = serde_json::from_value(runtime)?;
+        let member = DescriptorMember::new(runtime.clone(), chrono::Utc::now())?;
+        let flag = crate::runtime_build_flag(&runtime)?.map(|flag| flag.into_inner());
+        let expected = is_app.then(|| format!("runtime:descriptor:{}", member.digest()));
+        assert_eq!(flag, expected);
+        assert_eq!(member.app_build_flag(), flag);
         Ok(())
     }
 }

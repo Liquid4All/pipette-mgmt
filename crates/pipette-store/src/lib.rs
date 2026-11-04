@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use pipette_core::benchmark::{Benchmark, CatalogLoad};
 use pipette_core::campaign::Campaign;
-use pipette_core::client::{Client, MigrationRecord, SignatureMigration};
+use pipette_core::client::{Client, MigrationRecord, SignatureMigration, recorded_run_flags};
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_core::client_preauth::{
     ClientPreauthConsumeOutcome, ClientPreauthKey, ClientPreauthSecret,
@@ -46,7 +46,7 @@ use pipette_plan_types::{
 use pipette_plan_types::{
     AuditEvent, CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind,
     DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberKey, EntryError,
-    ModelFormat, ModelType, NonEmptyVec, QuantizationLabel, RuntimeType,
+    ModelFormat, ModelType, NonEmptyVec, QuantizationLabel, RunMark, RuntimeType,
 };
 
 /// Parse a persisted `queue-maintenance` key set; corrupt state reads as empty.
@@ -156,6 +156,24 @@ impl OutcomeProbe {
 #[derive(Debug, Deserialize)]
 pub struct FinalizeProbe {
     pub submission: OutcomeProbe,
+}
+
+/// What a submission record says of its run. Only a finished run gives the
+/// flags its device held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedRun {
+    Finished(BTreeSet<String>),
+    Failed,
+}
+
+impl RecordedRun {
+    pub fn of(body: &serde_json::Value) -> Self {
+        let message_type = body.get("message_type").and_then(serde_json::Value::as_str);
+        match SettledOutcome::from_message_type(message_type) {
+            SettledOutcome::Finished => Self::Finished(recorded_run_flags(body)),
+            SettledOutcome::Failed => Self::Failed,
+        }
+    }
 }
 
 /// [`SubmissionStore::find_outcomes`] for an object-store backend: one probe
@@ -767,6 +785,15 @@ pub enum CreateOutcome {
     AlreadyExists,
 }
 
+/// Counts one bounded pass over pending submission outcome rows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomeRepair {
+    pub attempted: usize,
+    pub repaired: usize,
+    pub deferred: usize,
+    pub failed: usize,
+}
+
 #[async_trait]
 pub trait SubmissionStore: Send + Sync {
     async fn write_incoming(&self, job_id: &JobId, body: &serde_json::Value) -> anyhow::Result<()>;
@@ -818,6 +845,26 @@ pub trait SubmissionStore: Send + Sync {
         &self,
         job_ids: &[JobId],
     ) -> anyhow::Result<HashMap<JobId, SettledOutcome>>;
+
+    /// The runs of the jobs that have a record. This default reads each whole
+    /// record through [`find_job`](Self::find_job); a backend with an index of
+    /// runs answers from it.
+    async fn find_runs(&self, job_ids: &[JobId]) -> anyhow::Result<HashMap<JobId, RecordedRun>> {
+        futures::stream::iter(job_ids.iter().cloned())
+            .map(|job_id| async move {
+                let record = self.find_job(&job_id).await?;
+                anyhow::Ok(record.map(|record| (job_id, RecordedRun::of(&record.body))))
+            })
+            .buffer_unordered(PLAN_JOB_CONCURRENCY)
+            .try_filter_map(|run| async move { Ok(run) })
+            .try_collect()
+            .await
+    }
+
+    /// Repair incomplete outcome publications, if this store keeps an index.
+    async fn repair_outcomes(&self) -> anyhow::Result<OutcomeRepair> {
+        Ok(OutcomeRepair::default())
+    }
 
     /// A [`JobState::Scoring`] record with the bare submission body, whichever
     /// stage holds it.
@@ -972,14 +1019,15 @@ pub struct ArtifactBody {
     pub stream: futures::stream::BoxStream<'static, anyhow::Result<bytes::Bytes>>,
 }
 
-/// `dataset-cache/artifacts/`: repacked corpora keyed by sha256, with build
-/// records. Nothing deletes: an unbacked artifact is refused at serve time.
+/// `dataset-cache/artifacts/`: the git corpora mgmt repacks, keyed by sha256,
+/// and every artifact's build record. Nothing deletes: an unbacked artifact is
+/// refused at serve time.
 #[async_trait]
 pub trait DatasetCacheStore: Send + Sync {
     async fn get_artifact(&self, digest: &Sha256) -> anyhow::Result<Option<DatasetArtifact>>;
 
-    /// The build writes the tar first, so metadata always describes a tar that
-    /// exists.
+    /// The build writes the tar, or finds the package, first, so metadata
+    /// always describes a tar that exists.
     async fn put_artifact(&self, artifact: &DatasetArtifact) -> anyhow::Result<()>;
 
     async fn has_tar(&self, digest: &Sha256) -> anyhow::Result<bool>;
@@ -989,6 +1037,14 @@ pub trait DatasetCacheStore: Send + Sync {
     async fn put_tar(&self, digest: &Sha256, file: &std::path::Path) -> anyhow::Result<()>;
 
     async fn open_tar(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>>;
+}
+
+/// The eval corpora the scores service packs,
+/// `scores-packages/tars/{digest}.tar`; mgmt only reads them.
+#[async_trait]
+pub trait EvalPackageStore: Send + Sync {
+    async fn package_bytes(&self, digest: &Sha256) -> anyhow::Result<Option<u64>>;
+    async fn open_package(&self, digest: &Sha256) -> anyhow::Result<Option<ArtifactBody>>;
 }
 
 /// One page of a keyspace in key order; an invalid object is reported, not fatal.
@@ -1236,7 +1292,8 @@ pub trait AuditStore: Send + Sync {
     async fn count_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64>;
 }
 
-/// The outcome of inserting a catalog entry. The catalog never reuses a name.
+/// The result when the store inserts a catalog entry. A live or tombstoned entry holds
+/// its name in its scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateEntryOutcome {
     Created,
@@ -1301,9 +1358,143 @@ impl AppendOutcome {
             error @ (EntryError::Tombstoned
             | EntryError::OrgKind
             | EntryError::ModelKind
-            | EntryError::CreatorScope) => Err(error),
+            | EntryError::CreatorScope
+            | EntryError::GlobalVaultSource
+            | EntryError::DescriptorInvalid(_)
+            | EntryError::RuntimeBuildMismatch
+            | EntryError::RuntimeBuildInvalid(_)) => Err(error),
         }
     }
+}
+
+/// The outcome of a new name for an entry. The old name is free when the lookup key changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// The stored old name and the entry under its new name, as they stood at
+    /// the rename.
+    Renamed {
+        old_name: CatalogName,
+        entry: DescriptorEntry,
+    },
+    NoSuchEntry,
+    Tombstoned,
+    /// The importer finds its entries by name, so a stable or daily entry
+    /// keeps its name.
+    ImporterKind(DescriptorEntryKind),
+    /// The new name is identical to the stored name, letter case included.
+    SameName,
+    /// Another live or tombstoned entry in the scope holds the new name.
+    NameTaken {
+        name: CatalogName,
+        state: DescriptorEntryState,
+    },
+}
+
+/// The outcome of a merge of one hand-made entry into another in the same
+/// scope. The source entry is gone after the merge, so its name is free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The stored name of the source entry, and the target entry with the
+    /// moved members at its end, as they stood at the merge.
+    Merged {
+        old_name: CatalogName,
+        entry: DescriptorEntry,
+        merge: MergedMembers,
+    },
+    NoSuchEntry,
+    Tombstoned,
+    /// The importer finds its entries by name, so it keeps each of them.
+    ImporterKind(DescriptorEntryKind),
+    /// No entry holds the target name.
+    TargetMissing,
+    TargetTombstoned,
+    /// Only a hand-made entry gets members from an operator.
+    TargetImporterKind(DescriptorEntryKind),
+    /// The members of the two entries cannot share one entry.
+    Refused(EntryError),
+}
+
+/// The source members moved or skipped during a merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedMembers {
+    /// The source members that the target gets, in source order.
+    pub moved: Vec<DescriptorMember>,
+    /// The source members that equal a target member in digest and key.
+    pub skipped: Vec<DescriptorMember>,
+}
+
+/// The outcome of a merge of the entry `source` into the entry `target`, as
+/// the two entries stand. [`DescriptorCatalogStore::merge_entry`] writes the
+/// `Merged` result, and a dry run shows it.
+pub fn merge_outcome(
+    source: Option<DescriptorEntry>,
+    target: Option<DescriptorEntry>,
+) -> MergeOutcome {
+    let Some(source) = source else {
+        return MergeOutcome::NoSuchEntry;
+    };
+    if source.state == DescriptorEntryState::Tombstoned {
+        return MergeOutcome::Tombstoned;
+    }
+    if source.kind != DescriptorEntryKind::HandMade {
+        return MergeOutcome::ImporterKind(source.kind);
+    }
+    let Some(target) = target else {
+        return MergeOutcome::TargetMissing;
+    };
+    if target.state == DescriptorEntryState::Tombstoned {
+        return MergeOutcome::TargetTombstoned;
+    }
+    if target.kind != DescriptorEntryKind::HandMade {
+        return MergeOutcome::TargetImporterKind(target.kind);
+    }
+    match merge_members(&target.members, &source.members) {
+        Ok((members, merge)) => MergeOutcome::Merged {
+            old_name: source.name,
+            entry: DescriptorEntry { members, ..target },
+            merge,
+        },
+        Err(error) => MergeOutcome::Refused(error),
+    }
+}
+
+/// Put the members of `source` after the members of `target`. A source member
+/// with the digest and the key of a target member is already in the target,
+/// so the merge skips it. The result passes
+/// [`DescriptorEntry::validate_members`].
+fn merge_members(
+    target: &NonEmptyVec<DescriptorMember>,
+    source: &NonEmptyVec<DescriptorMember>,
+) -> Result<(NonEmptyVec<DescriptorMember>, MergedMembers), EntryError> {
+    // This scans the target for each source member. If production merges make
+    // the scan costly, index the target's digest and key pairs once.
+    let (skipped, moved): (Vec<_>, Vec<_>) = source.iter().cloned().partition(|member| {
+        target
+            .iter()
+            .any(|held| held.digest() == member.digest() && held.key() == member.key())
+    });
+    let mut members = target.clone();
+    members.extend(moved.iter().cloned());
+    DescriptorEntry::validate_members(&members)?;
+    DescriptorEntry::validate_runtime_build(&members)?;
+    Ok((members, MergedMembers { moved, skipped }))
+}
+
+/// The outcome of a new quantization label for a model member. The old label
+/// is free after the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelabelOutcome {
+    /// The entry with the new label, as it stood at the change.
+    Relabeled(DescriptorEntry),
+    NoSuchEntry,
+    /// The entry has no member with the format and the old label.
+    NoSuchMember,
+    Tombstoned,
+    /// The entry holds runtime members, which have no label.
+    RuntimeEntry,
+    SameLabel,
+    /// Another member with the same format holds the new label.
+    LabelTaken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1422,8 +1613,9 @@ impl CatalogEntryLock for NoopCatalogEntryLock {
     }
 }
 
-/// A list cursor that names no entry. A cursor from a page always names one,
-/// because the store never deletes an entry.
+/// A list cursor that names no entry. The store never deletes an entry, so this
+/// happens only for a cursor that a page did not give, or after a rename of the
+/// cursor's entry.
 #[derive(Debug, thiserror::Error)]
 #[error("no descriptor catalog entry {cursor} to resume after")]
 pub struct UnknownCursorError {
@@ -1475,6 +1667,33 @@ pub trait DescriptorCatalogStore: Send + Sync {
         expected: DescriptorEntryState,
         state: DescriptorEntryState,
     ) -> anyhow::Result<TransitionOutcome>;
+    /// Give a hand-made entry a new name. The check and the write are one atomic step.
+    async fn rename_entry(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        new_name: &CatalogName,
+    ) -> anyhow::Result<RenameOutcome>;
+    /// Move the members of the hand-made entry `name` to the end of the
+    /// hand-made entry `into` in the same scope, and delete the entry `name`.
+    /// [`merge_outcome`] gives the result. The check and the write are one
+    /// atomic step.
+    async fn merge_entry(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        into: &CatalogName,
+    ) -> anyhow::Result<MergeOutcome>;
+    /// Give the model member with `format` and the label `from` the label `to`.
+    /// The digest, the position and the descriptor of the member stay the same.
+    async fn relabel_member(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        format: ModelFormat,
+        from: &QuantizationLabel,
+        to: &QuantizationLabel,
+    ) -> anyhow::Result<RelabelOutcome>;
     async fn get_entry(
         &self,
         scope: &CatalogScope,
@@ -1533,6 +1752,154 @@ pub trait CatalogImportRunStore: Send + Sync {
         at: DateTime<Utc>,
         finish: &CatalogImportRunFinish,
     ) -> anyhow::Result<()>;
+}
+
+/// The run evidence of one descriptor digest on one device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEvidenceRow {
+    /// The hex `sha256` of the runtime or model descriptor.
+    pub digest: String,
+    pub client_id: ClientId,
+    pub last_success: Option<RunMark>,
+    pub last_failure: Option<RunMark>,
+}
+
+impl RunEvidenceRow {
+    /// One run: a success, or a failure when `failed`.
+    pub fn of_run(digest: String, client_id: ClientId, failed: bool, run: RunMark) -> Self {
+        let (last_success, last_failure) = if failed {
+            (None, Some(run))
+        } else {
+            (Some(run), None)
+        };
+        Self {
+            digest,
+            client_id,
+            last_success,
+            last_failure,
+        }
+    }
+}
+
+/// Run evidence folded to one row for each digest and device. Each side keeps
+/// its newest run. On a tie, the run added first stays.
+#[derive(Debug, Default)]
+pub struct RunEvidenceFold {
+    rows: BTreeMap<(String, ClientId), (Option<RunMark>, Option<RunMark>)>,
+}
+
+impl RunEvidenceFold {
+    pub fn add(&mut self, row: RunEvidenceRow) {
+        let (success, failure) = self.rows.entry((row.digest, row.client_id)).or_default();
+        keep_newer(success, row.last_success);
+        keep_newer(failure, row.last_failure);
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn into_rows(self) -> Vec<RunEvidenceRow> {
+        self.rows
+            .into_iter()
+            .map(
+                |((digest, client_id), (last_success, last_failure))| RunEvidenceRow {
+                    digest,
+                    client_id,
+                    last_success,
+                    last_failure,
+                },
+            )
+            .collect()
+    }
+}
+
+impl FromIterator<RunEvidenceRow> for RunEvidenceFold {
+    fn from_iter<I: IntoIterator<Item = RunEvidenceRow>>(rows: I) -> Self {
+        rows.into_iter().fold(Self::default(), |mut fold, row| {
+            fold.add(row);
+            fold
+        })
+    }
+}
+
+fn keep_newer(kept: &mut Option<RunMark>, run: Option<RunMark>) {
+    if let Some(run) = run
+        && kept.as_ref().is_none_or(|k| run.at > k.at)
+    {
+        *kept = Some(run);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_run_evidence_fold_keeps_the_newest_run_of_each_side() -> anyhow::Result<()> {
+    let t0 = DateTime::<Utc>::UNIX_EPOCH;
+    let t1 = t0 + chrono::Duration::minutes(1);
+    let client = ClientId::try_new("ev1_a")?;
+    let run = |digest: &str, failed, at, version: &str| {
+        RunEvidenceRow::of_run(
+            digest.into(),
+            client.clone(),
+            failed,
+            RunMark {
+                at,
+                client_version: Some(version.into()),
+            },
+        )
+    };
+    let mark = |at, version: &str| {
+        Some(RunMark {
+            at,
+            client_version: Some(version.into()),
+        })
+    };
+    let rows = [
+        run("d1", false, t1, "new"),
+        run("d1", false, t0, "old"),
+        run("d1", false, t1, "tie"),
+        run("d1", true, t0, "fail"),
+        run("d2", true, t1, "fail"),
+    ]
+    .into_iter()
+    .collect::<RunEvidenceFold>()
+    .into_rows();
+    assert_eq!(
+        rows,
+        [
+            RunEvidenceRow {
+                digest: "d1".into(),
+                client_id: client.clone(),
+                last_success: mark(t1, "new"),
+                last_failure: mark(t0, "fail"),
+            },
+            RunEvidenceRow {
+                digest: "d2".into(),
+                client_id: client.clone(),
+                last_success: None,
+                last_failure: mark(t1, "fail"),
+            },
+        ]
+    );
+    Ok(())
+}
+
+/// The run evidence index: for each descriptor digest and device, the last
+/// success and the last failure. The scorer keeps it current, and
+/// `db backfill-run-evidence` makes it again from the warehouse. Only
+/// `[database]` keeps this index.
+#[async_trait]
+pub trait RunEvidenceStore: Send + Sync {
+    /// Record the rows. Each side keeps its newest run with its client
+    /// version, so an older run changes nothing and a replay is harmless.
+    async fn upsert(&self, rows: &[RunEvidenceRow]) -> anyhow::Result<()>;
+
+    /// The rows of `digests`, on every device.
+    async fn find(&self, digests: &[String]) -> anyhow::Result<Vec<RunEvidenceRow>>;
 }
 
 /// The vault's records alone: what the audit log reads to find the owner of a
@@ -2205,9 +2572,11 @@ pub enum RedateResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecycleResult {
+    /// The job is back in `avail/`. A recycler that lost the race to another
+    /// recycler of the same lease can also get this result.
     Recycled,
-    /// A benign race (the holder's submission or another recycler), not a
-    /// storage failure.
+    /// A benign race (the holder's submission, or a claim after another
+    /// recycler), not a storage failure.
     Gone,
 }
 
@@ -2400,12 +2769,17 @@ pub trait TodoStore: Send + Sync {
 
     // ── tmp/ ─────────────────────────────────────────────────────────────────
     /// Stage a job body, unclaimable until [`promote_avail`](Self::promote_avail).
-    /// Ingestion stages every job before promoting any, so a staging failure
-    /// leaves only stale `tmp/` files and nothing claimable.
+    /// Ingestion stages each job and then promotes it, several jobs at a time.
+    /// A staging failure leaves the promoted jobs in `avail/`, and the claim
+    /// path grants no lease on them until a committed plan holds them. It also
+    /// leaves at most one stale `tmp/` file for each job that ingestion was
+    /// staging.
     async fn write_tmp(&self, job_id: &JobId, body: &serde_json::Value) -> anyhow::Result<()>;
 
     /// Atomic rename into `avail/`, as `claim_job`'s, so a partial write never
-    /// surfaces. A missing `tmp/` source is an error, not a no-op.
+    /// surfaces. A missing `tmp/` source is an error. A backend whose client
+    /// retries a rename treats the source as moved when the destination exists,
+    /// because an earlier attempt completed.
     async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()>;
 
     async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>>;
@@ -2469,6 +2843,18 @@ pub trait TodoStore: Send + Sync {
     async fn validate_backend(&self) -> anyhow::Result<()>;
 }
 
+/// Sets the last-seen time of a device to a given instant. Only `queue import`
+/// uses it, to keep the modification time of each `liveness/` marker that it
+/// copies. A server records liveness with [`TodoStore::stamp_liveness`].
+#[async_trait]
+pub trait LivenessImport: Send + Sync {
+    async fn set_liveness(
+        &self,
+        client_id: &ClientId,
+        last_seen_at: DateTime<Utc>,
+    ) -> anyhow::Result<()>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspensionRecord {
     pub suspended_at: DateTime<Utc>,
@@ -2523,7 +2909,11 @@ pub struct Stores {
     pub audit: Option<Arc<dyn AuditStore>>,
     pub descriptor_catalog: Option<Arc<dyn DescriptorCatalogStore>>,
     pub catalog_import_runs: Option<Arc<dyn CatalogImportRunStore>>,
+    /// `None` without a `[database]`: no object store keeps the index.
+    pub run_evidence: Option<Arc<dyn RunEvidenceStore>>,
     pub dataset_cache: Arc<dyn DatasetCacheStore>,
+    /// `[eval_packages_storage]`, or `[storage]` without it.
+    pub eval_packages: Arc<dyn EvalPackageStore>,
     pub vault: Arc<dyn VaultStore>,
 }
 

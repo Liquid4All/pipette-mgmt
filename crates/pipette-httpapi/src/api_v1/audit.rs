@@ -161,7 +161,9 @@ fn keep_only_org(event: &mut AuditEvent, org_id: &OrgId) {
         AuditAction::Http { route, path, .. } => path.clone_from(route),
         AuditAction::Cli { args, .. } => args.clear(),
         // The keys are the account's own, which no other organization's id names.
-        AuditAction::FirstClerkSignIn { .. } => {}
+        AuditAction::FirstClerkSignIn { .. }
+        | AuditAction::CatalogRename { .. }
+        | AuditAction::CatalogMerge { .. } => {}
     }
 }
 

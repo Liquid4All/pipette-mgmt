@@ -15,7 +15,6 @@ export const IMPORT_RESULTS: Record<ImportResult, ResultLook> = {
   running: { label: "running", attention: false, counts: false },
   interrupted: { label: "did not finish", attention: true, counts: false },
   success: { label: "succeeded", attention: false, counts: true },
-  unclassified: { label: "finished with unclassified assets", attention: true, counts: true },
   failed: { label: "failed", attention: true, counts: true },
 };
 

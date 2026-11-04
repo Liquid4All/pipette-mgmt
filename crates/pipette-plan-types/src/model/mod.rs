@@ -43,6 +43,8 @@ pub enum Model {
     GgufVision(GgufVision),
     GgufVisionSpeculative(GgufVisionSpeculative),
     Mlx(Mlx),
+    #[serde(rename = "core_ai")]
+    AppleCoreAi(AppleCoreAi),
     MlxSpeculative(MlxSpeculative),
     Torch(Torch),
     TorchSpeculative(TorchSpeculative),
@@ -118,6 +120,14 @@ pub struct Mlx {
     pub source: ModelSource,
 }
 
+/// Apple Core AI `.aimodel` bundle, directory-shaped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct AppleCoreAi {
+    #[serde(flatten)]
+    pub source: ModelSource,
+}
+
 /// Speculative MLX pair. A model type of its own, not a flag on [`Mlx`]: the
 /// drafter is part of what was measured, so it must be part of the identity.
 pub type MlxSpeculative = SpeculativePair;
@@ -183,6 +193,7 @@ impl Model {
             Model::GgufVision(m) => m.source.auth_token(),
             Model::GgufVisionSpeculative(m) => m.source.auth_token(),
             Model::Mlx(m) => m.source.auth_token(),
+            Model::AppleCoreAi(m) => m.source.auth_token(),
             // One of the two; each repo is fetched with its own token.
             Model::MlxSpeculative(m) | Model::TorchSpeculative(m) => {
                 m.target.auth_token().or_else(|| m.draft.auth_token())
@@ -226,6 +237,11 @@ impl Model {
                         repo.auth_token = None;
                     }
                 });
+            }
+            Model::AppleCoreAi(m) => {
+                if let ModelSource::HuggingFace { repo, .. } = &mut m.source {
+                    repo.auth_token = None;
+                }
             }
             Model::Torch(m) => {
                 if let ModelSource::HuggingFace { repo, .. } = &mut m.source {
@@ -295,6 +311,12 @@ pub fn inject_hf_auth_token(model: &mut Model, token: AuthToken) -> bool {
             | ModelSource::RelativeDir { .. }
             | ModelSource::AbsoluteDir { .. } => None,
         },
+        Model::AppleCoreAi(m) => match &mut m.source {
+            ModelSource::HuggingFace { repo, .. } => Some(repo),
+            ModelSource::VaultArchive { .. }
+            | ModelSource::RelativeDir { .. }
+            | ModelSource::AbsoluteDir { .. } => None,
+        },
         Model::Torch(m) => match &mut m.source {
             ModelSource::HuggingFace { repo, .. } => Some(repo),
             ModelSource::VaultArchive { .. }
@@ -322,6 +344,12 @@ pub fn inject_hf_auth_token(model: &mut Model, token: AuthToken) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+impl std::fmt::Display for AppleCoreAi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.source.reference())
     }
 }
 
@@ -365,6 +393,7 @@ impl std::fmt::Display for Model {
             Model::GgufVision(m) => m.fmt(f),
             Model::GgufVisionSpeculative(m) => m.fmt(f),
             Model::Mlx(m) => m.fmt(f),
+            Model::AppleCoreAi(m) => m.fmt(f),
             Model::MlxSpeculative(m) | Model::TorchSpeculative(m) => m.fmt(f),
             Model::Torch(m) => m.fmt(f),
             Model::Openvino(m) => m.fmt(f),
@@ -397,6 +426,9 @@ pub enum ModelType {
     GgufVision,
     GgufVisionSpeculative,
     Mlx,
+    #[serde(rename = "core_ai")]
+    #[strum(serialize = "core_ai")]
+    AppleCoreAi,
     MlxSpeculative,
     Torch,
     TorchSpeculative,
@@ -413,6 +445,7 @@ impl ModelType {
             Model::GgufVision(_) => Self::GgufVision,
             Model::GgufVisionSpeculative(_) => Self::GgufVisionSpeculative,
             Model::Mlx(_) => Self::Mlx,
+            Model::AppleCoreAi(_) => Self::AppleCoreAi,
             Model::MlxSpeculative(_) => Self::MlxSpeculative,
             Model::Torch(_) => Self::Torch,
             Model::TorchSpeculative(_) => Self::TorchSpeculative,
@@ -429,6 +462,7 @@ impl ModelType {
             Self::GgufText
             | Self::GgufVision
             | Self::Mlx
+            | Self::AppleCoreAi
             | Self::Torch
             | Self::Openvino
             | Self::OnnxGenai

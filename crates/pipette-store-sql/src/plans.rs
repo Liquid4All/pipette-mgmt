@@ -121,9 +121,9 @@ fn revision_of(version: &ContentKeyVersion) -> Option<i64> {
     }
 }
 
-/// The revision is random, so a digest that a caller deletes and claims again
-/// never matches its earlier tokens.
-fn first_revision() -> i64 {
+/// The revision is random, so a row that a caller deletes and creates again
+/// never matches its earlier tokens. Plan digests and queue jobs both use it.
+pub(crate) fn first_revision() -> i64 {
     let (high, low) = uuid::Uuid::new_v4().as_u64_pair();
     // 62 bits keep the value positive and far from overflow, however often a
     // write increments it.

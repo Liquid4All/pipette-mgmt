@@ -658,7 +658,8 @@ fn wanted(model: &Model) -> Option<VaultModel<Wanted>> {
         Model::GgufText(_)
         | Model::GgufVision(_)
         | Model::GgufVisionSpeculative(_)
-        | Model::AppleFoundationText => return None,
+        | Model::AppleFoundationText
+        | Model::AppleCoreAi(_) => return None,
     })
 }
 

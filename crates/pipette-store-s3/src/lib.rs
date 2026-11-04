@@ -75,7 +75,7 @@ use pipette_store::decode_stats::S3_DECODE;
 use pipette_store::{
     BacklogSnapshot, CampaignBacklogSnapshot, CatalogStore, ClaimResult, ClientStore,
     ContentKeyCas, ContentKeyClaim, ContentKeyError, ContentKeyRecord, ContentKeyVersion,
-    CreateOutcome, EvalSampleResultStore, FinalizeProbe, JobPlanMarker, JobState,
+    CreateOutcome, EvalPackageStore, EvalSampleResultStore, FinalizeProbe, JobPlanMarker, JobState,
     ORG_BENCHMARKS_PREFIX, OutcomeProbe, PLANS_PREFIX, Page, PendingSourceMarker, PlanFilter,
     PlanPage, PlanStore, RecycleResult, RedateResult, RenewLeaseResult, ScoreQueueStage, Stores,
     SubmissionRecord, SubmissionStore, SuspensionRecord, TodoStore, UnreadableObjectError,
@@ -148,6 +148,16 @@ pub fn build_s3_user_store(
     Ok(Arc::new(S3UserStore::new(store, prefix)))
 }
 
+pub fn build_s3_eval_package_store(
+    storage: &pipette_core::config::StorageConfig,
+) -> anyhow::Result<Arc<dyn EvalPackageStore>> {
+    let (store, prefix) = build_s3_object_store(storage)?;
+    Ok(Arc::new(dataset_cache::S3EvalPackageStore {
+        store,
+        prefix,
+    }))
+}
+
 /// For tests in other crates; each decode still counts in [`S3_DECODE`].
 #[cfg(feature = "testkit")]
 pub fn in_memory_submission_store() -> Arc<dyn SubmissionStore> {
@@ -211,11 +221,16 @@ pub async fn build_s3_stores(config: &Config, todo: Arc<dyn TodoStore>) -> anyho
             store: store.clone(),
             prefix: prefix.clone(),
         }),
+        eval_packages: Arc::new(dataset_cache::S3EvalPackageStore {
+            store: store.clone(),
+            prefix: prefix.clone(),
+        }),
         campaigns: Arc::new(S3CampaignStore::new(store.clone(), prefix.clone())),
         model_params: Arc::new(S3ModelParamsStore::new(store.clone(), prefix.clone())),
         audit: None,
         descriptor_catalog: None,
         catalog_import_runs: None,
+        run_evidence: None,
         vault: Arc::new(vault_store::S3VaultStore::new(
             store.clone(),
             prefix.clone(),
@@ -265,29 +280,6 @@ enum Encoding {
 #[derive(Debug, Clone, Copy)]
 struct S3Tuning {
     max_concurrent_requests: usize,
-}
-
-/// Parse a stored body, and count the work in [`S3_DECODE`].
-fn parse_json_blob<T: serde::de::DeserializeOwned>(
-    data: &[u8],
-    encoding: Encoding,
-) -> anyhow::Result<T> {
-    let started = std::time::Instant::now();
-    let (parsed, decoded_bytes) = match encoding {
-        Encoding::Plain => (
-            serde_json::from_slice(data),
-            u64::try_from(data.len()).unwrap_or(u64::MAX),
-        ),
-        Encoding::Gz => {
-            let mut reader = CountingReader {
-                inner: GzDecoder::new(data),
-                bytes: 0,
-            };
-            (serde_json::from_reader(&mut reader), reader.bytes)
-        }
-    };
-    S3_DECODE.record(data.len(), decoded_bytes, started.elapsed());
-    Ok(parsed?)
 }
 
 struct CountingReader<R> {
@@ -1411,18 +1403,22 @@ impl SubmissionStore for S3SubmissionStore {
     }
 
     async fn get_submission(&self, job_id: &JobId) -> anyhow::Result<Option<SubmissionRecord>> {
-        if let Some(data) = get_bytes(&self.store, &self.incoming_path(job_id)).await? {
+        if let Some(body) =
+            stream_json_as(&self.store, &self.incoming_path(job_id), Encoding::Plain).await?
+        {
             return Ok(Some(SubmissionRecord {
                 job_id: job_id.clone(),
                 state: JobState::Incoming,
-                body: parse_json_blob(&data, Encoding::Plain)?,
+                body,
             }));
         }
-        if let Some(data) = get_bytes(&self.store, &self.processed_path(job_id)).await? {
+        if let Some(body) =
+            stream_json_as(&self.store, &self.processed_path(job_id), Encoding::Gz).await?
+        {
             return Ok(Some(SubmissionRecord {
                 job_id: job_id.clone(),
                 state: JobState::Processed,
-                body: parse_json_blob(&data, Encoding::Gz)?,
+                body,
             }));
         }
         Ok(None)
@@ -1495,10 +1491,12 @@ impl SubmissionStore for S3SubmissionStore {
         stage: ScoreQueueStage,
         job_id: &JobId,
     ) -> anyhow::Result<Option<serde_json::Value>> {
-        match get_bytes(&self.store, &self.stage_path(stage, job_id)).await? {
-            Some(data) => Ok(Some(parse_json_blob(&data, Encoding::Plain)?)),
-            None => Ok(None),
-        }
+        stream_json_as(
+            &self.store,
+            &self.stage_path(stage, job_id),
+            Encoding::Plain,
+        )
+        .await
     }
 
     async fn dequeue(&self, stage: ScoreQueueStage, job_id: &JobId) -> anyhow::Result<()> {
@@ -1506,18 +1504,22 @@ impl SubmissionStore for S3SubmissionStore {
     }
 
     async fn find_job(&self, job_id: &JobId) -> anyhow::Result<Option<SubmissionRecord>> {
-        if let Some(data) = get_bytes(&self.store, &self.incoming_path(job_id)).await? {
+        if let Some(body) =
+            stream_json_as(&self.store, &self.incoming_path(job_id), Encoding::Plain).await?
+        {
             return Ok(Some(SubmissionRecord {
                 job_id: job_id.clone(),
                 state: JobState::Incoming,
-                body: parse_json_blob(&data, Encoding::Plain)?,
+                body,
             }));
         }
-        if let Some(data) = get_bytes(&self.store, &self.processed_path(job_id)).await? {
+        if let Some(body) =
+            stream_json_as(&self.store, &self.processed_path(job_id), Encoding::Gz).await?
+        {
             return Ok(Some(SubmissionRecord {
                 job_id: job_id.clone(),
                 state: JobState::Processed,
-                body: parse_json_blob(&data, Encoding::Gz)?,
+                body,
             }));
         }
         self.find_in_score_queue(job_id).await
@@ -1575,10 +1577,11 @@ impl SubmissionStore for S3SubmissionStore {
             let Some(job_id) = job_id_from_path(&meta.location) else {
                 continue;
             };
-            let Some(data) = get_bytes(&self.store, &meta.location).await? else {
+            let Some(body) = stream_json_as(&self.store, &meta.location, Encoding::Plain).await?
+            else {
                 continue;
             };
-            out.push((job_id, parse_json_blob(&data, Encoding::Plain)?));
+            out.push((job_id, body));
         }
         Ok(out)
     }
@@ -1675,10 +1678,8 @@ impl SubmissionStore for S3SubmissionStore {
             Some((meta.location, client_id))
         });
         let reads = stream::iter(objects.map(|(location, client_id)| async move {
-            get_bytes(&self.store, &location)
-                .await?
-                .map(|data| anyhow::Ok((client_id, parse_json_blob(&data, Encoding::Gz)?)))
-                .transpose()
+            let output = stream_json_as(&self.store, &location, Encoding::Gz).await?;
+            anyhow::Ok(output.map(|output| (client_id, output)))
         }));
         Ok(reads
             .buffer_unordered(pipette_store::STORAGE_CONCURRENCY)
@@ -2065,11 +2066,18 @@ pub async fn build_s3_todo_store(
     let pipette_core::config::StorageConfig::S3 { bucket, prefix, .. } = storage else {
         anyhow::bail!("build_s3_todo_store called with non-S3 storage config");
     };
+    let promotion_attempt_timeout = attempt.max(Duration::from_secs(20));
+    let promotion_operation_timeout = operation
+        .max(Duration::from_secs(40))
+        .max(promotion_attempt_timeout);
 
     Ok(Arc::new(S3TodoStore {
         client: build_s3_sdk_client(storage, Some(queue_timeouts(attempt, operation))).await?,
         bucket: bucket.clone(),
         prefix: prefix.trim_end_matches('/').to_string(),
+        operation_budget: promotion_operation_timeout.saturating_mul(2),
+        promotion_attempt_timeout,
+        promotion_operation_timeout,
     }))
 }
 
@@ -2077,6 +2085,17 @@ pub struct S3TodoStore {
     client: aws_sdk_s3::Client,
     bucket: String,
     prefix: String,
+    /// Total budget for a promotion rename and its one possible resend.
+    operation_budget: Duration,
+    promotion_attempt_timeout: Duration,
+    promotion_operation_timeout: Duration,
+}
+
+/// Result of resolving a missing rename source against its destination.
+#[derive(Debug, PartialEq)]
+enum RenameOutcome {
+    Moved,
+    SourceGone,
 }
 
 impl S3TodoStore {
@@ -2091,7 +2110,16 @@ impl S3TodoStore {
             client,
             bucket: bucket.into(),
             prefix: prefix.into(),
+            operation_budget: Duration::from_secs(80),
+            promotion_attempt_timeout: Duration::from_secs(20),
+            promotion_operation_timeout: Duration::from_secs(40),
         }
+    }
+
+    /// Set the total time that one rename may use, its retry included.
+    pub fn with_operation_budget(mut self, budget: Duration) -> Self {
+        self.operation_budget = budget;
+        self
     }
 }
 
@@ -2207,6 +2235,120 @@ impl S3TodoStore {
             "todo storage validated: RenameObject supported (S3 Express One Zone)"
         );
         Ok(())
+    }
+
+    /// Rename `src` to `dst`. Read `dst` after any failed send, since a failed
+    /// response does not establish whether S3 moved the source. Only promotion
+    /// may send again when the destination is absent.
+    async fn rename(&self, src: &str, dst: &str) -> anyhow::Result<RenameOutcome> {
+        self.rename_via(src, dst, false, || self.send_rename(src, dst, false))
+            .await
+    }
+
+    async fn send_rename(
+        &self,
+        src: &str,
+        dst: &str,
+        promotion: bool,
+    ) -> Result<(), Box<SdkError<RenameObjectError>>> {
+        let request = self
+            .client
+            .rename_object()
+            .bucket(&self.bucket)
+            .key(dst)
+            .rename_source(src);
+        if promotion {
+            let timeouts = queue_timeouts(
+                self.promotion_attempt_timeout,
+                self.promotion_operation_timeout,
+            );
+            request
+                .customize()
+                .config_override(aws_sdk_s3::config::Builder::new().timeout_config(timeouts))
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(Box::new)
+        } else {
+            request.send().await.map(|_| ()).map_err(Box::new)
+        }
+    }
+
+    /// [`rename`](Self::rename), with `send` to make each `RenameObject` send.
+    async fn rename_via<F, Fut>(
+        &self,
+        src: &str,
+        dst: &str,
+        resend: bool,
+        send: F,
+    ) -> anyhow::Result<RenameOutcome>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(), Box<SdkError<RenameObjectError>>>> + Send,
+    {
+        let started = std::time::Instant::now();
+        let first = match send().await {
+            Ok(()) => return Ok(RenameOutcome::Moved),
+            Err(error) => error,
+        };
+        let source_gone = is_no_such_key(first.as_ref());
+        let first_error = s3_error("RenameObject", &rename_target(src, dst), *first);
+        match self.get_bytes(dst).await {
+            Ok(Some(_)) => return Ok(RenameOutcome::Moved),
+            Ok(None) => {}
+            Err(read_error) => {
+                return Err(first_error.context(format!(
+                    "reading the rename destination failed: {read_error:#}"
+                )));
+            }
+        }
+        if source_gone {
+            return Ok(RenameOutcome::SourceGone);
+        }
+        if !resend {
+            return Err(first_error);
+        }
+
+        let Some(left) = self
+            .operation_budget
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(
+                first_error.context("the operation budget has no time left to resend the rename")
+            );
+        };
+        tracing::warn!(
+            src = %src,
+            dst = %dst,
+            error = %format!("{first_error:#}"),
+            budget_left_ms = left.as_millis(),
+            "RenameObject outcome is unknown; resending promotion once"
+        );
+        let second = tokio::time::timeout(left, send()).await;
+        match second {
+            Ok(Ok(())) => Ok(RenameOutcome::Moved),
+            Ok(Err(error)) => {
+                let source_gone = is_no_such_key(error.as_ref());
+                let second_error = s3_error("RenameObject", &rename_target(src, dst), *error)
+                    .context(format!("first send failed: {first_error:#}"));
+                match self.get_bytes(dst).await {
+                    Ok(Some(_)) => Ok(RenameOutcome::Moved),
+                    Ok(None) if source_gone => Ok(RenameOutcome::SourceGone),
+                    Ok(None) => Err(second_error),
+                    Err(read_error) => Err(second_error.context(format!(
+                        "reading the rename destination failed: {read_error:#}"
+                    ))),
+                }
+            }
+            Err(_) => match self.get_bytes(dst).await {
+                Ok(Some(_)) => Ok(RenameOutcome::Moved),
+                Ok(None) => Err(first_error.context("the resend used all of the operation budget")),
+                Err(read_error) => Err(first_error.context(format!(
+                    "the resend used all of the operation budget; reading the rename destination failed: {read_error:#}"
+                ))),
+            },
+        }
     }
 
     async fn get_bytes(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -2398,7 +2540,7 @@ where
 impl TodoStore for S3TodoStore {
     async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
         // A recursive listing of `avail/` returns the `{job_id}/{expires_at}.json`
-        // relative keys directly, and sorting them orders by `job_id` first.
+        // relative keys directly. Sorting them gives the byte order of the key.
         let mut names: Vec<String> = self
             .list_keys(&self.list_prefix("avail/"))
             .await?
@@ -2480,23 +2622,9 @@ impl TodoStore for S3TodoStore {
         // first fails this with `NoSuchKey`, which is `Gone`.
         let src = self.key(&format!("avail/{}", avail_filename(job_id, from)));
         let dst = self.key(&format!("avail/{}", avail_filename(job_id, to)));
-        match self
-            .client
-            .rename_object()
-            .bucket(&self.bucket)
-            .key(&dst)
-            .rename_source(&src)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(RedateResult::Redated),
-            Err(e) => {
-                if is_no_such_key(&e) {
-                    Ok(RedateResult::Gone)
-                } else {
-                    Err(s3_error("RenameObject", &rename_target(&src, &dst), e))
-                }
-            }
+        match self.rename(&src, &dst).await? {
+            RenameOutcome::Moved => Ok(RedateResult::Redated),
+            RenameOutcome::SourceGone => Ok(RedateResult::Gone),
         }
     }
 
@@ -2566,22 +2694,10 @@ impl TodoStore for S3TodoStore {
                 "leased/{}",
                 leased_key(job_id, expires_at, client_id, new_expiry)
             ));
-            match self
-                .client
-                .rename_object()
-                .bucket(&self.bucket)
-                .key(&dst)
-                .rename_source(&src)
-                .send()
-                .await
-            {
-                Ok(_) => return Ok(RenewLeaseResult::Renewed(expires_at)),
-                Err(e) => {
-                    // Raced a recycle; fall through to the cross-partition check.
-                    if !is_no_such_key(&e) {
-                        return Err(s3_error("RenameObject", &rename_target(&src, &dst), e));
-                    }
-                }
+            match self.rename(&src, &dst).await? {
+                RenameOutcome::Moved => return Ok(RenewLeaseResult::Renewed(expires_at)),
+                // Raced a recycle; fall through to the cross-partition check.
+                RenameOutcome::SourceGone => {}
             }
         }
 
@@ -2629,18 +2745,12 @@ impl TodoStore for S3TodoStore {
             leased_key(job_id, expires_at, client_id, lease_expiry)
         ));
 
-        // Atomic move: the *source* is the contention point — a second claimant's
-        // rename of the now-gone source fails with `NoSuchKey` → `Gone`.
-        match self
-            .client
-            .rename_object()
-            .bucket(&self.bucket)
-            .key(&dst)
-            .rename_source(&src)
-            .send()
-            .await
-        {
-            Ok(_) => {
+        // The source is the contention point. If it is gone, read our destination
+        // before deciding whether this call landed or another claimant won. The
+        // destination key holds this client and this lease expiry, so no other
+        // claimant can write it.
+        match self.rename(&src, &dst).await? {
+            RenameOutcome::Moved => {
                 // `RenameObject` returns no body, so read the now-leased object; the lease
                 // is ours, so nothing can move it first.
                 let body = self.get_json(&dst).await?.ok_or_else(|| {
@@ -2648,13 +2758,7 @@ impl TodoStore for S3TodoStore {
                 })?;
                 Ok(ClaimResult::Claimed(body))
             }
-            Err(e) => {
-                if is_no_such_key(&e) {
-                    Ok(ClaimResult::Gone)
-                } else {
-                    Err(s3_error("RenameObject", &rename_target(&src, &dst), e))
-                }
-            }
+            RenameOutcome::SourceGone => Ok(ClaimResult::Gone),
         }
     }
 
@@ -2666,29 +2770,17 @@ impl TodoStore for S3TodoStore {
         lease_expiry: DateTime<Utc>,
     ) -> anyhow::Result<RecycleResult> {
         // The destination name comes from the lease key, so no body GET precedes the
-        // rename. A missing source is `Gone`: someone else resolved the lease.
+        // rename. If the source is missing, an `avail/` destination means the job is
+        // back in `avail/`, from this call or from another recycler: `Recycled`.
+        // Otherwise someone else resolved the lease: `Gone`.
         let src = self.key(&format!(
             "leased/{}",
             leased_key(job_id, expires_at, client_id, lease_expiry)
         ));
         let dst = self.key(&format!("avail/{}", avail_filename(job_id, expires_at)));
-        match self
-            .client
-            .rename_object()
-            .bucket(&self.bucket)
-            .key(&dst)
-            .rename_source(&src)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(RecycleResult::Recycled),
-            Err(e) => {
-                if is_no_such_key(&e) {
-                    Ok(RecycleResult::Gone)
-                } else {
-                    Err(s3_error("RenameObject", &rename_target(&src, &dst), e))
-                }
-            }
+        match self.rename(&src, &dst).await? {
+            RenameOutcome::Moved => Ok(RecycleResult::Recycled),
+            RenameOutcome::SourceGone => Ok(RecycleResult::Gone),
         }
     }
 
@@ -2983,19 +3075,20 @@ impl TodoStore for S3TodoStore {
     }
 
     async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()> {
-        // Atomic `RenameObject`, as in `claim_job`: the staged body appears in
-        // `avail/` whole or not at all. A vanished source is an error, not a no-op.
+        // Atomic rename keeps a partial body out of avail/. A missing source is an
+        // error unless the destination holds the body from an earlier attempt.
         let src = self.key(&format!("tmp/{}", tmp_filename(job_id)));
         let dst = self.key(&format!("avail/{}", avail_filename(job_id, expires_at)));
-        self.client
-            .rename_object()
-            .bucket(&self.bucket)
-            .key(&dst)
-            .rename_source(&src)
-            .send()
-            .await
-            .map_err(|e| s3_error("RenameObject", &rename_target(&src, &dst), e))?;
-        Ok(())
+        match self
+            .rename_via(&src, &dst, true, || self.send_rename(&src, &dst, true))
+            .await?
+        {
+            RenameOutcome::Moved => Ok(()),
+            RenameOutcome::SourceGone => Err(anyhow::anyhow!(
+                "S3 RenameObject on {}: the source is gone and the destination is absent",
+                rename_target(&src, &dst)
+            )),
+        }
     }
 
     async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>> {
@@ -3231,6 +3324,54 @@ mod tests {
     use pipette_store_testkit::TEST_LIST_LIMIT;
 
     use crate::*;
+
+    #[rstest::rstest]
+    #[case::plain(Encoding::Plain)]
+    #[case::gz(Encoding::Gz)]
+    #[tokio::test]
+    async fn result_decoding_runs_off_the_request_thread(
+        #[case] encoding: Encoding,
+    ) -> anyhow::Result<()> {
+        struct DecodedOn(std::thread::ThreadId);
+        impl<'de> serde::Deserialize<'de> for DecodedOn {
+            fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+                let _ = serde_json::Value::deserialize(decoder)?;
+                Ok(Self(std::thread::current().id()))
+            }
+        }
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = obj_path("test", "result.json");
+        let body = serde_json::json!({"completions": ["a", "b"]});
+        let bytes = match encoding {
+            Encoding::Plain => serde_json::to_vec(&body)?,
+            Encoding::Gz => gzip_json(&body)?,
+        };
+        put_bytes(&store, &path, bytes).await?;
+        let decoded: DecodedOn = stream_json_as(&store, &path, encoding)
+            .await?
+            .context("stored result")?;
+        assert_ne!(decoded.0, std::thread::current().id());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::plain(Encoding::Plain, b"{")]
+    #[case::gz(Encoding::Gz, b"broken gzip")]
+    #[tokio::test]
+    async fn a_malformed_result_fails_to_decode(
+        #[case] encoding: Encoding,
+        #[case] data: &'static [u8],
+    ) -> anyhow::Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = obj_path("test", "result.json");
+        put_bytes(&store, &path, data.to_vec()).await?;
+        assert!(
+            stream_json_as::<serde_json::Value>(&store, &path, encoding)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 
     /// The contracts' raw-write hook: `key` relative to the test prefix.
     pub(crate) fn write_raw_under(
@@ -3574,7 +3715,11 @@ mod tests {
                 prefix: prefix.clone(),
                 writer_opts: WriterOpts::default(),
             }),
-            dataset_cache: Arc::new(dataset_cache::S3DatasetCacheStore { store, prefix }),
+            dataset_cache: Arc::new(dataset_cache::S3DatasetCacheStore {
+                store: store.clone(),
+                prefix: prefix.clone(),
+            }),
+            eval_packages: Arc::new(dataset_cache::S3EvalPackageStore { store, prefix }),
             todo: Arc::new(pipette_store_testkit::TodoStoreUnimplemented),
             plans: Arc::new(pipette_store_testkit::PlanStoreUnimplemented),
             campaigns: Arc::new(pipette_store_testkit::CampaignStoreUnimplemented),
@@ -3582,6 +3727,7 @@ mod tests {
             audit: None,
             descriptor_catalog: None,
             catalog_import_runs: None,
+            run_evidence: None,
             vault: Arc::new(pipette_store_testkit::VaultStoreUnimplemented),
         }
     }
@@ -3639,6 +3785,12 @@ mod tests {
     async fn test_s3_find_outcomes_meets_the_shared_contract() -> anyhow::Result<()> {
         let stores = make_test_stores("");
         pipette_store_testkit::assert_find_outcomes_contract(stores.submissions.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn test_s3_find_runs_meets_the_shared_contract() -> anyhow::Result<()> {
+        let stores = make_test_stores("");
+        pipette_store_testkit::assert_find_runs_contract(stores.submissions.as_ref()).await
     }
 
     /// The kind of read that a [`RefusingReads`] store refuses.
@@ -4175,8 +4327,17 @@ mod todo_mock_tests {
     use aws_smithy_mocks::{Rule, RuleMode, mock};
     use rstest::rstest;
 
-    use super::mock_bucket::{bucket_list_rule, store};
+    use super::mock_bucket::{bucket_list_rule, fake_bucket, store};
     use super::*;
+
+    /// Scripted sends need one type for their different async branches.
+    type RenameSend<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), Box<SdkError<RenameObjectError>>>>
+                + std::marker::Send
+                + 'a,
+        >,
+    >;
 
     /// The three reads that address a job's `avail/` entry by `job_id` alone.
     #[derive(Debug, Clone, Copy)]
@@ -4232,6 +4393,34 @@ mod todo_mock_tests {
                     .is_truncated(false)
                     .build()
             })
+    }
+
+    /// The `get_object` of `key` that follows a rename's `NoSuchKey`. A `landed`
+    /// rename answers `reads` times with a body; otherwise the read is `NoSuchKey`.
+    fn destination_rule(key: String, landed: bool, reads: usize) -> Rule {
+        let rule = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |r| r.key() == Some(key.as_str()));
+        if landed {
+            rule.sequence()
+                .output(|| {
+                    GetObjectOutput::builder()
+                        .body(ByteStream::from_static(br#"{"requires":[]}"#))
+                        .build()
+                })
+                .times(reads)
+                .build()
+        } else {
+            rule.then_error(get_no_such_key)
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_store_meets_the_shared_contract() -> anyhow::Result<()> {
+        pipette_store_testkit::assert_todo_store_contract(
+            &store(fake_bucket()),
+            dt("2026-06-15T08:30:00.250Z"),
+        )
+        .await
     }
 
     // ── reads ────────────────────────────────────────────────────────────────
@@ -4431,18 +4620,34 @@ mod todo_mock_tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::landed(true)]
+    #[case::gone(false)]
     #[tokio::test]
-    async fn claim_gone_when_source_missing() -> anyhow::Result<()> {
+    async fn claim_resolves_a_retried_rename(#[case] landed: bool) -> anyhow::Result<()> {
         let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        // A landed claim reads the destination twice: once to resolve the
+        // rename, once for the body.
+        let dst = format!(
+            "todo/leased/{}",
+            leased_key(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, ts())
+        );
+        let get = destination_rule(dst, landed, 2);
         let s = store(aws_smithy_mocks::mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
-            &[&rename]
+            &[&rename, &get]
         ));
         let result = s
             .claim_job(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, ts())
             .await?;
-        assert!(matches!(result, ClaimResult::Gone));
+        if landed {
+            assert!(
+                matches!(result, ClaimResult::Claimed(body) if body["requires"] == serde_json::json!([]))
+            );
+        } else {
+            assert!(matches!(result, ClaimResult::Gone));
+        }
         Ok(())
     }
 
@@ -4479,6 +4684,217 @@ mod todo_mock_tests {
             &[&rename]
         ));
         s.promote_avail(&job("job1"), ExpiresAt::Never).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promote_avail_succeeds_when_a_retried_rename_landed() -> anyhow::Result<()> {
+        let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let get = destination_rule("todo/avail/job1/never.json".to_string(), true, 1);
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&rename, &get]
+        ));
+        s.promote_avail(&job("job1"), ExpiresAt::Never).await
+    }
+
+    #[tokio::test]
+    async fn promote_avail_fails_when_source_and_destination_are_missing() -> anyhow::Result<()> {
+        let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let get = destination_rule("todo/avail/job1/never.json".to_string(), false, 1);
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&rename, &get]
+        ));
+        let error = match s.promote_avail(&job("job1"), ExpiresAt::Never).await {
+            Ok(()) => anyhow::bail!("missing destination must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("the source is gone and the destination is absent"),
+            "{message}"
+        );
+        assert!(
+            message.contains("todo/tmp/job1.json -> todo/avail/job1/never.json"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    // ── rename timeout recovery ────────────────────────────────────────────────
+
+    const SRC: &str = "todo/tmp/job1.json";
+    const DST: &str = "todo/avail/job1/never.json";
+
+    /// One scripted answer of a `RenameObject` send.
+    #[derive(Debug, Clone, Copy)]
+    enum Send {
+        /// The SDK timeout error, at once.
+        TimeOut,
+        /// The SDK timeout error, after this delay.
+        Stall(Duration),
+        /// The answer of the mock bucket.
+        Bucket,
+    }
+
+    /// What the mock bucket answers to a `RenameObject` that reaches it.
+    #[derive(Debug, Clone, Copy)]
+    enum Bucket {
+        Moves,
+        SourceGone,
+        Denied,
+    }
+
+    #[derive(Debug)]
+    enum Expect {
+        Outcome(RenameOutcome),
+        /// The SDK timeout error, with this text in the chain.
+        TimedOut(&'static str),
+        /// Another failure, with this text in the chain.
+        Failed(&'static str),
+    }
+
+    fn sdk_timeout() -> SdkError<RenameObjectError> {
+        SdkError::timeout_error("operation attempt timeout (single attempt) occurred after 5s")
+    }
+
+    #[rstest]
+    #[case::first_timeout_landed(
+        Duration::from_secs(20), vec![Send::TimeOut], None, Some(true),
+        1, Expect::Outcome(RenameOutcome::Moved)
+    )]
+    #[case::resend_moves_after_absent_destination(
+        Duration::from_secs(20), vec![Send::TimeOut, Send::Bucket], Some(Bucket::Moves), Some(false),
+        2, Expect::Outcome(RenameOutcome::Moved)
+    )]
+    #[case::resend_finds_source_and_destination_absent(
+        Duration::from_secs(20), vec![Send::TimeOut, Send::Bucket], Some(Bucket::SourceGone), Some(false),
+        2, Expect::Outcome(RenameOutcome::SourceGone)
+    )]
+    #[case::both_sends_time_out(
+        Duration::from_secs(20), vec![Send::TimeOut, Send::TimeOut], None, Some(false),
+        2, Expect::TimedOut("S3 RenameObject on todo/tmp/job1.json -> todo/avail/job1/never.json failed")
+    )]
+    #[case::no_budget_no_resend(
+        Duration::ZERO, vec![Send::TimeOut], None, Some(false),
+        1, Expect::TimedOut("no time left to resend")
+    )]
+    #[case::first_send_spends_the_budget(
+        Duration::from_millis(20), vec![Send::Stall(Duration::from_millis(40))], None, Some(false),
+        1, Expect::TimedOut("no time left to resend")
+    )]
+    #[case::resend_stops_at_the_budget(
+        Duration::from_millis(100), vec![Send::TimeOut, Send::Stall(Duration::from_secs(30))], None, Some(false),
+        2, Expect::TimedOut("used all of the operation budget")
+    )]
+    #[case::non_timeout_error_checks_destination_and_resends(
+        Duration::from_secs(20), vec![Send::Bucket], Some(Bucket::Denied), Some(false),
+        2, Expect::Failed("code=AccessDenied")
+    )]
+    #[tokio::test]
+    async fn a_timed_out_rename_retries_once_within_the_budget(
+        #[case] budget: Duration,
+        #[case] script: Vec<Send>,
+        #[case] bucket: Option<Bucket>,
+        #[case] destination_present: Option<bool>,
+        #[case] sends: usize,
+        #[case] expect: Expect,
+    ) -> anyhow::Result<()> {
+        let rename = bucket.map(|answer| {
+            let rule = mock!(aws_sdk_s3::Client::rename_object)
+                .match_requests(|r| r.key() == Some(DST) && r.rename_source() == Some(SRC));
+            match answer {
+                Bucket::Moves => rule.then_output(|| RenameObjectOutput::builder().build()),
+                Bucket::SourceGone => rule.then_error(rename_no_such_key),
+                Bucket::Denied => rule.then_error(|| {
+                    RenameObjectError::generic(
+                        ErrorMetadata::builder()
+                            .code("AccessDenied")
+                            .message("denied")
+                            .build(),
+                    )
+                }),
+            }
+        });
+        let get = destination_present.map(|landed| destination_rule(DST.to_string(), landed, 1));
+        let rules: Vec<&Rule> = rename.iter().chain(get.iter()).collect();
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            rules
+        ))
+        .with_operation_budget(budget);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let send = || -> RenameSend<'_> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match script.get(call).copied().unwrap_or(Send::Bucket) {
+                Send::TimeOut => Box::pin(async { Err(Box::new(sdk_timeout())) }),
+                Send::Stall(delay) => Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    Err(Box::new(sdk_timeout()))
+                }),
+                Send::Bucket => Box::pin(s.send_rename(SRC, DST, false)),
+            }
+        };
+        let renamed = s.rename_via(SRC, DST, true, send).await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), sends);
+        match (expect, renamed) {
+            (Expect::Outcome(want), Ok(got)) => assert_eq!(got, want),
+            (Expect::TimedOut(text), Err(error)) => {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<SdkError<RenameObjectError>>(),
+                        Some(SdkError::TimeoutError(_))
+                    ),
+                    "{error:#}"
+                );
+                assert!(format!("{error:#}").contains(text), "{error:#}");
+            }
+            (Expect::Failed(text), Err(error)) => {
+                assert!(format!("{error:#}").contains(text), "{error:#}");
+            }
+            (expect, renamed) => anyhow::bail!("expected {expect:?}, got {renamed:?}"),
+        }
+        Ok(())
+    }
+
+    /// Claim, renew, recycle, and re-date share the one-send path. A timeout
+    /// can still mean the rename landed, but none of these paths resends it.
+    #[rstest]
+    #[case::landed(true)]
+    #[case::absent(false)]
+    #[tokio::test]
+    async fn a_non_promotion_timeout_checks_the_destination_without_resending(
+        #[case] landed: bool,
+    ) -> anyhow::Result<()> {
+        let destination = destination_rule(DST.to_string(), landed, 1);
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&destination]
+        ));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = s
+            .rename_via(SRC, DST, false, || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Err(Box::new(sdk_timeout())) })
+            })
+            .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if landed {
+            assert_eq!(outcome?, RenameOutcome::Moved);
+        } else {
+            assert!(outcome.err().is_some_and(|error| {
+                error
+                    .downcast_ref::<SdkError<RenameObjectError>>()
+                    .is_some_and(|error| matches!(error, SdkError::TimeoutError(_)))
+            }));
+        }
         Ok(())
     }
 
@@ -4627,6 +5043,45 @@ mod todo_mock_tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::landed(true, RenewLeaseResult::Renewed(ExpiresAt::Never))]
+    #[case::gone(false, RenewLeaseResult::NotFound)]
+    #[tokio::test]
+    async fn renew_resolves_a_retried_rename(
+        #[case] landed: bool,
+        #[case] expected: RenewLeaseResult,
+    ) -> anyhow::Result<()> {
+        let own_key = format!(
+            "todo/leased/{}",
+            leased_key(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, ts())
+        );
+        let own_list = list_rule("todo/leased/ev1_me/", vec![own_key]);
+        let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let renewed = ts() + chrono::Duration::minutes(5);
+        let dst = format!(
+            "todo/leased/{}",
+            leased_key(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, renewed)
+        );
+        let get = destination_rule(dst, landed, 1);
+        let all_list = list_rule("todo/leased/", vec![]);
+        let rules: Vec<&Rule> = if landed {
+            vec![&own_list, &rename, &get]
+        } else {
+            vec![&own_list, &rename, &get, &all_list]
+        };
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &rules
+        ));
+        assert_eq!(
+            s.renew_lease(&job("job1"), &cid("ev1_me")?, renewed)
+                .await?,
+            expected
+        );
+        Ok(())
+    }
+
     /// A job-prefixed key that does not parse is cruft: renewal scans past it to
     /// the real lease. The mock matches the destination, so adopting it fails.
     #[tokio::test]
@@ -4771,20 +5226,25 @@ mod todo_mock_tests {
         Ok(())
     }
 
-    /// The lease vanished before the rename (a terminal submission or another
-    /// recycler): `NoSuchKey` resolves to `Gone`.
+    #[rstest]
+    #[case::landed(true, RecycleResult::Recycled)]
+    #[case::gone(false, RecycleResult::Gone)]
     #[tokio::test]
-    async fn recycle_gone_when_lease_missing() -> anyhow::Result<()> {
+    async fn recycle_resolves_a_retried_rename(
+        #[case] landed: bool,
+        #[case] expected: RecycleResult,
+    ) -> anyhow::Result<()> {
         let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let get = destination_rule("todo/avail/job1/never.json".to_string(), landed, 1);
         let s = store(aws_smithy_mocks::mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
-            &[&rename]
+            &[&rename, &get]
         ));
         assert_eq!(
             s.recycle_lease(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, ts())
                 .await?,
-            RecycleResult::Gone
+            expected
         );
         Ok(())
     }
@@ -4817,20 +5277,84 @@ mod todo_mock_tests {
         Ok(())
     }
 
-    /// A claim took the entry first: `NoSuchKey` resolves to `Gone`.
+    #[rstest]
+    #[case::landed(true, RedateResult::Redated)]
+    #[case::gone(false, RedateResult::Gone)]
     #[tokio::test]
-    async fn redate_gone_when_the_entry_was_claimed() -> anyhow::Result<()> {
+    async fn redate_resolves_a_retried_rename(
+        #[case] landed: bool,
+        #[case] expected: RedateResult,
+    ) -> anyhow::Result<()> {
         let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let get = destination_rule(
+            "todo/avail/job1/20260908T000000Z.json".to_string(),
+            landed,
+            1,
+        );
         let s = store(aws_smithy_mocks::mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
-            &[&rename]
+            &[&rename, &get]
         ));
         assert_eq!(
-            s.redate_avail(&job("job1"), ExpiresAt::Never, ExpiresAt::Never)
-                .await?,
-            RedateResult::Gone
+            s.redate_avail(
+                &job("job1"),
+                ExpiresAt::At(dt("2026-08-01T00:00:00Z")),
+                ExpiresAt::At(dt("2026-09-08T00:00:00Z")),
+            )
+            .await?,
+            expected
         );
+        Ok(())
+    }
+
+    /// A destination read that fails for a reason other than `NoSuchKey` is an
+    /// error: the store cannot tell a landed rename from a lost race.
+    #[tokio::test]
+    async fn a_failed_destination_read_fails_the_rename() -> anyhow::Result<()> {
+        let rename = mock!(aws_sdk_s3::Client::rename_object).then_error(rename_no_such_key);
+        let get = mock!(aws_sdk_s3::Client::get_object).then_error(|| {
+            GetObjectError::generic(ErrorMetadata::builder().code("AccessDenied").build())
+        });
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&rename, &get]
+        ));
+        let result = s
+            .claim_job(&job("job1"), ExpiresAt::Never, &cid("ev1_me")?, ts())
+            .await;
+        anyhow::ensure!(
+            result.is_err(),
+            "a failed destination read must fail the claim"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_timeout_and_failed_destination_read_keep_both_errors() -> anyhow::Result<()> {
+        let get = mock!(aws_sdk_s3::Client::get_object).then_error(|| {
+            GetObjectError::generic(ErrorMetadata::builder().code("AccessDenied").build())
+        });
+        let s = store(aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&get]
+        ));
+        let error = s
+            .rename_via(SRC, DST, false, || {
+                Box::pin(async { Err(Box::new(sdk_timeout())) })
+            })
+            .await
+            .err()
+            .context("the failed destination read must fail the rename")?;
+        let chain = format!("{error:#}");
+        assert!(chain.contains("S3 RenameObject on"), "{chain}");
+        assert!(
+            chain.contains("reading the rename destination failed"),
+            "{chain}"
+        );
+        assert!(chain.contains("code=AccessDenied"), "{chain}");
         Ok(())
     }
 

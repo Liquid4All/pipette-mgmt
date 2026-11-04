@@ -4,8 +4,8 @@
 # PGPASSWORD. The [duckdb] password is the one secret the file holds.
 
 # Required: the edge-evals scoring service. `score-eval` scores through it,
-# `serve` fetches eval benchmark samples from it, and `dataset-cache` builds
-# vlm_eval corpora from it.
+# `serve` fetches eval benchmark samples from it, and `dataset-cache` asks it
+# for the digest of an eval corpus's samples.
 evals_server_url = "http://localhost:8080"
 
 # --- serve ---
@@ -58,7 +58,6 @@ authorities = ["localhost:3000", "127.0.0.1:3000", "localhost:5173", "127.0.0.1:
 # --- dataset-cache ---
 # dataset_probe_timeout_secs = 30
 # dataset_build_timeout_secs = 900
-# dataset_asr_build_timeout_secs = 7200   # an asr-eval-corpus/1 build or `pins`
 
 # Probe an s3 [storage] / [auth_storage] for conditional PUT at startup.
 # probe_backend_capabilities = true
@@ -82,11 +81,18 @@ data_dir = "./sample_data"
 backend = "local_fs"
 data_dir = "./sample_data"
 
-# Optional: the `todo/` queue. Defaults to [storage]; on S3 it must be an
-# Express One Zone bucket (docs/storage.md).
+# Optional: the job queue. If absent, the queue uses [storage]. An S3 queue
+# needs an Express One Zone bucket. Set backend = "database" to use [database].
 # [todo_storage]
 # backend = "s3"
 # bucket = "my-todo--use1-az4--x-s3"
+# region = "us-east-1"
+
+# Optional: the eval corpora the scores service packs, under scores-packages/.
+# If absent, they are read from [storage]. mgmt never writes them.
+# [eval_packages_storage]
+# backend = "s3"
+# bucket = "my-eval-datasets"
 # region = "us-east-1"
 
 # Optional: hold a pending client's submissions instead of refusing them.

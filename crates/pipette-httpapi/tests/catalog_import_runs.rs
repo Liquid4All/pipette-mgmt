@@ -142,7 +142,7 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
                 &CatalogImportRunFinish {
                     entries_hidden: 2,
                     unclassified_assets: vec!["b1/unknown.tar.gz".into()],
-                    error_summary: Some("1 unclassified assets".into()),
+                    error_summary: Some("GitHub unreachable".into()),
                     ..Default::default()
                 },
             )
@@ -165,7 +165,7 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
     assert_eq!(body["items"][0]["id"], "refresh");
     assert_eq!(body["items"][1]["id"], "error-b");
     assert_eq!(body["items"][1]["entries_hidden"], 2);
-    assert_eq!(body["items"][1]["outcome"], "unclassified");
+    assert_eq!(body["items"][1]["outcome"], "failed");
     assert_eq!(
         body["items"][1]["unclassified_assets"],
         serde_json::json!(["b1/unknown.tar.gz"])

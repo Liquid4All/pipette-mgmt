@@ -26,6 +26,7 @@ pipette-store.workspace = true
 pipette-store-init.workspace = true
 axum.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
@@ -48,6 +49,7 @@ strum.workspace = true
 pipette-core = { workspace = true, features = ["testkit"] }
 # The unit tests below the CLI build their fixtures on the filesystem backend.
 pipette-store-fs.workspace = true
+pipette-store-testkit.workspace = true
 pipette-hub-testkit.workspace = true
 async-trait.workspace = true
 pipette-store-sql = { workspace = true, features = ["testkit"] }

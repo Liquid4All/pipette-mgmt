@@ -15,21 +15,24 @@ use pipette_pipeline::descriptor_names::{self, CatalogReadScope, NameView};
 use pipette_pipeline::descriptor_offer::{self, OfferError, Resolution};
 use pipette_pipeline::model_params;
 use pipette_pipeline::org::{OrgRef, RosterScope};
+use pipette_pipeline::run_evidence::member_evidence;
 use pipette_plan_types::{
-    AddDescriptorMemberRequest, CatalogName, CatalogScope, ChangeDescriptorEntryStateRequest,
-    ClientId, CreateDescriptorEntryRequest, DescriptorCatalogQuery, DescriptorCatalogShortList,
-    DescriptorCatalogShortListItem, DescriptorDigestNames, DescriptorDigestQuery, DescriptorEntry,
-    DescriptorEntryAction, DescriptorEntryCreator, DescriptorEntryListRow, DescriptorEntryLookup,
-    DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberCoverage,
-    DescriptorMemberDescriptor, DescriptorMemberKey, DescriptorMemberParameters,
+    AddDescriptorMemberRequest, AuditActor, AuditTarget, CatalogName, CatalogScope,
+    ChangeDescriptorEntryStateRequest, ClientId, CreateDescriptorEntryRequest,
+    DescriptorCatalogQuery, DescriptorCatalogShortList, DescriptorCatalogShortListItem,
+    DescriptorDigestNames, DescriptorDigestQuery, DescriptorEntry, DescriptorEntryAction,
+    DescriptorEntryCreator, DescriptorEntryListRow, DescriptorEntryLookup, DescriptorEntryState,
+    DescriptorKind, DescriptorMember, DescriptorMemberCoverage, DescriptorMemberDescriptor,
+    DescriptorMemberEvidence, DescriptorMemberKey, DescriptorMemberParameters,
     DescriptorMemberSummary, DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery,
     DescriptorWithheldMember, DescriptorWithheldReasonCode, DescriptorWithheldReport, ListPage,
-    ModelKey, ModelType, OrgId, QualifiedCatalogName, Runtime, RuntimeType, UserPermission,
-    VaultEntry,
+    ModelKey, ModelType, OrgId, QualifiedCatalogName, RelabelDescriptorMemberRequest,
+    RenameDescriptorEntryRequest, Runtime, RuntimeType, UserPermission, VaultEntry,
 };
 use pipette_store::{
-    CatalogEntryKey, ClientListing, DescriptorCatalogStore, DescriptorEntryFilter, drain_clients,
-    drain_model_params, is_content_digest, warn_unreadable_clients, warn_unreadable_model_params,
+    CatalogEntryKey, ClientListing, DescriptorCatalogStore, DescriptorEntryFilter, RunEvidenceRow,
+    drain_clients, drain_model_params, is_content_digest, warn_unreadable_clients,
+    warn_unreadable_model_params,
 };
 
 use crate::{
@@ -97,7 +100,7 @@ fn coverage(
             | OfferError::ModelMember
             | OfferError::NoLoadingRuntime { .. },
         ) => DescriptorMemberCoverage::Unsupported,
-        Err(OfferError::NotMet) => DescriptorMemberCoverage::Covered,
+        Err(OfferError::NotMet | OfferError::NoBuild { .. }) => DescriptorMemberCoverage::Covered,
     }
 }
 
@@ -116,6 +119,7 @@ fn row(
     display_name: QualifiedCatalogName,
     include_members: bool,
     offer_counts: Option<&HashMap<String, usize>>,
+    evidence: Option<&Evidence>,
     parameters: &ParameterRows,
 ) -> Result<DescriptorEntryListRow, AppError> {
     let descriptor_kind = entry.descriptor_kind();
@@ -137,7 +141,16 @@ fn row(
             entry
                 .members
                 .iter()
-                .map(|member| member_view(state, &display_name, member, offer_counts, parameters))
+                .map(|member| {
+                    member_view(
+                        state,
+                        &display_name,
+                        member,
+                        offer_counts,
+                        evidence,
+                        parameters,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
@@ -333,7 +346,7 @@ async fn written_row(
     // The path can use different letter case from the name stored in the entry.
     shown.name = entry.name.clone();
     let parameters = parameter_rows(state, std::iter::once(&entry)).await;
-    row(state, entry, shown, true, None, &parameters)
+    row(state, entry, shown, true, None, None, &parameters)
 }
 
 // POST /api/v1/orgs/{org_id}/descriptor-catalog
@@ -404,6 +417,64 @@ pub async fn add_org_descriptor_member(
     Ok(Json(written_row(&state, entry, shown).await?))
 }
 
+pub async fn rename_org_descriptor_entry(
+    State(state): State<AppState>,
+    active: ActiveUser,
+    ApiPath((Parsed(org_id), Parsed(name))): ApiPath<(Parsed<OrgId>, Parsed<CatalogName>)>,
+    ApiJson(body): ApiJson<RenameDescriptorEntryRequest>,
+) -> Result<Json<DescriptorEntryListRow>, AppError> {
+    let caller = active.caller();
+    let scope = write_scope(&state, caller, org_id).await?;
+    let store = catalog(&state)?;
+    let shown = write_display_name(&state, store, caller, &scope, &name).await?;
+    let result = descriptor_catalog_admin::rename_entry_with_old_name(
+        store, &scope, &name, &body.name, false,
+    )
+    .await
+    .map_err(write_error)?;
+    let targets = match &scope {
+        CatalogScope::Global => BTreeSet::new(),
+        CatalogScope::Org(org_id) => BTreeSet::from([AuditTarget::Org {
+            org_id: org_id.clone(),
+        }]),
+    };
+    crate::audit::append(
+        &state,
+        AuditActor::User {
+            user_id: active.user.user_id.clone(),
+            key_id: active.key_id.clone(),
+        },
+        result.audit_action(&scope),
+        targets,
+    )
+    .await;
+    Ok(Json(written_row(&state, result.into_entry(), shown).await?))
+}
+
+pub async fn relabel_org_descriptor_member(
+    State(state): State<AppState>,
+    active: ActiveUser,
+    ApiPath((Parsed(org_id), Parsed(name))): ApiPath<(Parsed<OrgId>, Parsed<CatalogName>)>,
+    ApiJson(body): ApiJson<RelabelDescriptorMemberRequest>,
+) -> Result<Json<DescriptorEntryListRow>, AppError> {
+    let caller = active.caller();
+    let scope = write_scope(&state, caller, org_id).await?;
+    let store = catalog(&state)?;
+    let shown = write_display_name(&state, store, caller, &scope, &name).await?;
+    let entry = descriptor_catalog_admin::relabel_entry(
+        store,
+        &scope,
+        &name,
+        body.format,
+        &body.from,
+        &body.to,
+        false,
+    )
+    .await
+    .map_err(write_error)?;
+    Ok(Json(written_row(&state, entry, shown).await?))
+}
+
 // POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/state
 pub async fn change_org_descriptor_entry_state(
     State(state): State<AppState>,
@@ -467,6 +538,7 @@ fn member_view(
     name: &QualifiedCatalogName,
     member: &DescriptorMember,
     offer_counts: Option<&HashMap<String, usize>>,
+    evidence: Option<&Evidence>,
     parameters: &ParameterRows,
 ) -> Result<DescriptorMemberView, AppError> {
     let member_key = member.key();
@@ -503,7 +575,62 @@ fn member_view(
         plan_toml,
         model_key,
         parameters: counts,
+        evidence: evidence.map(|evidence| evidence.of(member)),
     })
+}
+
+/// Rows from the run evidence index for some members, and the device that a
+/// short list names.
+struct Evidence {
+    rows_by_digest: HashMap<String, Vec<RunEvidenceRow>>,
+    device: Option<ClientId>,
+}
+
+/// A member's digest, and its alias when it has one. Run evidence matches a
+/// warehouse row through either.
+fn evidence_digests(member: &DescriptorMember) -> impl Iterator<Item = &str> {
+    [Some(member.digest()), member.alias_digest()]
+        .into_iter()
+        .flatten()
+}
+
+impl Evidence {
+    /// Read the rows of `digests`. `None` without a `[database]`, which alone
+    /// keeps the index. A failed read is an error: an absent row reads as
+    /// "never ran", so a dropped read would mislead.
+    async fn read(
+        state: &AppState,
+        digests: BTreeSet<String>,
+        device: Option<ClientId>,
+    ) -> Result<Option<Self>, AppError> {
+        let Some(index) = state.run_evidence.as_deref() else {
+            return Ok(None);
+        };
+        let digests: Vec<String> = digests.into_iter().collect();
+        let rows = index.find(&digests).await.map_err(AppError::internal)?;
+        let mut rows_by_digest: HashMap<String, Vec<RunEvidenceRow>> = HashMap::new();
+        for row in rows {
+            rows_by_digest
+                .entry(row.digest.clone())
+                .or_default()
+                .push(row);
+        }
+        Ok(Some(Self {
+            rows_by_digest,
+            device,
+        }))
+    }
+
+    fn of(&self, member: &DescriptorMember) -> DescriptorMemberEvidence {
+        let digests: Vec<&str> = evidence_digests(member).collect();
+        let rows: Vec<RunEvidenceRow> = digests
+            .iter()
+            .filter_map(|digest| self.rows_by_digest.get(*digest))
+            .flatten()
+            .cloned()
+            .collect();
+        member_evidence(&digests, &rows, self.device.as_ref())
+    }
 }
 
 fn withheld_reason_code(reason: &OfferError) -> DescriptorWithheldReasonCode {
@@ -513,6 +640,7 @@ fn withheld_reason_code(reason: &OfferError) -> DescriptorWithheldReasonCode {
             DescriptorWithheldReasonCode::Unsupported
         }
         OfferError::NotMet => DescriptorWithheldReasonCode::NotMet,
+        OfferError::NoBuild { .. } => DescriptorWithheldReasonCode::NoBuild,
         OfferError::NoLoadingRuntime { .. } => DescriptorWithheldReasonCode::NoRuntime,
     }
 }
@@ -624,7 +752,8 @@ pub async fn list_descriptor_catalog_for_device(
         .into_iter()
         .partition(|entry| entry.descriptor_kind() == DescriptorKind::Runtime);
     let parameters = parameter_rows(&state, model_entries.iter()).await;
-    let mut items = Vec::new();
+    // Each offered entry with the members that it gives the device.
+    let mut chosen: Vec<(&DescriptorEntry, Vec<&DescriptorMember>)> = Vec::new();
     let mut withheld = Vec::new();
     let mut withheld_entries = 0usize;
     // Every runtime member offered to the device, not only the resolved
@@ -645,22 +774,11 @@ pub async fn list_descriptor_catalog_for_device(
         );
         withheld.extend(refused);
         match descriptor_offer::resolve(entry, config, &client, &tags) {
-            Resolution::Resolved(member) => items.push(DescriptorCatalogShortListItem {
-                name: entry.name.clone(),
-                release_time: entry.release_time,
-                descriptor_kind: DescriptorKind::Runtime,
-                members: vec![member_view(
-                    &state,
-                    &bare_name(entry),
-                    member,
-                    None,
-                    &parameters,
-                )?],
-            }),
+            Resolution::Resolved(member) => chosen.push((entry, vec![member])),
             Resolution::Withheld(_) => withheld_entries += 1,
         }
     }
-    let runtime_items = items.len();
+    let runtime_items = chosen.len();
     for entry in &model_entries {
         let (loadable, refused) = split_verdicts(
             entry,
@@ -675,17 +793,38 @@ pub async fn list_descriptor_catalog_for_device(
             withheld_entries += 1;
             continue;
         }
-        let members = loadable
-            .into_iter()
-            .map(|member| member_view(&state, &bare_name(entry), member, None, &parameters))
-            .collect::<Result<Vec<_>, _>>()?;
-        items.push(DescriptorCatalogShortListItem {
-            name: entry.name.clone(),
-            release_time: entry.release_time,
-            descriptor_kind: DescriptorKind::Model,
-            members,
-        });
+        chosen.push((entry, loadable));
     }
+    // Evidence is read for the offered members only. It never selects one.
+    let digests = chosen
+        .iter()
+        .flat_map(|(_, members)| members.iter().flat_map(|m| evidence_digests(m)))
+        .map(str::to_owned)
+        .collect();
+    let evidence = Evidence::read(&state, digests, Some(client_id.clone())).await?;
+    let items = chosen
+        .iter()
+        .map(|(entry, members)| {
+            Ok(DescriptorCatalogShortListItem {
+                name: entry.name.clone(),
+                release_time: entry.release_time,
+                descriptor_kind: entry.descriptor_kind(),
+                members: members
+                    .iter()
+                    .map(|member| {
+                        member_view(
+                            &state,
+                            &bare_name(entry),
+                            member,
+                            None,
+                            evidence.as_ref(),
+                            &parameters,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
     let withheld = DescriptorWithheldReport {
         member_count: withheld.len(),
         entry_count: withheld_entries,
@@ -831,6 +970,7 @@ pub async fn list_descriptor_catalog(
                 shown,
                 include_members,
                 None,
+                None,
                 &parameters,
             ))
         })
@@ -850,7 +990,8 @@ pub async fn lookup_descriptor_names(
 ) -> Result<Json<DescriptorEntryLookup>, AppError> {
     let store = catalog(&state)?;
     let names = required_batch(query.names, "names")?;
-    if query.offer_counts.unwrap_or(false) {
+    let with_evidence = query.evidence.unwrap_or(false);
+    if query.offer_counts.unwrap_or(false) || with_evidence {
         user.rights.require(UserPermission::ReadClients)?;
     }
     let read = catalog_read_scope(&state, user.caller()).await?;
@@ -880,6 +1021,16 @@ pub async fn lookup_descriptor_names(
     } else {
         None
     };
+    let evidence = if with_evidence {
+        let digests = entries
+            .iter()
+            .flat_map(|e| e.members.iter().flat_map(evidence_digests))
+            .map(str::to_owned)
+            .collect();
+        Evidence::read(&state, digests, None).await?
+    } else {
+        None
+    };
     let parameters = parameter_rows(&state, entries.iter()).await;
     let view = name_view(&state, store, read, entries.iter().map(|e| &e.scope)).await?;
     let entries = entries
@@ -892,6 +1043,7 @@ pub async fn lookup_descriptor_names(
                 shown,
                 true,
                 counts.as_ref(),
+                evidence.as_ref(),
                 &parameters,
             ))
         })

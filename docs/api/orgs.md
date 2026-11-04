@@ -134,9 +134,9 @@ one organization and who changed it, and
 [`GET /api/v1/audit`](orgs/list_audit.md), every audit event.
 
 Each request to a write route (any method but `GET`, `HEAD` and `OPTIONS`)
-creates one audit event, for any answer. The audit log also records a refusal,
-a failure, and a request whose caller left before the answer. The audit log
-does not record these requests:
+creates a request audit event, for any answer. The audit log also records a
+refusal, a failure, and a request whose caller left before the answer. The
+audit log does not record these requests:
 
 - A request that succeeded and changed nothing:
   - a dry run;
@@ -150,19 +150,25 @@ does not record these requests:
   the lease time. A renewal changes nothing that an operator audits.
 - A request that names no caller, claims no id, and does not succeed.
 
-The `status` of an event is the status of the answer. For a streamed answer, it
+The `status` of a request event is the status of the answer. For a streamed answer, it
 is the status of the last line. If the caller leaves first, the `status` is
 `499`. If writes that the request started finish after that, the `status` is
 the status of those writes. The `outcome` is `refused` for a `401`, a `403`, or
 the `404` that hides a record outside the caller's scope.
 
 The audit log also records the [`pipette-mgmt` commands](../cli.md#commands)
-that change records, and, beside its request's own event, an account's first
-Clerk sign-in when the account already held keys: a `first_clerk_sign_in`
-action naming each of them
-([Users: Signing in through Clerk](users.md#signing-in-through-clerk)). Only a
-`[database]` keeps the audit log. Without a
-`[database]`, the server records nothing and both routes answer `404`. The
+that change records. A successful catalog rename adds a `catalog_rename`
+event beside its request or command event. This event records the stored old
+name, the new name, and the scope. A rename that merges two entries adds a
+`catalog_merge` event in its place. This event records the stored old name,
+the name of the target entry, the scope, and the keys of the moved and the
+skipped members.
+
+Beside the request event, the log also records an account's first Clerk
+sign-in when the account already held keys. The `first_clerk_sign_in` action
+names each key ([Users: Signing in through Clerk](users.md#signing-in-through-clerk)).
+Only a `[database]` keeps the audit log. Without a `[database]`, the server
+records nothing and both routes answer `404`. The
 `AuditEvent` schema in the OpenAPI document
 ([the OpenAPI document](../httpapi.md#15-the-openapi-document)) is the shape of
 an event.

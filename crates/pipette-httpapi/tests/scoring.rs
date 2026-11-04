@@ -1206,7 +1206,7 @@ async fn test_asr_eval_scoring_reports_wer_and_its_beams() -> anyhow::Result<()>
     // eval would: the scorer still hears the recipe's mode, off.
     let claimed = "job-6a1f8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({
@@ -1219,7 +1219,8 @@ async fn test_asr_eval_scoring_reports_wer_and_its_beams() -> anyhow::Result<()>
                 "runtime_flags": {"reasoning": "on"},
             },
         }),
-    )?;
+    )
+    .await?;
 
     let job_id = submit_benchmark(
         &state,
@@ -1982,11 +1983,12 @@ async fn test_eval_sample_results_404_for_failed_job() -> anyhow::Result<()> {
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, "eval_test", &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
     let job_id = submit_benchmark(
         &state,
         &sk,
@@ -2232,7 +2234,7 @@ async fn assert_score_request_body(
         let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
         // A plan-authored group, axis keys included.
         seed_leased(
-            dir.path(),
+            state.todo_store.as_ref(),
             claimed,
             &client_id,
             &json!({
@@ -2244,7 +2246,8 @@ async fn assert_score_request_body(
                     "model_flags": model_flags,
                 },
             }),
-        )?;
+        )
+        .await?;
         body.as_object_mut()
             .context("the submission is a JSON object")?
             .insert("job_id".to_string(), json!(claimed));
@@ -2932,7 +2935,7 @@ async fn test_requested_and_effective_flags_both_reach_the_warehouse() -> anyhow
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &json!({
@@ -2944,7 +2947,8 @@ async fn test_requested_and_effective_flags_both_reach_the_warehouse() -> anyhow
                 "runtime_flags": {"runtime_type": "llamacpp_cli_stock_tools", "n_gpu_layers": 99},
             },
         }),
-    )?;
+    )
+    .await?;
 
     let mut body = json!({
         "job_id": claimed,
@@ -4623,11 +4627,12 @@ async fn test_client_failure_records_intended_metric_rows() -> anyhow::Result<()
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, "prefill_throughput_256", &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
 
     submit_benchmark(
         &state,
@@ -4712,11 +4717,12 @@ async fn test_recorded_failure_leaves_incoming_for_processed() -> anyhow::Result
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, "prefill_throughput_256", &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
     submit_benchmark(
         &state,
         &sk,
@@ -4768,11 +4774,12 @@ async fn test_archived_failure_still_reads_as_failed() -> anyhow::Result<()> {
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, "prefill_throughput_256", &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
     submit_benchmark(
         &state,
         &sk,
@@ -4846,7 +4853,7 @@ async fn test_synthetic_failure_records_its_source(
             pipette_plan_types::ExpiresAt::Never
         }
     };
-    let seeded = seed_avail(dir.path(), "job-1", expires_at, &body)?;
+    let seeded = seed_avail(state.todo_store.as_ref(), "job-1", expires_at, &body).await?;
     match retirement {
         Retirement::Expired => {}
         // The whole closed roster has denied it, so no eligible client is left.
@@ -5072,11 +5079,12 @@ async fn test_intended_metric_rows_per_benchmark_type(
 
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, benchmark_id, &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
     submit_benchmark(
         &state,
         &sk,
@@ -5151,11 +5159,12 @@ async fn test_failed_is_not_true_selects_exactly_the_measured_rows() -> anyhow::
     // A failure of the same cell, so both land in one partition.
     let claimed = "job-550e8400-e29b-41d4-a716-446655440000";
     seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         claimed,
         &client_id,
         &failure_job_body(claimed, "prefill_throughput_256", &[client_id.as_str()]),
-    )?;
+    )
+    .await?;
     submit_benchmark(
         &state,
         &sk,

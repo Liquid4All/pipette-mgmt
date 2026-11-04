@@ -12,11 +12,13 @@ nonempty ordered arrays:
   `model` is the model table of a plan. The `quantization` label matches
   `[a-z0-9_]+`. The server derives the format from the model type.
 
-The optional `release_time` follows Request for Comments (RFC) 3339. A runtime
-member cannot use a vault source. An org model member can use vault resources
-owned by that organization. The server checks each resource's owner, record,
-and pinned digest. A verified Hugging Face origin also lets the member name
-result rows that use the model's public alias.
+The optional `release_time` follows Request for Comments (RFC) 3339. Runtime
+and model members can use vault resources owned by that organization. The
+server checks each resource's owner, record, and pinned digest. A resource
+that a user owns does not qualify. The server refuses a resource outside the
+organization with the same message as a resource that does not exist. A
+verified Hugging Face origin also lets a model member name result rows that
+use the model's public alias.
 
 A Hugging Face model member must name only public, ungated repositories. The
 server asks Hugging Face about each repository without a token and pins each

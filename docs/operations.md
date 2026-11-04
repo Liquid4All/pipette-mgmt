@@ -105,39 +105,40 @@ pipette-mgmt --config /etc/pipette-mgmt/config.toml dataset-cache build   # ever
   than serving on a stale `ok`.
 - **`build` only acts on a missing artifact**, so its cadence bounds how long a
   new catalog pin waits to become servable. It never rebuilds or deletes.
+- **An eval corpus is the scores service's package.** The scores service packs
+  every `vlm_eval` and `asr_eval` corpus into `scores-packages/tars/` of
+  `[eval_packages_storage]` (default `[storage]`), and `GET /datasets` streams
+  it from there. `build` registers such a pin without downloading it: the
+  package must have the pinned size and a manifest naming the pin, and the
+  evals server must still serve the pinned samples. A pin whose package the
+  scores service has not written fails every build until it is there. mgmt
+  only reads `scores-packages/tars/`; on S3 its role also needs `s3:ListBucket`
+  on that prefix, so an absent package reads as absent, not as access denied.
 - The two hold separate locks, so an 80 MB build never delays the minute probe,
   and a second run of either exits rather than overlapping.
 - **A crashed build keeps its lock until the lease expires.** On `s3` the
-  `build` lease is the run's worst case: every pinned artifact at its deadline,
-  plus a minute, where an asr-eval corpus counts only while it is unbuilt. So a
-  build killed mid-run (out of memory, an evicted task) blocks the next ones
-  for up to that long: hours while asr-eval corpora are unbuilt. A built
+  `build` lease is the run's worst case: every pinned artifact at
+  `dataset_build_timeout_secs`, plus a minute, where an eval corpus counts only
+  while it is unregistered. So a build killed mid-run (out of memory, an
+  evicted task) blocks the next ones for up to that long. A registered eval
   corpus costs nothing. To clear it sooner, first make sure no `build` is still
   running, then delete `<storage-root>/locks/dataset-cache-build.lock` (the
   lease object; its body names the holder, host, pid and `expires_at`).
   `unlock` clears only the mutate lock. On `local_fs` the lock is a `flock(2)`
   that dies with its process, so there is nothing to clear.
 - **A build checks its corpus against its entry.** An asr-eval corpus must
-  hold its entry's `parameter_sample_count` samples, or the build fails and
-  stores nothing, rather than every device downloading a corpus it then
-  refuses. A corpus already built is held to the same count, so an entry
-  restated with another count fails the next build too (an artifact recorded
-  before it carried `samples` is checked against its stored manifest). A build past its deadline stops streaming and writing before the
-  next one starts, and a `/samples` body that sends nothing for five minutes
-  fails its build.
-- **asr_eval corpora are large.** The largest is many gigabytes per
-  prompt profile and the full catalog's corpora run to well over a hundred
-  gigabytes, so size the `[storage]` volume or bucket for them, give the build
-  host's `TMPDIR` room for twice the largest corpus, and expect the first build to take hours: each corpus
-  streams its whole set from the evals server, one at a time, under
-  `dataset_asr_build_timeout_secs` (default 7200). After an evals server
-  restart, a set's first probe may read `unavailable` until the server has
-  learnt its digests again.
+  hold its entry's `parameter_sample_count` samples, as its package's manifest
+  counts them, or the build fails and `GET /datasets` refuses the entry, rather
+  than every device downloading a corpus it then refuses. A corpus already
+  registered is held to the same count, so an entry restated with another count
+  fails the next build too.
+- **Only git corpora need build scratch**, tens of megabytes each. After an
+  evals server restart, a set's first probe may read `unavailable` until the
+  server has its digests again.
 - Both shell out to `git`: the host or image needs it on `PATH`, and outbound
   HTTPS to each upstream.
-- Both call `evals_server_url` for a `vlm_eval` corpus: `probe` for
-  `/samples/digest` alone, `build` for the whole `/samples` body (POPE's is
-  1.1 GB), streamed to disk.
+- Both call `evals_server_url` for an eval corpus, for `/samples/digest`
+  alone: `probe` every minute, `build` once per registration.
 
 ### 3.0.1. Descriptor catalog import
 
@@ -169,28 +170,21 @@ starts hidden. To import older daily entries, run
 `pipette-mgmt-catalog` log at the end of each run:
 
 - `INFO` `catalog import run finished`: the run succeeded. The line has the
-  fields `run_id`, `command`, `entries_created`, `members_added`, and
-  `entries_hidden`.
+  fields `run_id`, `command`, `entries_created`, `members_added`,
+  `entries_hidden`, and `unclassified_assets`.
 - `ERROR` `catalog import run failed`: the run recorded an error. The line has
-  the same fields, plus `error` and `unclassified_assets`.
+  the same fields, plus `error`.
 
 Alert when no `catalog import run finished` line with `command=import` appears
 in 36 hours. Set the alarm to fire on missing data, because a stopped schedule
 writes no line. Enable the alarm after you enable the daily import schedule.
 
-A `catalog import run failed` line with `unclassified_assets` above zero and
-`error` equal to `<n> unclassified assets` is an unclassified-assets report.
-The importer finished its catalog work but found assets that it could not
-classify. Any other `catalog import run failed` line is a failed import.
 A run that stops before it records its end writes no line. Its row stays
 `running`, and the query below reports it as `interrupted` after 6 hours.
 
 When the alert fires, run this query against PostgreSQL. The
-`latest_import_outcome` column tells an unclassified-assets report apart from a
-failed import. It uses the same rule as the `outcome` field of the
-[run history](api/descriptor-catalog/list_catalog_import_runs.md). Keep the
-`' unclassified assets'` text equal to `unclassified_summary` in
-`pipette-plan-types`:
+`latest_import_outcome` column uses the same rule as the `outcome` field of the
+[run history](api/descriptor-catalog/list_catalog_import_runs.md):
 
 ```sql
 SELECT success.last_successful_import_at,
@@ -202,9 +196,6 @@ SELECT success.last_successful_import_at,
            AND latest.started_at < now() - interval '6 hours' THEN 'interrupted'
          WHEN latest.result = 'running' THEN 'running'
          WHEN latest.result = 'success' THEN 'success'
-         WHEN jsonb_array_length(latest.unclassified_assets) > 0
-           AND latest.error_summary = jsonb_array_length(latest.unclassified_assets)::text || ' unclassified assets'
-           THEN 'unclassified'
          ELSE 'failed'
        END AS latest_import_outcome,
        latest.error_summary
@@ -214,7 +205,7 @@ FROM (
   WHERE command = 'import' AND result = 'success'
 ) AS success
 LEFT JOIN LATERAL (
-  SELECT id, started_at, result, unclassified_assets, error_summary
+  SELECT id, started_at, result, error_summary
   FROM catalog_import_runs
   WHERE command = 'import'
   ORDER BY started_at DESC, id DESC
@@ -223,14 +214,19 @@ LEFT JOIN LATERAL (
 ```
 
 The alert detects a stopped daily import schedule, even if the catalog still
-lists active entries. A successful `refresh` does not reset it. An import that
-finishes with unclassified assets logs `catalog import run failed`, so it does
-not reset the 36-hour limit. Handle it separately from a failed import:
+lists active entries. A successful `refresh` does not reset it.
 
-1. Inspect the unclassified assets in the
+**Unclassified assets.** An asset that the flavor table does not know becomes
+no member, but the run still succeeds. The importer logs each asset at `INFO`
+with the message `catalog asset is not classified` and the fields
+`release_tag` and `asset`. The run history lists the assets of each run. If a
+build variant is necessary:
+
+1. Find the asset names in the
    [run history](api/descriptor-catalog/list_catalog_import_runs.md).
-2. Update the flavor table.
-3. Run `catalog refresh` for the affected entries.
+2. Add the flavor to the flavor table.
+3. Run `catalog refresh` for each affected entry that is not active. The next
+   import adds the member to the active entries.
 
 For an upstream or storage error, inspect the run's `error_summary` and the
 `pipette-mgmt-catalog` logs.
@@ -323,15 +319,31 @@ carrying its figures as fields:
   `queue-maintenance: plan status changed` with `from` and `to`. A plan that
   fails gets the `WARN` `queue-maintenance: failed to reconcile a plan`.
 
-Each attempt that gets no response logs a `WARN`,
-`S3 request attempt got no response`, naming the client, method, path, bucket
-host, the time waited and the error. The `object_store` client waits 5 s to
-connect and 30 s for the request, and retries a request it can safely resend.
-To fail a stalled request sooner, set `queue_maintenance_read_timeout_secs`.
-The `aws-sdk-s3` client of the `todo/` queue waits 3.1 s to connect,
-`todo_attempt_timeout_secs` (default 5 s) for each attempt, and
-`todo_operation_timeout_secs` (default 20 s) for the whole request with its
-retries.
+S3 request attempts that reach the HTTP connector without an answer log
+`S3 request attempt got no response`, with the client, method, path, host,
+wait time and error. The SDK's per-attempt timeout can end an attempt before
+that connector emits a log, so the request log does not count every slow
+attempt. The `object_store` client waits 5 s to connect and 30 s for a
+request. To fail a stalled maintenance read sooner, set
+`queue_maintenance_read_timeout_secs`.
+
+The `todo/` queue's S3 client uses `todo_attempt_timeout_secs` (default 5 s)
+per attempt and `todo_operation_timeout_secs` (default 20 s) per call. A
+promotion `RenameObject` raises those limits to at least 20 s per attempt and
+40 s per call. Larger configured limits still apply. If a rename reports an
+error, the store reads its destination. A
+present destination means the move landed. If it is absent, only promotion
+may send once more, within a budget twice its operation timeout (80 s with
+the defaults). Its `WARN` includes the full
+first error chain. Other queue renames do not resend after an SDK failure.
+
+Each filing emits `plan job promotion latency` with its plan ID, completed
+promotion count, failure count, p50, p95, p99 and maximum call duration in
+milliseconds. The sample includes completed promotions before a filing error;
+in-flight promotions dropped on that error have no duration. Use the next
+large filing's values to size the provisional promotion timeout. The call
+duration includes any destination read and resend, so the maximum is the
+relevant bound for the whole promotion, not one RenameObject attempt.
 
 ### 3.2. Eligible index maintenance
 
@@ -363,6 +375,55 @@ one host:
 
 If a run does not happen, the audit log keeps the old events until the next
 run deletes them.
+
+### 3.5. Recover from a failed campaign filing
+
+A filing writes its plan and jobs before it writes the campaign. If it fails
+while staging, the plan can remain `creating` with promoted jobs in `avail/`.
+Queue maintenance leaves those jobs out of the eligible index while no final
+plan also holds them ([queue.md](queue.md#committed-filings)). A job already
+leased to a device can continue running. **Refile before you cancel or wait
+for teardown** if you want to preserve those jobs and results.
+
+1. **Find the plan and campaign.** Get their IDs from the error or the server
+   log's `request failed` line (`promoting job <job_id> for <plan_id>`). A
+   campaign-write error with an unknown outcome names both IDs. Read the
+   campaign with `pipette-mgmt campaigns show <campaign_id>`. If its current
+   plan or history includes `<plan_id>`, the filing completed. Stop here. A
+   negative read immediately after a timed-out campaign write does not prove
+   that the write will never land. Do not cancel or refile that plan until its
+   write outcome is reconciled. The remaining steps cover a staging failure
+   or a confirmed orphan.
+2. **Read the plan and record its work.** Run `pipette-mgmt plans status
+   <plan_id> --explain --leases` and note its status, available and leased job
+   counts, and the clients under **Running now**. Save recorded results with
+   `pipette-mgmt plans results <plan_id> --json`. Check how much time remains
+   before `plan_creating_max_age_secs` (default 6 hours) tears down a plan
+   stuck in `creating`.
+3. **Refile the same document before that deadline.** Use the same owner and
+   filing operation (`campaigns create` for a failed creation), not `--dry-run`.
+   Keep duplicate merging
+   enabled. A live job with the same content key joins the new plan; a
+   completed cell can reuse its result for the same owner. A job already gone
+   from both queue stages must be minted again. Do not cancel the old plan
+   before the new filing succeeds: teardown would retire its exclusive jobs
+   and end their leases.
+4. **Verify the new filing.** Its final response must report success (`201`
+   over HTTP). Compare `merged_job_count` with the old plan's available plus
+   leased jobs from step 2. The count includes finished runs reused, so it
+   should be at least that live count when those jobs remain in the queue.
+   Read the new campaign and plan to confirm they exist. If the filing fails,
+   retry with the same document before the old plan's teardown deadline.
+5. **Let the old plan finish cleanup.** A `creating` plan past its age limit
+   is torn down by queue maintenance. It releases jobs that the new plan now
+   holds and retires only jobs with no other member. No manual cancel is
+   needed. If the orphan was already final, cancel it only after the new
+   filing succeeds, then verify that its shared jobs remain with the new plan.
+
+A failed retry can leave extra membership markers even if it wrote no new
+manifest. Check the new campaign and plan, not only its HTTP status. Keep the
+original plan uncancelled while you retry; a later maintenance pass can then
+release its joined jobs to the successful filing.
 
 ## 4. Reprocessing
 
@@ -469,6 +530,12 @@ region = "us-east-1"
 [todo_storage]
 backend = "s3"
 bucket = "my-pipette-todo--use1-az4--x-s3"  # Express One Zone bucket naming convention
+region = "us-east-1"
+
+# The eval corpora the scores service packs, which mgmt only reads (§3.0).
+[eval_packages_storage]
+backend = "s3"
+bucket = "my-eval-datasets"
 region = "us-east-1"
 ```
 

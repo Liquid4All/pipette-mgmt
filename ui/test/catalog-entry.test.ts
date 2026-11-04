@@ -20,6 +20,9 @@ const VAULT = JSON.stringify({
   principal_id: ACME, flavor: "linux-x64-rocm",
 });
 
+/** The read's names of the vault resources that exist and that the reader can reach. */
+const RESOURCES = { vault_1: "fork" };
+const vaultRuntime = (more: Record<string, unknown>) => JSON.stringify({ ...JSON.parse(VAULT), ...more });
 const COMMIT = "c".repeat(40);
 const hf = (more: Record<string, unknown> = {}) => ({ source: "huggingface", org: "acme", repo_name: "AcmeLM-MLX", ...more });
 const model = (value: Record<string, unknown>) => JSON.stringify(value);
@@ -69,9 +72,9 @@ describe("a catalog entry from a campaign's progress table", () => {
     expect(displayOf([])).toBeNull();
   });
 
-  test("counts only a name of the same kind in the organization itself", () => {
+  test("counts only a name of the same kind in the organization or in the global scope", () => {
     expect(namedIn([hit(ACME, "my-fork")], ACME, "runtime")).toBe(true);
-    expect(namedIn([hit("global", "llamacpp-v0.7.0")], ACME, "runtime")).toBe(false);
+    expect(namedIn([hit("global", "llamacpp-v0.7.0")], ACME, "runtime")).toBe(true);
     expect(namedIn([hit("org_beta", "their-fork")], ACME, "runtime")).toBe(false);
     expect(namedIn([modelHit(ACME, "a-model")], ACME, "runtime")).toBe(false);
     expect(namedIn([modelHit(ACME, "a-model")], ACME, "model")).toBe(true);
@@ -90,22 +93,34 @@ describe("a catalog entry from a campaign's progress table", () => {
 
   test.each([
     ["an unnamed runtime", RUNTIME, DIGEST, new Map(), "create"],
-    ["a runtime with a global name only", RUNTIME, DIGEST, new Map([[DIGEST, [hit("global", "b11669")]]]), "create"],
+    ["a runtime with a global name only", RUNTIME, DIGEST, new Map([[DIGEST, [hit("global", "b11669")]]]), null],
+    ["a runtime with another organization's name only", RUNTIME, DIGEST,
+     new Map([[DIGEST, [hit("org_beta", "their-fork")]]]), "create"],
     ["a runtime that the organization names", RUNTIME, DIGEST, new Map([[DIGEST, [hit(ACME, "my-fork")]]]), null],
-    ["a vault runtime", VAULT, DIGEST, new Map(), "vault"],
+    ["a vault runtime", VAULT, DIGEST, new Map(), "create"],
+    ["a vault runtime whose resource is gone", vaultRuntime({ url: "/vault/resources/vault_gone/content" }), DIGEST,
+     new Map(), null],
+    ["a member's vault runtime", vaultRuntime({ principal_id: "user_1" }), DIGEST, new Map(), null],
+    ["another organization's vault runtime", vaultRuntime({ principal_id: "org_beta" }), DIGEST, new Map(), null],
     ["a runtime without a digest", RUNTIME, undefined, new Map(), null],
     ["a runtime before the names are read", RUNTIME, DIGEST, null, null],
   ])("offers %s: %j", (_, descriptor, digest, names, offer) => {
-    expect(entryOffer(descriptor, "runtime", digest, names, ACME)).toBe(offer);
+    expect(entryOffer(descriptor, "runtime", digest, names, ACME, RESOURCES)).toBe(offer);
   });
 
   test.each([
     ["a pinned Hugging Face model", GGUF, new Map(), "create"],
-    ["a model with a global name only", GGUF, new Map([[DIGEST, [modelHit("global", "acmelm")]]]), "create"],
+    ["a model with a global name only", GGUF, new Map([[DIGEST, [modelHit("global", "acmelm")]]]), null],
     ["a model that the organization names", GGUF, new Map([[DIGEST, [modelHit(ACME, "acmelm")]]]), null],
     ["a model with only a runtime name in the organization", GGUF, new Map([[DIGEST, [hit(ACME, "my-fork")]]]), "create"],
     ["a vault model", model({ type: "gguf_text", source: "vault_url", url: "/vault/resources/vault_1/content",
                               principal_id: ACME }), new Map(), "create"],
+    ["a vault model whose resource is gone",
+     model({ type: "gguf_text", source: "vault_url", url: "/vault/resources/vault_gone/content", principal_id: ACME }),
+     new Map(), null],
+    ["another organization's vault model",
+     model({ type: "gguf_text", source: "vault_url", url: "/vault/resources/vault_1/content", principal_id: "org_beta" }),
+     new Map(), null],
     ["a model with vault and Hugging Face sources",
      model({ type: "mlx_speculative", target: hf({ revision: COMMIT }),
              draft: { source: "vault_archive", url: "/vault/resources/vault_1/content", principal_id: ACME } }),
@@ -128,13 +143,12 @@ describe("a catalog entry from a campaign's progress table", () => {
      new Map(), "create"],
     ["a model before the names are read", GGUF, null, null],
   ])("offers %s", (_, descriptor, names, offer) => {
-    expect(entryOffer(descriptor, "model", DIGEST, names, ACME)).toBe(offer);
+    expect(entryOffer(descriptor, "model", DIGEST, names, ACME, RESOURCES)).toBe(offer);
   });
 
   test("says why each disabled button cannot create an entry", () => {
-    expect(offerReason("vault", "runtime")).toBe("The catalog cannot name a vault runtime yet.");
-    expect(offerReason("foreign", "model")).toBe("The catalog names models on Hugging Face or in the organization's vault.");
-    expect(offerReason("unpinned", "model")).toMatch(/^This model names no commit\./);
+    expect(offerReason("foreign")).toBe("The catalog names models on Hugging Face or in the organization's vault.");
+    expect(offerReason("unpinned")).toMatch(/^This model names no commit\./);
   });
 
   test("reads the digests in batches the route takes, each digest once", () => {
@@ -165,8 +179,20 @@ describe("a catalog entry from a campaign's progress table", () => {
      "The server refused the member: 409: duplicate member flavor linux-x64-vulkan"],
     [new ApiError(502, "bad gateway"), "member",
      "The server failed (502: bad gateway). Read the page again to see whether the server added the member."],
-  ] as const)("says why a write failed: %s (%s)", (error, noun, said) => {
-    expect(writeFailure(error, noun)).toBe(said);
+    [new ApiError(409, "catalog name AcmeLM is already held"), "name",
+     "The server refused the name: 409: catalog name AcmeLM is already held"],
+    [new ApiError(502, "bad gateway"), "name",
+     "The server failed (502: bad gateway). Read the page again to see whether the server renamed the entry."],
+    [new ApiError(409, "a gguf member holds the label q4_0"), "label",
+     "The server refused the label: 409: a gguf member holds the label q4_0"],
+    [new TypeError("Failed to fetch"), "label",
+     "No answer from the server (Failed to fetch). Read the page again to see whether the server changed the label."],
+    [new ApiError(409, "entry is pinned, not active"), "state",
+     "The server refused the change: 409: entry is pinned, not active"],
+    [new ApiError(500, "internal"), "state", "The server failed (500: internal). Read the page again to see whether "
+     + "the server changed the state of the entry."],
+  ] as const)("says why a write failed: %s (%s)", (error, write, said) => {
+    expect(writeFailure(error, write)).toBe(said);
   });
 });
 
@@ -191,10 +217,20 @@ describe("the target of a typed name in the dialog", () => {
     descriptor_kind: "runtime", descriptor_types: ["llamacpp_cli_stock_tools"],
     members: [runtimeMember({ ...LLAMACPP, flavor: "macos-arm64" })],
   });
-  const entries = [model, hidden, build];
+  const VAULT_BUILD = { type: "llamacpp_cli_stock_tools", source: "vault_remote_archive",
+                        url: "/vault/resources/vault_1/content", principal_id: ACME };
+  const vaultBuild = entry("vault-build", {
+    descriptor_kind: "runtime", descriptor_types: ["llamacpp_cli_stock_tools"],
+    members: [runtimeMember({ ...VAULT_BUILD, custom_label: "nightly", flavor: "macos-arm64" })],
+  });
+  const entries = [model, hidden, build, vaultBuild];
   const aModel = { kind: "model", value: { type: "gguf_text" } } as const;
   const sameBuild = { kind: "runtime", value: { ...LLAMACPP, flavor: "linux-x64-vulkan" } } as const;
   const otherBuild = { kind: "runtime", value: { ...LLAMACPP, repository_version: "b11670", flavor: "linux-x64" } } as const;
+  const renamedVault = { kind: "runtime",
+                         value: { ...VAULT_BUILD, custom_label: "renamed", flavor: "linux-x64" } } as const;
+  const otherVault = { kind: "runtime", value: { ...VAULT_BUILD, url: "/vault/resources/vault_2/content",
+                                                 custom_label: "nightly", flavor: "linux-x64" } } as const;
 
   test.each<[string, string, DescriptorEntryListRow[], { kind: DescriptorKind; value: unknown }, EntryTarget]>([
     ["a model, no entries", "acme-lm", [], aModel, { to: "create" }],
@@ -207,6 +243,9 @@ describe("the target of a typed name in the dialog", () => {
     ["a runtime, a flavor of the build", "my-build", entries, sameBuild, { to: "add", entry: build }],
     ["a runtime, another build", "my-build", entries, otherBuild, { to: "taken", why: "build", entry: build }],
     ["a runtime, a model entry", "acme-lm", entries, sameBuild, { to: "taken", why: "kind", entry: model }],
+    ["a vault runtime under another label", "vault-build", entries, renamedVault, { to: "add", entry: vaultBuild }],
+    ["a vault runtime of another resource", "vault-build", entries, otherVault,
+     { to: "taken", why: "build", entry: vaultBuild }],
   ])("%s", (_, name, rows, descriptor, expected) => {
     expect(entryTarget(name, rows, descriptor)).toEqual(expected);
   });

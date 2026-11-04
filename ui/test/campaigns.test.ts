@@ -2,9 +2,9 @@ import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
 import {
   CAMPAIGN_PAGES, LABELS_MAX, NAME_MAX_CHARS, NOTE_MAX_CHARS, campaignPlan, campaignQuery, campaignTable, chosenOwner, createQuery,
-  deviceTimeText, handedAway, stateOf, headAddress, knownLabels, labelLink, labelPairs, labelText, labelVocabulary, labelsBody,
+  deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelLink, labelPairs, labelText, labelVocabulary, labelsBody,
   labelScope, labelsProblem, mayLabel, nameProblem, newCampaignAction, newCampaignOwners, newCampaignRefusal, noteProblem,
-  parseLabel, planTrail, progressText, renameBody, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText,
+  parseLabel, planTrail, progressText, renameBody, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
   repeatedText, restoreEdit, revertOffered, revisionQuery, revisionSummary, importKey, importLine, importText, withLabel, withoutLabel, withVariantsOf,
 } from "../src/lib/campaigns";
 import { ownedEmpty, ownerBranch, underTrail } from "../src/lib/owned";
@@ -32,10 +32,34 @@ describe("the campaign listings", () => {
       .toEqual(["order=newest&plan=true&state=archived&owner=mine", "order=newest&plan=true&owner=mine"]);
   });
 
+  test("a job id keeps the campaigns of the plans that asked for it, and none for a job in no plan the reader reads", async () => {
+    const plans = (...campaign_ids: (string | null)[]) =>
+      Promise.resolve({ plans: campaign_ids.map((campaign_id) => ({ campaign_id })) });
+    // A plan filed outside any campaign adds none.
+    expect(await jobCampaigns(plans("campaign_1", null, "campaign_2", "campaign_1")))
+      .toEqual(new Set(["campaign_1", "campaign_2"]));
+    expect(await jobCampaigns(Promise.reject(new ApiError(404, "no readable plan holds this job")))).toEqual(new Set());
+    await expect(jobCampaigns(Promise.reject(new ApiError(400, "invalid job_id")))).rejects.toThrow("400: invalid job_id");
+    await expect(jobCampaigns(Promise.reject(new ApiError(403, "needs read_plans")))).rejects.toThrow("403: needs read_plans");
+  });
+
   test("an empty branch says so in the classic words", () => {
     expect(ownedEmpty({ kind: "me" }, "campaigns")).toBe("You own no campaigns.");
     expect(ownedEmpty(acme, "campaigns")).toBe("acme owns no campaigns you may see.");
     expect(ownedEmpty({ kind: "all" }, "campaigns")).toBe("No campaigns you may see.");
+  });
+
+  test("a branch that keeps no campaign for an id names the branch", () => {
+    expect(soughtEmpty({ kind: "me" }, "job-1")).toBe("You own no campaign that holds job-1.");
+    expect(soughtEmpty(acme, "plan-1 and job-1")).toBe("acme owns no campaign you may see that holds plan-1 and job-1.");
+    expect(soughtEmpty({ kind: "all" }, "job-1")).toBe("No campaign you may see holds job-1.");
+  });
+
+  test("a job's campaigns outside the listing are counted on one's own and an organization's, without a plan id", () => {
+    const ran = new Set(["campaign_1", "campaign_2", "campaign_3"]);
+    expect([outsideCount({ kind: "me" }, "", ran, 1), outsideCount(acme, "", ran, 3), outsideCount({ kind: "all" }, "", ran, 2),
+            outsideCount({ kind: "me" }, "plan-1", ran, 1), outsideCount({ kind: "me" }, "", undefined, 0)])
+      .toEqual([2, 0, 0, 0, 0]);
   });
 
   test("an organization's New campaign opens the form with it as the owner", () => {

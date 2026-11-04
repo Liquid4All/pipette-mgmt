@@ -322,7 +322,7 @@ async fn only_a_device_that_may_fetch_the_model_reports_its_result(
     #[case] refusal: Option<&str>,
     #[case] recorded: bool,
 ) -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
     let other_org = create_org(&state, &admin, "rival").await?;
@@ -333,11 +333,12 @@ async fn only_a_device_that_may_fetch_the_model_reports_its_result(
 
     let job_id = VAULT_JOB;
     let job = seed_leased(
-        dir.path(),
+        state.todo_store.as_ref(),
         job_id,
         &device_id,
         &vault_job(&resource_id, &org_id),
-    )?;
+    )
+    .await?;
     let leases = state.todo_store.list_leased_for_client(&device_id).await?;
 
     let mut result = if kind == "success" {
@@ -404,7 +405,7 @@ async fn only_a_device_that_may_fetch_the_model_holds_its_lease(
     #[case] held: bool,
     #[case] status: StatusCode,
 ) -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
     let other_org = create_org(&state, &admin, "rival").await?;
@@ -415,9 +416,16 @@ async fn only_a_device_that_may_fetch_the_model_holds_its_lease(
 
     let body = vault_job(&resource_id, &org_id);
     let job = if held {
-        seed_leased(dir.path(), VAULT_JOB, &device_id, &body)?
+        seed_leased(state.todo_store.as_ref(), VAULT_JOB, &device_id, &body).await?
     } else {
-        let job = seed_avail(dir.path(), VAULT_JOB, ExpiresAt::Never, &body)?;
+        let job = seed_avail(
+            state.todo_store.as_ref(),
+            VAULT_JOB,
+            ExpiresAt::Never,
+            &body,
+        )
+        .await?;
+        commit_job(&state, &job).await?;
         state
             .todo_store
             .write_eligible(&device_id, &job, ExpiresAt::Never)
@@ -483,7 +491,7 @@ async fn a_claim_moves_past_a_vault_job_it_puts_back(
     #[case] member: bool,
     #[case] well_formed: bool,
 ) -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
     let other_org = create_org(&state, &admin, "rival").await?;
@@ -496,18 +504,22 @@ async fn a_claim_moves_past_a_vault_job_it_puts_back(
     // Sooner than `never`, so the vault job ranks first.
     let soon = ExpiresAt::At(chrono::Utc::now() + chrono::Duration::days(1));
     let vault = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         VAULT_JOB,
         soon,
         &vault_job(&resource_id, principal),
-    )?;
+    )
+    .await?;
     let other_id = "job-6ba7b810-9dad-11d1-80b4-00c04fd430c8";
     let other = seed_avail(
-        dir.path(),
+        state.todo_store.as_ref(),
         other_id,
         ExpiresAt::Never,
         &json!({"job_id": other_id, "expires_at": "never", "spec": {"benchmark": "prefill_throughput_256"}}),
-    )?;
+    )
+    .await?;
+    commit_job(&state, &vault).await?;
+    commit_job(&state, &other).await?;
     state
         .todo_store
         .write_eligible(&device_id, &vault, soon)

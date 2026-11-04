@@ -1,5 +1,5 @@
 //! A benchmark's corpus as a client reads it: the upstream pin, the artifact
-//! mgmt repacks it into, and where to download it. The whole pin travels, as it
+//! it is repacked into, and where to download it. The whole pin travels, as it
 //! is what says which corpus a result measured.
 
 use serde::{Deserialize, Serialize};
@@ -172,9 +172,11 @@ pub enum DatasetUpstream {
         prompt_profile: Option<NonEmptyString>,
         /// The digest the evals server reports for those samples
         /// (`GET …/samples/digest`, the hex after `sha256:`): what the probe
-        /// compares and the build recomputes from every sample it packs.
+        /// compares and the scores service's packer recomputes from every
+        /// sample it packs.
         identity: Sha256,
-        /// Recorded, not interpreted.
+        /// Leave it out: the scores service's packages carry none, so a build
+        /// refuses a pin with one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         license: Option<String>,
     },
