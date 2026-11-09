@@ -8,8 +8,9 @@ use std::sync::LazyLock;
 use chrono::{DateTime, Utc};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
-use pipette_plan_types::{ClientId, ELLIPSIS, keep_tail};
+use pipette_plan_types::{ClientId, ELLIPSIS, FailureCode, keep_tail};
 
 /// The first words of every all-denied failure message.
 const ALL_DENIED_HEADLINE: &str = "All eligible clients reported failure";
@@ -49,6 +50,8 @@ pub struct DenialRecord {
     /// The client's `failure_reason`, cut to [`MAX_STORED_REASON_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub failure_code: FailureCode,
     /// The client's `client_version`, cut to [`MAX_STORED_VERSION_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
@@ -61,12 +64,14 @@ impl DenialRecord {
     pub fn new(
         denied_at: DateTime<Utc>,
         failure_reason: &str,
+        failure_code: FailureCode,
         client_version: Option<&str>,
         runtime_version: Option<&str>,
     ) -> Self {
         Self {
             denied_at: Some(denied_at),
             failure_reason: Some(keep_tail(failure_reason, MAX_STORED_REASON_BYTES)),
+            failure_code,
             client_version: client_version.map(|v| keep_tail(v, MAX_STORED_VERSION_BYTES)),
             runtime_version: runtime_version.map(|v| keep_tail(v, MAX_STORED_VERSION_BYTES)),
         }
@@ -93,6 +98,24 @@ pub struct DeniedClient {
     /// The member's stored denial, or `None` if the escalation cannot read the
     /// marker. An empty marker holds the default record.
     pub record: Option<DenialRecord>,
+}
+
+/// The code most members' denials name, `unspecified` ones aside, for a job
+/// every roster member denied. A tie goes to the code declared first.
+pub fn prevailing_failure_code(denials: &[DeniedClient]) -> FailureCode {
+    FailureCode::iter()
+        .filter(|code| *code != FailureCode::Unspecified)
+        .map(|code| {
+            let named = denials
+                .iter()
+                .filter(|d| d.record.as_ref().is_some_and(|r| r.failure_code == code))
+                .count();
+            (named, code)
+        })
+        .filter(|(named, _)| *named > 0)
+        .rev()
+        .max_by_key(|(named, _)| *named)
+        .map_or(FailureCode::Unspecified, |(_, code)| code)
 }
 
 /// The failure message for a job that every roster member denied.
@@ -536,6 +559,37 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::none_coded(&[Some(FailureCode::Unspecified), None], FailureCode::Unspecified)]
+    #[case::majority(
+        &[Some(FailureCode::RuntimeError), Some(FailureCode::OutOfMemory), Some(FailureCode::OutOfMemory), Some(FailureCode::Unspecified)],
+        FailureCode::OutOfMemory
+    )]
+    #[case::tie_goes_first_declared(
+        &[Some(FailureCode::HarnessError), Some(FailureCode::AttemptTimeout)],
+        FailureCode::AttemptTimeout
+    )]
+    fn the_prevailing_code_is_the_most_named(
+        #[case] codes: &[Option<FailureCode>],
+        #[case] expected: FailureCode,
+    ) -> anyhow::Result<()> {
+        let denials = codes
+            .iter()
+            .enumerate()
+            .map(|(i, code)| {
+                Ok(DeniedClient {
+                    client_id: ClientId::try_new(format!("ev1_{i}"))?,
+                    record: code.map(|failure_code| DenialRecord {
+                        failure_code,
+                        ..DenialRecord::default()
+                    }),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(prevailing_failure_code(&denials), expected);
+        Ok(())
+    }
+
     #[test]
     fn groups_past_the_limit_are_counted() -> anyhow::Result<()> {
         let denials = (0..7)
@@ -613,7 +667,13 @@ mod tests {
             .map(|(pid, client_id)| {
                 Ok(DeniedClient {
                     client_id: ClientId::try_new(client_id)?,
-                    record: Some(DenialRecord::new(Utc::now(), &reason(pid), None, None)),
+                    record: Some(DenialRecord::new(
+                        Utc::now(),
+                        &reason(pid),
+                        FailureCode::Unspecified,
+                        None,
+                        None,
+                    )),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -665,7 +725,13 @@ mod tests {
     #[test]
     fn new_caps_the_stored_fields() -> anyhow::Result<()> {
         let long = "x".repeat(MAX_STORED_REASON_BYTES * 2);
-        let record = DenialRecord::new(Utc::now(), &long, Some("1.4.2"), Some(&long));
+        let record = DenialRecord::new(
+            Utc::now(),
+            &long,
+            FailureCode::OutOfMemory,
+            Some("1.4.2"),
+            Some(&long),
+        );
         let back = DenialRecord::from_bytes(&record.to_bytes()?)?;
         assert!(
             back.failure_reason

@@ -500,8 +500,6 @@ pub struct ClientListRow {
     /// The device takes no work until maintenance re-evaluates its eligible
     /// jobs.
     pub reindex_pending: bool,
-    /// The claim path passes the device over until its suspension is cleared.
-    pub suspended: bool,
     /// The time of the device's last verified, signed request, accurate to
     /// the server's stamp interval. `null` when the server holds no stamp for
     /// the device.

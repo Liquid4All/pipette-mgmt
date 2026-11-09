@@ -346,6 +346,12 @@ pub struct CampaignView {
     /// or whose manifest does not read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanSummary>,
+    /// The source reference of each model in the plan document that `plan`
+    /// summarizes, in document order, each one time. Only the listing gives it,
+    /// with `models=true`. Absent where `plan` is absent, and for a plan whose
+    /// document does not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
 }
 
 /// The device time a set of plans spent, each job at its latest scoring run.
@@ -562,7 +568,8 @@ pub struct CampaignReadQuery {
     pub plan: Option<bool>,
 }
 
-/// The filter `GET /api/v1/campaigns` takes beside its owner filters.
+/// What `GET /api/v1/campaigns` takes beside its owner filters and
+/// [`CampaignReadQuery`]: its filters, and the models of each row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CampaignListQuery {
@@ -580,6 +587,14 @@ pub struct CampaignListQuery {
         skip_serializing_if = "Option::is_none"
     )]
     pub state: Option<CampaignState>,
+    /// Each row's `models`, the models its plan document names. Needs
+    /// `plan=true`.
+    #[serde(
+        default,
+        deserialize_with = "crate::empty_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub models: Option<bool>,
 }
 
 /// What `GET /api/v1/campaigns/{campaign_id}/overview` adds.

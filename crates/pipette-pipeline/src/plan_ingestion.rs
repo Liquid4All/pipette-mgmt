@@ -21,7 +21,7 @@ use pipette_core::matching::{
     job_matches_client,
 };
 use pipette_core::plan::{JobExpiry, PlanManifest, PlanNotes, PlanSource, StarvedGroup, past_gate};
-use pipette_core::todo_filename::{parse_avail_filename, parse_leased_key};
+use pipette_core::todo_filename::{Lease, parse_avail_filename};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
     BenchmarkId, BenchmarkType, CampaignId, ClientRunSpec, EvalContextError, ExpiresAt,
@@ -1581,9 +1581,6 @@ pub async fn ingest_prepared(
         todo,
         submissions,
         plan_id: &plan_id,
-        // Filled on the first index hit; a plan of all-new cells never lists
-        // `leased/` at all.
-        leased: tokio::sync::OnceCell::new(),
         now,
         creating_max_age,
     };
@@ -2399,10 +2396,6 @@ struct MergeContext<'a> {
     todo: &'a dyn TodoStore,
     submissions: &'a dyn SubmissionStore,
     plan_id: &'a PlanId,
-    /// Every `leased/` job's deadline, listed at most once per ingest. A fast
-    /// path only: `official_state` confirms against a fresh listing before it
-    /// reads a job as gone.
-    leased: tokio::sync::OnceCell<HashMap<JobId, ExpiresAt>>,
     now: DateTime<Utc>,
     /// `plan_creating_max_age_secs`. One gate decides whether a content-key
     /// record whose job is not live belongs to an ingest that is still staging
@@ -2438,7 +2431,8 @@ impl MergeContext<'_> {
     /// Place one unit: mint a fresh job, or join one that already runs the cell.
     /// `body` must be the lead's, since its digest is published with it.
     /// Units overlap safely: mergeable units never share a digest, opted-out
-    /// ones read no index, and the `leased/` snapshot is read-only once filled.
+    /// ones read no index, and each candidate read touches only that candidate's
+    /// job.
     async fn place(
         &self,
         unit: &Unit,
@@ -2791,28 +2785,31 @@ impl MergeContext<'_> {
     }
 
     /// What the queue says about a merge target, by the deadline in its `avail/`
-    /// or lease key. Reads `avail/`, the `leased/` snapshot, a fresh `leased/`
-    /// listing, then `avail/` again for the backward moves [`Self::try_join`]
-    /// names. The snapshot can only overstate liveness, which
-    /// [`Self::target_survives`] re-checks.
+    /// or lease key. It reads the availability of the job, then the leases of
+    /// the job. Then it reads the availability again, in case a recycle moved the
+    /// job between the two reads. [`Self::target_survives`] checks again after
+    /// the membership marker is written.
     async fn official_state(&self, job_id: &JobId) -> anyhow::Result<TargetState> {
         if let Some(state) = self.avail_state(job_id).await? {
             return Ok(state);
         }
-        let snapshot = self
-            .leased
-            .get_or_try_init(|| leased_expiries(self.todo))
-            .await?;
-        if let Some(expiry) = snapshot.get(job_id).copied() {
-            return Ok(TargetState::Live(expiry));
-        }
-        if let Some(expiry) = leased_expiries(self.todo).await?.get(job_id).copied() {
-            return Ok(TargetState::Live(expiry));
+        if let Some(lease) = self.lease_of(job_id).await? {
+            return Ok(TargetState::Live(lease.expires_at));
         }
         Ok(self
             .avail_state(job_id)
             .await?
             .unwrap_or(TargetState::Absent))
+    }
+
+    /// One lease on the merge target, read for this job alone.
+    async fn lease_of(&self, job_id: &JobId) -> anyhow::Result<Option<Lease>> {
+        Ok(self
+            .todo
+            .leases_for_jobs(std::slice::from_ref(job_id))
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// What an `avail/` entry says about the target; `None` is not absence, as
@@ -2840,13 +2837,12 @@ impl MergeContext<'_> {
     }
 
     /// Whether the merge target still exists, read fresh in [`Self::try_join`]'s
-    /// order. Never the `leased/` snapshot: it predates this plan's marker, and
-    /// would read a retired job as live.
+    /// order, after this plan's membership marker is written.
     async fn target_survives(&self, job_id: &JobId) -> anyhow::Result<bool> {
         if self.avail_state(job_id).await?.is_some() {
             return Ok(true);
         }
-        if leased_expiries(self.todo).await?.contains_key(job_id) {
+        if self.lease_of(job_id).await?.is_some() {
             return Ok(true);
         }
         // The recycler may have moved the job back into `avail/` while the two
@@ -2866,19 +2862,6 @@ impl MergeContext<'_> {
             created_at: self.now,
         }
     }
-}
-
-/// The official deadline of every job in `leased/`, from one listing.
-/// Unparseable keys are foreign cruft, already warned about by the maintenance
-/// pass that owns the tree.
-async fn leased_expiries(todo: &dyn TodoStore) -> anyhow::Result<HashMap<JobId, ExpiresAt>> {
-    Ok(todo
-        .list_leased()
-        .await?
-        .iter()
-        .filter_map(|key| parse_leased_key(key).ok())
-        .map(|lease| (lease.job_id, lease.expires_at))
-        .collect())
 }
 
 /// Validation of a single job body; the caller names the job. The table
@@ -8115,7 +8098,6 @@ mod tests {
             todo: stores.todo.as_ref(),
             submissions: stores.submissions.as_ref(),
             plan_id: &plan_id,
-            leased: tokio::sync::OnceCell::new(),
             // The ingest started an hour ago, when the target was still live.
             now: Utc::now() - Duration::hours(1),
             creating_max_age: CREATING_MAX_AGE,
@@ -8174,22 +8156,15 @@ mod tests {
     // ── the merge pass's re-check, driven directly ──────────────────────────
     //
     // No ordering of whole ingests opens the window between finding a live
-    // candidate and the re-check, so these seed a `leased/` snapshot that the
-    // fresh reads disagree with.
+    // candidate and the re-check, so script the first targeted lease read
+    // to return a lease that the next read no longer finds.
 
-    fn merge_context<'a>(
-        stores: &'a Stores,
-        plan_id: &'a PlanId,
-        leased: HashMap<JobId, ExpiresAt>,
-    ) -> MergeContext<'a> {
+    fn merge_context<'a>(stores: &'a Stores, plan_id: &'a PlanId) -> MergeContext<'a> {
         MergeContext {
             plans: stores.plans.as_ref(),
             todo: stores.todo.as_ref(),
             submissions: stores.submissions.as_ref(),
             plan_id,
-            // Pre-seeded: these tests drive the pass with a snapshot that
-            // deliberately disagrees with the fresh reads.
-            leased: tokio::sync::OnceCell::new_with(Some(leased)),
             now: Utc::now(),
             creating_max_age: CREATING_MAX_AGE,
         }
@@ -8249,6 +8224,16 @@ mod tests {
         Ok((unit.candidate, placed))
     }
 
+    /// A live lease on `job` by another client, scripted into a race window.
+    fn race_lease(job: &JobId) -> anyhow::Result<pipette_core::todo_filename::Lease> {
+        Ok(pipette_core::todo_filename::Lease {
+            job_id: job.clone(),
+            expires_at: ExpiresAt::Never,
+            client_id: ClientId::try_new("ev1_race")?,
+            lease_expiry: Utc::now() + chrono::Duration::hours(1),
+        })
+    }
+
     /// A candidate that **completes** inside the window is the wanted outcome:
     /// the joining plan reads the same submission record, so the join stands.
     #[tokio::test]
@@ -8263,11 +8248,11 @@ mod tests {
         // only its presence may be checked.
         local_fs_spoil_record(dir.path(), &target)?;
 
-        let context = merge_context(
-            &stores,
-            &plan_id,
-            HashMap::from([(target.clone(), ExpiresAt::Never)]),
-        );
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        observed.script_leases(vec![race_lease(&target)?]);
+        let mut stores = stores;
+        stores.todo = observed.clone();
+        let context = merge_context(&stores, &plan_id);
         let (_, placed) = place_one(&context, &cell_body("a", json!({})), ExpiresAt::Never).await?;
 
         assert!(
@@ -8275,6 +8260,13 @@ mod tests {
             "a completed candidate is still the job this plan wants"
         );
         assert_eq!(members(&stores, &target).await?, vec![plan_id]);
+        assert!(
+            observed
+                .take_reads()
+                .iter()
+                .all(|(_, ids)| ids == std::slice::from_ref(&target))
+        );
+        observed.unexpected.none()?;
         Ok(())
     }
 
@@ -8290,11 +8282,11 @@ mod tests {
         let digest = content_digest(&cell_body("a", json!({})));
         seed_content_key(&stores, &digest, &target, Utc::now()).await?;
 
-        let context = merge_context(
-            &stores,
-            &plan_id,
-            HashMap::from([(target.clone(), ExpiresAt::Never)]),
-        );
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        observed.script_leases(vec![race_lease(&target)?]);
+        let mut stores = stores;
+        stores.todo = observed.clone();
+        let context = merge_context(&stores, &plan_id);
         let (candidate, placed) =
             place_one(&context, &cell_body("a", json!({})), ExpiresAt::Never).await?;
 
@@ -8305,14 +8297,20 @@ mod tests {
         );
         let keys = stores.plans.list_content_keys().await?;
         assert_eq!(keys[0].1.job_id, candidate, "the digest is taken over");
+        assert!(
+            observed
+                .take_reads()
+                .iter()
+                .all(|(_, ids)| ids == std::slice::from_ref(&target))
+        );
+        observed.unexpected.none()?;
         Ok(())
     }
 
-    /// A claim renames `avail/` into `leased/`, so a job claimed after the
-    /// snapshot is in neither. It is live, so the pass joins it rather than
-    /// taking over its aged record, which a claim never touches.
+    /// A claimed job is live, so the pass joins it rather than taking over
+    /// its aged record, which a claim never touches.
     #[tokio::test]
-    async fn a_candidate_claimed_after_the_snapshot_is_still_joined() -> anyhow::Result<()> {
+    async fn a_leased_candidate_is_still_joined() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let stores = stores_in(dir.path())?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
@@ -8338,9 +8336,8 @@ mod tests {
             "the target is claimed before the pass runs"
         );
 
-        // An empty snapshot is what an ingest holds when the claim lands after
-        // its own listing.
-        let context = merge_context(&stores, &plan_id, HashMap::new());
+        // The targeted lease read must find the claimed job.
+        let context = merge_context(&stores, &plan_id);
         let (_, placed) = place_one(&context, &body, ExpiresAt::Never).await?;
 
         assert!(
@@ -8382,7 +8379,7 @@ mod tests {
             serde_json::to_vec(&queued)?,
         )?;
 
-        let context = merge_context(&stores, &plan_id, HashMap::new());
+        let context = merge_context(&stores, &plan_id);
         let (_, placed) = place_one(&context, &body, ExpiresAt::Never).await?;
 
         assert!(
@@ -8419,7 +8416,10 @@ mod tests {
         async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>> {
             self.inner.avail_key_for_job(job_id).await
         }
-        async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
+        async fn leases_for_jobs(
+            &self,
+            jobs: &[JobId],
+        ) -> anyhow::Result<Vec<pipette_core::todo_filename::Lease>> {
             if self
                 .listings
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -8434,7 +8434,10 @@ mod tests {
                     )
                     .await?;
             }
-            self.inner.list_leased().await
+            self.inner.leases_for_jobs(jobs).await
+        }
+        async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
+            Err(self.unexpected.record("list_leased"))
         }
         async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
             Err(self.unexpected.record("list_avail"))
@@ -8588,15 +8591,6 @@ mod tests {
         async fn has_pending_reindex(&self, _client_id: &ClientId) -> anyhow::Result<bool> {
             Err(self.unexpected.record("has_pending_reindex"))
         }
-        async fn write_pending_reindex_job(&self, _job_id: &JobId) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_pending_reindex_job"))
-        }
-        async fn list_pending_reindex_jobs(&self) -> anyhow::Result<Vec<JobId>> {
-            Err(self.unexpected.record("list_pending_reindex_jobs"))
-        }
-        async fn delete_pending_reindex_job(&self, _job_id: &JobId) -> anyhow::Result<()> {
-            Err(self.unexpected.record("delete_pending_reindex_job"))
-        }
         async fn write_lost_lease(
             &self,
             _job_id: &JobId,
@@ -8633,18 +8627,6 @@ mod tests {
         async fn delete_tmp_object(&self, _key: &str) -> anyhow::Result<()> {
             Err(self.unexpected.record("delete_tmp_object"))
         }
-        async fn read_eligible_indexed(&self) -> anyhow::Result<HashSet<String>> {
-            Err(self.unexpected.record("read_eligible_indexed"))
-        }
-        async fn write_eligible_indexed(&self, _indexed: &HashSet<String>) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_eligible_indexed"))
-        }
-        async fn read_eligible_workers(&self) -> anyhow::Result<HashSet<ClientId>> {
-            Err(self.unexpected.record("read_eligible_workers"))
-        }
-        async fn write_eligible_workers(&self, _workers: &HashSet<ClientId>) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_eligible_workers"))
-        }
         async fn read_backlog(&self) -> anyhow::Result<Option<pipette_store::BacklogSnapshot>> {
             Err(self.unexpected.record("read_backlog"))
         }
@@ -8670,31 +8652,6 @@ mod tests {
         }
         async fn write_gc_candidates(&self, _candidates: &HashSet<String>) -> anyhow::Result<()> {
             Err(self.unexpected.record("write_gc_candidates"))
-        }
-        async fn write_suspension(
-            &self,
-            _client_id: &ClientId,
-            _suspended_at: DateTime<Utc>,
-            _conflicting_job_id: &JobId,
-        ) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_suspension"))
-        }
-        async fn read_suspension(
-            &self,
-            _client_id: &ClientId,
-        ) -> anyhow::Result<Option<pipette_store::SuspensionRecord>> {
-            Err(self.unexpected.record("read_suspension"))
-        }
-        async fn delete_suspension(&self, _client_id: &ClientId) -> anyhow::Result<()> {
-            Err(self.unexpected.record("delete_suspension"))
-        }
-        async fn list_suspensions(
-            &self,
-        ) -> anyhow::Result<Vec<(ClientId, pipette_store::SuspensionRecord)>> {
-            Err(self.unexpected.record("list_suspensions"))
-        }
-        async fn list_suspended_ids(&self) -> anyhow::Result<Vec<ClientId>> {
-            Err(self.unexpected.record("list_suspended_ids"))
         }
         async fn stamp_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
             Err(self.unexpected.record("stamp_liveness"))
@@ -8758,9 +8715,6 @@ mod tests {
             todo: &recycling,
             submissions: stores.submissions.as_ref(),
             plan_id: &plan_id,
-            // Pre-seeded empty, as an ingest holds when the claim lands after
-            // its listing.
-            leased: tokio::sync::OnceCell::new_with(Some(HashMap::new())),
             now: Utc::now(),
             creating_max_age: CREATING_MAX_AGE,
         };
@@ -8801,7 +8755,7 @@ mod tests {
         .await?;
 
         // The loser reaches the claim with a record already in place.
-        let context = merge_context(&stores, &plan_id, HashMap::new());
+        let context = merge_context(&stores, &plan_id);
         let placed = context
             .claim(
                 &digest,
@@ -8840,7 +8794,7 @@ mod tests {
         // A version no record ever had: the swap is refused, exactly as it is
         // when a rival replaced the record since this pass read it.
         let stale_version = ContentKeyVersion::Digest("not-the-current-bytes".to_string());
-        let context = merge_context(&stores, &plan_id, HashMap::new());
+        let context = merge_context(&stores, &plan_id);
         let placed = context
             .replace_stale(
                 &digest,
@@ -9218,8 +9172,8 @@ mod tests {
 
     // ── satisfying a cell from an earlier run (PIP-541) ─────────────────────
 
-    /// Stores that keep their records in a scratch PostgreSQL database, and
-    /// the test [`catalog`]. Only this backend keeps the job-cell index.
+    /// Stores that keep their records and the queue in a scratch PostgreSQL
+    /// database, and the test [`catalog`]. Only this backend keeps the job-cell index.
     struct SqlEnv {
         stores: Stores,
         catalog: HashMap<BenchmarkId, Benchmark>,
@@ -9241,7 +9195,7 @@ mod tests {
             return Ok(None);
         };
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_sql::overlay(db.db(), stores_in(dir.path())?);
+        let stores = db.stores(stores_in(dir.path())?);
         Ok(Some(SqlEnv {
             stores,
             catalog: catalog()?,
@@ -9748,6 +9702,53 @@ mod tests {
         assert_eq!(only_job(&revision)?, job_id);
         let kinds = merge_kinds(&revision);
         assert_eq!(kinds, vec![kind]);
+        Ok(())
+    }
+
+    /// A revision keeps each finished run of the plan it supersedes, though a
+    /// newer run of the same cell answers it too. Removing or adding a cell
+    /// leaves the data of the other cells as it was.
+    #[rstest]
+    #[case::removes_a_cell(&["a"])]
+    #[case::adds_a_cell(&["a", "b", "c"])]
+    #[tokio::test]
+    async fn a_finished_carry_keeps_its_run_over_a_newer_one(
+        #[case] revised: &[&str],
+    ) -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let (campaign, first) = campaign_of(stores, cells(&["a", "b"], json!({}))).await?;
+        // Newer runs of the same cells, from another campaign in the same scope.
+        let newer = ingest_owned(
+            &env,
+            owner(USER_ADA)?,
+            cells(&["a", "b"], json!({"merge_duplicates": false})),
+        )
+        .await?;
+        futures::future::try_join_all(
+            first
+                .job_ids
+                .iter()
+                .chain(&newer.job_ids)
+                .map(|(_, job_id)| env.finish(job_id)),
+        )
+        .await?;
+
+        let revision = revise(stores, &campaign, cells(revised, json!({}))).await?;
+
+        let kept = revised.len().min(first.job_ids.len());
+        let ids = |report: &IngestReport| -> Vec<JobId> {
+            report
+                .job_ids
+                .iter()
+                .take(kept)
+                .map(|(_, job_id)| job_id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&revision), ids(&first));
+        assert_eq!(merge_kinds(&revision), vec![MergeKind::Carried; kept]);
         Ok(())
     }
 }

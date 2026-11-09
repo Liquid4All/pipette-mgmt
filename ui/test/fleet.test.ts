@@ -73,7 +73,7 @@ describe("fleet rows", () => {
   const row = (fields: Partial<ClientListRow>): ClientListRow => ({
     client_details: "", client_id: "client_1", contact_email: "", derived_capabilities: [], last_seen_at: null, backlog: null,
     organization: "", permissions: [], public_key: "", registered_at: "", reindex_pending: false, status: "approved",
-    suspended: false, tags: [], ...fields,
+    tags: [], ...fields,
   });
 
   test("a column is a field of the record, a list its JSON and an absent one nothing", () => {
@@ -90,7 +90,7 @@ describe("fleet rows", () => {
 
   test("standing names what the claim path passes over, else ok", () => {
     expect(standing(row({}))).toBe("ok");
-    expect(standing(row({ suspended: true, reindex_pending: true }))).toBe("suspended, reindexing");
+    expect(standing(row({ reindex_pending: true }))).toBe("reindexing");
   });
 
   test("activity is active through the window, inactive after it, and never without a last-seen time", () => {

@@ -93,8 +93,9 @@ impl RunRequest {
                 runtime_type: axes.1,
                 model_type: axes.2,
                 http_timeout_seconds: None,
-                bench_timeout_seconds: None,
+                attempt_timeout_seconds: None,
                 _doomloop_obsolete: None,
+                _bench_timeout_obsolete: None,
                 readiness: None,
             });
         };

@@ -8,6 +8,20 @@ export const BAND = 5;
 /** Why a combination with all three inputs has no estimate. */
 export const UNESTIMABLE = "a rate or time ≤ 0, or no decode_tokens";
 
+/** In seconds: a run under both, end to end and in prefill, is too short to judge against `BAND`; 0 judges every run. */
+export interface Short {
+  e2e: number;
+  prefill: number;
+}
+export const SHORT: Short = { e2e: 1.5, prefill: 1 };
+
+/** A too-short point's chip in a chart's tooltip, and its legend entry. */
+export const SHORT_POINT = "too short, not counted";
+
+/** What a too-short run is, as the finding and the chart's note say it. */
+export const shortText = (under: Short): string =>
+  `ran under ${under.e2e} s end to end with prefill under ${under.prefill} s, too short to judge`;
+
 /** The combinations that strayed one way, and the farthest, in % to a tenth. */
 export interface Spread {
   n: number;
@@ -33,11 +47,21 @@ export type E2eFinding =
     missing: { e2e: number; decode: number; prefill: number };
     /** More than one batch size among them. */
     batched: boolean;
-    /** The estimated ones within ±`BAND` %, and the rest by direction; null where none strayed that way. */
+    /** The estimated ones too short to judge, under `under`. */
+    short: number;
+    under: Short;
+    /** The judged ones within ±`BAND` %, and the rest by direction; null where none strayed that way. */
     within: number;
     slower: Spread | null;
     faster: Spread | null;
   };
+
+/** The TTFT check over each job that measured a time to first token and an end-to-end latency on one clock. */
+export interface TtftFinding {
+  jobs: number;
+  /** The jobs whose time to first token exceeds their end-to-end latency, by the most in % to a tenth; null where none. */
+  over: Spread | null;
+}
 
 /** How vl_spec_decode's benchmarks paired: both modes on one device, on different devices only, or one mode only. */
 export type Pairing =
@@ -63,9 +87,11 @@ export function e2eText(f: E2eFinding): string {
   const lacks = !unchecked ? ""
     : unchecked === 1 ? `1 more lacks ${listed(lacking.map((l) => l.name))}.`
     : `${unchecked} more lack a measurement: ${lacking.map((l) => `${l.name} in ${l.n}`).join(", ")}.`;
-  const tails = (estimable: boolean) => [lacks, estimable && f.unestimated
+  const tails = (estimable: boolean, short: boolean) => [short && f.short ? `${f.short} more ${shortText(f.under)}.` : "",
+    lacks, estimable && f.unestimated
     ? `${f.unestimated} more ${f.unestimated === 1 ? "has" : "have"} all three but no estimate (${UNESTIMABLE}).` : ""];
-  const sentences = (lead: string, estimable = true) => [lead, ...tails(estimable)].filter(Boolean).join(" ");
+  const sentences = (lead: string, estimable = true, short = true) =>
+    [lead, ...tails(estimable, short)].filter(Boolean).join(" ");
 
   if (!f.total) {
     return f.vl ? "No VL throughput job has a measurement to check."
@@ -76,11 +102,17 @@ export function e2eText(f: E2eFinding): string {
     return `None of the ${f.total} ${many} has all three measurements: `
       + lacking.map((l, i) => `${l.name}${i ? "" : " is missing"} in ${l.n}`).join(", ") + ".";
   }
-  const n = f.complete - f.unestimated;
-  if (!n) {
+  const estimated = f.complete - f.unestimated;
+  if (!estimated) {
     return sentences(f.complete === 1
       ? `The one ${one} with all three measurements could not be estimated (${UNESTIMABLE}).`
       : `None of the ${f.complete} ${many} with all three measurements could be estimated (${UNESTIMABLE}).`, false);
+  }
+  const could = " that could be checked";
+  const n = estimated - f.short;
+  if (!n) {
+    const all = estimated === 1 ? `The one ${one}` : `All ${estimated} ${many}`;
+    return sentences(`${all}${unchecked || f.unestimated ? could : ""} ${shortText(f.under)}.`, true, false);
   }
 
   const by = (s: Spread) => `by ${s.n === 1 ? "" : "up to "}${s.max.toFixed(1)} %`;
@@ -88,7 +120,7 @@ export function e2eText(f: E2eFinding): string {
                f.faster ? `${f.faster.n}${f.slower ? "" : " ran"} faster, ${by(f.faster)}` : ""]
     .filter(Boolean).join(", and ");
   const lead = `Measured end-to-end latency is within ±${BAND} % of ${sum} for`;
-  const checked = unchecked || f.unestimated ? " that could be checked" : "";
+  const checked = unchecked || f.unestimated || f.short ? could : "";
   if (n === 1) {
     const strayed = f.slower ?? f.faster;
     return sentences(!strayed ? `${lead} the one ${one}${checked}.`
@@ -97,6 +129,14 @@ export function e2eText(f: E2eFinding): string {
   }
   if (f.within === n) return sentences(`${lead} all ${n} ${many}${checked}.`);
   return sentences(`${lead} ${f.within ? `${f.within} of` : "none of the"} ${n} ${many}; ${off}.`);
+}
+
+/** The TTFT check's finding, as its Results tab leads with it. */
+export function ttftText({ jobs, over }: TtftFinding): string {
+  const of = jobs === 1 ? "the one job that measured both" : `${over ? "" : "all "}${jobs} jobs that measured both`;
+  if (!over) return `Time to first token is at or below end-to-end latency in ${of}.`;
+  const by = `by ${over.n === 1 ? "" : "up to "}${over.max.toFixed(1)} %`;
+  return `Time to first token exceeds end-to-end latency in ${jobs === 1 ? "" : `${over.n} of `}${of}, ${by}.`;
 }
 
 /** How the speculative benchmarks paired, and why the rest have no speedup, as their Results tab leads with it. */

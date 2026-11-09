@@ -284,6 +284,76 @@ fn vault_job(resource_id: &str, org_id: &str) -> Value {
 const VAULT_REFUSAL: &str =
     "the job names a vault resource this client may not fetch; only a failure may be reported";
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
+#[tokio::test]
+async fn revoked_vault_access_does_not_count_as_a_lost_hand_back(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(queue) = seeded_queue_state(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let admin = server_admin(state).await?;
+    let org_id = create_org(state, &admin, "acme").await?;
+    let owner = org_admin(state, &org_id).await?;
+    let resource = upload_gguf_text(state, &owner, Some(&org_id), BLOB).await?;
+    let (key, client) = owned_device(state, &admin, Some(org_owner(&org_id))).await?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        VAULT_JOB,
+        ExpiresAt::Never,
+        &vault_job(&resource, &org_id),
+    )
+    .await?;
+    commit_job(state, &job).await?;
+    state
+        .todo_store
+        .write_eligible(&client, &job, ExpiresAt::Never)
+        .await?;
+    let resp = authed_post(state, &key, &client, "/plans/claim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The next hand-back would reach the limit if it counted as another loss.
+    for hours in [1, 2] {
+        state
+            .todo_store
+            .write_lost_lease(
+                &job,
+                &client,
+                chrono::Utc::now() - chrono::Duration::hours(hours),
+            )
+            .await?;
+    }
+    state.org_store.delete_ownership(&client).await?;
+    let resp = authed_post(state, &key, &client, "/plans/claim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.todo_store.list_lost_leases(&job).await?.len(), 2);
+    assert!(
+        state
+            .todo_store
+            .leases_for_client(&client)
+            .await?
+            .is_empty()
+    );
+    assert!(state.todo_store.get_avail_by_job(&job).await?.is_some());
+    assert!(state.todo_store.is_denied(&job, &client).await?);
+    assert!(!state.submission_store.has_record(&job).await?);
+
+    let (other_key, other) = owned_device(state, &admin, Some(org_owner(&org_id))).await?;
+    state
+        .todo_store
+        .write_eligible(&other, &job, ExpiresAt::Never)
+        .await?;
+    let resp = authed_post(state, &other_key, &other, "/plans/claim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await?["job_id"], VAULT_JOB);
+    assert_eq!(state.todo_store.list_lost_leases(&job).await?.len(), 2);
+    Ok(())
+}
+
 /// A device outside the organization may claim a job on its vault model, but
 /// cannot fetch the weights, so only its failure is taken, on either route.
 #[rstest]

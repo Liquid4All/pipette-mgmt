@@ -211,8 +211,11 @@ pub struct Config {
     /// (three one-minute probe runs).
     #[serde(default = "default_dataset_probe_max_age_secs")]
     pub dataset_probe_max_age_secs: NonZeroU64,
-    /// Deadline for one artifact's upstream probe, all `git` steps together.
-    /// Past it the upstream is recorded `unavailable`. Defaults to 30.
+    /// Deadline for the probe of one upstream, all attempts and `git` steps
+    /// together. Past it the upstream is recorded `unavailable`.
+    /// Retry once if the upstream was `ok` and the first attempt finds it
+    /// unavailable. The first attempt gets half the deadline. The second
+    /// attempt gets the rest. At most 315360000 (10 years). Defaults to 30.
     #[serde(default = "default_dataset_probe_timeout_secs")]
     pub dataset_probe_timeout_secs: NonZeroU64,
     /// Deadline for one dataset build: a git upstream's fetch, verify and pack
@@ -1252,6 +1255,12 @@ impl Config {
                 self.plan_creating_max_age_secs
             );
         }
+        if self.dataset_probe_timeout_secs.get() > MAX_DURATION_SECS {
+            anyhow::bail!(
+                "dataset_probe_timeout_secs = {} exceeds the maximum of {MAX_DURATION_SECS} (10 years)",
+                self.dataset_probe_timeout_secs
+            );
+        }
         if self.default_body_limit_bytes.get() > MAX_DEFAULT_BODY_LIMIT {
             anyhow::bail!(
                 "default_body_limit_bytes = {} exceeds the maximum of {MAX_DEFAULT_BODY_LIMIT} (1 MB)",
@@ -1555,6 +1564,32 @@ backend = "local_fs"
         let config: Config =
             toml::from_str(&minimal_toml("plan_creating_max_age_secs = 99999999999999"))?;
         assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::default("", true)]
+    #[case::at_the_maximum("dataset_probe_timeout_secs = 315360000", true)]
+    #[case::above_the_maximum("dataset_probe_timeout_secs = 315360001", false)]
+    #[case::instant_overflow("dataset_probe_timeout_secs = 9223372036854775807", false)]
+    fn dataset_probe_timeout_is_bounded_at_load(
+        #[case] lines: &str,
+        #[case] is_valid: bool,
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, minimal_toml(lines))?;
+        let result = Config::load(&path);
+        if is_valid {
+            result?;
+        } else {
+            let error = result
+                .err()
+                .context("oversized probe timeout must not load")?;
+            let message = format!("{error:#}");
+            assert!(message.contains("dataset_probe_timeout_secs"), "{message}");
+            assert!(message.contains("exceeds the maximum"), "{message}");
+        }
         Ok(())
     }
 

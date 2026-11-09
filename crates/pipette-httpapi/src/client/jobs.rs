@@ -64,6 +64,7 @@ fn failed_job(f: pipette_pipeline::submission::FailureSubmission) -> FailedJob {
     let pipette_plan_types::FailureInput {
         benchmark_id,
         failure_reason,
+        failure_code,
         model_name,
         model_quant,
         runtime_name,
@@ -78,6 +79,7 @@ fn failed_job(f: pipette_pipeline::submission::FailureSubmission) -> FailedJob {
         status: JobStatus::Failed,
         submitted_at,
         failure_reason,
+        failure_code,
         model_name,
         model_quant,
         runtime_name,

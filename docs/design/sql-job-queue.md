@@ -55,18 +55,18 @@ Seven decisions shape the work:
 
 | # | Decision | Choice |
 |---|---|---|
-| D1 | The local_fs and S3 queue backends | Retire both after the cutover. The queue then requires `[database]`, and the queue tests run on PostgreSQL. |
+| D1 | The local_fs and S3 queue backends | Retire both after the cutover. The queue then requires `[database]`, and the queue tests run on PostgreSQL. `queue-maintenance` and `plans status --explain` need `[database]` from the incremental eligibility stage on. |
 | D2 | The cutover | A short pause with a mirror copy, not a live composite store. The copy runs warm and then cold. The `serve` outage is two to three minutes, and the cost is about zero lost leases. |
 | D3 | Client suspension | Retire it. The claim transaction serializes the claims of each client and recycles the client's own lapsed leases first. So a client cannot hold two live leases. |
 | D4 | Claim isolation | `READ COMMITTED` with `FOR UPDATE SKIP LOCKED`. This is the one documented exception to the crate's `REPEATABLE READ` rule. |
 | D5 | The job body | A `text` column on the queue row, a copy of `job_sources.body`. The store stays self-contained, and the copy from S3 is verbatim. |
-| D6 | Matching in SQL | No. Eligibility stays a table that the Rust matcher writes. So the scheduler and the fleet reports cannot disagree. |
+| D6 | Matching in SQL | No. Eligibility stays a table that the Rust matcher writes. Plan starvation follows claimable eligibility rows and excludes denied clients. After a client change the index can differ from the run's snapshot for one run. |
 | D7 | Local development | PostgreSQL, not SQLite. The SQL crate is specific to PostgreSQL throughout. A script starts the CI image locally. |
 
 ## Tables
 
-All tables are in `[database]`, in one migration, `job_queue`, with an up and a
-down script. The migrations are in
+All tables are in `[database]`. The migration `job_queue` creates them, with an
+up and a down script. The migrations are in
 [`crates/pipette-store-sql/migrations/`](../../crates/pipette-store-sql/migrations/).
 Ids are `text`, as in every other table. Instants are `timestamptz`. The body
 stays `text`, so the store can report a corrupt body rather than refuse it.
@@ -76,6 +76,8 @@ stays `text`, so the store can report a corrupt body rather than refuse it.
 CREATE TABLE queue_jobs (
   job_id        text PRIMARY KEY,
   body          text NOT NULL,                 -- the job JSON that ingestion promoted
+  match_clauses jsonb GENERATED ALWAYS AS (queue_match_clauses(body)) STORED,
+  needs_reindex boolean NOT NULL DEFAULT true,
   expires_at    timestamptz,                   -- the deadline; NULL = never
   enqueued_at   timestamptz NOT NULL DEFAULT now(),
   leased_by     text,                          -- the client that holds the lease
@@ -89,8 +91,8 @@ CREATE INDEX queue_jobs_leased ON queue_jobs (leased_by, lease_expiry) WHERE lea
 -- Staged bodies between write_tmp and promote_avail.
 CREATE TABLE queue_tmp (job_id text PRIMARY KEY, body text NOT NULL, written_at timestamptz NOT NULL DEFAULT now());
 
--- The eligibility index that queue-maintenance writes and claim reads. The
--- expires_at column stays until the simplification stage drops it.
+-- The eligibility index that queue-maintenance writes and claim reads.
+-- Migration 0024 drops expires_at.
 CREATE TABLE queue_eligibility (
   client_id text NOT NULL, job_id text NOT NULL, expires_at timestamptz,
   PRIMARY KEY (client_id, job_id)
@@ -127,17 +129,34 @@ CREATE TABLE queue_suspensions (
 -- so the replicas agree, as the S3 server clock does.
 CREATE TABLE client_liveness (client_id text PRIMARY KEY, last_seen_at timestamptz NOT NULL);
 
--- Transitional: the five run-state blobs (.eligible-indexed, .eligible-workers,
--- .gc-candidates, .backlog, .backlog-campaigns) as text, keyed by name.
+-- Transitional: the run-state blobs as text, keyed by name. Migration 0024
+-- deletes .eligible-indexed and .eligible-workers; .gc-candidates, .backlog and
+-- .backlog-campaigns stay.
 CREATE TABLE queue_maintenance_state (name text PRIMARY KEY, body text NOT NULL);
 ```
 
-The simplification stages add these later:
+The incremental eligibility stage is the migration
+`queue_incremental_eligibility` (0024):
 
 ```sql
 ALTER TABLE queue_jobs ADD COLUMN needs_reindex boolean NOT NULL DEFAULT true;  -- replaces .eligible-indexed and queue_reindex_jobs
-CREATE TABLE queue_workers (client_id text PRIMARY KEY);                         -- replaces .eligible-workers
+CREATE TABLE queue_workers (client_id text PRIMARY KEY);                         -- replaces .eligible-workers, and starts from it
 ALTER TABLE queue_eligibility DROP COLUMN expires_at;                            -- a listing joins queue_jobs for the live deadline
+DROP TABLE queue_reindex_jobs;
+DELETE FROM queue_maintenance_state WHERE name IN ('eligible-indexed', 'eligible-workers');
+```
+
+The migration imports legacy worker snapshots that contain arrays of strings.
+Missing, malformed, or differently shaped snapshots start with an empty worker set.
+
+Every job present at the migration starts with the flag set, so the first run
+after it indexes the whole queue once. The down script restores deadlines from
+`queue_jobs` and the worker blob from `queue_workers`. It restores a
+`queue_reindex_jobs` row for each flagged leased job.
+
+The later simplification stages add these:
+
+```sql
 ALTER TABLE queue_eligibility ADD FOREIGN KEY (job_id) REFERENCES queue_jobs ON DELETE CASCADE;
 ALTER TABLE queue_denials     ADD FOREIGN KEY (job_id) REFERENCES queue_jobs ON DELETE CASCADE;
 ALTER TABLE queue_lost_leases ADD FOREIGN KEY (job_id) REFERENCES queue_jobs ON DELETE CASCADE;
@@ -160,11 +179,11 @@ outlives the queue row by design, and `gc_plan_index` collects it later.
 | The recycle rename | `UPDATE … SET leased_by = NULL, lease_expiry = NULL WHERE job_id AND leased_by AND lease_expiry`. On zero rows, `SELECT` that the job is available at the same `expires_at`, to answer `Recycled` after a lost recycle race, as S3 does. |
 | The re-date rename | `UPDATE … SET expires_at WHERE job_id AND leased_by IS NULL AND expires_at = $from` |
 | The terminal delete of `avail/` and `leased/` | `DELETE FROM queue_jobs WHERE job_id`. The cascade removes the markers. |
-| `eligible/clients/{c}/{job}.{exp}` | `queue_eligibility` |
+| `eligible/clients/{c}/{job}.{exp}` | A `queue_eligibility` row, the pair of client and job. A read joins `queue_jobs` for the deadline. |
 | `denied/{job}.{client}` | `queue_denials` |
 | `lost/{job}/{client}.{lease_exp}` | `queue_lost_leases` |
 | `pending-reindex/{client}.{uuid}` | `queue_reindex_requests`. `has_pending_reindex` is an `EXISTS`, not a listing. |
-| `pending-reindex-jobs/{job}` | `queue_reindex_jobs`, then `queue_jobs.needs_reindex` |
+| `pending-reindex-jobs/{job}` | `queue_jobs.needs_reindex` |
 | `suspended/{client}.json` | `queue_suspensions`, then retired (D3) |
 | The `liveness/{client}` modification time | `client_liveness.last_seen_at = now()` |
 | `.eligible-indexed`, `.eligible-workers` | `needs_reindex`, `queue_workers` |
@@ -186,8 +205,8 @@ outlives the queue row by design, and `gc_plan_index` collects it later.
 - **Byte-identical keys.** The store builds `{job_id}/{expires_at}.json` and
   `{client}/{job}.{expires_at}.{lease_expiry}.json` exactly as
   `pipette_core::todo_filename` does (`never`, the basic format, `.json`). So
-  the `.eligible-indexed` and `.gc-candidates` strings that an S3 run wrote read
-  correctly in a SQL run. `list_avail` builds the keys and sorts them in
+  the `.gc-candidates` strings that an S3 run wrote read correctly in a SQL
+  run. `list_avail` builds the keys and sorts them in
   Rust. The Rust sort gives the S3 byte order. In that order, `-` sorts
   before the `/` that ends a job id.
 - **The server clock for liveness.** Liveness uses `now()` in SQL, not a
@@ -240,10 +259,64 @@ write both commit, and the joiner holds a marker on a deleted job. Teardown
 then has no need to restore a job for a late joiner.
 
 **Eligibility** stays a materialized table that the Rust matcher
-`job_matches_client` writes. `queue-maintenance` indexes the jobs
-`WHERE needs_reindex`. A recycle or a re-date sets the flag. A later option:
-ingestion inserts the eligibility rows in the same transaction as the job. This
-removes the claim lag of one interval.
+`job_matches_client` writes. Each job carries the flag `needs_reindex`. These
+events set it:
+
+- an insert of the job (the column default)
+- a recycle, in `recycle_lease` and in the claim transaction's recycle of
+  lapsed leases
+- a re-date
+- a denial write, which also advances the revision
+- a client reindex, for each job that is out on lease while the client's rows
+  are rebuilt
+- a teardown that restores the job, or that finds it leased
+
+`queue-maintenance` reads the flagged available jobs, with their bodies and
+revisions: `WHERE needs_reindex AND leased_by IS NULL`. It indexes only the
+jobs that this run listed and that a committed plan holds. For each job it
+matches the body against every worker in Rust. Then one transaction locks the
+row, checks that the revision is unchanged, replaces the job's eligibility rows
+and clears the flag. A claim or a re-date between the read and the write moves
+the revision. The write then changes nothing, and the flag stays for the next
+run.
+
+The run indexes the flagged jobs before it rebuilds the flagged clients. The
+client rebuild reads the current client record. It uses input changes that occur
+after the run's client snapshot.
+
+Migration 0025 stores six matcher fields in `match_clauses`:
+
+- `requires`
+- `any_of`
+- `excludes`
+- `exclude_clients`
+- `not_all_of`
+- `clients`
+
+The projection preserves absent keys and JSON null values. It validates the
+body as JSON, then converts only the six top-level matcher values to JSONB.
+Unrelated fields can contain escapes such as `\u0000` that JSONB cannot
+represent.
+
+If the body is invalid JSON, or a matcher value does not fit in JSONB, the
+projection is SQL NULL.
+The store can still report each corrupt body. Client rebuilds omit the job and
+retain its reindex flag.
+
+Rebuilds group by the projection and use the Rust matcher. They read no full
+bodies. Denial writes atomically set `needs_reindex` and bump the revision.
+The migration flags existing available jobs and jobs with denials once.
+
+The generated column rewrites `queue_jobs` under a lock. Before deployment,
+measure migration time on a copy with production's row count and body sizes.
+
+`queue_workers` holds the workers that the last run indexed. The run compares
+it with the current workers: it deletes the rows of a worker that left, and
+rebuilds a worker that joined against every available job. It writes the new
+set after the rebuilds, so a run that fails sees the same joiners again.
+
+A later option: ingestion inserts the eligibility rows in the same transaction
+as the job. This removes the claim lag of one interval.
 
 **The backlog** is a query that the console runs. No snapshot files exist.
 
@@ -273,12 +346,16 @@ the config from before the switch to `backend = "database"`.
 
 `queue export` is the same copy in the other direction. It is the rollback.
 
-The warm pass takes under a minute at the production sizes above. The full
-`eligible/` listing took 21 seconds from a laptop. The 9,109 body reads take
-seconds inside the region. The rows go in one at a time through the store, 16
-at once. The cold pass copies only the few claims and heartbeats since the warm
-pass. A timed dry run against production is the gate before anyone schedules
-the pause.
+At the production sizes above, the estimate for the warm pass is under a
+minute. The full `eligible/` listing took 21 seconds from a laptop. The 9,109
+body reads take seconds inside the region. The rows go in one at a time
+through the store, 16 at once.
+
+The cold pass reads the whole queue and writes only the differences since the
+warm pass. A timed dry run against production is the gate before anyone
+schedules the pause. The
+[production runbook](../operations.md#311-moving-the-queue-to-postgresql)
+gives the commands, the timing gate, and the rollback.
 
 The runbook assumes a deployment that runs `serve` as 2 replicas. Each replica
 reads its config from a parameter store when it starts.
@@ -298,9 +375,10 @@ reads its config from a parameter store when it starts.
    the default), so that every live device renews its lease. Then enable the
    schedule again.
 
-The `serve` outage is steps 4 to 7: the drain, the delta copy, the parameter
-update and one replica start. That is two to three minutes. The replica start
-takes most of it, not the copy. The cost at the defaults:
+The `serve` outage is steps 4 to 7: the drain, the cold copy, the parameter
+update and its checks, and the replica start. The estimate is two to three
+minutes. The replica start takes most of it, not the copy. The cost at the
+defaults:
 
 - Connection errors for that window. The documented client policy retries
   them.
@@ -309,9 +387,14 @@ takes most of it, not the copy. The cost at the defaults:
 - Zero suspensions, because no mix of replicas exists.
 - A `last_seen_at` that is stale by the length of the window.
 
-Until step 8, the rollback is: stop `serve`, revert the config parameter, run
-`queue export`, and start `serve`. `queue export` reads the object-store queue
-from the reverted parameter.
+If SQL accepted no request, the object-store queue stays authoritative. The
+rollback then restores the config parameter and runs no export. An export from a
+partial import can delete valid jobs from the object-store queue. If SQL
+accepted requests, the rollback stops all queue writers, restores the config
+parameter, and runs `queue export`. `queue export` reads the object-store
+queue from the restored parameter. The
+[production runbook](../operations.md#311-moving-the-queue-to-postgresql)
+gives the steps.
 
 ## The alternative not taken: a live composite store
 
@@ -370,6 +453,8 @@ its ticket and its blockers.
   job. That removes the claim lag of one interval. It needs the fleet snapshot
   that ingestion already reads for the plan status.
 - The testkit could start an embedded PostgreSQL when `TEST_DATABASE_URL` is
-  unset. Then `cargo nextest run` needs no setup.
+  unset. Then `cargo nextest run` needs no setup. The tests of
+  `queue-maintenance` and of `plans status --explain` run on PostgreSQL only,
+  so without the variable they skip.
 - The production `plan_lease_duration_secs` sets the wait in step 8 of the
   runbook. Read it from the config before the cutover.

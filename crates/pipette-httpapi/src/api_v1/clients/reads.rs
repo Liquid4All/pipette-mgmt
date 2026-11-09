@@ -249,13 +249,6 @@ async fn fleet_views(
     caller: Caller<'_>,
     rows: Vec<Row>,
 ) -> Result<Vec<ClientListRow>, AppError> {
-    let suspended: HashSet<ClientId> = state
-        .todo_store
-        .list_suspended_ids()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list the suspensions: {e:#}")))?
-        .into_iter()
-        .collect();
     let reindexing: HashSet<ClientId> = state
         .todo_store
         .list_pending_reindex()
@@ -316,7 +309,6 @@ async fn fleet_views(
         .map(|(((client, permissions), owner), administered)| {
             let derived_capabilities = normalized_flags(&client.device_profile);
             ClientListRow {
-                suspended: suspended.contains(&client.client_id),
                 reindex_pending: reindexing.contains(&client.client_id),
                 last_seen_at: seen.get(&client.client_id).copied(),
                 backlog: backlog(snapshot.as_ref(), &client.client_id),
@@ -523,7 +515,7 @@ fn by_campaign(
 /// One client's row, scoped by the same fleet grant the listing takes. Its reads
 /// are independent, so they run concurrently.
 pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetRow, AppError> {
-    let (client, permissions, suspended, reindex_pending, last_seen_at, snapshot, tags, owner) = futures::try_join!(
+    let (client, permissions, reindex_pending, last_seen_at, snapshot, tags, owner) = futures::try_join!(
         async {
             state
                 .client_store
@@ -537,14 +529,6 @@ pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetR
                 .get_client_permissions(client_id)
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to read the permissions: {e:#}")))
-        },
-        async {
-            Ok(state
-                .todo_store
-                .read_suspension(client_id)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to read the suspension: {e:#}")))?
-                .is_some())
         },
         async {
             state
@@ -591,7 +575,6 @@ pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetR
             permissions,
         )),
         reindex_pending,
-        suspended,
         last_seen_at,
         backlog: backlog(snapshot.as_ref(), client_id),
     })
@@ -604,7 +587,6 @@ pub(crate) struct FleetRow {
     tags: BTreeSet<Tag>,
     permissions: pipette_plan_types::ClientPermissionSet,
     reindex_pending: bool,
-    suspended: bool,
     last_seen_at: Option<DateTime<Utc>>,
     backlog: Option<Backlog>,
 }
@@ -621,7 +603,6 @@ impl FleetRow {
             tags: self.tags,
             permissions: self.permissions,
             reindex_pending: self.reindex_pending,
-            suspended: self.suspended,
             last_seen_at: self.last_seen_at,
             backlog: self.backlog,
         }

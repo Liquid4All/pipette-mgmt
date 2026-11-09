@@ -23,14 +23,14 @@ use pipette_plan_types::{
 };
 use pipette_store::drain_vault_resources;
 use pipette_web_testkit::{
-    GATED_GGUF_FILE, GatedModel, ONE_CELL_PLAN, UserSigner, VISION_MMPROJ_FILE, VISION_MODEL_BYTES,
-    VISION_MODEL_FILE, approved_client, assert_nothing_staged, authed_post, authed_user_get,
-    body_json, file_job_bodies, filing_uri, gated_hub, gated_macos_document, job, json_str,
-    make_state_with_hf_endpoint, make_state_with_plan_max_jobs, own_campaign_plans_uri,
+    GATED_GGUF_FILE, GatedModel, ONE_CELL_PLAN, QueueBackend, UserSigner, VISION_MMPROJ_FILE,
+    VISION_MODEL_BYTES, VISION_MODEL_FILE, approved_client, assert_nothing_staged, authed_post,
+    authed_user_get, body_json, file_job_bodies, filing_uri, gated_hub, gated_macos_document, job,
+    json_str, make_state_with_hf_endpoint, make_state_with_plan_max_jobs, own_campaign_plans_uri,
     post_plan_document, put_idle_campaign, put_idle_campaign_of, raw_request, register_and_approve,
-    registered_user, registered_user_with_detail, run_qm, seed_org, seeded_state,
-    set_matching_input, set_user_org, setup_benchmarks, setup_scheduler_benchmarks, signed_json,
-    stream_lines, stream_plan_document, user_auth_headers,
+    registered_user, registered_user_with_detail, run_qm, seed_org, seeded_queue_state,
+    seeded_state, set_matching_input, set_user_org, setup_benchmarks, setup_scheduler_benchmarks,
+    signed_json, stream_lines, stream_plan_document, user_auth_headers,
 };
 
 use crate::campaign_listings::as_a_row;
@@ -778,21 +778,26 @@ async fn mac_reporting(
 #[tokio::test]
 async fn test_a_pinned_document_is_claimed_at_a_listed_build() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, signer) = document_state(dir.path()).await?;
+    setup_scheduler_benchmarks(dir.path())?;
+    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let signer = filer(state).await?;
     let (listed_key, listed) =
-        mac_reporting(&state, &["client_version:2.0", "client_version:3.0"]).await?;
-    let (other_key, other) = mac_reporting(&state, &["client_version:3.0"]).await?;
+        mac_reporting(state, &["client_version:2.0", "client_version:3.0"]).await?;
+    let (other_key, other) = mac_reporting(state, &["client_version:3.0"]).await?;
 
     let document = mlx_document("requires = [\"os:macos\"]\nclient_versions = [\"1.0\", \"2.0\"]");
-    let resp = post_into_own_campaign(&state, &signer, "", &document).await?;
+    let resp = post_into_own_campaign(state, &signer, "", &document).await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let report = body_json(resp).await?;
-    run_qm(&state).await?;
+    run_qm(state).await?;
 
-    let resp = authed_post(&state, &other_key, &other, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &other_key, &other, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    let resp = authed_post(&state, &listed_key, &listed, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &listed_key, &listed, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let claim = body_json(resp).await?;
     assert_eq!(claim["job_id"], report["job_ids"]["0"]);

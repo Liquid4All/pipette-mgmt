@@ -92,14 +92,16 @@ function strings(value: unknown): string[] {
 
 /**
  * A quantization in a file name, a repository name or a prefix of a model descriptor. The alternatives:
- * - a GGUF type, such as `Q4_0`, `Q4_K_M` or `IQ4_XS`;
- * - a float type, such as `F16`, `BF16`, `fp16` or `mxfp4`;
+ * - a GGUF type, such as `Q4_0`, `Q4_K_M`, `IQ4_XS`, `TQ1_0`, `PQ2_0` or `PTQ1_0`;
+ * - a block-scaled float type, such as `MXFP4` or `MXFP4_MOE`;
+ * - a float type, such as `F16`, `BF16` or `fp16`;
  * - an MLX bit width, such as `4bit`;
  * - an ONNX or OpenVINO scheme, such as `int4-asym-gq128`.
+ * `model_params.rs` `is_quant_tag` strips the same forms from a model name for the lookup of its parameters.
  * A letter or a digit on either side ends the match, so `Qwen3` and a commit hash do not match.
  */
 const QUANTIZATION =
-  /(?<![a-z0-9])(i?q\d+(?:_[a-z0-9]+)*|b?f(?:16|32)|fp(?:8|16|32)|(?:mx|nv)fp\d+|\d+bit|int\d+(?:[-_][a-z0-9]+)*)(?![a-z0-9])/gi;
+  /(?<![a-z0-9])((?:(?:i|t|pt?)?q|(?:mx|nv)fp)\d+(?:_[a-z0-9]+)*|b?f(?:16|32)|fp(?:8|16|32)|\d+bit|int\d+(?:[-_][a-z0-9]+)*)(?![a-z0-9])/gi;
 
 /**
  * The quantization labels that the strings of the parsed model `descriptor` show, in the order of the JSON text, each

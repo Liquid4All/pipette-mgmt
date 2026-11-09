@@ -64,6 +64,35 @@ pub fn parse(
     Ok(plan)
 }
 
+/// A warning for each variant whose `benchmark_flags` still set the retired
+/// `bench_timeout_seconds`. Parsing absorbs it unread, so without this the
+/// variant would lose its limit silently.
+pub fn retired_flag_warnings(document: &str) -> Result<Vec<PlanWarning>, PlanParseError> {
+    let table: toml::Table = toml::from_str(document)?;
+    Ok(table
+        .get("variants")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, variant)| {
+            variant
+                .get("benchmark_flags")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.get("bench_timeout_seconds").is_some())
+        })
+        .map(|(variant, _)| PlanWarning {
+            variant,
+            message: format!(
+                "variant {variant}: `bench_timeout_seconds` is retired and ignored; set \
+                 `attempt_timeout_seconds`, the limit on each warm-up and measured rep"
+            ),
+        })
+        .collect())
+}
+
 /// Every benchmark id `document` names, at the root or in a variant. Unchecked
 /// beyond TOML shape, so a document that would not parse may still list them.
 pub fn benchmark_ids(document: &str) -> Result<BTreeSet<BenchmarkId>, PlanParseError> {

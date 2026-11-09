@@ -16,7 +16,7 @@ use pipette_core::matching::{NarrowingClauses, describe_clauses};
 use pipette_core::plan::{
     PlanExplanation, PlanLeases, PlanManifest, PlanNotes, StarvedExplanation, StarvedGroup,
 };
-use pipette_core::todo_filename::{Lease, parse_leased_key};
+use pipette_core::todo_filename::avail_filename;
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
     CampaignId, ClientId, FleetStanding, JobCensus, JobId, NonEmptyTrimmedString, PlanId,
@@ -32,7 +32,9 @@ use crate::plan_document::{DocumentDryRun, ExpandedDocument, index_labels};
 use crate::plan_ingestion::{
     CampaignMembership, IngestContext, IngestReport, PlanSubmission, ingest_jobs,
 };
-use crate::queue_maintenance::{AvailKey, cached_body, collect_all_avail};
+#[cfg(test)]
+use crate::queue_maintenance::collect_all_avail;
+use crate::queue_maintenance::{AvailKey, cached_body};
 
 /// A plan failed to read, or there is none by that id.
 #[derive(Debug, thiserror::Error)]
@@ -271,34 +273,11 @@ pub async fn plan_leases(
     now: DateTime<Utc>,
 ) -> Result<(PlanRecord, PlanLeases), PlanLookupError> {
     let record = plan_status(stores.plans.as_ref(), plan_id).await?;
-    let members: HashSet<JobId> = record.manifest.job_ids.iter().cloned().collect();
-    let (leases, unparseable_keys) = collect_plan_leases(stores.todo.as_ref(), &members).await?;
-    Ok((record, PlanLeases::new(leases, unparseable_keys, now)))
-}
-
-/// Every lease held on a job in `members`, beside the count of `leased/` keys
-/// that do not parse (they name no job, so the reports only count them).
-async fn collect_plan_leases(
-    todo: &dyn TodoStore,
-    members: &HashSet<JobId>,
-) -> anyhow::Result<(Vec<Lease>, usize)> {
-    Ok(todo
-        .list_leased()
-        .await
-        .context("listing leases")?
-        .iter()
-        .fold(
-            (Vec::new(), 0usize),
-            |(mut leases, skipped), key| match parse_leased_key(key) {
-                Ok(lease) => {
-                    if members.contains(&lease.job_id) {
-                        leases.push(lease);
-                    }
-                    (leases, skipped)
-                }
-                Err(_) => (leases, skipped + 1),
-            },
-        ))
+    let leases = stores
+        .todo
+        .leases_for_jobs(&record.manifest.job_ids)
+        .await?;
+    Ok((record, PlanLeases::new(leases, now)))
 }
 
 /// `plans status --explain` — why the plan's jobs are not scheduled.
@@ -337,17 +316,20 @@ pub async fn explain_plan_with(
     let cancel_requested = record.cancel_requested;
     let plan_id = manifest.plan_id.clone();
 
-    let members: HashSet<JobId> = manifest.job_ids.iter().cloned().collect();
-
-    // ── the queue ───────────────────────────────────────────────────────────
-    let listing = collect_all_avail(todo)
+    // Rebuild each avail/ key: the indexed-state and body-cache lookups below key on it.
+    let entries = todo
+        .avail_for_jobs(&manifest.job_ids)
         .await
-        .context("listing the available-job queue")?;
-    let avail: Vec<&AvailKey> = listing
-        .keys
-        .iter()
-        .filter(|key| members.contains(&key.job_id))
+        .context("reading the plan's available jobs")?;
+    let keys: Vec<AvailKey> = entries
+        .into_iter()
+        .map(|entry| AvailKey {
+            key: avail_filename(&entry.job_id, entry.expires_at),
+            job_id: entry.job_id,
+            expires_at: entry.expires_at,
+        })
         .collect();
+    let avail: Vec<&AvailKey> = keys.iter().collect();
     // The claim path refuses an expired job even before `queue-maintenance`
     // sweeps it, so an expired entry is available but not claimable.
     let claimable: Vec<&AvailKey> = avail
@@ -356,43 +338,40 @@ pub async fn explain_plan_with(
         .filter(|key| !key.expires_at.is_expired(now))
         .collect();
 
-    // Not the `eligible/` tree: that is hundreds of thousands of keys.
-    let indexed_keys = todo
-        .read_eligible_indexed()
+    let claimable_ids: Vec<JobId> = claimable.iter().map(|key| key.job_id.clone()).collect();
+    let awaiting = todo
+        .jobs_awaiting_index(&claimable_ids)
         .await
-        .context("reading the eligible-index state")?;
-    let indexed = claimable
-        .iter()
-        .filter(|key| indexed_keys.contains(&key.key))
-        .count();
+        .context("reading the reindex flags of the plan's jobs")?;
 
-    // A job under an unparseable key reads as `gone`; the count is the caveat
-    // on that figure, as the key names no job to subtract.
-    let (leases, unparseable_leased_keys) = collect_plan_leases(todo, &members).await?;
-    let held = PlanLeases::new(leases, unparseable_leased_keys, now);
+    let leases = todo
+        .leases_for_jobs(&manifest.job_ids)
+        .await
+        .context("reading the plan's leases")?;
+    let held = PlanLeases::new(leases, now);
     let leased = held.live.len() + held.lapsed.len();
 
     let denied: HashMap<JobId, HashSet<ClientId>> = todo
-        .list_all_denied()
+        .denials_for_jobs(&manifest.job_ids)
         .await
         .context("listing denial markers")?
         .into_iter()
-        .filter(|(job_id, _)| members.contains(job_id))
         .fold(HashMap::new(), |mut denied, (job_id, client_id)| {
             denied.entry(job_id).or_default().insert(client_id);
             denied
         });
 
+    // A claimable job is indexed when it carries no reindex flag. A denial also
+    // sets the flag, but a denied job was indexed before its claim, so its
+    // eligibility rows still exist.
+    let indexed = claimable_ids
+        .iter()
+        .filter(|job_id| !awaiting.contains(job_id) || denied.contains_key(job_id))
+        .count();
+
     // ── the fleet ───────────────────────────────────────────────────────────
     let fleet = drain_clients(clients).await.context("listing clients")?;
     warn_unreadable_clients(&fleet.unreadable);
-    let suspended: HashSet<ClientId> = todo
-        .list_suspensions()
-        .await
-        .context("listing suspensions")?
-        .into_iter()
-        .map(|(client_id, _)| client_id)
-        .collect();
     let pending_reindex: HashSet<ClientId> = todo
         .list_pending_reindex()
         .await
@@ -423,22 +402,14 @@ pub async fn explain_plan_with(
     let unblocked: Vec<&Client> = workers
         .iter()
         .copied()
-        .filter(|client| {
-            !suspended.contains(&client.client_id) && !pending_reindex.contains(&client.client_id)
-        })
+        .filter(|client| !pending_reindex.contains(&client.client_id))
         .collect();
     let fleet_standing = FleetStanding {
         registered: registered.len(),
         approved: approved.len(),
         working: workers.len(),
-        suspended: workers
-            .iter()
-            .filter(|client| suspended.contains(&client.client_id))
-            .count(),
-        pending_reindex: workers
-            .iter()
-            .filter(|client| pending_reindex.contains(&client.client_id))
-            .count(),
+        // A pending rebuild is the only standing that blocks a worker.
+        pending_reindex: workers.len() - unblocked.len(),
         unblocked: unblocked.len(),
     };
 
@@ -504,8 +475,6 @@ pub async fn explain_plan_with(
             .iter()
             .filter(|key| denied.contains_key(&key.job_id))
             .count(),
-        unparseable_avail_keys: listing.skipped,
-        unparseable_leased_keys: held.unparseable_keys,
     };
     let gated = decide_scheduling_state(SchedulingInputs {
         status: manifest.status,
@@ -602,7 +571,7 @@ fn decide_scheduling_state(input: SchedulingInputs<'_>) -> Option<SchedulingStat
 /// What the live body scan found across a plan's claimable jobs.
 ///
 /// The two negative answers split a clause edit (`NoMatch`) from a fleet that
-/// needs an approval, unsuspension or cleared denial (`Blocked`).
+/// needs an approval, finished rebuild or cleared denial (`Blocked`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Takeability {
     Takeable,
@@ -617,14 +586,14 @@ enum Takeability {
 /// A lapsed lease is not proof of a claim.
 async fn leased_job_ids(
     todo: &dyn TodoStore,
+    jobs: &[JobId],
     now: DateTime<Utc>,
 ) -> anyhow::Result<HashSet<JobId>> {
     Ok(todo
-        .list_leased()
+        .leases_for_jobs(jobs)
         .await
-        .context("listing leases to confirm a claim")?
-        .iter()
-        .filter_map(|key| parse_leased_key(key).ok())
+        .context("reading leases to confirm a claim")?
+        .into_iter()
         .filter(|lease| lease.lease_expiry > now)
         .map(|lease| lease.job_id)
         .collect())
@@ -636,7 +605,7 @@ struct ScanFleet<'a> {
     /// Approved and holding `perform_work`, whatever its standing. A job that
     /// matches none of these is starved.
     working: &'a [&'a Client],
-    /// Not suspended, and not pending an eligible-index rebuild.
+    /// Not pending an eligible-index rebuild.
     unblocked: &'a [&'a Client],
     denied: &'a HashMap<JobId, HashSet<ClientId>>,
     tags: &'a matching::FleetTags,
@@ -645,7 +614,7 @@ struct ScanFleet<'a> {
 /// Which clients can take a plan's claimable jobs now, read from the job bodies.
 ///
 /// Weighs each job against the clients that match it, never fleet-wide, so a
-/// job whose only match is suspended cannot read as schedulable. Starvation is
+/// job whose only match waits on a rebuild cannot read as schedulable. Starvation is
 /// against the working fleet: such a job is blocked, not starved.
 ///
 /// Reads non-starved jobs first and stops at the first takeable one. A job
@@ -683,7 +652,8 @@ async fn scan_takeability(
             .with_context(|| format!("reading the body of {}", key.job_id))?
         else {
             if leased.is_none() {
-                leased = Some(leased_job_ids(todo, now).await?);
+                let jobs: Vec<_> = claimable.iter().map(|entry| entry.job_id.clone()).collect();
+                leased = Some(leased_job_ids(todo, &jobs, now).await?);
             }
             if leased.as_ref().is_some_and(|ids| ids.contains(&key.job_id)) {
                 return Ok(Takeability::Takeable);
@@ -894,6 +864,18 @@ mod tests {
             ..Config::default()
         };
         build_local_fs_stores(&config)
+    }
+
+    /// [`stores_in`] with the record stores and the queue on a new database,
+    /// for a test that runs `queue-maintenance`. `None` skips the test without
+    /// `TEST_DATABASE_URL`.
+    async fn sql_stores_in(
+        dir: &std::path::Path,
+    ) -> anyhow::Result<Option<(Stores, pipette_store_sql::scratch::TestDb)>> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(None);
+        };
+        Ok(Some((db.stores(stores_in(dir)?), db)))
     }
 
     fn manifest(id: u128, status: PlanStatus) -> anyhow::Result<PlanManifest> {
@@ -1558,6 +1540,63 @@ runtime_flags = [
 
     // ── explain_plan ────────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn explain_reads_only_the_plans_denials() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((mut stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
+        let worker = client("ev1_targeted", "iOS")?;
+        enlist(&stores, &worker).await?;
+        let plan = ingest(&stores, vec![job("wanted.json", "os:ios")]).await?;
+        let unrelated = ingest(&stores, vec![job("other.json", "os:ios")]).await?;
+        run_maintenance(&stores).await?;
+        let ids = stores.plans.get_plan(&plan).await?.context("plan")?.job_ids;
+        let other = stores
+            .plans
+            .get_plan(&unrelated)
+            .await?
+            .context("other plan")?
+            .job_ids;
+        stores
+            .todo
+            .write_denied(
+                &other[0],
+                &worker.client_id,
+                &pipette_core::denial::DenialRecord::default(),
+            )
+            .await?;
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        stores.todo = observed.clone();
+        let (_, before) = explain_plan(&stores, &plan, Utc::now()).await?;
+        assert_eq!(before.census.denied, 0);
+        stores
+            .todo
+            .write_denied(
+                &ids[0],
+                &worker.client_id,
+                &pipette_core::denial::DenialRecord::default(),
+            )
+            .await?;
+        let (_, after) = explain_plan(&stores, &plan, Utc::now()).await?;
+        assert_eq!(after.census.denied, 1);
+        assert_ne!(
+            before.verdict, after.verdict,
+            "a relevant denial changes takeability"
+        );
+        let reads = observed.take_reads();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|(method, _)| *method == "denials_for_jobs")
+                .count(),
+            2
+        );
+        assert!(reads.iter().all(|(_, jobs)| jobs == &ids));
+        observed.unexpected.none()?;
+        Ok(())
+    }
+
     /// The record and its `perform_work` grant.
     async fn enlist(stores: &Stores, client: &pipette_core::client::Client) -> anyhow::Result<()> {
         stores.clients.put_client(client).await?;
@@ -1673,7 +1712,7 @@ runtime_flags = [
         JustIngested,
         /// One `queue-maintenance` pass.
         Indexed,
-        IndexedThenSuspended,
+        IndexedThenReindexing,
         IndexedThenCancelled,
         IndexedThenDrained,
         IndexedThenLeased,
@@ -1686,14 +1725,10 @@ runtime_flags = [
         }
         run_maintenance(stores).await?;
         match seed {
-            Seed::IndexedThenSuspended => {
+            Seed::IndexedThenReindexing => {
                 stores
                     .todo
-                    .write_suspension(
-                        &ClientId::try_new("ev1_alpha")?,
-                        Utc::now(),
-                        &JobId::new_unchecked("job-stale"),
-                    )
+                    .write_pending_reindex(&ClientId::try_new("ev1_alpha")?)
                     .await?
             }
             Seed::IndexedThenCancelled => stores.plans.write_cancel_marker(plan_id).await?,
@@ -1735,8 +1770,10 @@ runtime_flags = [
     #[case::starved(&["os:android"], Seed::Indexed, SchedulingState::Starved)]
     #[case::schedulable_by_tag(&["tag:lab"], Seed::Indexed, SchedulingState::Schedulable)]
     #[case::starved_on_a_tag(&["tag:bench"], Seed::Indexed, SchedulingState::Starved)]
-    #[case::suspended_tagged_client_beats_starvation(&["tag:lab"], Seed::IndexedThenSuspended, SchedulingState::ClientsBlocked)]
-    #[case::suspended_beats_starvation(&["os:ios"], Seed::IndexedThenSuspended, SchedulingState::ClientsBlocked)]
+    #[case::reindexing_tagged_client_beats_starvation(&["tag:lab"], Seed::IndexedThenReindexing, SchedulingState::ClientsBlocked)]
+    #[case::reindexing_beats_starvation(&["os:ios"], Seed::IndexedThenReindexing, SchedulingState::ClientsBlocked)]
+    // After the rebuild finishes, the job still matches no client, so the clause is the fix.
+    #[case::starved_behind_a_reindexing_fleet(&["os:android"], Seed::IndexedThenReindexing, SchedulingState::Starved)]
     #[case::cancel_pending(&["os:ios"], Seed::IndexedThenCancelled, SchedulingState::CancelPending)]
     #[case::nothing_outstanding(&["os:ios"], Seed::IndexedThenDrained, SchedulingState::NothingOutstanding)]
     // A live lease is work in flight, not a block.
@@ -1749,7 +1786,9 @@ runtime_flags = [
         #[case] expected: SchedulingState,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         let rig = client("ev1_alpha", "iOS")?;
         enlist(&stores, &rig).await?;
         stores
@@ -1777,7 +1816,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_returns_the_status_view_plan_status_would() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         run_maintenance(&stores).await?;
@@ -1793,7 +1834,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_reads_the_ingestion_warnings_when_no_snapshot_exists() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
 
         let _first = ingest(&stores, vec![job("a.json", "os:android")]).await?;
@@ -1836,7 +1879,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_reports_a_strand_beside_a_live_lease() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(
             &stores,
@@ -1881,18 +1926,22 @@ runtime_flags = [
     /// What blocks the one client that matches the plan's job.
     #[derive(Debug, Clone, Copy)]
     enum Blocker {
-        Suspended,
         PendingReindex,
         Denied,
+        /// Denied by one matcher while a second matcher stays unblocked.
+        DeniedBesideAnotherMatcher,
         None,
     }
 
     /// The unblocked `os:android` bystander is what a fleet-wide test would
     /// mistake for a taker.
     #[rstest]
-    #[case::suspended_only_matcher(Blocker::Suspended, SchedulingState::ClientsBlocked)]
     #[case::reindexing_only_matcher(Blocker::PendingReindex, SchedulingState::ClientsBlocked)]
     #[case::denied_by_only_matcher(Blocker::Denied, SchedulingState::ClientsBlocked)]
+    #[case::denied_beside_another_matcher(
+        Blocker::DeniedBesideAnotherMatcher,
+        SchedulingState::Schedulable
+    )]
     #[case::nothing_blocks_the_matcher(Blocker::None, SchedulingState::Schedulable)]
     #[tokio::test]
     async fn explain_weighs_each_job_against_the_clients_that_match_it(
@@ -1900,9 +1949,14 @@ runtime_flags = [
         #[case] expected: SchedulingState,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         enlist(&stores, &client("ev1_beta", "Android")?).await?;
+        if matches!(blocker, Blocker::DeniedBesideAnotherMatcher) {
+            enlist(&stores, &client("ev1_gamma", "iOS")?).await?;
+        }
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         run_maintenance(&stores).await?;
 
@@ -1917,14 +1971,8 @@ runtime_flags = [
             .cloned()
             .context("one job minted")?;
         match blocker {
-            Blocker::Suspended => {
-                stores
-                    .todo
-                    .write_suspension(&matcher, Utc::now(), &job_id)
-                    .await?
-            }
             Blocker::PendingReindex => stores.todo.write_pending_reindex(&matcher).await?,
-            Blocker::Denied => {
+            Blocker::Denied | Blocker::DeniedBesideAnotherMatcher => {
                 stores
                     .todo
                     .write_denied(&job_id, &matcher, &DenialRecord::default())
@@ -1953,23 +2001,15 @@ runtime_flags = [
         #[case] expected: SchedulingState,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         apply(&stores, &plan_id, seed).await?;
 
-        // A directory where the body belongs, so any read of it fails. No `TodoStore`
-        // call creates this fault in the `local_fs` layout.
-        let key = collect_all_avail(stores.todo.as_ref())
-            .await?
-            .keys
-            .first()
-            .context("one job staged")?
-            .key
-            .clone();
-        let body = dir.path().join("todo").join("avail").join(&key);
-        std::fs::remove_file(&body)?;
-        std::fs::create_dir(&body)?;
+        // A corrupt body, so any read of it fails. No `TodoStore` call writes one.
+        db.execute("UPDATE queue_jobs SET body = '{'").await?;
 
         let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
         assert_eq!(
@@ -2029,8 +2069,9 @@ runtime_flags = [
         }
 
         let fleet = [&bystander];
+        let observed = pipette_store_testkit::ObservedTodoStore::new(stores.todo.clone());
         let takeability = scan_takeability(
-            stores.todo.as_ref(),
+            &observed,
             &[key],
             &HashSet::new(),
             ScanFleet {
@@ -2044,6 +2085,14 @@ runtime_flags = [
         )
         .await?;
         assert_eq!(takeability, expected);
+        assert_eq!(
+            observed.take_reads(),
+            vec![
+                ("get_avail", vec![key.job_id.clone()]),
+                ("leases_for_jobs", vec![key.job_id.clone()]),
+            ]
+        );
+        observed.unexpected.none()?;
         Ok(())
     }
 
@@ -2052,7 +2101,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_says_which_starved_jobs_the_snapshot_accounts_for() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         // Keeps the unblocked set non-empty without matching either job.
         enlist(&stores, &client("ev1_beta", "Linux")?).await?;
@@ -2099,44 +2150,14 @@ runtime_flags = [
         Ok(())
     }
 
-    /// Lifting the suspension would still leave a job no client matches, so the
-    /// clause is the answer that helps.
-    #[tokio::test]
-    async fn explain_reports_starvation_behind_a_fully_suspended_fleet() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
-        enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
-        let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
-        run_maintenance(&stores).await?;
-        stores
-            .todo
-            .write_suspension(
-                &ClientId::try_new("ev1_alpha")?,
-                Utc::now(),
-                &JobId::new_unchecked("job-stale"),
-            )
-            .await?;
-
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
-        assert_eq!(
-            report.fleet.unblocked, 0,
-            "the premise: nobody can take work"
-        );
-        assert_eq!(
-            report.verdict,
-            SchedulingState::Starved,
-            "{}",
-            report.headline(FleetDetail::Full)
-        );
-        Ok(())
-    }
-
     /// `clients blocked` would send the operator to audit client standing that
     /// is in good order; the headline names the stale snapshot instead.
     #[tokio::test]
     async fn explain_reports_starvation_the_stale_snapshot_missed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         // The bystander keeps the unblocked set non-empty, so the scan runs.
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         enlist(&stores, &client("ev1_beta", "Android")?).await?;
@@ -2178,11 +2199,99 @@ runtime_flags = [
         Ok(())
     }
 
+    /// How an indexed job returns to the queue.
+    #[derive(Debug, Clone, Copy)]
+    enum Return {
+        Recycled,
+        Redated,
+    }
+
+    /// A recycle or a re-date sets the job's reindex flag, so the report counts
+    /// the job unindexed until the next run. The flag read names the plan's jobs
+    /// only, not the other plan's.
+    #[rstest]
+    #[case::recycled(Return::Recycled)]
+    #[case::redated(Return::Redated)]
+    #[tokio::test]
+    async fn explain_reports_a_returned_job_as_unindexed(
+        #[case] how: Return,
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((mut stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
+        enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
+        let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
+        ingest(&stores, vec![job("other.json", "os:ios")]).await?;
+        run_maintenance(&stores).await?;
+        let (_, before) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        assert_eq!(before.census.indexed, 1);
+
+        let ids = stores
+            .plans
+            .get_plan(&plan_id)
+            .await?
+            .context("plan")?
+            .job_ids;
+        let entry = stores
+            .todo
+            .avail_for_jobs(&ids)
+            .await?
+            .into_iter()
+            .next()
+            .context("the plan's job is queued")?;
+        match how {
+            Return::Recycled => {
+                let holder = ClientId::try_new("ev1_alpha")?;
+                let lease_expiry = Utc::now() + Duration::hours(1);
+                stores
+                    .todo
+                    .claim_job(&entry.job_id, entry.expires_at, &holder, lease_expiry)
+                    .await?;
+                stores
+                    .todo
+                    .recycle_lease(&entry.job_id, entry.expires_at, &holder, lease_expiry)
+                    .await?;
+            }
+            Return::Redated => {
+                let later = match entry.expires_at {
+                    pipette_plan_types::ExpiresAt::At(at) => {
+                        pipette_plan_types::ExpiresAt::At(at + Duration::hours(1))
+                    }
+                    pipette_plan_types::ExpiresAt::Never => {
+                        pipette_plan_types::ExpiresAt::At(Utc::now() + Duration::days(1))
+                    }
+                };
+                stores
+                    .todo
+                    .redate_avail(&entry.job_id, entry.expires_at, later)
+                    .await?;
+            }
+        }
+
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        stores.todo = observed.clone();
+        let (_, after) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        assert_eq!(after.verdict, SchedulingState::NotIndexed);
+        assert_eq!(after.census.indexed, 0);
+        let flag_reads: Vec<Vec<JobId>> = observed
+            .take_reads()
+            .into_iter()
+            .filter(|(method, _)| *method == "jobs_awaiting_index")
+            .map(|(_, jobs)| jobs)
+            .collect();
+        assert_eq!(flag_reads, vec![ids]);
+        observed.unexpected.none()?;
+        Ok(())
+    }
+
     /// A plan that reads `active` and runs nothing: the report contradicts it.
     #[tokio::test]
     async fn explain_reports_an_unindexed_queue_under_an_active_plan() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(
             &stores,
@@ -2214,7 +2323,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_narrows_a_starved_group_to_the_blocking_clause() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let mut pending = client("ev1_beta", "Android")?;
         pending.status = ClientStatus::Pending;
@@ -2248,7 +2359,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_reports_a_live_match_against_a_stale_group() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
         run_maintenance(&stores).await?;
@@ -2283,7 +2396,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_counts_a_newly_tagged_client_as_a_live_match() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         let rig = client("ev1_alpha", "iOS")?;
         enlist(&stores, &rig).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "tag:lab")]).await?;
@@ -2323,7 +2438,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_names_the_missing_perform_work_grant() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
         run_maintenance(&stores).await?;
@@ -2381,7 +2498,9 @@ runtime_flags = [
         #[case] expected: &str,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
         run_maintenance(&stores).await?;
@@ -2408,7 +2527,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_counts_live_matches_against_the_real_body() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
         run_maintenance(&stores).await?;
@@ -2440,7 +2561,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_reports_roster_standing_for_a_pinned_group() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(
             &stores,
@@ -2472,7 +2595,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_denies_a_roster_client_an_excluded_tag_names() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         let rig = client("ev1_alpha", "iOS")?;
         enlist(&stores, &rig).await?;
         stores
@@ -2500,56 +2625,12 @@ runtime_flags = [
         Ok(())
     }
 
-    #[derive(Debug, Clone, Copy)]
-    enum Tree {
-        Avail,
-        Leased,
-    }
-
-    /// The key disturbs no bucket: "0 of N indexed" must not quietly mean "0 of
-    /// the N I parsed".
-    #[rstest]
-    #[case::avail(Tree::Avail)]
-    #[case::leased(Tree::Leased)]
-    #[tokio::test]
-    async fn explain_carries_the_unparseable_key_count(#[case] tree: Tree) -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
-        enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
-        let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
-        // No `TodoStore` call writes an invalid key, so this test writes one in the
-        // `local_fs` layout.
-        match tree {
-            Tree::Avail => std::fs::write(dir.path().join("todo/avail/not-a-job-key.json"), b"{}")?,
-            Tree::Leased => {
-                let partition = dir.path().join("todo/leased/ev1_alpha");
-                std::fs::create_dir_all(&partition)?;
-                std::fs::write(partition.join("not-a-lease.json"), b"{}")?;
-            }
-        }
-
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
-        let c = &report.census;
-        assert_eq!(c.total, 1);
-        match tree {
-            Tree::Avail => {
-                assert_eq!(c.unparseable_avail_keys, 1);
-                assert_eq!(c.unparseable_leased_keys, 0);
-            }
-            Tree::Leased => {
-                assert_eq!(c.unparseable_leased_keys, 1);
-                assert_eq!(c.unparseable_avail_keys, 0);
-                assert_eq!(c.leased, 0, "the bad key joins no bucket");
-            }
-        }
-        assert_eq!(c.available, 1, "the plan's own job alone");
-        Ok(())
-    }
-
     #[tokio::test]
     async fn explain_reports_an_expired_queue() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         enlist(&stores, &client("ev1_alpha", "iOS")?).await?;
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
 
@@ -2577,7 +2658,9 @@ runtime_flags = [
     #[tokio::test]
     async fn explain_reports_a_creating_plan() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         let m = manifest(7, PlanStatus::Creating)?;
         stores.plans.put_plan(&m).await?;
 
@@ -2627,7 +2710,9 @@ runtime_flags = [
         #[case] lapsed: usize,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         stores
             .clients
             .put_client(&client("ev1_alpha", "iOS")?)
@@ -2638,7 +2723,6 @@ runtime_flags = [
         let (_, held) = plan_leases(&stores, &plan_id, Utc::now()).await?;
         assert_eq!(held.live.len(), live, "live holders");
         assert_eq!(held.lapsed.len(), lapsed, "stranded jobs");
-        assert_eq!(held.unparseable_keys, 0);
         assert_eq!(held.is_empty(), live == 0 && lapsed == 0);
         held.live.iter().chain(&held.lapsed).for_each(|lease| {
             assert_eq!(
@@ -2653,7 +2737,9 @@ runtime_flags = [
     #[tokio::test]
     async fn plan_leases_ignores_a_hold_on_a_job_outside_the_plan() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         stores
             .clients
             .put_client(&client("ev1_alpha", "iOS")?)
@@ -2680,30 +2766,11 @@ runtime_flags = [
     }
 
     #[tokio::test]
-    async fn plan_leases_carries_the_unparseable_key_count() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
-        stores
-            .clients
-            .put_client(&client("ev1_alpha", "iOS")?)
-            .await?;
-        let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
-        // No `TodoStore` call writes an invalid key, so this test writes one in the
-        // `local_fs` layout.
-        let partition = dir.path().join("todo/leased/ev1_alpha");
-        std::fs::create_dir_all(&partition)?;
-        std::fs::write(partition.join("not-a-lease.json"), b"{}")?;
-
-        let (_, held) = plan_leases(&stores, &plan_id, Utc::now()).await?;
-        assert_eq!(held.unparseable_keys, 1);
-        assert!(held.is_empty(), "the bad key joins neither list");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn plan_leases_returns_the_status_view_plan_status_would() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let Some((stores, _db)) = sql_stores_in(dir.path()).await? else {
+            return Ok(());
+        };
         stores
             .clients
             .put_client(&client("ev1_alpha", "iOS")?)

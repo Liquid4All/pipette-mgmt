@@ -52,6 +52,10 @@ A `scheduling_state` of `schedulable` means at least one claimable job matches a
 client holding no denial marker for it. The plan is not blocked, and the answer
 is to wait.
 
+The report reads queue availability, leases, and denials only for the job IDs
+of the plan. The census counts only the jobs of the plan. Queue maintenance logs
+malformed queue keys.
+
 ## Statuses
 
 | Status | When |

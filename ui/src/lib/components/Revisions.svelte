@@ -8,6 +8,7 @@
   import { PLAN_STATUSES, changeText, doneShare, shownStatus, statusChoices } from "../plans";
   import type { TableSpec } from "../table";
   import type { CampaignPlanRow, NamedCampaignOverview } from "../api-types";
+  import Clamped from "./Clamped.svelte";
   import DataTable from "./DataTable.svelte";
   import RevertAction from "./RevertAction.svelte";
 
@@ -49,9 +50,10 @@
             onclick={() => reverter?.revert(row.plan_id)}><span aria-hidden="true">↺</span> Revert to this</button>
   {/if}
 {/snippet}
+{#snippet note(row: CampaignPlanRow)}{#if row.plan?.note}<Clamped text={row.plan.note} note />{:else}—{/if}{/snippet}
 {#snippet progressCell(row: CampaignPlanRow)}{row.plan ? progressOf(row.plan.counts) : "—"}{/snippet}
 
 {#if detail.history_truncated}<p class="muted">Older revisions than these are not walked.</p>{/if}
 <RevertAction {detail} {onchange} bind:this={reverter} />
 <DataTable {spec} rows={detail.history} id={(row) => row.plan_id} noun="revisions" empty="No revision is listed."
-           cells={{ plan_id, progress: progressCell }} marked={(row) => row.plan_id === shown} />
+           cells={{ plan_id, note, progress: progressCell }} marked={(row) => row.plan_id === shown} />

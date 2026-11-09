@@ -11,6 +11,7 @@
   import { planTable, shownStatus } from "../plans";
   import { userLink } from "../routes";
   import type { PlanView } from "../api-types";
+  import Clamped from "./Clamped.svelte";
   import DataTable from "./DataTable.svelte";
   import StatusPill from "./StatusPill.svelte";
 
@@ -36,7 +37,8 @@
   {#if plan.submitted_by}<a href={userLink(plan.submitted_by)}>{names[plan.submitted_by] ?? plan.submitted_by}</a>
   {:else}<span class="muted">operator</span>{/if}
 {/snippet}
+{#snippet note(plan: PlanView)}{#if plan.note}<Clamped text={plan.note} note />{:else}—{/if}{/snippet}
 {#snippet progressCell(plan: PlanView)}{progress(plan)}{/snippet}
 
 <DataTable {spec} rows={plans} id={(plan) => plan.plan_id} noun="plans" {path} {kept} {empty}
-           columnsKey="pipette.plans.columns" cells={{ status, submitted_by, progress: progressCell }} />
+           columnsKey="pipette.plans.columns" cells={{ note, status, submitted_by, progress: progressCell }} />

@@ -109,13 +109,12 @@ A `ClientListRow` is the stored record plus what the server reads beside it.
 | `permissions` | The stored set, a name a device cannot hold included; `[]` when it holds none |
 | `tags` | Assigned by an operator ([client tags](#client-tags)) |
 | `derived_capabilities` | The flags the server derives from the `device_*` profile; with `capabilities` and `tags`, the set a job's clauses test ([capability matching](#capability-matching)) |
-| `suspended` | Set when the device holds more than one live lease, as checked by claim, heartbeat and reclaim. A suspended device gets no job, and its heartbeats and reclaims are refused, so its leases lapse, until [unsuspend](devices/unsuspend_client.md) clears it |
 | `reindex_pending` | The device takes no work until `queue-maintenance` re-evaluates its eligible jobs |
 | `last_seen_at` | The device's last verified, signed request to any device route, a refused one included, to within about a minute; `null` when the server holds no stamp. Age never clears it |
 | `backlog` | `job_count`, the queued jobs the device could claim (unleased, before their deadline, not denied by the device), as the `queue-maintenance` run that started at `counted_at` counted them; `null` before the first count or when the count cannot be read |
 | `contact_email` | Present only for a caller that administers the device ([The scope](#the-scope)), wherever a user reads a device record, the organization's roster and overview included |
 
-A `backlog` is at most one run old and ignores suspension. A device that is not
+A `backlog` is at most one run old. A device that is not
 a worker counts zero, and one awaiting a reindex shows its count from before.
 [`GET /api/v1/clients/{client_id}`](devices/get_client.md) adds
 `backlog_by_campaign`: each campaign the caller may read with the distinct jobs

@@ -444,6 +444,25 @@ export type UvRuntimeSource =
     };
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "AppleCoreAiMacosPipette".
+ */
+export type AppleCoreAiMacosPipette = {
+  packages: CoreAiSwiftStack;
+} & AppleCoreAiMacosPipette1;
+export type AppleCoreAiMacosPipette1 =
+  | {
+      source?: "bundled";
+    }
+  | {
+      dir: string;
+      source: "relative_dir";
+    }
+  | {
+      dir: string;
+      source: "absolute_dir";
+    };
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "MlxIosPipetteFlavor".
  */
 export type MlxIosPipetteFlavor = "ios-arm64";
@@ -677,18 +696,21 @@ export type AuditTarget =
  */
 export type BenchmarkFlags =
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "gguf_text";
@@ -702,6 +724,7 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_throughput";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
@@ -709,6 +732,7 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "asr_throughput";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
@@ -716,14 +740,14 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_max_memory";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "asr_max_memory";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
@@ -744,7 +768,7 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
@@ -752,7 +776,7 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision_speculative";
@@ -760,24 +784,27 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "max_memory_usage";
       model_type: "gguf_text";
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
       runtime_type: "mlx_macos_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
       runtime_type: "mlx_macos_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
@@ -790,6 +817,7 @@ export type BenchmarkFlags =
       runtime_type: "mlx_macos_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_throughput";
       http_timeout_seconds?: number | null;
       model_type: "mlx";
@@ -797,7 +825,7 @@ export type BenchmarkFlags =
       runtime_type: "mlx_macos_pipette";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "mlx";
@@ -805,7 +833,7 @@ export type BenchmarkFlags =
       runtime_type: "mlx_macos_pipette";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "mlx_speculative";
@@ -813,6 +841,7 @@ export type BenchmarkFlags =
       runtime_type: "mlx_macos_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
@@ -831,72 +860,84 @@ export type BenchmarkFlags =
       runtime_type: "llamacpp_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_throughput";
       model_type: "gguf_vision";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "asr_throughput";
       model_type: "gguf_vision";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
       runtime_type: "mlx_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
       runtime_type: "mlx_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "mlx";
       readiness?: ReadinessOverrides | null;
       runtime_type: "mlx_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_apk_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_apk_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "gguf_text";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_apk_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_throughput";
       model_type: "gguf_vision";
       readiness?: ReadinessOverrides | null;
       runtime_type: "llamacpp_apk_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -904,6 +945,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -911,6 +953,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -918,6 +961,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -925,6 +969,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -932,6 +977,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -939,6 +985,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -946,6 +993,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -953,6 +1001,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -960,6 +1009,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -967,6 +1017,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_vllm";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -974,6 +1025,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -1017,7 +1069,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_sglang";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -1025,7 +1077,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_sglang";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "torch_speculative";
@@ -1033,7 +1085,7 @@ export type BenchmarkFlags =
       runtime_type: "docker_sglang";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "torch";
@@ -1041,7 +1093,7 @@ export type BenchmarkFlags =
       runtime_type: "uv_sglang";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_spec_decode";
       http_timeout_seconds?: number | null;
       model_type: "torch_speculative";
@@ -1049,24 +1101,28 @@ export type BenchmarkFlags =
       runtime_type: "uv_sglang";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "openvino";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_openvino";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "openvino";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_openvino";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "openvino";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_openvino";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       http_timeout_seconds?: number | null;
       model_type: "openvino";
@@ -1074,6 +1130,7 @@ export type BenchmarkFlags =
       runtime_type: "ovms";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       http_timeout_seconds?: number | null;
       model_type: "openvino";
@@ -1081,6 +1138,7 @@ export type BenchmarkFlags =
       runtime_type: "ovms";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       http_timeout_seconds?: number | null;
       model_type: "openvino";
@@ -1088,42 +1146,49 @@ export type BenchmarkFlags =
       runtime_type: "ovms";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_onnx_genai";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_onnx_genai";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "uv_onnx_genai";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "prefill_throughput";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "onnx_genai_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "onnx_genai_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "end_to_end_latency";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "onnx_genai_ios_pipette";
     }
   | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_throughput";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
@@ -1131,11 +1196,142 @@ export type BenchmarkFlags =
       runtime_type: "trt_edgellm";
     }
   | {
-      bench_timeout_seconds?: number | null;
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "vl_max_memory";
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
       runtime_type: "trt_edgellm";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "mlx";
+      runtime_type: "mlx_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "torch";
+      runtime_type: "docker_vllm";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "torch";
+      runtime_type: "uv_vllm";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "torch";
+      runtime_type: "docker_sglang";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "torch";
+      runtime_type: "uv_sglang";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "openvino";
+      runtime_type: "uv_openvino";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "openvino";
+      runtime_type: "ovms";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "onnx_genai";
+      runtime_type: "uv_onnx_genai";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "gguf_text";
+      runtime_type: "llamacpp_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "mlx";
+      runtime_type: "mlx_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "onnx_genai";
+      runtime_type: "onnx_genai_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "gguf_text";
+      runtime_type: "llamacpp_apk_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "core_ai";
+      runtime_type: "core_ai_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "vl_max_memory";
+      model_type: "mlx";
+      runtime_type: "mlx_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "vl_max_memory";
+      model_type: "gguf_vision";
+      runtime_type: "llamacpp_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "asr_max_memory";
+      model_type: "gguf_vision";
+      runtime_type: "llamacpp_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "prefill_throughput";
+      model_type: "core_ai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "core_ai_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decode_throughput";
+      model_type: "core_ai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "core_ai_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "end_to_end_latency";
+      model_type: "core_ai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "core_ai_macos_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decode_throughput";
+      model_type: "apple_foundation_text";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "apple_foundation";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "end_to_end_latency";
+      model_type: "apple_foundation_text";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "apple_foundation";
     };
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -2496,13 +2692,6 @@ export interface MlxMacosPipette {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "AppleCoreAiMacosPipette".
- */
-export interface AppleCoreAiMacosPipette {
-  packages: CoreAiSwiftStack;
-}
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CoreAiSwiftStack".
  */
 export interface CoreAiSwiftStack {
@@ -2832,6 +3021,7 @@ export interface CampaignView {
   labels?: {
     [k: string]: string;
   };
+  models?: string[] | null;
   name: string;
   owner: PrincipalOwner;
   plan?: PlanSummary | null;
@@ -3050,7 +3240,6 @@ export interface ClientDetail {
   registered_at: string;
   reindex_pending: boolean;
   status: ClientStatus;
-  suspended: boolean;
   tags: string[];
 }
 /**
@@ -3092,7 +3281,6 @@ export interface ClientListRow {
   registered_at: string;
   reindex_pending: boolean;
   status: ClientStatus;
-  suspended: boolean;
   tags: string[];
 }
 /**
@@ -3644,6 +3832,7 @@ export interface NamedCampaignView {
   labels?: {
     [k: string]: string;
   };
+  models?: string[] | null;
   name: string;
   names?: {
     [k: string]: string;
@@ -3897,7 +4086,6 @@ export interface OrgOverview {
   pending_members: UserHighlights;
   slug: string;
   status: OrgStatus;
-  suspended_clients: ClientHighlights | null;
   vault_resource_count: number | null;
 }
 /**

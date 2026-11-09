@@ -319,6 +319,49 @@
       "type": "object"
     },
     "AppleCoreAiMacosPipette": {
+      "oneOf": [
+        {
+          "properties": {
+            "source": {
+              "const": "bundled",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "source": {
+              "const": "relative_dir",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "dir"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "source": {
+              "const": "absolute_dir",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "dir"
+          ],
+          "type": "object"
+        }
+      ],
       "properties": {
         "packages": {
           "$ref": "#/$defs/CoreAiSwiftStack"
@@ -825,6 +868,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -858,6 +908,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -891,6 +948,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -961,6 +1025,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "vl_throughput",
               "type": "string"
@@ -1001,6 +1072,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "asr_throughput",
               "type": "string"
@@ -1041,7 +1119,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1078,7 +1156,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1195,7 +1273,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1242,7 +1320,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1289,7 +1367,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1319,6 +1397,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -1352,6 +1437,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -1385,6 +1477,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -1448,6 +1547,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "vl_throughput",
               "type": "string"
@@ -1488,7 +1594,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1535,7 +1641,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -1582,6 +1688,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -1681,6 +1794,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -1714,6 +1834,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -1747,6 +1874,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "vl_throughput",
               "type": "string"
@@ -1780,6 +1914,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "asr_throughput",
               "type": "string"
@@ -1813,6 +1954,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -1846,6 +1994,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -1879,6 +2034,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -1912,6 +2074,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -1945,6 +2114,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -1978,6 +2154,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2011,6 +2194,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "vl_throughput",
               "type": "string"
@@ -2044,6 +2234,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -2084,6 +2281,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -2124,6 +2328,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -2164,6 +2375,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -2204,6 +2422,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -2244,6 +2469,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -2284,6 +2516,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -2324,6 +2563,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -2364,6 +2610,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2404,6 +2657,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2444,6 +2704,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2484,6 +2751,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2704,7 +2978,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -2751,7 +3025,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -2798,7 +3072,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -2845,7 +3119,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -2892,6 +3166,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -2925,6 +3206,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -2958,6 +3246,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -2991,6 +3286,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -3031,6 +3333,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -3071,6 +3380,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -3111,6 +3427,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -3144,6 +3467,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -3177,6 +3507,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -3210,6 +3547,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "prefill_throughput",
               "type": "string"
@@ -3243,6 +3587,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "decode_throughput",
               "type": "string"
@@ -3276,6 +3627,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "end_to_end_latency",
               "type": "string"
@@ -3309,6 +3667,13 @@
         {
           "additionalProperties": false,
           "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "benchmark_type": {
               "const": "vl_throughput",
               "type": "string"
@@ -3349,7 +3714,7 @@
         {
           "additionalProperties": false,
           "properties": {
-            "bench_timeout_seconds": {
+            "attempt_timeout_seconds": {
               "minimum": 1,
               "type": [
                 "integer",
@@ -3373,6 +3738,686 @@
             },
             "runtime_type": {
               "const": "trt_edgellm",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "mlx",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "mlx_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "torch",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "docker_vllm",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "torch",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "uv_vllm",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "torch",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "docker_sglang",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "torch",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "uv_sglang",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "openvino",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "uv_openvino",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "openvino",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "ovms",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "uv_onnx_genai",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "llamacpp_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "mlx",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "mlx_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "onnx_genai_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "llamacpp_apk_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "core_ai",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "core_ai_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "vl_max_memory",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "mlx",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "mlx_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "vl_max_memory",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "llamacpp_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "asr_max_memory",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "llamacpp_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "prefill_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "core_ai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "core_ai_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decode_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "core_ai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "core_ai_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "end_to_end_latency",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "core_ai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "core_ai_macos_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decode_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "apple_foundation_text",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "apple_foundation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "end_to_end_latency",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "apple_foundation_text",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "apple_foundation",
               "type": "string"
             }
           },
@@ -3606,6 +4651,15 @@
             "minLength": 1
           },
           "type": "object"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "name": {
           "type": "string"
@@ -4417,9 +5471,6 @@
         "status": {
           "$ref": "#/$defs/ClientStatus"
         },
-        "suspended": {
-          "type": "boolean"
-        },
         "tags": {
           "items": {
             "type": "string"
@@ -4439,7 +5490,6 @@
         "tags",
         "permissions",
         "reindex_pending",
-        "suspended",
         "last_seen_at",
         "backlog",
         "may_administer",
@@ -4616,9 +5666,6 @@
         "status": {
           "$ref": "#/$defs/ClientStatus"
         },
-        "suspended": {
-          "type": "boolean"
-        },
         "tags": {
           "items": {
             "type": "string"
@@ -4638,7 +5685,6 @@
         "tags",
         "permissions",
         "reindex_pending",
-        "suspended",
         "last_seen_at",
         "backlog"
       ],
@@ -8062,6 +9108,15 @@
           },
           "type": "object"
         },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -8995,16 +10050,6 @@
         "status": {
           "$ref": "#/$defs/OrgStatus"
         },
-        "suspended_clients": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientHighlights"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "vault_resource_count": {
           "format": "uint",
           "minimum": 0,
@@ -9026,7 +10071,6 @@
         "pending_members",
         "client_status_counts",
         "pending_clients",
-        "suspended_clients",
         "campaigns",
         "vault_resource_count",
         "benchmark_count",

@@ -60,7 +60,7 @@ runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", speculative_enabled = false },
 ]
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", http_timeout_seconds = 600 },
 ]
 # The runtime is spelled out rather than referenced by catalog key, because a
 # plan carries the environment it measured: `version` selects nothing here, it
@@ -144,7 +144,7 @@ runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", speculative_enabled = true },
 ]
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", http_timeout_seconds = 600 },
 ]
 # The runtime is spelled out rather than referenced by catalog key, because a
 # plan carries the environment it measured: `version` selects nothing here, it

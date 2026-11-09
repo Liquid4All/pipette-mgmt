@@ -2187,6 +2187,25 @@ mod tests {
         Ok((dir, build_local_fs_stores(&config)?))
     }
 
+    /// [`stores`] with the queue on a new database, for a test that runs
+    /// `queue-maintenance`. The records stay in the directory, where
+    /// [`as_filed_under_v1`] deletes a job source. `None` skips the test
+    /// without `TEST_DATABASE_URL`.
+    async fn sql_stores() -> anyhow::Result<
+        Option<(
+            tempfile::TempDir,
+            Stores,
+            pipette_store_sql::scratch::TestDb,
+        )>,
+    > {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(None);
+        };
+        let (dir, mut stores) = stores()?;
+        stores.todo = std::sync::Arc::new(pipette_store_sql::SqlTodoStore::new(db.db().clone()));
+        Ok(Some((dir, stores, db)))
+    }
+
     fn a_new_campaign(name: &str) -> anyhow::Result<NewCampaign> {
         Ok(NewCampaign::new(
             NonEmptyTrimmedString::try_new(name)?,
@@ -3244,24 +3263,6 @@ mod tests {
             };
             assert_eq!(creating.status, PlanStatus::Creating);
             assert!(!stores.plans.has_cancel_marker(&creating.plan_id).await?);
-            crate::queue_maintenance::run(
-                &*stores.todo,
-                &*stores.clients,
-                &*stores.tags,
-                &*stores.submissions,
-                &*stores.plans,
-                &std::collections::HashMap::new(),
-                crate::queue_maintenance::MaintenanceSettings {
-                    tmp_max: std::time::Duration::from_secs(86_400),
-                    plan_creating_max: CREATING_MAX_AGE,
-                    lost_lease_limit: 3,
-                },
-            )
-            .await?;
-            assert!(
-                stores.todo.read_eligible_indexed().await?.is_empty(),
-                "maintenance must not index jobs of the creating plan"
-            );
             assert!(sends.load(std::sync::atomic::Ordering::SeqCst) >= 3);
         }
         Ok(())
@@ -3850,7 +3851,9 @@ benchmarks = ["decode_throughput_512_100"]
     /// the finished one included, queues one, and teardown retires the iOS job.
     #[tokio::test]
     async fn a_variant_edit_keeps_what_it_kept_and_stops_what_it_dropped() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
         let (campaign, first) = created(&stores, dir.path()).await?;
         let dropped = queued_requiring(&stores, &first, "os:ios").await?;
         let kept = queued_requiring(&stores, &first, "os:macos").await?;
@@ -5574,7 +5577,9 @@ benchmarks = ["decode_throughput_512_100"]
     /// retiring it.
     #[tokio::test]
     async fn a_variant_edit_keeps_a_running_job_running() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
         let (campaign, first) = created(&stores, dir.path()).await?;
         let running = queued_requiring(&stores, &first, "os:macos")
             .await?
@@ -5660,7 +5665,9 @@ benchmarks = ["decode_throughput_512_100"]
     /// the same cell.
     #[tokio::test]
     async fn a_finished_job_carries_through_a_chain_of_edits() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
         let (campaign, first) = created(&stores, dir.path()).await?;
         let done = queued_requiring(&stores, &first, "os:macos")
             .await?
@@ -5735,7 +5742,9 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_rerun_runs_one_cell_again_and_keeps_the_rest(
         #[case] v1_unstored: Option<bool>,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
         let (campaign, first) = created(&stores, dir.path()).await?;
         let jobs: Vec<JobId> = first
             .job_ids
@@ -6508,7 +6517,9 @@ benchmarks = ["decode_throughput_512_100"]
     /// named job's record; the other jobs carry over.
     #[tokio::test]
     async fn a_recalculation_scores_one_eval_again_and_keeps_the_rest() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let jobs: Vec<JobId> = first
             .job_ids

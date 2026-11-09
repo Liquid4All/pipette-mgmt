@@ -4,7 +4,7 @@
   // reaches it. Each write reads the device again, as the classic form redirected.
   import {
     account as accountOf, amendClientPermissions, approveClient, client, deleteClient, deviceOwners, rejectClient,
-    setClientOwner, unsuspendClient,
+    setClientOwner,
   } from "../lib/api";
   import DangerRow from "../lib/components/DangerRow.svelte";
   import DeviceCatalog from "../lib/components/DeviceCatalog.svelte";
@@ -199,15 +199,6 @@
               {#snippet control(ids)}
                 <button type="button" aria-describedby={ids.text} aria-disabled={work.busy}
                         onclick={() => act(() => approveClient(session.signer, id))}>Approve</button>
-              {/snippet}
-            </SettingRow>
-          {/if}
-          {#if view.suspended}
-            <SettingRow title="Clear the suspension"
-                        text="Suspended: it claimed work while it still held a lease, so the claim path passes it over until the suspension is cleared.">
-              {#snippet control(ids)}
-                <button type="button" aria-describedby={ids.text} aria-disabled={work.busy}
-                        onclick={() => act(() => unsuspendClient(session.signer, id))}>Clear the suspension</button>
               {/snippet}
             </SettingRow>
           {/if}

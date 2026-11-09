@@ -1247,7 +1247,7 @@ async fn test_list_jobs_outside_the_scope_is_a_404() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_list_jobs_pages_in_manifest_order() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (mut state, _key, client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(
         &state,
         &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
@@ -1255,15 +1255,27 @@ async fn test_list_jobs_pages_in_manifest_order() -> anyhow::Result<()> {
     .await?;
     let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "p", 3).await?;
     let jobs = manifest_job_ids(&state, &plan_id).await?;
-
-    let resp = authed_user_get(
-        &state,
-        &key,
-        &user_id,
-        &key_id,
-        &format!("/api/v1/plans/{plan_id}/jobs?limit=2&offset=1"),
+    pipette_store_testkit::seed_avail(
+        state.todo_store.as_ref(),
+        "unrelated-page-job",
+        ExpiresAt::Never,
+        &json!({}),
     )
     .await?;
+    let observed = pipette_store_testkit::ObservedTodoStore::wrap(&state.todo_store);
+    state.todo_store = observed.clone();
+    let jobs_get = async |suffix: &str| {
+        authed_user_get(
+            &state,
+            &key,
+            &user_id,
+            &key_id,
+            &format!("/api/v1/plans/{plan_id}/jobs{suffix}"),
+        )
+        .await
+    };
+
+    let resp = jobs_get("?limit=2&offset=1").await?;
     let body = body_json(resp).await?;
     assert_eq!(body["total"], json!(3));
     assert_eq!(body["offset"], json!(1));
@@ -1277,6 +1289,30 @@ async fn test_list_jobs_pages_in_manifest_order() -> anyhow::Result<()> {
         page,
         vec![jobs[1].as_str().to_string(), jobs[2].as_str().to_string()]
     );
+    let mut reads = observed.take_reads();
+    reads.sort_by_key(|(method, _)| *method);
+    assert_eq!(
+        reads,
+        vec![
+            ("avail_for_jobs", jobs[1..].to_vec()),
+            ("leases_for_jobs", jobs[1..].to_vec())
+        ]
+    );
+    for suffix in ["?limit=0", "?offset=99"] {
+        let resp = jobs_get(suffix).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(observed.take_reads().iter().all(|(_, ids)| ids.is_empty()));
+    }
+    let mut manifest = state.plan_store.get_plan(&plan_id).await?.context("plan")?;
+    manifest.status = PlanStatus::Complete;
+    state.plan_store.put_plan(&manifest).await?;
+    let resp = jobs_get("").await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        observed.take_reads().is_empty(),
+        "complete plans without expired jobs skip queue reads"
+    );
+    observed.unexpected.none()?;
     Ok(())
 }
 
@@ -1698,17 +1734,22 @@ async fn test_cancel_writes_the_marker_and_leaves_the_status() -> anyhow::Result
 #[tokio::test]
 async fn test_cancel_over_http_is_torn_down_by_queue_maintenance() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, _key, client_id)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let (key, user_id, key_id) = registered_user(
-        &state,
+        state,
         &[UserPermission::SubmitPlans, UserPermission::CancelPlans],
     )
     .await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "doomed", 2).await?;
-    let job_ids = manifest_job_ids(&state, &plan_id).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client_id, "doomed", 2).await?;
+    let job_ids = manifest_job_ids(state, &plan_id).await?;
 
     let resp = pipette_web_testkit::authed_user_post(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -1718,7 +1759,7 @@ async fn test_cancel_over_http_is_torn_down_by_queue_maintenance() -> anyhow::Re
     .await?;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    pipette_web_testkit::run_qm(&state).await?;
+    pipette_web_testkit::run_qm(state).await?;
 
     let manifest = state
         .plan_store
@@ -2015,22 +2056,31 @@ async fn test_cancel_a_complete_plan_is_a_conflict() -> anyhow::Result<()> {
 
 // ── GET /api/v1/plans/{plan_id}/explain ────────────────────────────────────────────
 
-/// The report reaches a scheduling state and a headline, and the caller's **own** counts
-/// are never gated: a submitter must be able to ask why its plan is stuck
-/// whatever fleet rights it holds.
+/// A caller always sees its plan counts. Only `read_clients` reveals the fleet.
+#[rstest]
+#[case::withheld(false, "withheld")]
+#[case::full(true, "full")]
 #[tokio::test]
-async fn test_explain_withholds_the_fleet_without_read_clients() -> anyhow::Result<()> {
+async fn test_explain_fleet_permission_tier(
+    #[case] read_clients: bool,
+    #[case] fleet_detail: &str,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
-    let (key, user_id, key_id) = registered_user(
-        &state,
-        &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
-    )
-    .await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "p", 1).await?;
+    let Some((queue, _key, client_id)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let grants: Vec<UserPermission> = [UserPermission::SubmitPlans, UserPermission::ReadPlans]
+        .into_iter()
+        .chain(read_clients.then_some(UserPermission::ReadClients))
+        .collect();
+    let (key, user_id, key_id) = registered_user(state, &grants).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client_id, "p", 1).await?;
 
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -2048,47 +2098,17 @@ async fn test_explain_withholds_the_fleet_without_read_clients() -> anyhow::Resu
             .unwrap_or_default()
             .is_empty()
     );
-    // The caller's own jobs, always present.
     assert_eq!(body["census"]["total"], json!(1));
-    // The fleet, never present at this tier.
-    assert_eq!(body["fleet_detail"], json!("withheld"));
-    assert!(
-        body.get("fleet").is_none(),
-        "the fleet standing reached a caller holding no read_clients: {body}"
-    );
-    Ok(())
-}
-
-/// `read_clients` opens the fleet standing, which is the whole difference
-/// between the two tiers.
-#[tokio::test]
-async fn test_explain_names_the_fleet_with_read_clients() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
-    let (key, user_id, key_id) = registered_user(
-        &state,
-        &[
-            UserPermission::SubmitPlans,
-            UserPermission::ReadPlans,
-            UserPermission::ReadClients,
-        ],
-    )
-    .await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "p", 1).await?;
-
-    let resp = authed_user_get(
-        &state,
-        &key,
-        &user_id,
-        &key_id,
-        &format!("/api/v1/plans/{plan_id}/explain"),
-    )
-    .await?;
-    let body = body_json(resp).await?;
-    assert_eq!(body["fleet_detail"], json!("full"));
-    // One approved client registered by the fixture.
-    assert_eq!(body["fleet"]["registered"], json!(1));
-    assert_eq!(body["fleet"]["approved"], json!(1));
+    assert_eq!(body["fleet_detail"], json!(fleet_detail));
+    if read_clients {
+        assert_eq!(body["fleet"]["registered"], json!(1));
+        assert_eq!(body["fleet"]["approved"], json!(1));
+    } else {
+        assert!(
+            body.get("fleet").is_none(),
+            "the fleet standing reached a caller holding no read_clients: {body}"
+        );
+    }
     Ok(())
 }
 
@@ -2263,9 +2283,14 @@ async fn test_status_listing_and_explain_project_fleet_detail(
     #[case] tier: &str,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, _key, client_id)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let (key, user_id, key_id) = registered_user(
-        &state,
+        state,
         &[
             UserPermission::SubmitPlans,
             UserPermission::ReadPlans,
@@ -2273,9 +2298,9 @@ async fn test_status_listing_and_explain_project_fleet_detail(
         ],
     )
     .await?;
-    grant_plan_user_detail(&state, &user_id, permission).await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "tier", 2).await?;
-    let full_group = add_starved_snapshot(&state, &plan_id).await?;
+    grant_plan_user_detail(state, &user_id, permission).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client_id, "tier", 2).await?;
+    let full_group = add_starved_snapshot(state, &plan_id).await?;
     let stored = state
         .plan_store
         .get_plan(&plan_id)
@@ -2283,7 +2308,7 @@ async fn test_status_listing_and_explain_project_fleet_detail(
         .context("plan exists")?;
 
     for route in [format!("/api/v1/plans/{plan_id}"), "/api/v1/plans".into()] {
-        let resp = authed_user_get(&state, &key, &user_id, &key_id, &route).await?;
+        let resp = authed_user_get(state, &key, &user_id, &key_id, &route).await?;
         assert!(resp.status().is_success(), "{route}: {}", resp.status());
         let body = body_json(resp).await?;
         let def = match route.as_str() {
@@ -2325,7 +2350,7 @@ async fn test_status_listing_and_explain_project_fleet_detail(
     // rather than the teardown.
     state.plan_store.delete_cancel_marker(&plan_id).await?;
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -2369,15 +2394,20 @@ async fn test_status_listing_and_explain_project_fleet_detail(
 #[tokio::test]
 async fn test_explain_projects_a_starved_headline(#[case] full: bool) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, _client_id) = approved_client(dir.path()).await?;
-    let (key, user_id, key_id) = registered_user_with_detail(&state, full).await?;
+    let Some((queue, _key, _client_id)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (key, user_id, key_id) = registered_user_with_detail(state, full).await?;
     // Pinned to a client that never registered, so no approved client matches
     // the job and the scan reaches starvation rather than a standing gate.
     let absent = ClientId::try_new("ev1_absent")?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &absent, "starved", 1).await?;
-    pipette_web_testkit::run_qm(&state).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &absent, "starved", 1).await?;
+    pipette_web_testkit::run_qm(state).await?;
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -2408,7 +2438,7 @@ async fn test_explain_projects_a_starved_headline(#[case] full: bool) -> anyhow:
     }
     state.plan_store.put_plan(&manifest).await?;
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -2433,17 +2463,18 @@ async fn test_explain_projects_a_blocked_clients_headline(
     #[case] full: bool,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
-    let (key, user_id, key_id) = registered_user_with_detail(&state, full).await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client_id, "blocked", 1).await?;
-    pipette_web_testkit::run_qm(&state).await?;
-    let jobs = manifest_job_ids(&state, &plan_id).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, Utc::now(), &jobs[0])
-        .await?;
+    let Some((queue, _key, client_id)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (key, user_id, key_id) = registered_user_with_detail(state, full).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client_id, "blocked", 1).await?;
+    pipette_web_testkit::run_qm(state).await?;
+    state.todo_store.write_pending_reindex(&client_id).await?;
     let resp = authed_user_get(
-        &state,
+        state,
         &key,
         &user_id,
         &key_id,
@@ -2456,7 +2487,7 @@ async fn test_explain_projects_a_blocked_clients_headline(
     if full {
         assert_eq!(
             body["headline"],
-            "no client can take a claimable job: 1 suspended"
+            "no client can take a claimable job: 1 pending an eligible-index rebuild"
         );
     } else {
         assert_eq!(

@@ -355,12 +355,10 @@ Key obligations while running:
   must not claim again while it holds a live lease. (A client that does claim
   while already holding exactly one lease gets that *same* job handed back
   idempotently, so a lost claim response recovers transparently, though each
-  hand-back counts against the job's lost-lease limit; accumulating more than
-  one lease gets the client suspended. See
+  hand-back counts against the job's lost-lease limit. See
   [queue.md](queue.md#claiming-a-job).) Never have two `claim` or `reclaim`
-  requests in flight: overlapping requests that each win a job suspend the
-  client. Retry a claim only after the earlier request has returned or its
-  connection is closed.
+  requests in flight. Retry a claim only after the earlier request has
+  returned or its connection is closed.
 - **Heartbeat at half the `time_window`.** The claim response reports
   `time_window` as an ISO 8601 duration (e.g. `PT10M`). The client heartbeats at
   half that interval. Each successful heartbeat extends the lease by the full
@@ -404,7 +402,7 @@ Retry transient failures with exponential backoff: start at ~1–2 s, double to 
 | Endpoint | Transient failure (5xx / network) | Definitive answers |
 |---|---|---|
 | `POST /plans/claim` | back off and retry at the idle cadence | `204` → idle wait; `403` → **stop** (not approved, or `perform_work` not granted, the message says which) |
-| `PUT /plans/{job_id}/heartbeat` | **retry with short backoff. Do not abort.** You have up to `time_window/2` of slack before the lease lapses; if you cannot succeed within it, proactively `reclaim` | `404` → try `reclaim`; `409` → abort (superseded, zombie); `403` → abort and re-poll `claim` (suspended, not approved, `perform_work` not granted, or the job names a vault resource this client may not fetch; the message says which) |
+| `PUT /plans/{job_id}/heartbeat` | **retry with short backoff. Do not abort.** You have up to `time_window/2` of slack before the lease lapses; if you cannot succeed within it, proactively `reclaim` | `404` → try `reclaim`; `409` → abort (superseded, zombie); `403` → abort and re-poll `claim` (not approved, `perform_work` not granted, or the job names a vault resource this client may not fetch; the message says which) |
 | `POST /plans/{job_id}/reclaim` | brief retry | `200` → resume + heartbeat; `403`/`404`/`409` → abort and re-poll `claim` |
 | `PATCH /clients/me` | retry with backoff | `409` → resend the same PATCH (it re-reads the record); `401` after a resend → the client was deleted |
 | `POST /benchmarks` | retry with backoff. **Safe when plan-attached, not when ad-hoc** (see below) | `202` → done; `403` → **stop** (the permission this body needs is not granted); a success refused with `the job names a vault resource this client may not fetch…` is instead answered by reporting the job's failure (`retriable: true`, so the job goes back to the queue for a device that may fetch the model); `404` → `reclaim` then resubmit; `409` → drop the result (superseded) |
@@ -413,7 +411,7 @@ The heartbeat row is the one that matters most: a `503` or a dropped connection
 is **not** lease loss. A definitive `404` (lease reaped) is not the end of the
 run either. It is a prompt to `reclaim`, and the run dies only if that reclaim
 in turn fails with `404`/`409`. A `409` (the lease was taken by another client)
-or a `403` (the client is suspended, lost its standing, or may not fetch the
+or a `403` (the client lost its standing or may not fetch the
 job's vault model) ends the run outright.
 
 ### Retrying a submission
@@ -442,10 +440,9 @@ plan-attached, where the lease makes the retry safe.
 When `claim` returns `204` (no work), wait approximately **5 minutes plus 0–60 s
 of jitter** before retrying; the jitter avoids synchronized polling bursts across
 the fleet. The interval may be configurable, but neither hammer the server nor
-sleep so long that throughput suffers. Note that `204` is deliberately
-indistinguishable between "no eligible job right now" and "this client is
-suspended". The client treats both identically and simply keeps polling; an
-operator clearing a suspension resumes work with no client action required.
+sleep so long that throughput suffers. A `204` does not say why there is no
+job ([httpapi.md §2.9](httpapi.md#29-post-plansclaim) lists the causes). The
+client treats every `204` the same way and polls again after the idle interval.
 
 ## 6. Retriable vs. non-retriable failures
 
@@ -478,9 +475,11 @@ A failure is reported through the same `POST /benchmarks` endpoint as a result,
 with `message_type: "failure"`. The body echoes the claim's `job_id`,
 `benchmark_id`, and `model_*` / `runtime_*` fields verbatim, and carries the
 `retriable` flag plus a human-readable `failure_reason`: conventionally a
-timestamp followed by the runtime's own error output. No device or metric fields
-are sent. A client that ran out of memory loading the model reports a *retriable*
-failure:
+timestamp followed by the runtime's own error output. It should also send a
+`failure_code` naming the kind of failure (`out_of_memory`, `attempt_timeout`,
+`runtime_error`, `device_error` or `harness_error`; one it leaves out is
+recorded as `unspecified`). No device or metric fields are sent. A client that ran out of
+memory loading the model reports a *retriable* failure:
 
 ```json
 {
@@ -488,6 +487,7 @@ failure:
   "job_id": "job-550e8400-e29b-41d4-a716-446655440000",
   "benchmark_id": "prefill_throughput_256",
   "failure_reason": "[2026-03-10T12:04:51Z] llama-server failed to load model: out of memory",
+  "failure_code": "out_of_memory",
   "retriable": true,
   "model_name": "llama-3.2-1b",
   "model_quant": "q4_0",
@@ -554,7 +554,21 @@ Everything a client needs to execute arrives in the claim's `spec`
 ([httpapi.md](httpapi.md#292-response-200-ok)): `benchmark`, `model`, `runtime`,
 and the optional `model_flags` / `runtime_flags` / `benchmark_flags` groups.
 `spec.benchmark_flags` is where the HTTP timeout, doom-loop detection settings,
-and the readiness wait live.
+the readiness wait and the attempt limit live.
+
+`attempt_timeout_seconds` is the wall-clock limit on each attempt: one warm-up
+or one measured rep, each timed on its own; on `vl_spec_decode` an attempt is
+one sample with all its turns. The warm-up is an uncounted attempt with the
+same limit, and model load and server start count against it, so a prefill cell
+with a warm-up and 5 reps can take up to 6 times the limit. Calibration does
+not count. Readiness-gate waits do not count either, since each gate has its
+own `readiness.max_wait_secs` (300 s by default, 420 s on macOS) before every
+rep. An attempt past the limit is stopped and the run fails. Unset, the
+client's default applies: 300 s on the prefill, decode, end-to-end, max-memory,
+VL and ASR throughput and VL and ASR max-memory cells, from the clients release
+that reads this field; `vl_spec_decode` has no default. Eval cells and the iOS
+`vl_spec_decode` cells refuse the field. The retired `bench_timeout_seconds` is
+accepted and ignored, so queued specs and recorded results still parse.
 
 `spec` is one type (`pipette-plan-types`' `ClientRunSpec`), so a client
 deserializes it whole rather than field by field, and the flag groups' embedded

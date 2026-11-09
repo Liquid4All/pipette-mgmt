@@ -14,6 +14,10 @@
         --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
         --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
         --grid: #e4e4e7; --band: #94a3b8;
+        /* A campaign's progress bar, by the phase of its plan: the finished jobs, then the failed ones. */
+        --fill-active: #e4d7ff; --fill-active-failed: #fed7aa;
+        --fill-complete: #c9f0d6; --fill-complete-failed: #fcc9c9;
+        --fill-cancelled: #e4e4e7; --fill-cancelled-failed: #ead1d1;
         --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
 body { margin: 0; font: 13px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
        color: var(--text); background: var(--bg); }
@@ -92,6 +96,19 @@ tbody tr:hover > td { background: var(--surface); }
 td.num { text-align: right; }
 /* Lighter than a status pill's tint, so an `active` pill still reads on it. */
 tr.shown > td, tbody tr.shown:hover > td { background: var(--selected); }
+/* A bar fills a cell from the left, behind its text and over the row's tint, inside the cell's borders.
+   The failed part is at least `--sliver` wide, so a few failures among many jobs stay visible. */
+td:has(> .fill) { position: relative; z-index: 0; min-width: 110px; }
+.fill { position: absolute; inset: 0; z-index: -1; --sliver: 0px;
+        --failed-end: max(var(--done), var(--sliver));
+        --failed-start: min(var(--finished), calc(var(--failed-end) - var(--sliver)));
+        background: linear-gradient(to right, var(--fill-ok) var(--failed-start),
+                                    var(--fill-bad) var(--failed-start) var(--failed-end),
+                                    transparent var(--failed-end)); }
+.fill[data-failed] { --sliver: 1px; }
+.fill[data-phase=active] { --fill-ok: var(--fill-active); --fill-bad: var(--fill-active-failed); }
+.fill[data-phase=complete] { --fill-ok: var(--fill-complete); --fill-bad: var(--fill-complete-failed); }
+.fill[data-phase=cancelled] { --fill-ok: var(--fill-cancelled); --fill-bad: var(--fill-cancelled-failed); }
 
 /* A wide table keeps each row on one line and scrolls sideways as a whole. */
 .wide { overflow-x: auto; margin: 8px 0 14px; }

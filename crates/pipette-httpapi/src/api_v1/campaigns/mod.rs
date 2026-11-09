@@ -814,6 +814,7 @@ fn view(campaign: Campaign) -> CampaignView {
     CampaignView {
         campaign: campaign.into(),
         plan: None,
+        models: None,
     }
 }
 

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use pipette_core::benchmark::Benchmark;
 use pipette_core::client::Client;
-use pipette_core::denial::{DeniedClient, summarize_denials};
+use pipette_core::denial::{DeniedClient, prevailing_failure_code, summarize_denials};
 use pipette_core::matching;
 use pipette_core::matching::{FleetTags, capability_clauses_malformed, job_matches_client};
 use pipette_core::plan::PlanManifest;
@@ -21,14 +21,15 @@ use pipette_core::todo_filename::{
     parse_leased_key,
 };
 use pipette_plan_types::{
-    BenchmarkId, CampaignId, ClientId, ExpiresAt, FailureSource, JobId, PlanId, PlanStatus,
+    BenchmarkId, CampaignId, ClientId, ExpiresAt, FailureCode, FailureSource, JobId, PlanId,
+    PlanStatus,
 };
 use pipette_store::decode_stats::{DecodeCounts, S3_DECODE};
 use pipette_store::http_stats::{HttpCounts, S3_HTTP};
 use pipette_store::{
     BacklogSnapshot, CampaignBacklog, CampaignBacklogSnapshot, ClientStore, CreateOutcome,
-    JobPlanMarker, PlanStore, RecycleResult, RedateResult, STORAGE_CONCURRENCY, SubmissionStore,
-    TagStore, TodoStore, drain_clients, drain_plans, warn_unreadable_clients,
+    JobPlanMarker, PlanStore, RecycleResult, RedateResult, ReindexJob, STORAGE_CONCURRENCY,
+    SubmissionStore, TagStore, TodoStore, drain_clients, drain_plans, warn_unreadable_clients,
 };
 
 use crate::submission::{UnrecordableJobError, record_system_failure};
@@ -63,6 +64,7 @@ pub async fn run(
     catalog: &HashMap<BenchmarkId, Benchmark>,
     settings: MaintenanceSettings,
 ) -> anyhow::Result<()> {
+    let bodies_before = todo.queue_body_reads();
     let at_start = PhaseMark::now();
     let now = Utc::now();
     // Cleared at once, so a failed run leaves no sightings a later run would
@@ -115,7 +117,6 @@ pub async fn run(
     )
     .await?;
     let failed_items = failed_items + teardown.failures;
-    // The `avail/` keys keep a recycled lease from being re-indexed as new.
     let leased_ids: HashSet<JobId> = teardown.leased.iter().map(|l| l.job_id.clone()).collect();
 
     // Before the expiry pass, which re-dates or retires a job from the member
@@ -136,38 +137,65 @@ pub async fn run(
     let (all_keys, expired_now, expiry_failures) =
         expire_overdue_jobs(todo, submissions, plans, catalog, teardown.avail, now).await?;
 
-    let mut bodies: HashMap<String, Value> = HashMap::new();
-    // Retirement first, so an unmatchable body is not reported as an exhausted
-    // roster.
-    let (all_keys, retired_now, retirement_failures) =
-        retire_unmatchable_jobs(todo, submissions, catalog, all_keys, &mut bodies, now).await?;
-    let (all_keys, escalated_now, escalation_failures) =
-        escalate_all_denied_jobs(todo, submissions, catalog, all_keys, &mut bodies, now).await?;
-    let failed_items = failed_items + expiry_failures + retirement_failures + escalation_failures;
-
     // A promoted job waits in avail/ until at least one of its plans leaves
-    // creating. Keep it out of all three index passes and the persisted set,
-    // so the next run evaluates it when its plan becomes active.
+    // creating. Keep it out of the flagged read and the passes after it, so it
+    // keeps its reindex flag and the run reads its body only after its plan
+    // becomes active.
     let index_candidates: HashSet<JobId> = all_keys
         .iter()
         .map(|key| key.job_id.clone())
         .chain(teardown.leased.iter().map(|lease| lease.job_id.clone()))
         .collect();
     let withheld = uncommitted_jobs(&index_candidates, &job_plan_markers, &manifests);
-    let indexable_keys: Vec<AvailKey> = all_keys
+    let listed: Vec<JobId> = all_keys
         .iter()
-        .filter(|key| !withheld.contains(&key.job_id))
-        .map(|key| AvailKey {
-            key: key.key.clone(),
-            job_id: key.job_id.clone(),
-            expires_at: key.expires_at,
+        .map(|key| key.job_id.clone())
+        .filter(|job_id| !withheld.contains(job_id))
+        .collect();
+    let batch = todo.jobs_needing_reindex(&listed).await?;
+    let unreadable: HashSet<JobId> = batch.unreadable.into_iter().collect();
+    let mut flagged = batch.jobs;
+    let failed_items = failed_items + unreadable.len();
+    let flagged_ids: HashSet<JobId> = flagged.iter().map(|job| job.job_id.clone()).collect();
+    // The cache owns each flagged body; the index pass borrows it back below.
+    let mut bodies: HashMap<String, Value> = flagged
+        .iter_mut()
+        .map(|job| {
+            (
+                avail_filename(&job.job_id, job.expires_at),
+                std::mem::take(&mut job.body),
+            )
         })
         .collect();
-    let indexable_leased_avail_keys: HashSet<String> = teardown
-        .leased
+    // Retirement first, so an unmatchable body is not reported as an exhausted
+    // roster.
+    let (all_keys, retired_now, retirement_failures) = retire_unmatchable_jobs(
+        todo,
+        submissions,
+        catalog,
+        all_keys,
+        &flagged_ids,
+        &mut bodies,
+        now,
+    )
+    .await?;
+    let (all_keys, escalated_now, escalation_failures) = escalate_all_denied_jobs(
+        todo,
+        submissions,
+        catalog,
+        all_keys,
+        &flagged_ids,
+        &mut bodies,
+        now,
+    )
+    .await?;
+    let failed_items =
+        failed_items + expiry_failures + retirement_failures.len() + escalation_failures.len();
+
+    let indexable_ids: Vec<JobId> = all_keys
         .iter()
-        .filter(|lease| !withheld.contains(&lease.job_id))
-        .map(|lease| avail_filename(&lease.job_id, lease.expires_at))
+        .map(|key| key.job_id.clone())
+        .filter(|id| !withheld.contains(id) && !unreadable.contains(id))
         .collect();
 
     // Confirmed terminal for this run's GC sweeps.
@@ -179,7 +207,7 @@ pub async fn run(
 
     let clients = drain_clients(auth).await?;
     warn_unreadable_clients(&clients.unreadable);
-    let mut client_records_drained = clients.items.len() + clients.unreadable.len();
+    let client_records_drained = clients.items.len() + clients.unreadable.len();
     let clients = clients.items;
     let fleet_tags = FleetTags::new(tags.list_forward_tag_markers().await?);
     // A leased job is live: a marker swept mid-lease is never rebuilt. Only
@@ -209,47 +237,50 @@ pub async fn run(
         "queue-maintenance: eligible-index pass starting"
     );
 
-    let indexed_workers = todo.read_eligible_workers().await?;
+    let indexed_workers = todo.read_workers().await?;
     let joined = track_worker_changes(todo, &indexed_workers, &worker_ids).await?;
-    index_new_jobs(
-        todo,
-        &workers,
-        &fleet_tags,
-        &indexable_keys,
-        &indexable_leased_avail_keys,
-        &mut bodies,
-    )
-    .await?;
+    // Before the client rebuilds: they read each record fresh, so a matching
+    // input that changed after the snapshot wins.
+    let indexable: HashSet<JobId> = indexable_ids
+        .iter()
+        .filter(|id| !retirement_failures.contains(*id) && !escalation_failures.contains(*id))
+        .cloned()
+        .collect();
+    // A job without a cached body keeps its flag for the next run.
+    let to_index: Vec<ReindexJob> = flagged
+        .into_iter()
+        .filter(|job| indexable.contains(&job.job_id))
+        .filter_map(|mut job| {
+            job.body = bodies.remove(&avail_filename(&job.job_id, job.expires_at))?;
+            Some(job)
+        })
+        .collect();
+    let indexed = index_flagged_jobs(todo, &workers, &fleet_tags, &to_index).await?;
+    bodies.extend(
+        to_index
+            .into_iter()
+            .map(|job| (avail_filename(&job.job_id, job.expires_at), job.body)),
+    );
+    let fallback: HashSet<JobId> = flagged_ids.difference(&indexed).cloned().collect();
     reindex_flagged_clients(
         todo,
         auth,
         tags,
         &worker_ids,
         &joined,
-        &indexable_keys,
+        &indexable_ids,
         &leased_ids,
-        &mut bodies,
     )
     .await?;
     // After every joiner's rebuild, so a failed run sees the same joiners again.
     if indexed_workers != worker_ids {
-        todo.write_eligible_workers(&worker_ids).await?;
+        todo.write_workers(&worker_ids).await?;
     }
-    client_records_drained += settle_pending_reindex_jobs(
-        todo,
-        auth,
-        tags,
-        submissions,
-        &worker_ids,
-        &indexable_keys,
-        &mut bodies,
-    )
-    .await?;
 
     // After the index passes, so the sweep never deletes a marker they wrote.
     let live_clients: HashSet<ClientId> = clients.iter().map(|c| c.client_id.clone()).collect();
-    // Tells a re-date's leftover `eligible/` marker from a current one. A job
-    // with two `avail/` entries is omitted: none of its markers is provably stale.
+    // The backlog counts a marker only at its job's current deadline. A job
+    // with two `avail/` entries is omitted.
     let avail_expiries: HashMap<JobId, ExpiresAt> = all_keys
         .iter()
         .fold(
@@ -280,7 +311,6 @@ pub async fn run(
         &denied,
         &live_ids,
         &live_clients,
-        &avail_expiries,
         &terminal_now,
         &prior_gc_candidates,
     )
@@ -345,6 +375,9 @@ pub async fn run(
         &live_ids,
         &workers,
         &fleet_tags,
+        &claimable.iter().map(|(_, job, _)| job.clone()).collect(),
+        &fallback,
+        &denied,
         &mut bodies,
         now,
         settings.plan_creating_max,
@@ -418,6 +451,7 @@ pub async fn run(
         cpu_user_ms = run_cpu.map(|cpu| millis(cpu.user)),
         cpu_system_ms = run_cpu.map(|cpu| millis(cpu.system)),
         failed_items,
+        bodies_read = todo.queue_body_reads().saturating_sub(bodies_before),
         "queue-maintenance: run finished"
     );
 
@@ -600,7 +634,7 @@ async fn settle_expired_leases(
 }
 
 #[derive(Debug)]
-enum ExpiredLease {
+pub enum ExpiredLease {
     Settled(LeaseResolution),
     /// `recorded` is false when a result landed first and was kept.
     Retired {
@@ -613,7 +647,7 @@ enum ExpiredLease {
 ///
 /// A holder that renews its lapsed lease just before a retirement keeps a lease
 /// on a recorded job; a later run deletes it once it lapses.
-async fn settle_expired_lease(
+pub async fn settle_expired_lease(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
@@ -644,7 +678,7 @@ async fn settle_expired_lease(
                 catalog,
                 &QueueEntry::Lease(lease),
                 &body,
-                std::future::ready(lost_lease_reason(&losses)),
+                std::future::ready((lost_lease_reason(&losses), FailureCode::Unspecified)),
                 "lease_lost",
                 FailureSource::LeaseLost,
                 now,
@@ -807,9 +841,7 @@ async fn settle_overdue_job(
         .await?
     {
         RedateResult::Redated => {
-            // Its markers name the old deadline; the flag is the backstop for a
-            // run that dies before the index passes rewrite them.
-            todo.write_pending_reindex_job(&avail.job_id).await?;
+            // The re-date sets the job's reindex flag.
             tracing::info!(
                 job_id = %avail.job_id,
                 from = %avail.expires_at,
@@ -827,9 +859,12 @@ async fn settle_overdue_job(
     }
 }
 
-/// Retire every `avail/` job whose body no possible client can match, as a
-/// synthetic `"system"` failure; ingestion refuses one, so it came from a
-/// bypassing writer or an older build.
+/// Retire each flagged `avail/` job that no possible client can match.
+/// Record a synthetic `"system"` failure.
+/// Ingestion rejects these jobs. Another writer or an older build created them.
+///
+/// A job that is already indexed is not checked again. A build that makes
+/// these rules stricter must ship a migration that flags every available job.
 ///
 /// Not part of [`escalate_all_denied_jobs`]: such a job collects no denials. A
 /// job an older build indexed can be claimed while it is retired, leaving a
@@ -839,13 +874,20 @@ async fn retire_unmatchable_jobs(
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     all_keys: Vec<AvailKey>,
+    flagged: &HashSet<JobId>,
     bodies: &mut HashMap<String, Value>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, usize)> {
+) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, HashSet<JobId>)> {
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
-    let mut failures = 0usize;
+    let mut failures = HashSet::new();
+    let mut checked = 0usize;
     for avail in all_keys {
+        if !flagged.contains(&avail.job_id) {
+            survivors.push(avail);
+            continue;
+        }
+        checked += 1;
         match retire_one_if_unmatchable(todo, submissions, catalog, &avail, bodies, now).await {
             Ok(true) => {
                 removed.insert(avail.job_id.clone());
@@ -853,11 +895,16 @@ async fn retire_unmatchable_jobs(
             Ok(false) => survivors.push(avail),
             Err(e) => {
                 tracing::warn!(job_id = %avail.job_id, error = %e, "failed to retire unmatchable job");
-                failures += 1;
+                failures.insert(avail.job_id.clone());
                 survivors.push(avail);
             }
         }
     }
+    tracing::info!(
+        jobs_checked_for_retirement = checked,
+        jobs_retired = removed.len(),
+        "queue-maintenance: checked flagged jobs for retirement"
+    );
     Ok((survivors, removed, failures))
 }
 
@@ -903,8 +950,9 @@ async fn retire_one_if_unmatchable(
         catalog,
         &QueueEntry::Avail(avail),
         &body,
-        std::future::ready(format!(
-            "No client can ever be eligible for this job: {rule}"
+        std::future::ready((
+            format!("No client can ever be eligible for this job: {rule}"),
+            FailureCode::Unspecified,
         )),
         cause,
         FailureSource::Unmatchable,
@@ -921,9 +969,10 @@ async fn retire_one_if_unmatchable(
     Ok(true)
 }
 
-/// Escalate every `avail/` job whose closed `clients` roster is fully denied to
-/// a synthetic `"system"` failure. The sole owner of this rule: the submit path
-/// only records the denial, so an exhausted roster would otherwise sit forever.
+/// Check each flagged `avail/` job with a closed `clients` roster.
+/// If every client denied the job, record a synthetic `"system"` failure.
+/// This function owns the rule. The submit path records the denial but does not
+/// escalate it. Without this function, a job with a denied roster stays in `avail/`.
 ///
 /// A vanished entry survives: unlike an expired one it was likely just claimed.
 async fn escalate_all_denied_jobs(
@@ -931,9 +980,10 @@ async fn escalate_all_denied_jobs(
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     all_keys: Vec<AvailKey>,
+    flagged: &HashSet<JobId>,
     bodies: &mut HashMap<String, Value>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, usize)> {
+) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, HashSet<JobId>)> {
     let denied_by: HashMap<JobId, HashSet<ClientId>> = todo
         .list_all_denied()
         .await?
@@ -945,12 +995,18 @@ async fn escalate_all_denied_jobs(
 
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
-    let mut failures = 0usize;
+    let mut failures = HashSet::new();
+    let mut checked = 0;
     for avail in all_keys {
+        if !flagged.contains(&avail.job_id) {
+            survivors.push(avail);
+            continue;
+        }
         let Some(denied) = denied_by.get(&avail.job_id) else {
             survivors.push(avail);
             continue;
         };
+        checked += 1;
         match escalate_one_if_all_denied(todo, submissions, catalog, &avail, denied, bodies, now)
             .await
         {
@@ -960,11 +1016,16 @@ async fn escalate_all_denied_jobs(
             Ok(false) => survivors.push(avail),
             Err(e) => {
                 tracing::warn!(job_id = %avail.job_id, error = %e, "failed to escalate all-denied job");
-                failures += 1;
+                failures.insert(avail.job_id.clone());
                 survivors.push(avail);
             }
         }
     }
+    tracing::info!(
+        jobs_checked_for_escalation = checked,
+        jobs_escalated = removed.len(),
+        "queue-maintenance: checked flagged jobs with a denial for escalation"
+    );
     Ok((survivors, removed, failures))
 }
 
@@ -1007,13 +1068,16 @@ async fn escalate_one_if_all_denied(
 
     // From the denied set, so an id listed twice counts once.
     let members = denied.iter().filter(|d| roster.contains(&d.as_str()));
-    let failure_reason = async {
+    let failure = async {
         let denials: Vec<DeniedClient> =
             stream::iter(members.map(|id| denied_client(todo, &avail.job_id, id)))
                 .buffered(STORAGE_CONCURRENCY)
                 .collect()
                 .await;
-        summarize_denials(&denials)
+        (
+            summarize_denials(&denials),
+            prevailing_failure_code(&denials),
+        )
     };
 
     resolve_job_terminal(
@@ -1022,7 +1086,7 @@ async fn escalate_one_if_all_denied(
         catalog,
         &QueueEntry::Avail(avail),
         &body,
-        failure_reason,
+        failure,
         "all_denied",
         FailureSource::AllClientsDenied,
         now,
@@ -1108,7 +1172,7 @@ async fn resolve_job_terminal(
     catalog: &HashMap<BenchmarkId, Benchmark>,
     entry: &QueueEntry<'_>,
     body: &Value,
-    failure_reason: impl Future<Output = String>,
+    failure: impl Future<Output = (String, FailureCode)>,
     cause: &str,
     failure_source: FailureSource,
     now: DateTime<Utc>,
@@ -1122,11 +1186,13 @@ async fn resolve_job_terminal(
         );
         return Ok(false);
     }
+    let (failure_reason, failure_code) = failure.await;
     match record_system_failure(
         submissions,
         catalog,
         body,
-        failure_reason.await,
+        failure_reason,
+        failure_code,
         failure_source,
         now,
     )
@@ -1191,9 +1257,12 @@ async fn expire_one_job(
         catalog,
         &QueueEntry::Avail(avail),
         &body,
-        std::future::ready(format!(
-            "Job expired at {} before any client completed it",
-            deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
+        std::future::ready((
+            format!(
+                "Job expired at {} before any client completed it",
+                deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
+            ),
+            FailureCode::Unspecified,
         )),
         "expired",
         FailureSource::Expired,
@@ -1203,11 +1272,9 @@ async fn expire_one_job(
     Ok(true)
 }
 
-/// Every `avail/` key the queue holds, decoded once. `skipped` lets a report
-/// state its denominator.
+/// Every `avail/` key the queue holds, decoded once.
 pub struct AvailListing {
     pub keys: Vec<AvailKey>,
-    pub skipped: usize,
 }
 
 /// List every `avail/` key in key order, decoding each once. An unparseable
@@ -1217,26 +1284,22 @@ pub async fn collect_all_avail(todo: &dyn TodoStore) -> anyhow::Result<AvailList
     // An unmigrated key would drop below as cruft, taking a live job out of the
     // GC live set.
     pipette_store::reject_unmigrated_avail_keys(keys.iter().map(String::as_str))?;
-    Ok(keys.into_iter().fold(
-        AvailListing {
-            keys: Vec::new(),
-            skipped: 0,
-        },
-        |mut listing, key| {
-            match parse_avail_filename(&key) {
-                Ok((job_id, expires_at)) => listing.keys.push(AvailKey {
+    Ok(AvailListing {
+        keys: keys
+            .into_iter()
+            .filter_map(|key| match parse_avail_filename(&key) {
+                Ok((job_id, expires_at)) => Some(AvailKey {
                     key,
                     job_id,
                     expires_at,
                 }),
                 Err(_) => {
                     tracing::warn!(key = %key, "skipping unparseable avail filename");
-                    listing.skipped += 1;
+                    None
                 }
-            }
-            listing
-        },
-    ))
+            })
+            .collect(),
+    })
 }
 
 /// Make the eligible index match the workers. Returns the joiners, for a full
@@ -1299,78 +1362,64 @@ fn uncommitted_jobs(
         .collect()
 }
 
-/// Index every `avail/` key absent from the persisted indexed set against the
-/// workers, then rewrite the set; a key, once indexed, is never paid for again.
+/// Rebuild eligibility for the fetched flagged jobs against the workers.
+/// Clear their flags. The caller excludes jobs that wait for a committed plan
+/// and jobs whose terminal check failed. The flags of those jobs stay set.
 ///
-/// Key order means nothing: `Uuid::now_v7` orders ids only within one process.
-/// The set keeps the leased keys, so a recycled lease is not re-indexed, and is
-/// written after the markers, so a crash re-indexes.
-async fn index_new_jobs(
+/// A job that changes between the read and the write keeps its flag too; the
+/// next run indexes it again.
+async fn index_flagged_jobs(
     todo: &dyn TodoStore,
     workers: &[&Client],
     tags: &FleetTags,
-    all_keys: &[AvailKey],
-    leased_avail_keys: &HashSet<String>,
-    bodies: &mut HashMap<String, Value>,
-) -> anyhow::Result<()> {
-    let indexed = todo.read_eligible_indexed().await?;
-    let new_keys: Vec<&AvailKey> = all_keys
-        .iter()
-        .filter(|a| !indexed.contains(&a.key))
-        .collect();
-    let mut markers = 0usize;
-    for avail in &new_keys {
-        let Some(body) = cached_body(todo, avail, bodies).await? else {
-            continue;
-        };
-        for client in workers {
-            if job_matches_client(&body, client, tags) {
-                todo.write_eligible(&client.client_id, &avail.job_id, avail.expires_at)
-                    .await?;
-                markers += 1;
-            }
+    flagged: &[ReindexJob],
+) -> anyhow::Result<HashSet<JobId>> {
+    let mut indexed_ids = HashSet::new();
+    let (mut indexed, mut rows, mut moved) = (0usize, 0usize, 0usize);
+    for job in flagged {
+        let matching: Vec<ClientId> = workers
+            .iter()
+            .filter(|client| job_matches_client(&job.body, client, tags))
+            .map(|client| client.client_id.clone())
+            .collect();
+        if todo
+            .replace_eligibility(&job.job_id, job.revision, &matching)
+            .await?
+        {
+            indexed_ids.insert(job.job_id.clone());
+            indexed += 1;
+            rows += matching.len();
+        } else {
+            moved += 1;
+            tracing::debug!(
+                job_id = %job.job_id,
+                "queue-maintenance: kept the reindex flag of a job that changed after the read"
+            );
         }
     }
-
-    // Skip the PUT when the retained set already matches, so an idle queue
-    // writes nothing.
-    let retained: HashSet<String> = all_keys
-        .iter()
-        .map(|a| a.key.clone())
-        .chain(leased_avail_keys.iter().cloned())
-        .collect();
-    if retained != indexed {
-        todo.write_eligible_indexed(&retained).await?;
-    }
-    if !new_keys.is_empty() {
-        tracing::info!(
-            new_jobs = new_keys.len(),
-            markers_written = markers,
-            "queue-maintenance: indexed new avail jobs"
-        );
-    }
-    Ok(())
+    tracing::info!(
+        jobs_indexed = indexed,
+        rows_written = rows,
+        jobs_skipped_moved = moved,
+        "queue-maintenance: indexed flagged jobs"
+    );
+    Ok(indexed_ids)
 }
 
 /// Re-evaluate each flagged client, and each joiner, against the whole `avail/`
 /// set; a flagged non-worker gets its markers cleared instead.
 ///
-/// Reads the record fresh and deletes only the flags captured before it, so a
-/// newer reindex request is never consumed. Leased jobs are flagged into
-/// `pending-reindex-jobs/` before the wipe, so a crash never loses one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is distinct context the caller already holds"
-)]
+/// The function reads the current record and deletes only the earlier flags. It
+/// preserves newer reindex requests. Leased jobs get their reindex
+/// flag before the wipe, so a crash never loses one.
 async fn reindex_flagged_clients(
     todo: &dyn TodoStore,
     auth: &dyn ClientStore,
     tag_store: &dyn TagStore,
     workers: &HashSet<ClientId>,
     joined: &BTreeSet<ClientId>,
-    all_keys: &[AvailKey],
+    listed: &[JobId],
     leased_ids: &HashSet<JobId>,
-    bodies: &mut HashMap<String, Value>,
 ) -> anyhow::Result<()> {
     let flags = todo.list_pending_reindex().await?;
     // One rebuild consumes all of a client's flag keys; a joiner has none.
@@ -1387,23 +1436,37 @@ async fn reindex_flagged_clients(
 
     // Only a rebuild misses the leased jobs; a non-worker's cleanup drops its
     // whole partition, leased jobs included.
-    if by_client
+    let groups = if by_client
         .keys()
         .any(|client_id| workers.contains(client_id))
     {
-        // Sorted so a failing write stops at the same job on every run.
-        let mut leased: Vec<&JobId> = leased_ids.iter().collect();
-        leased.sort_unstable();
-        for job_id in leased {
-            todo.write_pending_reindex_job(job_id).await?;
-        }
+        let leased: Vec<JobId> = leased_ids.iter().cloned().collect();
+        todo.flag_for_reindex(&leased).await?;
         if !leased_ids.is_empty() {
             tracing::info!(
                 jobs_flagged = leased_ids.len(),
                 "queue-maintenance: flagged leased jobs for deferred reindex"
             );
         }
-    }
+        let groups = todo.avail_clause_groups(listed).await?;
+        let present: HashSet<&JobId> = groups.iter().flat_map(|(_, jobs)| jobs).collect();
+        let missing: Vec<JobId> = listed
+            .iter()
+            .filter(|id| !present.contains(id))
+            .cloned()
+            .collect();
+        todo.flag_for_reindex(&missing).await?;
+        // A claim since the listing, or a body whose matcher projection is NULL.
+        if !missing.is_empty() {
+            tracing::warn!(
+                jobs_flagged = missing.len(),
+                "queue-maintenance: flagged listed jobs that a client rebuild could not group"
+            );
+        }
+        groups
+    } else {
+        Vec::new()
+    };
 
     for (client_id, keys) in &by_client {
         // `claim` refuses a non-worker, so its markers are dead; a later join
@@ -1434,27 +1497,16 @@ async fn reindex_flagged_clients(
         let evaluated_capabilities = tags.capabilities_of(&client);
 
         todo.delete_eligible_for_client(client_id).await?;
-        let mut markers = 0usize;
-        for avail in all_keys {
-            let Some(body) = cached_body(todo, avail, bodies).await? else {
-                // Not evaluable now; defer it like the leased jobs above.
-                todo.write_pending_reindex_job(&avail.job_id).await?;
-                tracing::debug!(
-                    job_id = %avail.job_id,
-                    client_id = %client_id,
-                    "queue-maintenance: flagged a job that left avail/ mid-rebuild for deferred reindex"
-                );
-                continue;
-            };
-            if job_matches_client(&body, &client, &tags) {
-                todo.write_eligible(client_id, &avail.job_id, avail.expires_at)
-                    .await?;
-                markers += 1;
-            }
-        }
+        let matching: Vec<JobId> = groups
+            .iter()
+            .filter(|(clauses, _)| job_matches_client(clauses, &client, &tags))
+            .flat_map(|(_, jobs)| jobs.iter().cloned())
+            .collect();
+        todo.write_eligible_rows(client_id, &matching).await?;
         tracing::info!(
             client_id = %client_id,
-            markers_written = markers,
+            markers_written = matching.len(),
+            clause_sets = groups.len(),
             "queue-maintenance: reindexed client after a matching-input change"
         );
 
@@ -1490,69 +1542,6 @@ async fn reindex_flagged_clients(
         }
     }
     Ok(())
-}
-
-/// Re-match each flagged job that is back in `avail/` against every client,
-/// writing or deleting each marker, then clear the flag. Returns the number of
-/// client records read.
-///
-/// Reads clients fresh: [`reindex_flagged_clients`] may have consumed the flag
-/// that would repair markers from an older record.
-async fn settle_pending_reindex_jobs(
-    todo: &dyn TodoStore,
-    auth: &dyn ClientStore,
-    tag_store: &dyn TagStore,
-    submissions: &dyn SubmissionStore,
-    workers: &HashSet<ClientId>,
-    all_keys: &[AvailKey],
-    bodies: &mut HashMap<String, Value>,
-) -> anyhow::Result<usize> {
-    let flags = todo.list_pending_reindex_jobs().await?;
-    if flags.is_empty() {
-        return Ok(0);
-    }
-    let clients = drain_clients(auth).await?;
-    warn_unreadable_clients(&clients.unreadable);
-    let drained = clients.items.len() + clients.unreadable.len();
-    let clients = clients.items;
-    let tags = FleetTags::new(tag_store.list_forward_tag_markers().await?);
-    let avail_by_job: HashMap<&JobId, &AvailKey> =
-        all_keys.iter().map(|a| (&a.job_id, a)).collect();
-
-    for job_id in &flags {
-        let Some(avail) = avail_by_job.get(job_id) else {
-            if submissions.has_record(job_id).await? {
-                todo.delete_pending_reindex_job(job_id).await?;
-                tracing::info!(
-                    job_id = %job_id,
-                    "queue-maintenance: cleared deferred-reindex flag for completed job"
-                );
-            }
-            continue;
-        };
-        let Some(body) = cached_body(todo, avail, bodies).await? else {
-            // Claimed since the listing; settle on a later run.
-            continue;
-        };
-        let mut markers = 0usize;
-        for client in &clients {
-            if workers.contains(&client.client_id) && job_matches_client(&body, client, &tags) {
-                todo.write_eligible(&client.client_id, &avail.job_id, avail.expires_at)
-                    .await?;
-                markers += 1;
-            } else {
-                todo.delete_eligible(&client.client_id, &avail.job_id, avail.expires_at)
-                    .await?;
-            }
-        }
-        todo.delete_pending_reindex_job(job_id).await?;
-        tracing::info!(
-            job_id = %job_id,
-            markers_written = markers,
-            "queue-maintenance: settled deferred reindex for recycled job"
-        );
-    }
-    Ok(drained)
 }
 
 /// Whether to act on an orphaned marker now: its `key` was staged last run, or
@@ -1603,27 +1592,19 @@ async fn reconcile_orphans(
     denied: &[(JobId, ClientId)],
     live_jobs: &HashSet<JobId>,
     live_clients: &HashSet<ClientId>,
-    avail_expiries: &HashMap<JobId, ExpiresAt>,
     terminal_jobs: &HashSet<JobId>,
     prior: &HashSet<String>,
 ) -> anyhow::Result<HashSet<String>> {
     let mut next = HashSet::new();
 
-    // ── eligible/clients/{client}/{job}_{exp} ── orphan iff job or client dead,
-    // or the marker names a deadline the job's `avail/` entry does not carry.
+    // ── eligible/clients/{client}/{job}_{exp} ── orphan iff job or client dead.
     let mut dead_client_eligible: BTreeMap<ClientId, Vec<(String, JobId, ExpiresAt)>> =
         BTreeMap::new();
     let mut eligible_removed = 0usize;
-    let mut stale_expiry_removed = 0usize;
     for (client_id, job_id, expires_at) in eligible {
         let client_dead = !live_clients.contains(client_id);
         let job_dead = !live_jobs.contains(job_id);
-        // A re-date's residue, provably stale, so it goes on first sighting. A
-        // leased job has no `avail_expiries` entry, so its markers are safe.
-        let stale_expiry = avail_expiries
-            .get(job_id)
-            .is_some_and(|current| current != expires_at);
-        if !client_dead && !job_dead && !stale_expiry {
+        if !client_dead && !job_dead {
             continue;
         }
         let key = format!(
@@ -1636,9 +1617,6 @@ async fn reconcile_orphans(
                 .entry(client_id.clone())
                 .or_default()
                 .push((key, job_id.clone(), *expires_at));
-        } else if stale_expiry {
-            todo.delete_eligible(client_id, job_id, *expires_at).await?;
-            stale_expiry_removed += 1;
         } else if confirm_or_stage(prior, terminal_jobs, &mut next, key, Some(job_id)) {
             todo.delete_eligible(client_id, job_id, *expires_at).await?;
             eligible_removed += 1;
@@ -1686,24 +1664,6 @@ async fn reconcile_orphans(
         }
     }
 
-    // ── suspended/{client}.json ── orphan iff client dead; `conflicting_job_id`
-    // is not an owner.
-    let mut suspensions_removed = 0usize;
-    for (client_id, _record) in todo.list_suspensions().await? {
-        if live_clients.contains(&client_id) {
-            continue;
-        }
-        let key = format!("suspended/{}.json", client_id);
-        if confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
-            todo.delete_suspension(&client_id).await?;
-            suspensions_removed += 1;
-            tracing::info!(
-                client_id = %client_id,
-                "queue-maintenance: deleted orphaned suspension for deleted client"
-            );
-        }
-    }
-
     // ── liveness/{client} ── orphan iff client dead; never collected by age.
     let mut liveness_removed = 0usize;
     for (client_id, _seen_at) in todo.list_liveness().await? {
@@ -1731,20 +1691,6 @@ async fn reconcile_orphans(
         if confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
             todo.delete_pending_reindex(&raw_key).await?;
             reindex_flags_removed += 1;
-        }
-    }
-
-    // ── pending-reindex-jobs/{job} ── orphan iff job dead, such as one deleted
-    // while flagged that the settle pass never clears.
-    let mut reindex_job_flags_removed = 0usize;
-    for job_id in todo.list_pending_reindex_jobs().await? {
-        if live_jobs.contains(&job_id) {
-            continue;
-        }
-        let key = format!("pending-reindex-jobs/{}", job_id);
-        if confirm_or_stage(prior, terminal_jobs, &mut next, key, Some(&job_id)) {
-            todo.delete_pending_reindex_job(&job_id).await?;
-            reindex_job_flags_removed += 1;
         }
     }
 
@@ -1813,24 +1759,18 @@ async fn reconcile_orphans(
     }
 
     if eligible_removed
-        + stale_expiry_removed
         + denied_removed
-        + suspensions_removed
         + liveness_removed
         + reindex_flags_removed
-        + reindex_job_flags_removed
         + lost_lease_jobs_removed
         + leases_recycled
         > 0
     {
         tracing::info!(
             eligible_removed,
-            stale_expiry_removed,
             denied_removed,
-            suspensions_removed,
             liveness_removed,
             reindex_flags_removed,
-            reindex_job_flags_removed,
             lost_lease_jobs_removed,
             leases_recycled,
             "queue-maintenance: reconciled orphaned todo/ markers"
@@ -1968,30 +1908,64 @@ mod tests {
     use pipette_core::denial::DenialRecord;
     use pipette_plan_types::ClientId;
     use pipette_store::ClientStore;
-    use pipette_store_fs::{
-        LocalFsSubmissionStore, LocalFsTagStore, build_local_fs_client_store,
-        build_local_fs_todo_store,
-    };
+    use pipette_store_fs::{LocalFsSubmissionStore, LocalFsTagStore};
+    use pipette_store_sql::scratch::TestDb;
     use pipette_store_testkit::seed_leased_until;
 
     use super::*;
 
+    /// A database queue, for a test of a pass that reads or writes the
+    /// eligibility index. `None` skips the test without `TEST_DATABASE_URL`.
+    async fn sql_todo() -> anyhow::Result<Option<(std::sync::Arc<dyn TodoStore>, TestDb)>> {
+        let Some(db) = TestDb::new().await? else {
+            return Ok(None);
+        };
+        let todo = pipette_store_sql::SqlTodoStore::new(db.db().clone());
+        Ok(Some((std::sync::Arc::new(todo), db)))
+    }
+
+    /// Lease a new job whose reindex flag is clear, as after an index pass.
+    async fn seed_indexed_lease(todo: &dyn TodoStore, job_id: &str) -> anyhow::Result<JobId> {
+        let job = pipette_store_testkit::seed_avail(
+            todo,
+            job_id,
+            ExpiresAt::Never,
+            &serde_json::json!({"job_id": job_id}),
+        )
+        .await?;
+        for flagged in todo
+            .jobs_needing_reindex(std::slice::from_ref(&job))
+            .await?
+            .jobs
+        {
+            todo.replace_eligibility(&flagged.job_id, flagged.revision, &[])
+                .await?;
+        }
+        let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+        todo.claim_job(
+            &job,
+            ExpiresAt::Never,
+            &ClientId::try_new("holder")?,
+            lease_expiry,
+        )
+        .await?;
+        Ok(job)
+    }
+
     #[tokio::test]
     async fn sql_queue_runs_every_maintenance_pass() -> anyhow::Result<()> {
         use pipette_store_testkit::seed_avail;
-        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+        let Some(db) = TestDb::new().await? else {
             return Ok(());
         };
         let dir = tempfile::tempdir()?;
-        let mut stores = pipette_store_sql::overlay(
-            db.db(),
-            pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
+        let stores = db.stores(pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
                 storage: StorageConfig::local_fs(dir.path().to_path_buf()),
                 auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
                 ..Default::default()
-            })?,
-        );
-        stores.todo = std::sync::Arc::new(pipette_store_sql::SqlTodoStore::new(db.db().clone()));
+            },
+        )?);
         let worker = settle_test_client("sql-worker", "66", "chip-a")?;
         let client = &worker.client_id;
         stores.clients.put_client(&worker).await?;
@@ -2008,7 +1982,7 @@ mod tests {
         // rebuild deletes the sql-ghost marker before the orphan sweep sees it.
         stores
             .todo
-            .write_eligible_workers(&HashSet::from([client.clone()]))
+            .write_workers(&HashSet::from([client.clone()]))
             .await?;
         let body =
             |id: &str| pipette_store_testkit::todo_job_body(id, &[client.as_str()], "bench-1");
@@ -2157,7 +2131,6 @@ mod tests {
         );
         let swept = collect_all_avail(&todo).await?;
         assert_eq!(swept.keys.len(), BUCKET.len(), "the sweep sees every entry");
-        assert_eq!(swept.skipped, 0, "every entry parsed");
         assert_eq!(list.num_calls(), 1, "the sweep lists `avail/` once");
         Ok(())
     }
@@ -2166,10 +2139,10 @@ mod tests {
     /// reported as resolved.
     #[tokio::test]
     async fn recycle_pass_reports_live_and_expired_leases_as_seen() -> anyhow::Result<()> {
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
         let dir = tempfile::tempdir()?;
-        let todo = build_local_fs_todo_store(&StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
-        })?;
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
 
         let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
@@ -2224,10 +2197,9 @@ mod tests {
     /// this needs its own process, as `cargo nextest` gives it.
     #[tokio::test]
     async fn recycle_pass_decodes_no_submission_body() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let todo = build_local_fs_todo_store(&StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
-        })?;
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
         let submissions = pipette_store_s3::in_memory_submission_store();
 
         let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
@@ -2283,55 +2255,35 @@ mod tests {
         })
     }
 
-    /// Both directions: the stale marker is deleted, the missing one written. A
-    /// client outside the workers loses its marker even though it matches.
+    /// The pass replaces a flagged job's rows with the workers that match it,
+    /// and clears the flag. A client outside the workers loses its row even
+    /// though it matches; a job the run did not list keeps its flag.
     #[tokio::test]
-    async fn settle_matches_against_current_client_records() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let config = StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
+    async fn index_rebuilds_each_listed_flagged_job() -> anyhow::Result<()> {
+        use pipette_store_testkit::seed_avail;
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
         };
-        let todo = build_local_fs_todo_store(&config)?;
-        let auth = build_local_fs_client_store(&config)?;
-        let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
-
-        let mismatched = settle_test_client("settle-mismatch", "00", "chip-b")?;
-        let matched = settle_test_client("settle-match", "11", "chip-a")?;
-        let outsider = settle_test_client("settle-outsider", "99", "chip-a")?;
-        auth.put_client(&mismatched).await?;
-        auth.put_client(&matched).await?;
-        auth.put_client(&outsider).await?;
-
-        let job = JobId::new_unchecked("job-settle");
+        let mismatched = settle_test_client("index-mismatch", "00", "chip-b")?;
+        let matched = settle_test_client("index-match", "11", "chip-a")?;
+        let outsider = settle_test_client("index-outsider", "99", "chip-a")?;
+        let body = serde_json::json!({"job_id": "job-index", "requires": ["chip:chip-a"]});
+        let job = seed_avail(&*todo, "job-index", ExpiresAt::Never, &body).await?;
+        let unlisted = seed_avail(&*todo, "job-unlisted", ExpiresAt::Never, &body).await?;
         todo.write_eligible(&mismatched.client_id, &job, ExpiresAt::Never)
             .await?;
         todo.write_eligible(&outsider.client_id, &job, ExpiresAt::Never)
             .await?;
-        todo.write_pending_reindex_job(&job).await?;
 
-        let avail = AvailKey {
-            key: "avail/job-settle".into(),
-            job_id: job.clone(),
-            expires_at: ExpiresAt::Never,
-        };
-        let mut bodies = HashMap::from([(
-            avail.key.clone(),
-            serde_json::json!({
-                "job_id": "job-settle",
-                "requires": ["chip:chip-a"],
-            }),
-        )]);
-
-        let tags = LocalFsTagStore::new(dir.path().to_path_buf());
-        let workers = HashSet::from([mismatched.client_id.clone(), matched.client_id.clone()]);
-        settle_pending_reindex_jobs(
+        let flagged = todo
+            .jobs_needing_reindex(std::slice::from_ref(&job))
+            .await?
+            .jobs;
+        let indexed = index_flagged_jobs(
             &*todo,
-            &*auth,
-            &tags,
-            &submissions,
-            &workers,
-            &[avail],
-            &mut bodies,
+            &[&mismatched, &matched],
+            &FleetTags::new(Vec::new()),
+            &flagged,
         )
         .await?;
 
@@ -2339,7 +2291,242 @@ mod tests {
             todo.list_all_eligible().await?,
             vec![(matched.client_id.clone(), job.clone(), ExpiresAt::Never)]
         );
-        assert!(todo.list_pending_reindex_jobs().await?.is_empty());
+        let still_flagged: Vec<JobId> = todo
+            .jobs_needing_reindex(std::slice::from_ref(&unlisted))
+            .await?
+            .jobs
+            .into_iter()
+            .map(|flagged| flagged.job_id)
+            .collect();
+        assert_eq!(still_flagged, vec![unlisted]);
+        assert_eq!(indexed, HashSet::from([job]));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::withheld(false, false)]
+    #[case::revision_race(true, false)]
+    #[case::denied_fallback(true, true)]
+    #[tokio::test]
+    async fn starvation_matches_unindexed_jobs_from_the_cached_body(
+        #[case] race: bool,
+        #[case] denied: bool,
+    ) -> anyhow::Result<()> {
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let plans = pipette_store_fs::build_local_fs_plan_store(&StorageConfig::local_fs(
+            dir.path().to_path_buf(),
+        ))?;
+        let submissions = pipette_store_s3::in_memory_submission_store();
+        let client = settle_test_client("fallback-client", "11", "chip-a")?;
+        let job = pipette_store_testkit::seed_avail(
+            &*todo,
+            "job-fallback",
+            ExpiresAt::Never,
+            &serde_json::json!({"requires": ["chip:chip-a"]}),
+        )
+        .await?;
+        let flagged = todo
+            .jobs_needing_reindex(std::slice::from_ref(&job))
+            .await?
+            .jobs;
+        let mut bodies = flagged
+            .iter()
+            .map(|job| {
+                (
+                    avail_filename(&job.job_id, job.expires_at),
+                    job.body.clone(),
+                )
+            })
+            .collect();
+        let denier = if denied {
+            client.client_id.clone()
+        } else {
+            ClientId::try_new("other-client")?
+        };
+        let denied_rows = if race {
+            todo.write_denied(&job, &denier, &DenialRecord::default())
+                .await?;
+            vec![(job.clone(), denier)]
+        } else {
+            Vec::new()
+        };
+        let tags = FleetTags::new(Vec::new());
+        let indexed = if race {
+            index_flagged_jobs(&*todo, &[&client], &tags, &flagged).await?
+        } else {
+            HashSet::new()
+        };
+        assert!(indexed.is_empty());
+        let fallback = HashSet::from([job.clone()]);
+        let mut manifest = backlog_manifest(1, None, PlanStatus::Active)?;
+        manifest.job_ids = vec![job.clone()];
+        let entry = AvailKey {
+            key: avail_filename(&job, ExpiresAt::Never),
+            job_id: job.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        let report = plan_maintenance::reconcile_plans(
+            &*plans,
+            &*todo,
+            &*submissions,
+            &[manifest.clone()],
+            &HashSet::new(),
+            &plan_maintenance::PlanEndings {
+                released: HashMap::new(),
+                perturbed: HashSet::new(),
+                stranded: HashSet::new(),
+            },
+            &plan_maintenance::Membership::new(Vec::new()),
+            &[entry],
+            &HashSet::new(),
+            &fallback,
+            &[&client],
+            &tags,
+            &indexed,
+            &fallback,
+            &denied_rows,
+            &mut bodies,
+            Utc::now(),
+            Duration::from_secs(60),
+        )
+        .await?;
+        assert_eq!(report.failures, 0);
+        let updated = plans
+            .get_plan(&manifest.plan_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("updated plan"))?;
+        assert_eq!(
+            updated.status,
+            if denied {
+                PlanStatus::PendingClients
+            } else {
+                PlanStatus::Active
+            }
+        );
+        let snapshot = updated
+            .progress_snapshot
+            .ok_or_else(|| anyhow::anyhow!("snapshot"))?;
+        assert_eq!(snapshot.starved.len(), usize::from(denied));
+        assert_eq!(bodies.len(), 1);
+        assert!(todo.jobs_awaiting_index(&[job]).await?.len() == 1);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::claimed_after_listing(true)]
+    #[case::still_available(false)]
+    #[tokio::test]
+    async fn starvation_grouping_confirms_availability_before_plan_status(
+        #[case] claimed: bool,
+    ) -> anyhow::Result<()> {
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let plans = pipette_store_fs::build_local_fs_plan_store(&StorageConfig::local_fs(
+            dir.path().to_path_buf(),
+        ))?;
+        let submissions = pipette_store_s3::in_memory_submission_store();
+        let client = settle_test_client("late-claim-client", "11", "chip-a")?;
+        let tags = FleetTags::new(Vec::new());
+        let job = pipette_store_testkit::seed_avail(
+            &*todo,
+            "job-late-claim",
+            ExpiresAt::Never,
+            &serde_json::json!({"requires": ["chip:chip-a"]}),
+        )
+        .await?;
+        let flagged = todo
+            .jobs_needing_reindex(std::slice::from_ref(&job))
+            .await?
+            .jobs;
+        index_flagged_jobs(&*todo, &[&client], &tags, &flagged).await?;
+        assert!(
+            todo.jobs_awaiting_index(std::slice::from_ref(&job))
+                .await?
+                .is_empty()
+        );
+        let avail = AvailKey {
+            key: avail_filename(&job, ExpiresAt::Never),
+            job_id: job.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        // The run listed an available job and no lease. A claim and a client
+        // rebuild can then remove its eligibility before plan reconciliation.
+        if claimed {
+            assert!(matches!(
+                todo.claim_job(
+                    &job,
+                    ExpiresAt::Never,
+                    &client.client_id,
+                    Utc::now() + chrono::Duration::hours(1)
+                )
+                .await?,
+                pipette_store::ClaimResult::Claimed(_)
+            ));
+        }
+        todo.delete_eligible_for_client(&client.client_id).await?;
+        let observed = pipette_store_testkit::ObservedTodoStore::new(todo.clone());
+        let before = todo.queue_body_reads();
+        let mut manifest = backlog_manifest(1, None, PlanStatus::Active)?;
+        manifest.job_ids = vec![job.clone()];
+        let live = HashSet::from([job.clone()]);
+        let mut bodies = HashMap::new();
+        let report = plan_maintenance::reconcile_plans(
+            &*plans,
+            &observed,
+            &*submissions,
+            &[manifest.clone()],
+            &HashSet::new(),
+            &plan_maintenance::PlanEndings {
+                released: HashMap::new(),
+                perturbed: HashSet::new(),
+                stranded: HashSet::new(),
+            },
+            &plan_maintenance::Membership::new(Vec::new()),
+            &[avail],
+            &HashSet::new(),
+            &live,
+            &[&client],
+            &tags,
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &mut bodies,
+            Utc::now(),
+            Duration::from_secs(60),
+        )
+        .await?;
+        assert_eq!(report.failures, 0);
+        let updated = plans
+            .get_plan(&manifest.plan_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("updated plan"))?;
+        assert_eq!(
+            updated.status,
+            if claimed {
+                PlanStatus::Active
+            } else {
+                PlanStatus::PendingClients
+            }
+        );
+        let snapshot = updated
+            .progress_snapshot
+            .ok_or_else(|| anyhow::anyhow!("snapshot"))?;
+        if claimed {
+            assert!(snapshot.starved.is_empty());
+        } else {
+            assert_eq!(snapshot.starved.len(), 1);
+            assert_eq!(snapshot.starved[0].job_ids, vec![job.clone()]);
+            assert_eq!(snapshot.starved[0].clauses.requires, vec!["chip:chip-a"]);
+        }
+        assert_eq!(observed.take_reads(), vec![("get_avail", vec![job])]);
+        assert_eq!(todo.queue_body_reads() - before, u64::from(!claimed));
+        assert_eq!(bodies.len(), usize::from(!claimed));
+        observed.unexpected.none()?;
         Ok(())
     }
 
@@ -2479,10 +2666,11 @@ mod tests {
         }
     }
 
-    /// One `reindex_flagged_clients` call over a todo store in a tempdir; the
+    /// One `reindex_flagged_clients` call over a database todo store; the
     /// inputs a test does not set start empty.
     struct Reindex<T = LocalFsTagStore> {
         _dir: tempfile::TempDir,
+        _db: TestDb,
         todo: std::sync::Arc<dyn TodoStore>,
         tags: T,
         workers: HashSet<ClientId>,
@@ -2493,24 +2681,26 @@ mod tests {
     }
 
     impl Reindex {
-        fn new() -> anyhow::Result<Self> {
+        /// `None` skips the test without `TEST_DATABASE_URL`.
+        async fn new() -> anyhow::Result<Option<Self>> {
             let dir = tempfile::tempdir()?;
             let tags = LocalFsTagStore::new(dir.path().to_path_buf());
-            Self::in_dir(dir, tags)
+            Self::in_dir(dir, tags).await
         }
     }
 
     impl<T: TagStore> Reindex<T> {
-        fn with_tags(tags: T) -> anyhow::Result<Self> {
-            Self::in_dir(tempfile::tempdir()?, tags)
+        async fn with_tags(tags: T) -> anyhow::Result<Option<Self>> {
+            Self::in_dir(tempfile::tempdir()?, tags).await
         }
 
-        fn in_dir(dir: tempfile::TempDir, tags: T) -> anyhow::Result<Self> {
-            let todo = build_local_fs_todo_store(&StorageConfig::LocalFs {
-                data_dir: dir.path().to_path_buf(),
-            })?;
-            Ok(Self {
+        async fn in_dir(dir: tempfile::TempDir, tags: T) -> anyhow::Result<Option<Self>> {
+            let Some((todo, db)) = sql_todo().await? else {
+                return Ok(None);
+            };
+            Ok(Some(Self {
                 _dir: dir,
+                _db: db,
                 todo,
                 tags,
                 workers: HashSet::new(),
@@ -2518,22 +2708,99 @@ mod tests {
                 keys: Vec::new(),
                 leased: HashSet::new(),
                 bodies: HashMap::new(),
-            })
+            }))
         }
 
-        async fn run(&mut self, auth: &dyn ClientStore) -> anyhow::Result<()> {
+        async fn run(&self, auth: &dyn ClientStore) -> anyhow::Result<()> {
+            stream::iter(
+                self.keys
+                    .iter()
+                    .filter_map(|key| self.bodies.get(&key.key).map(|body| (key, body))),
+            )
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(key, body)| async move {
+                pipette_store_testkit::seed_avail(
+                    &*self.todo,
+                    key.job_id.as_str(),
+                    key.expires_at,
+                    body,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await?;
             reindex_flagged_clients(
                 &*self.todo,
                 auth,
                 &self.tags,
                 &self.workers,
                 &self.joined,
-                &self.keys,
+                &self
+                    .keys
+                    .iter()
+                    .map(|key| key.job_id.clone())
+                    .collect::<Vec<_>>(),
                 &self.leased,
-                &mut self.bodies,
             )
             .await
         }
+    }
+
+    #[tokio::test]
+    async fn client_rebuilds_share_one_clause_group_read() -> anyhow::Result<()> {
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
+        let a = settle_test_client("batch-a", "11", "chip-a")?;
+        let b = settle_test_client("batch-b", "22", "chip-b")?;
+        let auth = ScriptedClientStore::new([
+            Ok(Some(a.clone())),
+            Ok(Some(a.clone())),
+            Ok(Some(b.clone())),
+            Ok(Some(b.clone())),
+        ]);
+        let job_a = JobId::try_new("job-batch-a")?;
+        let job_b = JobId::try_new("job-batch-b")?;
+        let key_a = avail_filename(&job_a, ExpiresAt::Never);
+        let key_b = avail_filename(&job_b, ExpiresAt::Never);
+        r.keys = vec![
+            AvailKey {
+                key: key_a.clone(),
+                job_id: job_a.clone(),
+                expires_at: ExpiresAt::Never,
+            },
+            AvailKey {
+                key: key_b.clone(),
+                job_id: job_b.clone(),
+                expires_at: ExpiresAt::Never,
+            },
+        ];
+        r.bodies = HashMap::from([
+            (key_a, serde_json::json!({"requires": ["chip:chip-a"]})),
+            (key_b, serde_json::json!({"requires": ["chip:chip-b"]})),
+        ]);
+        r.workers = HashSet::from([a.client_id.clone(), b.client_id.clone()]);
+        r.joined = BTreeSet::from([a.client_id.clone(), b.client_id.clone()]);
+        let observed = std::sync::Arc::new(pipette_store_testkit::ObservedTodoStore::new(
+            r.todo.clone(),
+        ));
+        r.todo = observed.clone();
+        r.run(&auth).await?;
+        assert_eq!(
+            observed.take_reads(),
+            vec![("avail_clause_groups", vec![job_a.clone(), job_b.clone()])]
+        );
+        assert_eq!(
+            r.todo.list_all_eligible().await?,
+            vec![
+                (a.client_id, job_a, ExpiresAt::Never),
+                (b.client_id, job_b, ExpiresAt::Never),
+            ]
+        );
+        assert_eq!(r.todo.queue_body_reads(), 0);
+        auth.unexpected.none()?;
+        observed.unexpected.none()?;
+        Ok(())
     }
 
     /// A record that still matches at the recheck consumes the flags as usual.
@@ -2544,7 +2811,9 @@ mod tests {
     async fn reindex_keeps_captured_flags_when_record_changes_mid_rebuild(
         #[case] changed: bool,
     ) -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
 
         // The rebuild reads the first record; the recheck reads the second.
         let evaluated = settle_test_client("recheck-client", "22", "chip-a")?;
@@ -2591,7 +2860,9 @@ mod tests {
     /// The run also continues past the failed read.
     #[tokio::test]
     async fn reindex_keeps_flags_when_the_recheck_read_fails() -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
 
         let evaluated = settle_test_client("recheck-io-fail", "33", "chip-a")?;
         let auth = ScriptedClientStore::new([
@@ -2683,7 +2954,9 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_rebuild_matches_the_clients_tags() -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
         let client = settle_test_client("tagged-client", "44", "chip-a")?;
         let auth = ScriptedClientStore::new([Ok(Some(client.clone())), Ok(Some(client.clone()))]);
         r.tags
@@ -2727,36 +3000,77 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reindex_flags_a_job_that_left_avail_after_the_listing() -> anyhow::Result<()> {
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
+        let job = seed_indexed_lease(&*r.todo, "job-moved-during-rebuild").await?;
+        let client = settle_test_client("rebuild-client", "11", "chip-a")?;
+        let auth = ScriptedClientStore::new([Ok(Some(client.clone())), Ok(Some(client.clone()))]);
+        r.todo.write_pending_reindex(&client.client_id).await?;
+        // The availability listing saw it, but the lease listing did not.
+        r.keys.push(AvailKey {
+            key: avail_filename(&job, ExpiresAt::Never),
+            job_id: job.clone(),
+            expires_at: ExpiresAt::Never,
+        });
+        r.workers.insert(client.client_id.clone());
+        let observed = std::sync::Arc::new(pipette_store_testkit::ObservedTodoStore::new(
+            r.todo.clone(),
+        ));
+        r.todo = observed.clone();
+        r.run(&auth).await?;
+        assert_eq!(
+            observed.take_reads(),
+            vec![("avail_clause_groups", vec![job.clone()])]
+        );
+        assert_eq!(
+            r.todo
+                .jobs_awaiting_index(std::slice::from_ref(&job))
+                .await?,
+            HashSet::from([job])
+        );
+        assert!(r.todo.list_all_eligible().await?.is_empty());
+        auth.unexpected.none()?;
+        observed.unexpected.none()?;
+        Ok(())
+    }
+
     /// No record read, and no leased job flagged: the cleanup covers them.
     #[tokio::test]
     async fn reindex_clears_a_flagged_client_that_is_not_a_worker() -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
         let auth = ScriptedClientStore::new([]);
         let client = ClientId::try_new("ev1_pending")?;
-        let job = JobId::new_unchecked("job-held");
+        let job = seed_indexed_lease(&*r.todo, "job-held").await?;
         r.todo
             .write_eligible(&client, &job, ExpiresAt::Never)
             .await?;
         r.todo.write_pending_reindex(&client).await?;
 
-        r.leased.insert(job);
+        r.leased.insert(job.clone());
         r.run(&auth).await?;
         auth.unexpected.none()?;
 
         assert!(r.todo.list_all_eligible().await?.is_empty());
         assert!(r.todo.list_pending_reindex().await?.is_empty());
-        assert!(r.todo.list_pending_reindex_jobs().await?.is_empty());
+        assert!(r.todo.jobs_awaiting_index(&[job]).await?.is_empty());
         Ok(())
     }
 
     /// The leased jobs are still flagged, because the client counted as a worker.
     #[tokio::test]
     async fn reindex_clears_a_flagged_worker_deleted_mid_run() -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
         let auth = ScriptedClientStore::new([Ok(None)]);
         let client = ClientId::try_new("ev1_deleted")?;
         let job = JobId::new_unchecked("job-held");
-        let leased = JobId::new_unchecked("job-leased");
+        let leased = seed_indexed_lease(&*r.todo, "job-leased").await?;
         r.todo
             .write_eligible(&client, &job, ExpiresAt::Never)
             .await?;
@@ -2769,17 +3083,21 @@ mod tests {
 
         assert!(r.todo.list_all_eligible().await?.is_empty());
         assert!(r.todo.list_pending_reindex().await?.is_empty());
-        assert_eq!(r.todo.list_pending_reindex_jobs().await?, vec![leased]);
+        assert_eq!(
+            r.todo
+                .jobs_awaiting_index(std::slice::from_ref(&leased))
+                .await?,
+            HashSet::from([leased])
+        );
         Ok(())
     }
 
     /// A joiner gets no `pending-reindex/` flag; unchanged workers return none.
     #[tokio::test]
     async fn worker_changes_return_joiners_and_clear_leavers() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let todo = build_local_fs_todo_store(&StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
-        })?;
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
         let stays = ClientId::try_new("ev1_stays")?;
         let leaves = ClientId::try_new("ev1_leaves")?;
         let joins = ClientId::try_new("ev1_joins")?;
@@ -2805,14 +3123,16 @@ mod tests {
         Ok(())
     }
 
-    /// The leased jobs are flagged for a deferred settle as for any rebuild.
+    /// The leased jobs get the reindex flag, as for any rebuild.
     #[tokio::test]
     async fn reindex_rebuilds_a_joiner_without_a_flag() -> anyhow::Result<()> {
-        let mut r = Reindex::new()?;
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
         let client = settle_test_client("joined-client", "55", "chip-a")?;
         let auth = ScriptedClientStore::new([Ok(Some(client.clone())), Ok(Some(client.clone()))]);
         let stale = JobId::new_unchecked("job-stale");
-        let leased = JobId::new_unchecked("job-leased");
+        let leased = seed_indexed_lease(&*r.todo, "job-leased").await?;
         r.todo
             .write_eligible(&client.client_id, &stale, ExpiresAt::Never)
             .await?;
@@ -2825,7 +3145,12 @@ mod tests {
 
         assert!(r.todo.list_all_eligible().await?.is_empty());
         assert!(r.todo.list_pending_reindex().await?.is_empty());
-        assert_eq!(r.todo.list_pending_reindex_jobs().await?, vec![leased]);
+        assert_eq!(
+            r.todo
+                .jobs_awaiting_index(std::slice::from_ref(&leased))
+                .await?,
+            HashSet::from([leased])
+        );
         Ok(())
     }
 
@@ -2834,10 +3159,14 @@ mod tests {
         let client = settle_test_client("retagged-client", "55", "chip-a")?;
         let auth = ScriptedClientStore::new([Ok(Some(client.clone())), Ok(Some(client.clone()))]);
         // The rebuild reads no tag; the recheck reads the one written since.
-        let mut r = Reindex::with_tags(ScriptedTagStore::new([
+        let Some(mut r) = Reindex::with_tags(ScriptedTagStore::new([
             std::collections::BTreeSet::new(),
             std::collections::BTreeSet::from([pipette_plan_types::Tag::try_new("lab")?]),
-        ]))?;
+        ]))
+        .await?
+        else {
+            return Ok(());
+        };
         r.todo.write_pending_reindex(&client.client_id).await?;
 
         r.workers.insert(client.client_id.clone());
@@ -3107,18 +3436,22 @@ mod tests {
 
     // ── orphan reconciliation ──────────────────────────────────────────────
 
-    /// A `TodoStore` + `SubmissionStore` pair over one tempdir.
-    fn recon_stores() -> anyhow::Result<(
-        std::sync::Arc<dyn TodoStore>,
-        LocalFsSubmissionStore,
-        tempfile::TempDir,
-    )> {
+    /// A database `TodoStore` and a `SubmissionStore` in a tempdir. `None`
+    /// skips the test without `TEST_DATABASE_URL`.
+    async fn recon_stores() -> anyhow::Result<
+        Option<(
+            std::sync::Arc<dyn TodoStore>,
+            LocalFsSubmissionStore,
+            tempfile::TempDir,
+            TestDb,
+        )>,
+    > {
+        let Some((todo, db)) = sql_todo().await? else {
+            return Ok(None);
+        };
         let dir = tempfile::tempdir()?;
-        let todo = build_local_fs_todo_store(&StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
-        })?;
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
-        Ok((todo, submissions, dir))
+        Ok(Some((todo, submissions, dir, db)))
     }
 
     /// Seed one lease of `job` under `ExpiresAt::Never`. Set the job ID in its body.
@@ -3140,17 +3473,11 @@ mod tests {
         Ok(())
     }
 
-    /// No job was re-dated, so only job and client liveness are in play.
-    fn no_redates() -> HashMap<JobId, ExpiresAt> {
-        HashMap::new()
-    }
-
     async fn sweep(
         todo: &dyn TodoStore,
         submissions: &dyn SubmissionStore,
         live_jobs: &HashSet<JobId>,
         live_clients: &HashSet<ClientId>,
-        avail_expiries: &HashMap<JobId, ExpiresAt>,
         terminal_jobs: &HashSet<JobId>,
         prior: &HashSet<String>,
     ) -> anyhow::Result<HashSet<String>> {
@@ -3161,7 +3488,6 @@ mod tests {
             &todo.list_all_denied().await?,
             live_jobs,
             live_clients,
-            avail_expiries,
             terminal_jobs,
             prior,
         )
@@ -3177,15 +3503,15 @@ mod tests {
     async fn reconcile_client_owned_markers_across_subtrees(
         #[case] client_live: bool,
     ) -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
+        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new(if client_live { "live-client" } else { "ghost" })?;
         let job = JobId::new_unchecked("job-live");
         let job_leased = JobId::new_unchecked("job-leased");
 
         todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
         todo.write_denied(&job, &client, &DenialRecord::default())
-            .await?;
-        todo.write_suspension(&client, "2026-06-01T00:00:00Z".parse()?, &job)
             .await?;
         todo.stamp_liveness(&client).await?;
         todo.write_pending_reindex(&client).await?;
@@ -3211,25 +3537,22 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &HashSet::new(),
         )
         .await?;
         assert_eq!(todo.list_all_eligible().await?.len(), 1);
         assert_eq!(todo.list_all_denied().await?.len(), 1);
-        assert_eq!(todo.list_suspensions().await?.len(), 1);
         assert_eq!(todo.list_liveness().await?.len(), 1);
         assert_eq!(todo.list_pending_reindex().await?.len(), 1);
         assert_eq!(todo.list_leased().await?.len(), 1);
-        assert_eq!(candidates.len(), if client_live { 0 } else { 6 });
+        assert_eq!(candidates.len(), if client_live { 0 } else { 5 });
 
         let candidates = sweep(
             &*todo,
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &candidates,
         )
@@ -3237,7 +3560,6 @@ mod tests {
         let remaining = usize::from(client_live);
         assert_eq!(todo.list_all_eligible().await?.len(), remaining);
         assert_eq!(todo.list_all_denied().await?.len(), remaining);
-        assert_eq!(todo.list_suspensions().await?.len(), remaining);
         assert_eq!(todo.list_liveness().await?.len(), remaining);
         assert_eq!(todo.list_pending_reindex().await?.len(), remaining);
         assert_eq!(todo.list_leased().await?.len(), remaining);
@@ -3252,7 +3574,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_deletes_deleted_client_lease_when_job_recorded() -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
+        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
+            return Ok(());
+        };
         let ghost = ClientId::try_new("ghost")?;
         let job = JobId::new_unchecked("job-recorded");
 
@@ -3274,7 +3598,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &HashSet::new(),
         )
@@ -3288,7 +3611,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &candidates,
         )
@@ -3302,7 +3624,9 @@ mod tests {
     /// clients.
     #[tokio::test]
     async fn reconcile_collects_both_orphan_directions() -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
+        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
+            return Ok(());
+        };
         let live_client = ClientId::try_new("live-client")?;
         let dead_client = ClientId::try_new("dead-client")?;
         let live_job = JobId::new_unchecked("job-live");
@@ -3327,7 +3651,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &HashSet::new(),
         )
@@ -3337,7 +3660,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &candidates,
         )
@@ -3353,7 +3675,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_sweeps_terminal_job_markers_same_run() -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
+        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new("live-client")?;
         let job = JobId::new_unchecked("job-terminal");
 
@@ -3370,7 +3694,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &HashSet::new(),
         )
@@ -3384,7 +3707,9 @@ mod tests {
     /// Its marker is neither deleted nor re-staged.
     #[tokio::test]
     async fn reconcile_spares_reappearing_client() -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
+        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new("flapper")?;
         let job = JobId::new_unchecked("job-x");
         todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
@@ -3398,7 +3723,6 @@ mod tests {
             &submissions,
             &live_jobs,
             &HashSet::new(),
-            &no_redates(),
             &terminal,
             &HashSet::new(),
         )
@@ -3413,57 +3737,12 @@ mod tests {
             &submissions,
             &live_jobs,
             &live_clients,
-            &no_redates(),
             &terminal,
             &candidates,
         )
         .await?;
         assert_eq!(todo.list_all_eligible().await?.len(), 1);
         assert!(candidates.is_empty());
-        Ok(())
-    }
-
-    /// A live job's flag is spared.
-    #[tokio::test]
-    async fn reconcile_collects_pending_reindex_job_flag_for_dead_job() -> anyhow::Result<()> {
-        let (todo, submissions, _dir) = recon_stores()?;
-        let dead_job = JobId::new_unchecked("job-dead");
-        let live_job = JobId::new_unchecked("job-live");
-        todo.write_pending_reindex_job(&dead_job).await?;
-        todo.write_pending_reindex_job(&live_job).await?;
-
-        let live_jobs = HashSet::from([live_job.clone()]);
-        let live_clients: HashSet<ClientId> = HashSet::new();
-        let terminal: HashSet<JobId> = HashSet::new();
-
-        // First sweep stages the dead job's flag but removes nothing.
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &no_redates(),
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        assert_eq!(todo.list_pending_reindex_jobs().await?.len(), 2);
-
-        // Second sweep collects the dead job's flag; the live job's is spared.
-        sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &no_redates(),
-            &terminal,
-            &candidates,
-        )
-        .await?;
-        assert_eq!(
-            todo.list_pending_reindex_jobs().await?,
-            vec![live_job.clone()]
-        );
         Ok(())
     }
 
@@ -3648,12 +3927,17 @@ mod tests {
     /// not latch `complete`.
     #[tokio::test]
     async fn a_plan_ingested_mid_run_is_not_latched_complete() -> anyhow::Result<()> {
+        let Some(db) = TestDb::new().await? else {
+            return Ok(());
+        };
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
-            storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..pipette_core::config::Config::default()
-        })?;
+        let stores = db.stores(pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..pipette_core::config::Config::default()
+            },
+        )?);
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(1));
         let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(2));
         let creating = PlanManifest {

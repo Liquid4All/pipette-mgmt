@@ -2,7 +2,7 @@
 //! transport that files a TOML plan runs [`expand_document`], so each refuses
 //! the same documents with the same messages.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
@@ -235,7 +235,11 @@ pub fn expand_text(
         });
     }
 
-    pipette_planner::expand(&plan).map_err(DocumentError::Expand)
+    let mut expansion = pipette_planner::expand(&plan).map_err(DocumentError::Expand)?;
+    expansion
+        .warnings
+        .extend(pipette_planner::retired_flag_warnings(text)?);
+    Ok(expansion)
 }
 
 /// An error and every source under it, joined the way `anyhow` renders `{:#}`.
@@ -547,6 +551,25 @@ pub async fn read_source(
     })
 }
 
+/// The reference of each model that `document`'s variants name, as [`Model`]
+/// displays it, in document order and each one time. A model entry that does
+/// not parse adds nothing. Only a text that is not TOML is an error.
+pub fn document_models(document: &str) -> Result<Vec<String>, toml::de::Error> {
+    let table: toml::Table = toml::from_str(document)?;
+    let mut seen = HashSet::new();
+    Ok(table
+        .get(crate::variant_edit::VARIANTS)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|variant| variant.get(MODELS)?.as_array())
+        .flatten()
+        .filter_map(|model| model.clone().try_into::<Model>().ok())
+        .map(|model| model.to_string())
+        .filter(|reference| seen.insert(reference.clone()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -753,6 +776,25 @@ mod tests {
         assert!(!echoed.contains("hf_one"), "{echoed}");
         assert_eq!(models(&echoed)?, [vec![model(&kept)?]]);
         assert_eq!(echoed == source.text(), unchanged, "{echoed}");
+        Ok(())
+    }
+
+    /// Each model one time, in document order; a model that does not parse is
+    /// skipped.
+    #[rstest]
+    #[case::gguf(vec![gguf("")], &["o/gated:a.gguf"])]
+    #[case::speculative(vec![speculative("")], &["o/target+o/draft"])]
+    #[case::repeated_across_variants(vec![gguf(""), gguf_in("other", ""), gguf("")], &["o/gated:a.gguf", "o/other:a.gguf"])]
+    #[case::unparsed_skipped(vec![r#"{ type = "no_such_type" }"#.to_owned(), gguf("")], &["o/gated:a.gguf"])]
+    fn a_document_names_its_models(
+        #[case] models: Vec<String>,
+        #[case] expected: &[&str],
+    ) -> anyhow::Result<()> {
+        let variants: Vec<(&str, &str)> = models
+            .iter()
+            .map(|model| (model.as_str(), LLAMACPP))
+            .collect();
+        assert_eq!(document_models(document(&variants)?.text())?, expected);
         Ok(())
     }
 }

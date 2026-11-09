@@ -32,9 +32,11 @@ command can pass while CI fails.
 
 Two test sets need more than the command:
 
-- The tests that run on PostgreSQL, `pipette-store-sql`'s and those built on
-  `seeded_sql_state` in `pipette-web-testkit`, need a server at `TEST_DATABASE_URL`
-  (e.g. `postgres://postgres@127.0.0.1:5432/postgres`). Unset, they skip
+- The tests that run on PostgreSQL need a server at `TEST_DATABASE_URL`. These
+  are `pipette-store-sql`'s tests, the tests built on `seeded_sql_state` or
+  `seeded_queue_state` in `pipette-web-testkit`, and every test that runs
+  `queue-maintenance`. An example address is
+  `postgres://postgres@127.0.0.1:5432/postgres`. Unset, they skip
   locally and fail in CI. Each test makes and drops a schema of its own in a
   `pipette_test` database, which the first test creates and later runs reuse.
 

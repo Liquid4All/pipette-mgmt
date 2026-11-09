@@ -205,13 +205,6 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             "/api/v1/clients/{client_id}/reject",
             post(gate(Needs(ManageClients), api_v1::clients::reject_client)),
         )
-        .route(
-            "/api/v1/clients/{client_id}/unsuspend",
-            post(gate(
-                Needs(ManageClients),
-                api_v1::clients::unsuspend_client,
-            )),
-        )
         // Whom the device may be handed to, for the app's owner field: the
         // console's boundary, which `PUT …/owner` itself does not draw.
         .route(

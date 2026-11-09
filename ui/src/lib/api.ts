@@ -356,9 +356,6 @@ export const approveClient = (signer: Signer, client_id: string) =>
 export const rejectClient = (signer: Signer, client_id: string) =>
   signed<unknown>(signer, "POST", device(client_id, "/reject"));
 
-export const unsuspendClient = (signer: Signer, client_id: string) =>
-  signed<unknown>(signer, "POST", device(client_id, "/unsuspend"));
-
 export const deleteClient = (signer: Signer, client_id: string) =>
   signed<unknown>(signer, "DELETE", device(client_id));
 

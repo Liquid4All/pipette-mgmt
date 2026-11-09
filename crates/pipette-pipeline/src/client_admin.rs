@@ -259,17 +259,6 @@ async fn release_tags(tags: &dyn TagStore, client_id: &ClientId) {
     }
 }
 
-/// Clear a device's suspension; idempotent. Touches only the `todo/` marker:
-/// a suspension is queue state, not an approval decision.
-pub async fn unsuspend(todo: &dyn TodoStore, client_id: &ClientId) -> anyhow::Result<bool> {
-    let was_suspended = todo.read_suspension(client_id).await?.is_some();
-    todo.delete_suspension(client_id).await?;
-    if was_suspended {
-        tracing::info!(client_id = %client_id, "client unsuspended");
-    }
-    Ok(was_suspended)
-}
-
 /// A device's resolved permission set: what its object holds, or nothing when
 /// it has no object (granted by hand). Shared so no surface reads the set raw.
 pub async fn resolved_permissions(

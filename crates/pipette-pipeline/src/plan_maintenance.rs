@@ -11,11 +11,9 @@ use serde_json::Value;
 
 use pipette_core::client::Client;
 use pipette_core::matching::{FleetTags, job_matches_client};
-use pipette_core::plan::{
-    ExpiredJob, PlanManifest, ProgressSnapshot, SettledOutcome, StarvedGroup, past_gate,
-};
+use pipette_core::plan::{ExpiredJob, PlanManifest, ProgressSnapshot, SettledOutcome, past_gate};
 use pipette_core::todo_filename::Lease;
-use pipette_plan_types::{Counts, ExpiresAt, JobId, PlanId, PlanStatus};
+use pipette_plan_types::{ClientId, Counts, ExpiresAt, JobId, PlanId, PlanStatus};
 use pipette_store::{JobPlanMarker, PlanStore, SubmissionStore, TodoStore};
 
 use crate::plan_ingestion::requirement_key;
@@ -332,7 +330,7 @@ async fn end_membership(
     let Some(body) = body else {
         // Flag it either way: the deletes above may have taken its `avail/`
         // entry, so its markers need re-matching when it returns.
-        todo.write_pending_reindex_job(job_id).await?;
+        todo.flag_for_reindex(std::slice::from_ref(job_id)).await?;
         if joiners.is_empty() {
             tracing::warn!(
                 plan_id = %plan_id,
@@ -357,7 +355,7 @@ async fn end_membership(
     todo.write_tmp(job_id, &body).await?;
     todo.promote_avail(job_id, expires_at).await?;
     // Out of `avail/` while the index ran, so its markers may be stale.
-    todo.write_pending_reindex_job(job_id).await?;
+    todo.flag_for_reindex(std::slice::from_ref(job_id)).await?;
     tracing::info!(
         plan_id = %plan_id,
         job_id = %job_id,
@@ -618,8 +616,10 @@ pub(crate) struct SlowestPlan {
 /// Write every plan's `status`, `progress_snapshot`, and `terminal_at`, and
 /// collect the cancel markers that can no longer lead to work.
 ///
-/// `workers` must be the fleet the claim path admits, so starvation says what
-/// the claim door would do. Lenient per plan.
+/// Starvation follows claimable eligibility rows after the index passes.
+/// Jobs withheld from the index or changed during the pass use the worker
+/// snapshot and their cached body. The pass excludes denied clients.
+/// A failure in one plan does not stop the other plans.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is distinct context the caller already holds"
@@ -637,11 +637,16 @@ pub(crate) async fn reconcile_plans(
     live_ids: &HashSet<JobId>,
     workers: &[&Client],
     tags: &FleetTags,
+    matched: &HashSet<JobId>,
+    fallback: &HashSet<JobId>,
+    denied: &[(JobId, ClientId)],
     bodies: &mut HashMap<String, Value>,
     now: DateTime<Utc>,
     creating_max_age: Duration,
 ) -> anyhow::Result<ReconcileReport> {
     let avail_by_job: HashMap<&JobId, &AvailKey> = avail.iter().map(|a| (&a.job_id, a)).collect();
+    let denied: HashSet<(&JobId, &ClientId)> =
+        denied.iter().map(|(job, client)| (job, client)).collect();
 
     let mut report = ReconcileReport::default();
     // Terminal plans included: a campaign revision carries its usually terminal
@@ -670,6 +675,9 @@ pub(crate) async fn reconcile_plans(
             live_ids,
             workers,
             tags,
+            matched,
+            fallback,
+            &denied,
             bodies,
             &mut settled,
             &mut report,
@@ -742,6 +750,9 @@ async fn reconcile_one_plan(
     live_ids: &HashSet<JobId>,
     workers: &[&Client],
     tags: &FleetTags,
+    matched: &HashSet<JobId>,
+    fallback: &HashSet<JobId>,
+    denied: &HashSet<(&JobId, &ClientId)>,
     bodies: &mut HashMap<String, Value>,
     settled: &mut HashMap<JobId, SettledOutcome>,
     report: &mut ReconcileReport,
@@ -795,29 +806,48 @@ async fn reconcile_one_plan(
         .collect();
 
     // A leased job matched a client, so only `avail/` jobs can be starved.
-    let (starved_ids, any_matched) = timed(&mut report.starvation, async {
-        let mut starved_ids: Vec<&JobId> = Vec::new();
+    // A starved job's body is read only to group it by requirement set, using
+    // the same keys as the warnings in the manifest. A job that left
+    // availability before that read counts as matched.
+    let (groups, any_matched) = timed(&mut report.starvation, async {
+        let mut groups: Vec<(crate::plan_ingestion::RequirementKey, Vec<JobId>)> = Vec::new();
         let mut any_matched = false;
         for job_id in &outstanding {
             let Some(entry) = avail_by_job.get(*job_id) else {
                 any_matched = true;
                 continue;
             };
+            // A past-deadline entry survived a failed expiry; its rows no
+            // longer count as claimable, so match it from its body.
+            let matches = if fallback.contains(*job_id) || entry.expires_at.is_expired(now) {
+                let Some(body) = cached_body(todo, entry, bodies).await? else {
+                    any_matched = true;
+                    continue;
+                };
+                workers.iter().any(|client| {
+                    !denied.contains(&(*job_id, &client.client_id))
+                        && job_matches_client(&body, client, tags)
+                })
+            } else {
+                matched.contains(*job_id)
+            };
+            if matches {
+                any_matched = true;
+                continue;
+            }
             let Some(body) = cached_body(todo, entry, bodies).await? else {
-                // Left `avail/` since the listing, so a client took it.
                 any_matched = true;
                 continue;
             };
-            if workers.iter().any(|c| job_matches_client(&body, c, tags)) {
-                any_matched = true;
-            } else {
-                starved_ids.push(*job_id);
+            let key = requirement_key(&body);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ids)) => ids.push((*job_id).clone()),
+                None => groups.push((key, vec![(*job_id).clone()])),
             }
         }
-        anyhow::Ok((starved_ids, any_matched))
+        anyhow::Ok((groups, any_matched))
     })
     .await?;
-
     let (status, terminal_at) = decide_status(
         is_ending,
         outstanding.is_empty(),
@@ -841,11 +871,10 @@ async fn reconcile_one_plan(
     let snapshot = ProgressSnapshot {
         computed_at: now,
         counts: counted.counts,
-        starved: timed(
-            &mut report.starvation,
-            group_starved(todo, &starved_ids, avail_by_job, bodies),
-        )
-        .await?,
+        starved: groups
+            .into_iter()
+            .map(|(key, job_ids)| key.into_starved_group(job_ids))
+            .collect(),
     };
 
     let updated = PlanManifest {
@@ -1061,34 +1090,6 @@ fn add_outcome(counts: &mut Counts, outcome: SettledOutcome) {
         SettledOutcome::Finished => counts.finished += 1,
         SettledOutcome::Failed => counts.failed += 1,
     }
-}
-
-/// Group the starved jobs by requirement set, keyed like the manifest's
-/// ingestion-time `warnings` so the two compare.
-async fn group_starved(
-    todo: &dyn TodoStore,
-    starved_ids: &[&JobId],
-    avail_by_job: &HashMap<&JobId, &AvailKey>,
-    bodies: &mut HashMap<String, Value>,
-) -> anyhow::Result<Vec<StarvedGroup>> {
-    let mut groups: Vec<(crate::plan_ingestion::RequirementKey, Vec<JobId>)> = Vec::new();
-    for job_id in starved_ids {
-        let Some(entry) = avail_by_job.get(*job_id) else {
-            continue;
-        };
-        let Some(body) = cached_body(todo, entry, bodies).await? else {
-            continue;
-        };
-        let key = requirement_key(&body);
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, ids)) => ids.push((*job_id).clone()),
-            None => groups.push((key, vec![(*job_id).clone()])),
-        }
-    }
-    Ok(groups
-        .into_iter()
-        .map(|(key, job_ids)| key.into_starved_group(job_ids))
-        .collect())
 }
 
 /// Keeps plan-index candidates from colliding with `todo/` keys in the shared
@@ -1705,6 +1706,7 @@ mod tests {
     /// One teardown run over a job that stays live inside the retire window.
     struct RetireWindow {
         _dir: tempfile::TempDir,
+        _db: pipette_store_sql::scratch::TestDb,
         todo: std::sync::Arc<dyn TodoStore>,
         plans: std::sync::Arc<dyn PlanStore>,
         job_id: JobId,
@@ -1718,13 +1720,20 @@ mod tests {
     async fn tear_down_in_retire_window(
         claim_first: bool,
         joiner_appears: bool,
-    ) -> anyhow::Result<RetireWindow> {
+    ) -> anyhow::Result<Option<RetireWindow>> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(None);
+        };
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
-            storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..pipette_core::config::Config::default()
-        })?;
+        let stores = db.stores(pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
+                storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: pipette_core::config::StorageConfig::local_fs(
+                    dir.path().to_path_buf(),
+                ),
+                ..pipette_core::config::Config::default()
+            },
+        )?);
         let todo = stores.todo.clone();
 
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(7));
@@ -1811,8 +1820,9 @@ mod tests {
         )
         .await?;
 
-        Ok(RetireWindow {
+        Ok(Some(RetireWindow {
             _dir: dir,
+            _db: db,
             todo,
             plans: stores.plans.clone(),
             job_id,
@@ -1821,7 +1831,7 @@ mod tests {
             body,
             holder,
             outcome,
-        })
+        }))
     }
 
     fn assert_not_retired(w: &RetireWindow) {
@@ -1842,7 +1852,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_joined_inside_the_retire_window_is_restored() -> anyhow::Result<()> {
-        let w = tear_down_in_retire_window(false, true).await?;
+        let Some(w) = tear_down_in_retire_window(false, true).await? else {
+            return Ok(());
+        };
         assert_not_retired(&w);
 
         let restored = w
@@ -1855,8 +1867,10 @@ mod tests {
             "restored under its original key, body intact"
         );
         assert_eq!(
-            w.todo.list_pending_reindex_jobs().await?,
-            vec![w.job_id.clone()],
+            w.todo
+                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
+                .await?,
+            HashSet::from([w.job_id.clone()]),
             "the job was invisible to the index while it was gone, so it is re-matched"
         );
         assert_eq!(
@@ -1871,7 +1885,9 @@ mod tests {
     /// `eligible/` markers.
     #[tokio::test]
     async fn a_job_claimed_inside_the_retire_window_is_released() -> anyhow::Result<()> {
-        let w = tear_down_in_retire_window(true, true).await?;
+        let Some(w) = tear_down_in_retire_window(true, true).await? else {
+            return Ok(());
+        };
         assert_not_retired(&w);
 
         let (client, lease_expiry) = w
@@ -1886,8 +1902,10 @@ mod tests {
             "the holder's lease survives teardown"
         );
         assert_eq!(
-            w.todo.list_pending_reindex_jobs().await?,
-            vec![w.job_id.clone()],
+            w.todo
+                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
+                .await?,
+            HashSet::from([w.job_id.clone()]),
             "the job is flagged, so its markers are re-matched once it is queued again"
         );
         assert_eq!(
@@ -1902,7 +1920,9 @@ mod tests {
     /// reports it already gone.
     #[tokio::test]
     async fn a_claimed_job_with_no_other_member_is_not_reported_retired() -> anyhow::Result<()> {
-        let w = tear_down_in_retire_window(true, false).await?;
+        let Some(w) = tear_down_in_retire_window(true, false).await? else {
+            return Ok(());
+        };
         assert_not_retired(&w);
 
         let (client, lease_expiry) = w
@@ -1917,8 +1937,10 @@ mod tests {
             "the holder's lease survives teardown"
         );
         assert_eq!(
-            w.todo.list_pending_reindex_jobs().await?,
-            vec![w.job_id.clone()],
+            w.todo
+                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
+                .await?,
+            HashSet::from([w.job_id.clone()]),
             "the job is flagged, so its markers are re-matched once it is queued again"
         );
         assert!(

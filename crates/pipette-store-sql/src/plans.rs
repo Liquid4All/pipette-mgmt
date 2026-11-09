@@ -20,9 +20,9 @@ use pipette_plan_types::{
 };
 use pipette_store::{
     CellResult, CellScope, ContentKeyCas, ContentKeyClaim, ContentKeyRecord, ContentKeyVersion,
-    CreateOutcome, JobPlanMarker, Listing, PLANS_PREFIX, PendingSourceMarker, PlanFilter,
-    PlanHeaderPage, PlanListing, PlanPage, PlanStore, PlanSummaryListing, UnreadableObjectError,
-    is_content_digest,
+    CreateOutcome, JobHolder, JobHolderListing, JobPlanMarker, Listing, PLANS_PREFIX,
+    PendingSourceMarker, PlanFilter, PlanHeaderPage, PlanListing, PlanPage, PlanStore,
+    PlanSummaryListing, UnreadableObjectError, is_content_digest,
 };
 
 use crate::ClaimVanishedError;
@@ -1575,6 +1575,63 @@ impl PlanStore for SqlPlanStore {
             .map(|(job_id, plan_ids)| (job_id.clone(), plan_ids))
             .collect())
     }
+
+    /// One statement for every job. It reads each plan's `created_at` and the
+    /// job's own `plan_jobs` row, so no plan's job list leaves the database.
+    async fn job_holders(
+        &self,
+        campaign_id: &CampaignId,
+        job_ids: &[JobId],
+    ) -> anyhow::Result<JobHolderListing> {
+        if job_ids.is_empty() {
+            return Ok(Listing::default());
+        }
+        let ids: Vec<&str> = job_ids.iter().map(JobId::as_str).collect();
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = self
+            .db
+            .fetch_all("job_holders", || {
+                sqlx::query_as(
+                    "SELECT l.job_id, l.plan_id, j.rerun_of,
+                            CASE WHEN p.body IS JSON OBJECT
+                                 THEN p.body::json ->> 'created_at' END
+                     FROM job_plan_links l
+                     JOIN plan_jobs j ON (j.plan_id, j.job_id) = (l.plan_id, l.job_id)
+                     JOIN plans p ON p.plan_id = l.plan_id
+                     WHERE l.job_id = ANY($1) AND j.ordinal IS NOT NULL
+                       AND p.campaign_id = $2",
+                )
+                .bind(ids.as_slice())
+                .bind(campaign_id.as_str())
+            })
+            .await?;
+        Ok(rows.into_iter().fold(
+            Listing::default(),
+            |mut listing, (job_id, plan_id, rerun_of, created_at)| {
+                let holder = (|| {
+                    Ok::<_, String>(JobHolder {
+                        job_id: job_id.parse().map_err(|e| format!("job_id: {e}"))?,
+                        plan_id: plan_id.parse().map_err(|e| format!("plan_id: {e}"))?,
+                        created_at: created_at
+                            .ok_or("body has no created_at")?
+                            .parse()
+                            .map_err(|e| format!("created_at: {e}"))?,
+                        rerun_of: rerun_of
+                            .map(|id| id.parse())
+                            .transpose()
+                            .map_err(|e| format!("rerun_of: {e}"))?,
+                    })
+                })();
+                match holder {
+                    Ok(holder) => listing.items.push(holder),
+                    Err(reason) => listing.unreadable.push(UnreadableObjectError {
+                        key: PLANS.report_key(&plan_id),
+                        reason,
+                    }),
+                }
+                listing
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -2071,6 +2128,12 @@ mod tests {
             plant_manifest(db.clone(), leaf, bytes)
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn job_holders_meet_the_shared_contract() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        pipette_store_testkit::assert_job_holders_contract(&store(&test_db)).await
     }
 
     #[tokio::test]

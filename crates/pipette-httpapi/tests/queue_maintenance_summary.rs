@@ -10,12 +10,14 @@
 
 use std::collections::BTreeMap;
 
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::json;
 
 use pipette_core::plan::sample_manifest;
 use pipette_plan_types::{ExpiresAt, PlanId, PlanStatus};
 use pipette_web_testkit::{
-    capture_logs_at_level, job, job_spec, make_state, run_qm, seed_avail, setup_benchmarks,
+    QueueBackend, capture_logs_at_level, job, job_spec, run_qm, seed_avail, seeded_queue_state,
+    setup_benchmarks,
 };
 
 /// A `field` ending in `=` matches by key only; any other must match a whole
@@ -34,7 +36,10 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let state = make_state(dir.path()).await?;
+            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+                return Ok(false);
+            };
+            let state = &queue.state;
             let finished = job("job-finished")?;
             let cancelled = job("job-cancelled")?;
             // A job that requires a tag can match a later client, so the run
@@ -67,11 +72,15 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
                 )?
             };
             state.plan_store.clone().put_plan(&manifest).await?;
-            run_qm(&state).await?;
-            run_qm(&state).await
+            run_qm(state).await?;
+            run_qm(state).await?;
+            anyhow::Ok(true)
         })
     })?;
-    outcome?;
+    // Without a database the runs are skipped, so the logs hold no summary.
+    if !outcome? {
+        return Ok(());
+    }
 
     let summaries: Vec<&str> = logs
         .lines()
@@ -101,6 +110,7 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
             "cpu_user_ms=",
             "cpu_system_ms=",
             "failed_items=0",
+            "bodies_read=1",
         ]
     };
     [
@@ -162,7 +172,10 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let state = make_state(dir.path()).await?;
+            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+                return Ok(false);
+            };
+            let state = &queue.state;
             let finished = job("job-finished")?;
             let cancelled = job("job-cancelled")?;
             let queued = seed_avail(
@@ -211,11 +224,15 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
                     std::slice::from_ref(&queued),
                 )?)
                 .await?;
-            run_qm(&state).await?;
-            run_qm(&state).await
+            run_qm(state).await?;
+            run_qm(state).await?;
+            anyhow::Ok(true)
         })
     })?;
-    outcome?;
+    // Without a database the runs are skipped, so the logs hold no summary.
+    if !outcome? {
+        return Ok(());
+    }
 
     // A plan that fails also logs no `INFO` line, so the checks below need
     // every plan to reconcile.
@@ -259,5 +276,115 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
             &["status=\"pending_clients\"", probes, settled, "elapsed_ms="],
         );
     });
+    Ok(())
+}
+
+/// Expiration reads its body before the shared cache exists. An earlier store
+/// read belongs to setup, and an empty follow-up run reads no bodies.
+#[test]
+fn a_run_counts_expired_bodies_and_resets_its_body_read_total() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
+        runtime.block_on(async {
+            setup_benchmarks(dir.path())?;
+            let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await?
+            else {
+                return Ok(false);
+            };
+            // The store wrapper must preserve the underlying read counter.
+            queue.state.todo_store = std::sync::Arc::new(
+                pipette_store_testkit::ObservedTodoStore::new(queue.state.todo_store.clone())
+                    .with_global_listings(),
+            );
+            let state = &queue.state;
+            let deadline = ExpiresAt::At(chrono::Utc::now() - chrono::Duration::hours(1));
+            let body =
+                pipette_store_testkit::todo_job_body("job-expired", &[], "prefill_throughput_256");
+            let expired = seed_avail(&*state.todo_store, "job-expired", deadline, &body).await?;
+            assert_eq!(
+                state.todo_store.get_avail(&expired, deadline).await?,
+                Some(body)
+            );
+            run_qm(state).await?;
+            assert!(state.todo_store.get_avail_by_job(&expired).await?.is_none());
+            run_qm(state).await?;
+            anyhow::Ok(true)
+        })
+    })?;
+    if !outcome? {
+        return Ok(());
+    }
+    let summaries: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("queue-maintenance: run finished"))
+        .collect();
+    let [first, second] = summaries[..] else {
+        anyhow::bail!("two summaries expected: {logs}");
+    };
+    assert_fields(first, &["bodies_read=1", "failed_items=0"]);
+    assert_fields(second, &["bodies_read=0", "failed_items=0"]);
+    Ok(())
+}
+
+/// Count every fetched row, the corrupt one included. The corrupt row keeps
+/// its flag, so the next run reads it again.
+#[test]
+fn a_run_counts_corrupt_rows_in_the_flagged_batch() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
+        runtime.block_on(async {
+            setup_benchmarks(dir.path())?;
+            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+                return Ok(false);
+            };
+            let state = &queue.state;
+            stream::iter(["job-a-corrupt", "job-z-healthy"])
+                .map(Ok::<_, anyhow::Error>)
+                .try_for_each(|name| async move {
+                    seed_avail(
+                        &*state.todo_store,
+                        name,
+                        ExpiresAt::Never,
+                        &json!({"job_id": name, "requires": ["gpu"]}),
+                    )
+                    .await?;
+                    anyhow::Ok(())
+                })
+                .await?;
+            queue
+                .execute_sql(
+                    "UPDATE queue_jobs SET body = 'not json' WHERE job_id = 'job-a-corrupt'",
+                )
+                .await?;
+            stream::iter(0..2)
+                .map(Ok::<_, anyhow::Error>)
+                .try_for_each(|_| async {
+                    let Err(error) = run_qm(state).await else {
+                        anyhow::bail!("the corrupt row must still fail the run");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("item(s) failed and were skipped"),
+                        "{error:#}"
+                    );
+                    anyhow::Ok(())
+                })
+                .await?;
+            anyhow::Ok(true)
+        })
+    })?;
+    if !outcome? {
+        return Ok(());
+    }
+    let summaries: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("queue-maintenance: run finished"))
+        .collect();
+    let [first, second] = summaries[..] else {
+        anyhow::bail!("two summaries expected: {logs}");
+    };
+    assert_fields(first, &["bodies_read=2", "failed_items=1"]);
+    assert_fields(second, &["bodies_read=1", "failed_items=1"]);
     Ok(())
 }

@@ -23,11 +23,11 @@ use pipette_plan_types::{
 use pipette_store::JobState;
 use pipette_store_testkit::an_org_benchmark;
 use pipette_web_testkit::{
-    authed_get, authed_post, benchmark_ids, body_json, denied_clients, job, json_str,
-    make_state_with_unverified, own_client_by_org, post_plan_document, put_idle_campaign,
-    register_and_approve, register_pending, registered_user, run_full_score, run_qm, seed_avail,
-    seed_leased, seed_org, set_user_org, setup_benchmarks, signed_empty, signed_json, unauthed_get,
-    valid_submission,
+    QueueBackend, QueueState, authed_get, authed_post, benchmark_ids, body_json, denied_clients,
+    job, json_str, make_state_with_unverified, own_client_by_org, post_plan_document,
+    put_idle_campaign, register_and_approve, register_pending, registered_user, run_full_score,
+    run_qm, seed_avail, seed_leased, seed_org, seeded_queue_state, set_user_org, setup_benchmarks,
+    signed_empty, signed_json, unauthed_get, valid_submission,
 };
 
 /// The id [`an_org_benchmark`] carries: a prefill entry, so scoring needs no
@@ -43,6 +43,8 @@ struct World {
     state: AppState,
     acme: OrgId,
     labs: OrgId,
+    /// Owns the scratch database of a [`sql_world`]. It drops after `state`.
+    _queue: Option<QueueState>,
 }
 
 async fn world() -> anyhow::Result<World> {
@@ -55,6 +57,26 @@ async fn world_holding(holding: bool) -> anyhow::Result<World> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state_with_unverified(dir.path(), holding).await?;
+    world_over(dir, state, None).await
+}
+
+/// [`world`] on the database queue, for a test that runs `queue-maintenance`.
+/// It returns `None` if `TEST_DATABASE_URL` is not set and the run is not in CI.
+async fn sql_world() -> anyhow::Result<Option<World>> {
+    let dir = tempfile::tempdir()?;
+    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+        return Ok(None);
+    };
+    let state = queue.state.clone();
+    Ok(Some(world_over(dir, state, Some(queue)).await?))
+}
+
+/// Seed the two organizations and `acme`'s benchmark into `state`.
+async fn world_over(
+    dir: TempDir,
+    state: AppState,
+    queue: Option<QueueState>,
+) -> anyhow::Result<World> {
     let acme = seed_org(&state, "acme").await?.org_id;
     let labs = seed_org(&state, "labs").await?.org_id;
     state
@@ -66,6 +88,7 @@ async fn world_holding(holding: bool) -> anyhow::Result<World> {
         state,
         acme,
         labs,
+        _queue: queue,
     })
 }
 
@@ -773,7 +796,9 @@ async fn private_results_are_scored() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn an_expired_private_job_gets_a_synthetic_failure() -> anyhow::Result<()> {
-    let world = world().await?;
+    let Some(world) = sql_world().await? else {
+        return Ok(());
+    };
     let deadline = Utc
         .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
         .single()

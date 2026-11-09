@@ -16,7 +16,7 @@ const reader = (permissions: UserPermission[], org_id?: string): OwnUserView => 
 const device = (fields: Partial<ClientDetail>): ClientDetail => ({
   client_id: "ev1_x", client_details: "", contact_email: "", organization: "", public_key: "",
   registered_at: "2026-10-01T00:00:00Z", status: "approved", derived_capabilities: [], permissions: [], tags: [],
-  suspended: false, reindex_pending: false, last_seen_at: null, backlog: null, backlog_by_campaign: null, may_administer: false, ...fields,
+  reindex_pending: false, last_seen_at: null, backlog: null, backlog_by_campaign: null, may_administer: false, ...fields,
 });
 
 const acme = { org_id: "org_acme", slug: "acme" };

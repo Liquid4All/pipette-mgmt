@@ -72,7 +72,6 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         ("DELETE", format!("/api/v1/clients/{CLIENT}")),
         ("POST", format!("/api/v1/clients/{CLIENT}/approve")),
         ("POST", format!("/api/v1/clients/{CLIENT}/reject")),
-        ("POST", format!("/api/v1/clients/{CLIENT}/unsuspend")),
         ("PUT", format!("/api/v1/clients/{CLIENT}/owner")),
         ("GET", format!("/api/v1/clients/{CLIENT}/owners")),
         ("PUT", format!("/api/v1/clients/{CLIENT}/permissions")),
@@ -242,7 +241,6 @@ const HUMAN_ONLY_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/clients/{}"),
     ("POST", "/api/v1/clients/{}/approve"),
     ("POST", "/api/v1/clients/{}/reject"),
-    ("POST", "/api/v1/clients/{}/unsuspend"),
     ("PUT", "/api/v1/clients/{}/owner"),
     ("GET", "/api/v1/clients/{}/owners"),
     ("PUT", "/api/v1/clients/{}/permissions"),
@@ -315,7 +313,6 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
             ("DELETE", "/api/v1/clients/{}"),
             ("POST", "/api/v1/clients/{}/approve"),
             ("POST", "/api/v1/clients/{}/reject"),
-            ("POST", "/api/v1/clients/{}/unsuspend"),
             ("PUT", "/api/v1/clients/{}/owner"),
             ("PUT", "/api/v1/clients/{}/permissions"),
             ("PATCH", "/api/v1/clients/{}/permissions"),
@@ -882,7 +879,6 @@ async fn an_unknown_path_is_a_404() -> anyhow::Result<()> {
 const BODYLESS_WRITES: &[(&str, &str)] = &[
     ("POST", "/api/v1/clients/{}/approve"),
     ("POST", "/api/v1/clients/{}/reject"),
-    ("POST", "/api/v1/clients/{}/unsuspend"),
     ("POST", "/api/v1/plans/{}/cancel"),
 ];
 

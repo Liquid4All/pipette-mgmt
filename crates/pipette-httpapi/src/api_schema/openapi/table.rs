@@ -190,24 +190,6 @@ pub(super) fn operations() -> Vec<Operation> {
         .errors(&[409])
         .empty(204, "Rejected"),
         op(
-            M::POST,
-            "/api/v1/clients/{client_id}/unsuspend",
-            "unsuspend_client",
-            Devices,
-            gated!(Needs(ManageClients)),
-        )
-        .summary("Lift a device's suspension")
-        .human_only()
-        .reply(
-            200,
-            "The device and its owner, and whether a suspension was lifted",
-            [json::<pt::Changed<pt::ClientView>>()],
-        )
-        .empty(
-            204,
-            "No device record answers to the id; its suspension is cleared",
-        ),
-        op(
             M::GET,
             "/api/v1/clients/{client_id}/owners",
             "list_client_owners",

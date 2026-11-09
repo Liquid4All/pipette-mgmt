@@ -342,6 +342,97 @@ async fn test_a_reader_without_read_plans_gets_no_plan(#[case] order: &str) -> a
     Ok(())
 }
 
+// ── GET /api/v1/campaigns?plan=true&models=true ───────────────────────────────────
+
+/// Asked, a row whose `plan` the reader reads carries the models its plan
+/// document names. A row without `plan` has no `models`, though its pointer
+/// names another account's document. Unasked, no row has `models`, and `models`
+/// without `plan=true` is a `400`.
+#[tokio::test]
+async fn test_each_row_carries_its_plan_models_when_asked() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _key, _client_id) = approved_client(dir.path()).await?;
+    let reader = registered_user(
+        &state,
+        &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
+    )
+    .await?;
+    let stranger = registered_user(&state, &[UserPermission::SubmitPlans]).await?;
+    let (filed, _) = created_campaign(&state, &reader, &[("name", "Nightly")]).await?;
+    let idle = put_idle_campaign(&state, &reader.1, "Idle").await?;
+    let (_, theirs) = created_campaign(&state, &stranger, &[("name", "Theirs")]).await?;
+    let pointer = put_idle_campaign(&state, &reader.1, "Pointer").await?;
+    point(&state, &pointer, &theirs).await?;
+
+    let body = listed(&state, &reader, "/api/v1/campaigns?plan=true&models=true").await?;
+    assert_eq!(
+        row(&body, &filed)?["models"],
+        json!(["LiquidAI/LFM2.5-350M-MLX-4bit"])
+    );
+    [&idle, &pointer]
+        .into_iter()
+        .try_for_each(|unread| -> anyhow::Result<()> {
+            let unread = row(&body, unread.as_str())?;
+            assert!(unread.get("plan").is_none(), "{unread}");
+            assert!(unread.get("models").is_none(), "{unread}");
+            Ok(())
+        })?;
+
+    let body = listed(&state, &reader, "/api/v1/campaigns?plan=true").await?;
+    assert!(row(&body, &filed)?.get("models").is_none(), "{body}");
+
+    let (status, body) = read(&state, &reader, "/api/v1/campaigns?models=true").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    Ok(())
+}
+
+/// Missing, mismatched, or malformed documents cost only their row's models.
+/// The plan summary and healthy rows remain in the successful response.
+#[rstest]
+#[case::missing(None, false)]
+#[case::mismatched(Some(ONE_CELL_PLAN.replace("LFM2.5-350M-MLX-4bit", "other-model")), false)]
+#[case::malformed(Some("variants = [".to_string()), true)]
+#[tokio::test]
+async fn test_bad_source_omits_models_and_preserves_the_page(
+    #[case] replacement: Option<String>,
+    #[case] matching_digest: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _key, _client_id) = approved_client(dir.path()).await?;
+    let reader = registered_user(
+        &state,
+        &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
+    )
+    .await?;
+    let (healthy, _) = created_campaign(&state, &reader, &[("name", "Healthy")]).await?;
+    let (damaged, plan_id) = created_campaign(&state, &reader, &[("name", "Damaged")]).await?;
+    state.plan_store.delete_plan_source(&plan_id).await?;
+    if let Some(text) = replacement {
+        let source = pipette_core::plan::PlanSource::new(text)?;
+        state.plan_store.put_plan_source(&plan_id, &source).await?;
+        if matching_digest {
+            // Reach TOML parsing instead of rejecting the source's digest.
+            let mut manifest = state
+                .plan_store
+                .get_plan(&plan_id)
+                .await?
+                .context("the plan was filed")?;
+            manifest.source_sha256 = Some(source.sha256().clone());
+            state.plan_store.put_plan(&manifest).await?;
+        }
+    }
+
+    let body = listed(&state, &reader, "/api/v1/campaigns?plan=true&models=true").await?;
+    let affected = row(&body, &damaged)?;
+    assert!(affected.get("plan").is_some(), "{affected}");
+    assert!(affected.get("models").is_none(), "{affected}");
+    assert_eq!(
+        row(&body, &healthy)?["models"],
+        json!(["LiquidAI/LFM2.5-350M-MLX-4bit"])
+    );
+    Ok(())
+}
+
 // ── GET /api/v1/campaigns?names=true ───────────────────────────────────────────────
 
 /// `names` names exactly the owners of the rows served: an organization by

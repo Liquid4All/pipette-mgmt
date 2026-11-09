@@ -321,6 +321,15 @@ describe("a line's spread and issues", () => {
     expect(issues(row("decode", null, { failed: true, model_params_total_millions: null }))).toEqual(["failed"]);
   });
 
+  test("mark both lines of a job whose time to first token exceeds its end-to-end latency, from its other rows", () => {
+    const ms = { unit: "ms" };
+    const rows = [row("ttft", 2500, ms), row("decode_throughput", 40), row("end_to_end_latency", 2000, ms)];
+    const marks = (of: ResultRow[]) => linesOf([job("job", "finished", { result: scored(...of) })])
+      .map((l) => issuesOf(l).map((i) => i.text));
+    expect(marks(rows)).toEqual([["TTFT 125.0% of E2E"], [], ["TTFT 125.0% of E2E"]]);
+    expect(marks([row("ttft", 500, ms), row("end_to_end_latency", 2000, ms)])).toEqual([[], []]);
+  });
+
   test("a line swapped where its run held swap, as the `swap` issue reads it", () => {
     expect(swapped(line(row("decode", 100, { observations: { max_swap_bytes: 4096 } })))).toBe(true);
     // A reading of none, no reading and no row are no swap.

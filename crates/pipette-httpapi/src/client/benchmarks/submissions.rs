@@ -826,6 +826,7 @@ async fn handle_retriable_failure(
     let record = DenialRecord::new(
         failure.submitted_at,
         failure.wire.failure_reason.as_str(),
+        failure.wire.failure_code,
         failure.wire.client_version.as_ref().map(|v| v.as_str()),
         failure.wire.runtime_version.as_ref().map(|v| v.as_str()),
     );
@@ -918,6 +919,7 @@ fn log_denied_retriable_failure(failure: &pipette_pipeline::submission::FailureS
         client_version = ?failure.wire.client_version.as_ref().map(|v| v.as_str()),
         runtime_version = ?failure.wire.runtime_version.as_ref().map(|v| v.as_str()),
         failure_reason = ?failure.wire.failure_reason.as_str(),
+        failure_code = %failure.wire.failure_code,
         "job denied for client: retriable failure"
     );
 }
@@ -945,6 +947,7 @@ fn log_accepted_submission(submission: &Submission) {
                 runtime_name = ?f.wire.runtime_name,
                 retriable = f.wire.retriable,
                 failure_reason = ?f.wire.failure_reason.as_str(),
+                failure_code = %f.wire.failure_code,
                 "accepted failure submission"
             );
         }
@@ -1117,7 +1120,6 @@ mod tests {
             "eligible/clients",
             "pending-reindex",
             "tmp",
-            "suspended",
         ]
         .iter()
         .try_for_each(|sub| std::fs::create_dir_all(todo_dir.join(sub)))?;
@@ -1131,6 +1133,7 @@ mod tests {
             job_body,
             BenchmarkType::PrefillThroughput,
             "x",
+            pipette_plan_types::FailureCode::Unspecified,
             pipette_plan_types::FailureSource::Client,
             Utc::now(),
         )? {

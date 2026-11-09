@@ -23,7 +23,7 @@ use pipette_core::matching::describe_clauses;
 use pipette_core::organization::Organization;
 use pipette_core::plan::{JobExpiry, PlanExplanation, PlanLeases, PlanManifest, ProgressSnapshot};
 use pipette_core::preauth_prune;
-use pipette_core::todo_filename::{Lease, parse_leased_key};
+use pipette_core::todo_filename::Lease;
 use pipette_core::user::UserKey;
 use pipette_core::user_permission;
 use pipette_core::user_permission::{
@@ -1513,15 +1513,6 @@ enum ClientAction {
         #[arg(value_parser = parse_client_id)]
         client_id: ClientId,
     },
-    /// List clients currently suspended from claiming (each holds a stale
-    /// lease that must be reclaimed or expire before it can claim again)
-    ListSuspended,
-    /// Clear a client's suspension so it may claim jobs again
-    Unsuspend {
-        /// Client ID to unsuspend
-        #[arg(value_parser = parse_client_id)]
-        client_id: ClientId,
-    },
     /// Show or set who owns a device: an organization directly, or a user
     /// account whose own membership then says which organization
     /// (`pipette-mgmt orgs`).
@@ -2587,9 +2578,7 @@ fn writes(command: &Command) -> bool {
         | Command::FixVaultLabels { dry_run, .. }
         | Command::RequeueEval { dry_run, .. } => !dry_run,
         Command::Clients { action } => match action {
-            ClientAction::List { .. }
-            | ClientAction::Capabilities { .. }
-            | ClientAction::ListSuspended => false,
+            ClientAction::List { .. } | ClientAction::Capabilities { .. } => false,
             ClientAction::Tag { action } => !matches!(action, TagAction::List { .. }),
             ClientAction::Permission { action } => !matches!(action, PermissionAction::List { .. }),
             ClientAction::Preauth { action } => match action {
@@ -2601,7 +2590,6 @@ fn writes(command: &Command) -> bool {
             ClientAction::Approve { .. }
             | ClientAction::Reject { .. }
             | ClientAction::Delete { .. }
-            | ClientAction::Unsuspend { .. }
             | ClientAction::Update { .. } => true,
         },
         Command::Users { action } => match action {
@@ -6592,11 +6580,7 @@ fn print_plan_status(record: plan_cli::PlanRecord, starved_block: bool) {
 /// all is said outright, since silence would read as a missing flag.
 fn print_plan_leases(leases: &PlanLeases) {
     if leases.is_empty() {
-        if leases.unparseable_keys == 0 {
-            println!("\nNo client holds a lease on this plan's jobs.");
-        } else {
-            println!("\nNo client holds a lease under a `leased/` key the report can read.");
-        }
+        println!("\nNo client holds a lease on this plan's jobs.");
     }
     print_lease_list(
         "Running now. Clients that hold a live lease on one of the plan's jobs:",
@@ -6610,12 +6594,6 @@ fn print_plan_leases(leases: &PlanLeases) {
         &leases.lapsed,
         leases.read_at,
     );
-    if leases.unparseable_keys > 0 {
-        println!(
-            "\n{} `leased/` key(s) name no job, so a lease on this plan's jobs may sit under one.",
-            leases.unparseable_keys
-        );
-    }
 }
 
 /// Rows carry the deadline's age: the recycle cron is unreadable from here, so
@@ -6711,34 +6689,12 @@ fn print_plan_explanation(report: &PlanExplanation) {
         "            {} claimable ({} past their deadline); {} indexed; {} denied",
         c.claimable, c.expired, c.indexed, c.denied
     );
-    if c.unparseable_avail_keys > 0 {
-        println!(
-            "            {} `avail/` key(s) in the queue are unparseable and count in no \
-             bucket above",
-            c.unparseable_avail_keys
-        );
-    }
-    if c.unparseable_leased_keys > 0 {
-        println!(
-            "            {} `leased/` key(s) in the queue are unparseable and count in no \
-             bucket above",
-            c.unparseable_leased_keys
-        );
-    }
-    if c.unparseable_avail_keys > 0 || c.unparseable_leased_keys > 0 {
-        println!(
-            "            A plan job under such a key counts in `finished or retired` above. \
-             Treat that {} as an upper bound.",
-            c.gone
-        );
-    }
-
     let f = &report.fleet;
     // The counts nest, so the first drop names the gate to act on.
     println!(
-        "  Fleet     {} registered, {} approved, {} holding `perform_work`, {} suspended, \
+        "  Fleet     {} registered, {} approved, {} holding `perform_work`, \
          {} pending an eligible-index rebuild, {} unblocked",
-        f.registered, f.approved, f.working, f.suspended, f.pending_reindex, f.unblocked
+        f.registered, f.approved, f.working, f.pending_reindex, f.unblocked
     );
 
     if report.groups.is_empty() {
@@ -6918,12 +6874,12 @@ async fn handle_unverified_action(action: UnverifiedAction, stores: Stores) -> a
                 })
                 .try_collect::<Vec<_>>()
                 .await?;
+            let held_ids: Vec<_> = held.iter().map(|(_, job, _)| job.clone()).collect();
             let leased = &stores
                 .todo
-                .list_leased()
+                .leases_for_jobs(&held_ids)
                 .await?
-                .iter()
-                .filter_map(|key| parse_leased_key(key).ok())
+                .into_iter()
                 .map(|lease| lease.job_id)
                 .collect::<HashSet<_>>();
             let (kept, free): (Vec<_>, Vec<_>) = stream::iter(held)
@@ -7436,14 +7392,25 @@ async fn run_queue(action: QueueAction, config: &Config) -> anyhow::Result<()> {
     let report = match action {
         QueueAction::Import { dry_run } => {
             let liveness: &dyn LivenessImport = &*stores.database_liveness;
-            queue_copy::copy_queue(&*stores.objects, &*stores.database, Some(liveness), dry_run)
-                .instrument(tracing::info_span!("queue_copy", direction = "import"))
-                .await?
+            queue_copy::copy_queue(
+                &*stores.objects,
+                queue_copy::QueueCopyTarget::Database {
+                    store: &*stores.database,
+                    liveness,
+                },
+                dry_run,
+            )
+            .instrument(tracing::info_span!("queue_copy", direction = "import"))
+            .await?
         }
         QueueAction::Export { dry_run } => {
-            queue_copy::copy_queue(&*stores.database, &*stores.objects, None, dry_run)
-                .instrument(tracing::info_span!("queue_copy", direction = "export"))
-                .await?
+            queue_copy::copy_queue(
+                &*stores.database,
+                queue_copy::QueueCopyTarget::Objects(&*stores.objects),
+                dry_run,
+            )
+            .instrument(tracing::info_span!("queue_copy", direction = "export"))
+            .await?
         }
     };
     print_queue_copy_report(&report);
@@ -7740,16 +7707,6 @@ struct CapabilityRow {
     clients: usize,
 }
 
-#[derive(tabled::Tabled)]
-struct SuspendedRow {
-    #[tabled(rename = "Client ID")]
-    client_id: String,
-    #[tabled(rename = "Suspended At")]
-    suspended_at: String,
-    #[tabled(rename = "Conflicting Job")]
-    conflicting_job_id: String,
-}
-
 fn join_tags(tags: &std::collections::BTreeSet<pipette_plan_types::Tag>) -> String {
     if tags.is_empty() {
         "-".to_string()
@@ -8028,32 +7985,6 @@ async fn handle_client_action(action: ClientAction, stores: Stores) -> anyhow::R
                     "client {client_id}: no identity record found; removed any residual queue state"
                 );
             }
-        }
-        ClientAction::ListSuspended => {
-            let mut records = stores.todo.list_suspensions().await?;
-            if records.is_empty() {
-                println!("No clients are suspended.");
-            } else {
-                records.sort_by_key(|(_, r)| std::cmp::Reverse(r.suspended_at));
-                let rows: Vec<SuspendedRow> = records
-                    .iter()
-                    .map(|(client_id, record)| SuspendedRow {
-                        client_id: client_id.to_string(),
-                        suspended_at: record.suspended_at.to_string(),
-                        conflicting_job_id: record.conflicting_job_id.to_string(),
-                    })
-                    .collect();
-                println!("{} suspended client(s):\n", rows.len());
-                let mut table = tabled::Table::new(&rows);
-                table.with(tabled::settings::Style::psql());
-                println!("{table}");
-            }
-        }
-        ClientAction::Unsuspend { client_id } => {
-            // Idempotent: a no-op if the client was not suspended.
-            stores.todo.delete_suspension(&client_id).await?;
-            tracing::info!(client_id = %client_id, "client unsuspended");
-            println!("Cleared suspension for client {client_id}.");
         }
         ClientAction::Update {
             client_id,
@@ -9149,8 +9080,6 @@ mod tests {
             lapsed_leases: lapsed,
             gone: 2,
             denied: 0,
-            unparseable_avail_keys: 0,
-            unparseable_leased_keys: 0,
         };
         assert_eq!(leased_cell(&census), expected);
     }
@@ -12911,6 +12840,9 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 &held_failure_body(job_id.as_str(), retriable),
             )
             .await?;
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        let mut stores = stores;
+        stores.todo = observed.clone();
 
         handle_unverified_action(
             UnverifiedAction::Promote {
@@ -12921,6 +12853,12 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         )
         .await?;
 
+        // The lease read names only the held job, never the whole `leased/` tree.
+        assert_eq!(
+            observed.take_reads(),
+            vec![("leases_for_jobs", vec![job_id.clone()])]
+        );
+        observed.unexpected.none()?;
         let record = stores.submissions.find_job(&job_id).await?;
         assert_eq!(
             record.map(|r| (r.state, r.body)),

@@ -1032,21 +1032,18 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
     let job1 = job("job-1")?;
     let job2 = job("job-2")?;
 
-    todo.write_suspension(&a, chrono::Utc::now(), &job1).await?;
     todo.stamp_liveness(&a).await?;
     todo.write_eligible(&a, &job1, ExpiresAt::Never).await?;
     todo.write_eligible(&a, &job2, ExpiresAt::Never).await?;
     todo.write_pending_reindex(&a).await?;
     todo.write_pending_reindex(&a).await?; // two flags, as a real client may hold
 
-    todo.write_suspension(&b, chrono::Utc::now(), &job1).await?;
     todo.stamp_liveness(&b).await?;
     todo.write_eligible(&b, &job1, ExpiresAt::Never).await?;
     todo.write_pending_reindex(&b).await?;
 
     purge_client_todo_state(todo, &a).await;
 
-    assert!(todo.read_suspension(&a).await?.is_none());
     assert!(todo.read_liveness(&a).await?.is_none());
     assert!(
         !todo
@@ -1063,7 +1060,6 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
             .any(|(c, _)| c == &a)
     );
 
-    assert!(todo.read_suspension(&b).await?.is_some());
     assert!(todo.read_liveness(&b).await?.is_some());
     assert!(
         todo.list_all_eligible()
@@ -1080,7 +1076,7 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
 
     // A clean no-op, so `clients delete` re-runs to converge after a failure.
     purge_client_todo_state(todo, &a).await;
-    assert!(todo.read_suspension(&a).await?.is_none());
+    assert!(todo.read_liveness(&a).await?.is_none());
     Ok(())
 }
 

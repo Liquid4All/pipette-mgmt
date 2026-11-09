@@ -41,7 +41,7 @@ pub use uv::{
 use nutype::nutype;
 use serde::{Deserialize, Serialize};
 
-use crate::NonEmptyString;
+use crate::{AbsolutePath, NonEmptyString, RelativePath};
 
 /// Runtime declaration on a variant. vLLM and sglang are split per server so
 /// each keeps its own flavor set.
@@ -200,8 +200,80 @@ pub struct SourceRepository {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schemars", schemars(transform = core_ai_bundled_source_optional))]
 pub struct AppleCoreAiMacosPipette {
     pub packages: CoreAiSwiftStack,
+    #[serde(
+        flatten,
+        deserialize_with = "deserialize_core_ai_source",
+        skip_serializing_if = "AppleCoreAiMacosPipetteSource::is_bundled"
+    )]
+    pub source: AppleCoreAiMacosPipetteSource,
+}
+
+/// Schemars sees the tagged source through `flatten`, but Serde also accepts
+/// its absence as `Bundled`. Keep the bundled schema arm in step with that.
+#[cfg(feature = "schemars")]
+fn core_ai_bundled_source_optional(schema: &mut schemars::Schema) {
+    use serde_json::Value;
+
+    let Some(arms) = schema.get_mut("oneOf").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for arm in arms {
+        if arm
+            .pointer("/properties/source/const")
+            .and_then(Value::as_str)
+            != Some("bundled")
+        {
+            continue;
+        }
+        if let Some(required) = arm.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|field| field.as_str() != Some("source"));
+            if required.is_empty()
+                && let Some(object) = arm.as_object_mut()
+            {
+                let _ = object.remove("required");
+            }
+        }
+    }
+}
+
+fn deserialize_core_ai_source<'de, D>(
+    deserializer: D,
+) -> Result<AppleCoreAiMacosPipetteSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let wire = serde_json::Value::deserialize(deserializer)?;
+    if wire.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(AppleCoreAiMacosPipetteSource::Bundled);
+    }
+    AppleCoreAiMacosPipetteSource::deserialize(wire).map_err(D::Error::custom)
+}
+
+/// Where the Core AI Swift sidecar is installed. The package pins, rather than
+/// this location, identify the runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AppleCoreAiMacosPipetteSource {
+    /// Install the sidecar bundled with Pipette.
+    #[default]
+    Bundled,
+    /// Installed payload under a runtime-store entry.
+    RelativeDir { dir: RelativePath },
+    /// Installed payload bound to an absolute host path for execution.
+    AbsoluteDir { dir: AbsolutePath },
+}
+
+impl AppleCoreAiMacosPipetteSource {
+    /// Whether the sidecar is declared to come from the Pipette bundle.
+    pub fn is_bundled(&self) -> bool {
+        matches!(self, Self::Bundled)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -220,6 +292,7 @@ impl AppleCoreAiMacosPipette {
     }
     pub fn bundled() -> Self {
         Self {
+            source: AppleCoreAiMacosPipetteSource::Bundled,
             packages: CoreAiSwiftStack {
                 coreai_models: SourceRepository {
                     repository_url: RepositoryUrl::new("github.com/apple/coreai-models"),
@@ -240,8 +313,10 @@ impl AppleCoreAiMacosPipette {
             },
         }
     }
+    /// Whether these package pins match the Swift stack shipped with Pipette,
+    /// independent of where the sidecar is installed.
     pub fn is_bundled(&self) -> bool {
-        *self == Self::bundled()
+        self.packages == Self::bundled().packages
     }
 }
 impl Default for AppleCoreAiMacosPipette {
@@ -574,6 +649,96 @@ mod tests {
     use super::uv::sample_catalog_source;
     use super::*;
     use crate::*;
+
+    #[test]
+    fn core_ai_source_defaults_to_bundled_for_legacy_json() -> anyhow::Result<()> {
+        let bundled = Runtime::AppleCoreAiMacosPipette(AppleCoreAiMacosPipette::bundled());
+        let legacy = json!({
+            "type": "core_ai_macos_pipette",
+            "packages": AppleCoreAiMacosPipette::bundled().packages,
+        });
+        assert_eq!(serde_json::from_value::<Runtime>(legacy.clone())?, bundled);
+        assert_eq!(serde_json::to_value(&bundled)?, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn core_ai_sources_round_trip_without_changing_identity() -> anyhow::Result<()> {
+        let bundled = AppleCoreAiMacosPipette::bundled();
+        let identity = bundled.to_string();
+        for (source, wire_source, dir) in [
+            (AppleCoreAiMacosPipetteSource::Bundled, "bundled", None),
+            (
+                AppleCoreAiMacosPipetteSource::RelativeDir {
+                    dir: RelativePath::try_new("blobs/core-ai".to_owned())?,
+                },
+                "relative_dir",
+                Some("blobs/core-ai"),
+            ),
+            (
+                AppleCoreAiMacosPipetteSource::AbsoluteDir {
+                    dir: AbsolutePath::try_new("/opt/pipette/core-ai".to_owned())?,
+                },
+                "absolute_dir",
+                Some("/opt/pipette/core-ai"),
+            ),
+        ] {
+            let runtime = Runtime::AppleCoreAiMacosPipette(AppleCoreAiMacosPipette {
+                packages: bundled.packages.clone(),
+                source: source.clone(),
+            });
+            let mut explicit = serde_json::to_value(&runtime)?;
+            explicit["source"] = wire_source.into();
+            if let Some(dir) = dir {
+                explicit["dir"] = dir.into();
+            }
+            assert_eq!(serde_json::from_value::<Runtime>(explicit)?, runtime);
+            assert_eq!(
+                serde_json::from_value::<Runtime>(serde_json::to_value(&runtime)?)?,
+                runtime
+            );
+            assert_eq!(runtime.to_string(), identity);
+            assert_eq!(runtime.cli_ref(), identity);
+            assert!(matches!(runtime, Runtime::AppleCoreAiMacosPipette(ref rt) if rt.is_bundled()));
+            assert_eq!(
+                source.is_bundled(),
+                matches!(source, AppleCoreAiMacosPipetteSource::Bundled)
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("relative_dir", "/opt/core-ai")]
+    #[case("relative_dir", "../core-ai")]
+    #[case("absolute_dir", "blobs/core-ai")]
+    #[case("absolute_dir", "/opt/../core-ai")]
+    fn core_ai_source_rejects_invalid_paths(
+        #[case] source: &str,
+        #[case] dir: &str,
+    ) -> anyhow::Result<()> {
+        let mut wire = serde_json::to_value(Runtime::AppleCoreAiMacosPipette(
+            AppleCoreAiMacosPipette::bundled(),
+        ))?;
+        wire["source"] = source.into();
+        wire["dir"] = dir.into();
+        assert!(serde_json::from_value::<Runtime>(wire).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn core_ai_unsupported_packages_remain_distinguishable() -> anyhow::Result<()> {
+        let mut runtime = AppleCoreAiMacosPipette::bundled();
+        runtime.source = AppleCoreAiMacosPipetteSource::RelativeDir {
+            dir: RelativePath::try_new("blobs/core-ai".to_owned())?,
+        };
+        runtime.packages.swift_jinja.repository_version =
+            NonEmptyString::try_new("unsupported".to_owned())?;
+        assert!(!runtime.is_bundled());
+        assert!(!runtime.source.is_bundled());
+        assert!(runtime.to_string().contains("unsupported"));
+        Ok(())
+    }
 
     #[rstest]
     #[case::stock(json!({}), false, false)]

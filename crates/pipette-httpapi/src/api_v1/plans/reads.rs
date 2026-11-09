@@ -24,7 +24,7 @@ use pipette_core::campaign::Campaign;
 use pipette_core::plan::{
     PlanHeader, PlanManifest, PlanNotes, PlanSource, PlanSummary, SettledOutcome,
 };
-use pipette_core::todo_filename::{Lease, parse_leased_key};
+use pipette_core::todo_filename::Lease;
 use pipette_core::user::User;
 use pipette_core::warehouse::is_system_client;
 use pipette_pipeline::campaign_chain;
@@ -35,7 +35,6 @@ use pipette_pipeline::plan_cells::{
 use pipette_pipeline::plan_cli::{CancelOutcome, explain_plan_with, request_cancel};
 use pipette_pipeline::plan_document::SourceRead;
 use pipette_pipeline::plan_results::{ResultRow, ResultsDb, ResultsError, rows_by_job};
-use pipette_pipeline::queue_maintenance::{AvailKey, collect_all_avail};
 use pipette_pipeline::submission::ServedJobSource;
 use pipette_pipeline::variant_edit;
 use pipette_pipeline::vault_check::{named_resources, typed_descriptor_sha256};
@@ -47,7 +46,9 @@ use pipette_plan_types::{
     RequestedScope, ResultsRead, Runtime, UpdatePlanRequest, UserId, UserPermission,
     VaultResourceId,
 };
-use pipette_store::{PlanFilter, PlanReach, STORAGE_CONCURRENCY, drain_campaigns};
+use pipette_store::{
+    AvailEntry, JobHolder, PlanFilter, PlanReach, STORAGE_CONCURRENCY, drain_campaigns,
+};
 
 use super::csv::results_csv;
 use super::job_results::{rescored_of, with_job_results};
@@ -1519,65 +1520,64 @@ async fn with_results(
     let campaign_id = manifest.campaign_id.as_ref();
     let ((cells, page, results, queue), rerun_campaign_id) = futures::try_join!(
         async {
-            // An all read needs queue listings only when the complete plan
-            // has expired jobs. Its manifest names every job, so the listing
-            // can run beside a cold cache fill before the cells are ready.
-            let (kept, early_queue) =
-                futures::try_join!(kept_results(state, manifest, window, timing), async {
-                    if window == JobWindow::All && manifest.status == PlanStatus::Complete {
+            // An all read's manifest names every job, so its queue listings
+            // and its results read beside the cells.
+            let (results, queue) = match window {
+                JobWindow::All => futures::try_join!(
+                    async {
+                        match kept_results(state, manifest, window, timing).await? {
+                            Some(kept) => Ok(kept),
+                            None => whole_plan_results(state, manifest, timing)
+                                .await
+                                .map(Arc::new),
+                        }
+                    },
+                    async {
                         let started = Instant::now();
                         let answer = queue_listings(state, manifest, &manifest.job_ids).await;
                         if let Some(timing) = timing {
                             timing.set(|s| s.queue_ms = elapsed_ms(started));
                         }
-                        answer.map(Some)
-                    } else {
-                        Ok(None)
-                    }
-                })?;
-            let cells = match &kept {
-                Some(kept) => kept.cells.clone(),
-                None => {
-                    let started = Instant::now();
-                    let answer = cells(state, manifest).await;
-                    if let Some(timing) = timing {
-                        timing.set(|s| s.cells_ms = elapsed_ms(started));
-                    }
-                    answer?
-                }
-            };
-            let page = page_ids(&cells, window);
-            let (results, queue) = futures::try_join!(
-                async {
-                    Ok(match kept {
-                        Some(kept) => kept,
-                        None => Arc::new(
-                            read_plan_results(
-                                state,
-                                manifest,
-                                cells.clone(),
-                                &page,
-                                window,
-                                timing,
-                            )
-                            .await,
-                        ),
-                    })
-                },
-                async {
-                    match early_queue {
-                        Some(queue) => Ok(queue),
-                        None => {
+                        answer
+                    },
+                )?,
+                JobWindow::Page { .. } => {
+                    let kept = kept_results(state, manifest, window, timing).await?;
+                    let cells = match &kept {
+                        Some(kept) => kept.cells.clone(),
+                        None => timed_cells(state, manifest, timing).await?,
+                    };
+                    let page = page_ids(&cells, window);
+                    futures::try_join!(
+                        async {
+                            Ok(match kept {
+                                Some(kept) => kept,
+                                None => Arc::new(
+                                    read_plan_results(
+                                        state,
+                                        manifest,
+                                        std::future::ready(Ok(cells)),
+                                        &page,
+                                        window,
+                                        timing,
+                                    )
+                                    .await?,
+                                ),
+                            })
+                        },
+                        async {
                             let started = Instant::now();
                             let answer = queue_listings(state, manifest, &page).await;
                             if let Some(timing) = timing {
                                 timing.set(|s| s.queue_ms = elapsed_ms(started));
                             }
                             answer
-                        }
-                    }
-                },
-            )?;
+                        },
+                    )?
+                }
+            };
+            let cells = results.cells.clone();
+            let page = page_ids(&cells, window);
             Ok::<_, AppError>((cells, page, results, queue))
         },
         async {
@@ -1685,16 +1685,7 @@ async fn kept_results(
             let filled_here = std::sync::atomic::AtomicBool::new(false);
             let fill = || async {
                 filled_here.store(true, std::sync::atomic::Ordering::Relaxed);
-                let started = Instant::now();
-                let cells = cells(state, manifest).await;
-                if let Some(timing) = timing {
-                    timing.set(|s| s.cells_ms = elapsed_ms(started));
-                }
-                let cells = cells?;
-                let page = page_ids(&cells, window);
-                Ok::<_, AppError>(
-                    read_plan_results(state, manifest, cells, &page, window, timing).await,
-                )
+                whole_plan_results(state, manifest, timing).await
             };
             let result = state.plan_results_cache.get_or_fill(plan_id, fill).await?;
             if let Some(timing) = timing {
@@ -1708,17 +1699,49 @@ async fn kept_results(
     }
 }
 
-/// The runs of `page` at the full tier, with their parameter counts, and the
-/// history above the page's re-runs and recalculations. The function logs
-/// each failed read and records the failure in the answer.
+async fn timed_cells(
+    state: &AppState,
+    manifest: &PlanManifest,
+    timing: Option<&JobReadTiming>,
+) -> Result<JobCells, AppError> {
+    let started = Instant::now();
+    let answer = cells(state, manifest).await;
+    if let Some(timing) = timing {
+        timing.set(|s| s.cells_ms = elapsed_ms(started));
+    }
+    answer
+}
+
+/// [`read_plan_results`] for every job of `manifest`. The manifest names the
+/// jobs, so the results read beside the cells.
+async fn whole_plan_results(
+    state: &AppState,
+    manifest: &PlanManifest,
+    timing: Option<&JobReadTiming>,
+) -> Result<PlanJobResults, AppError> {
+    read_plan_results(
+        state,
+        manifest,
+        timed_cells(state, manifest, timing),
+        &manifest.job_ids,
+        JobWindow::All,
+        timing,
+    )
+    .await
+}
+
+/// Read the page's runs, parameter counts, and history concurrently with `cells`.
+/// Use the full detail tier.
+/// The function logs each failed results read and records the failure in the
+/// answer; only a failed `cells` fails it.
 async fn read_plan_results(
     state: &AppState,
     manifest: &PlanManifest,
-    cells: JobCells,
+    cells: impl Future<Output = Result<JobCells, AppError>>,
     page: &[JobId],
     window: JobWindow,
     timing: Option<&JobReadTiming>,
-) -> PlanJobResults {
+) -> Result<PlanJobResults, AppError> {
     let started = Instant::now();
     let campaign_id = manifest.campaign_id.as_ref();
     // One deadline for every results read of the page, so the earlier runs
@@ -1736,7 +1759,8 @@ async fn read_plan_results(
         .cloned()
         .collect();
     // The runs come first: they settle the jobs that have one.
-    let ((read, mut runs, rescores), mut history) = futures::join!(
+    let (cells, (read, mut runs, rescores), mut history) = futures::join!(
+        cells,
         async {
             let duckdb_started = Instant::now();
             let (read, runs) = read_results(state, manifest, page, window, FleetDetail::Full).await;
@@ -1766,12 +1790,12 @@ async fn read_plan_results(
     if let Some(timing) = timing {
         timing.set(|s| s.results_ms = elapsed_ms(started));
     }
-    PlanJobResults {
-        cells,
+    Ok(PlanJobResults {
+        cells: cells?,
         read,
         runs,
         history,
-    }
+    })
 }
 
 /// `campaign_id`, the campaign of `plan_id`, when `user` may re-run its jobs
@@ -1916,8 +1940,9 @@ impl Parents {
 }
 
 /// For each job in `frontier`, find the newest plan in `campaign_id` that
-/// holds it. Follow one hop per round. Read each plan once. The flag is
-/// `false` if a read failed.
+/// holds it. Follow one hop per round, with one
+/// [`job_holders`](pipette_store::PlanStore::job_holders) read per round. The
+/// flag is `false` if a read failed.
 async fn parent_plans(
     state: &AppState,
     campaign_id: Option<&CampaignId>,
@@ -1929,8 +1954,6 @@ async fn parent_plans(
         return (Parents::default(), true);
     };
     let mut seen = frontier.clone();
-    // `None` for a plan that did not read or is outside the campaign.
-    let mut manifests: HashMap<PlanId, Option<PlanManifest>> = HashMap::new();
     let mut parents = Parents::default();
     let mut whole = true;
     for _ in 0..=HISTORY_LIMIT {
@@ -1938,35 +1961,15 @@ async fn parent_plans(
             break;
         }
         let asked: Vec<JobId> = frontier.drain().collect();
-        let links: Vec<(JobId, Vec<PlanId>)> = state
-            .plan_store
-            .list_job_plan_links_of(&asked)
-            .await
-            .inspect_err(|e| {
-                whole = false;
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "the rows' parent jobs did not list their plans; the rows name them unlinked"
-                );
-            })
-            .unwrap_or_default();
-        let unread: Vec<PlanId> = links
-            .iter()
-            .flat_map(|(_, plan_ids)| plan_ids)
-            .filter(|plan_id| !manifests.contains_key(*plan_id))
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
         let read = state
             .plan_store
-            .get_plans(&unread)
+            .job_holders(campaign_id, &asked)
             .await
             .inspect_err(|e| {
                 whole = false;
                 tracing::warn!(
                     error = %format!("{e:#}"),
-                    "a row's parent jobs' plans did not read; the rows name them unlinked"
+                    "the rows' parent jobs' plans did not read; the rows name them unlinked"
                 );
             })
             .unwrap_or_default();
@@ -1977,38 +1980,29 @@ async fn parent_plans(
                 "a row's parent job's plan did not read; the row names it unlinked"
             );
         });
-        // Settle every id first, so a plan that did not read is not read again;
-        // the reads below overwrite the ones that came back.
-        manifests.extend(unread.into_iter().map(|plan_id| (plan_id, None)));
-        manifests.extend(
-            read.items
-                .into_iter()
-                .filter(|manifest| manifest.campaign_id.as_ref() == Some(campaign_id))
-                .map(|manifest| (manifest.plan_id.clone(), Some(manifest))),
+        let newest = read.items.into_iter().fold(
+            HashMap::<JobId, JobHolder>::new(),
+            |mut newest, holder| {
+                match newest.get(&holder.job_id) {
+                    Some(kept)
+                        if (kept.created_at, &kept.plan_id)
+                            > (holder.created_at, &holder.plan_id) => {}
+                    _ => {
+                        newest.insert(holder.job_id.clone(), holder);
+                    }
+                }
+                newest
+            },
         );
-        for (job_id, plan_ids) in links {
-            let Some(manifest) = plan_ids
-                .iter()
-                .filter_map(|plan_id| manifests.get(plan_id)?.as_ref())
-                .filter(|m| m.job_ids.contains(&job_id))
-                .max_by(|a, b| {
-                    a.created_at
-                        .cmp(&b.created_at)
-                        .then_with(|| a.plan_id.cmp(&b.plan_id))
-                })
-            else {
-                continue;
-            };
-            parents
-                .plans
-                .insert(job_id.clone(), manifest.plan_id.clone());
-            if let Some(earlier) = manifest.rerun_of.get(&job_id) {
+        newest.into_values().for_each(|holder| {
+            if let Some(earlier) = holder.rerun_of {
                 if seen.insert(earlier.clone()) {
                     frontier.insert(earlier.clone());
                 }
-                parents.ran_again.insert(job_id, earlier.clone());
+                parents.ran_again.insert(holder.job_id.clone(), earlier);
             }
-        }
+            parents.plans.insert(holder.job_id, holder.plan_id);
+        });
     }
     (parents, whole)
 }
@@ -2209,14 +2203,14 @@ async fn rows_of(
     Ok(rows_by_job(rows))
 }
 
-/// The queue's `avail/` keys and leases, for a page of `page`'s jobs: two
-/// listings for the whole page, as each `TodoStore` call returns its whole
-/// tree. A complete plan holds only lapsed jobs there, so only those need them.
+/// Read the availability entries and the leases for the jobs on this page. A
+/// complete plan keeps only lapsed jobs in the queue, so only those jobs need a
+/// queue read.
 async fn queue_listings(
     state: &AppState,
     manifest: &PlanManifest,
     page: &[JobId],
-) -> Result<(Vec<AvailKey>, Vec<String>), AppError> {
+) -> Result<(Vec<AvailEntry>, Vec<Lease>), AppError> {
     let queued = manifest.status != PlanStatus::Complete
         || page
             .iter()
@@ -2226,17 +2220,14 @@ async fn queue_listings(
     }
     futures::try_join!(
         async {
-            collect_all_avail(state.todo_store.as_ref())
-                .await
-                .map(|listing| listing.keys)
-                .map_err(|e| {
-                    AppError::internal(e.context("failed to list the available-job queue"))
-                })
+            state.todo_store.avail_for_jobs(page).await.map_err(|e| {
+                AppError::internal(e.context("failed to list the available-job queue"))
+            })
         },
         async {
             state
                 .todo_store
-                .list_leased()
+                .leases_for_jobs(page)
                 .await
                 .map_err(|e| AppError::internal(e.context("failed to list the leases")))
         },
@@ -2259,38 +2250,32 @@ async fn jobs_of(
     fleet: FleetDetail,
     results: ResultsRead,
     runs: &HashMap<JobId, Vec<ResultRow>>,
-    (avail_keys, leased_keys): (Vec<AvailKey>, Vec<String>),
+    (avail_entries, page_leases): (Vec<AvailEntry>, Vec<Lease>),
 ) -> Result<PlanJobs, AppError> {
     let plan_id = &manifest.plan_id;
 
     let (offset, limit) = window.bounds(cells.len());
     let page = crate::list::page_of(cells, offset, limit);
-    let members: HashSet<&JobId> = page.iter().map(|(job_id, _)| job_id).collect();
     let now = Utc::now();
 
-    let avail: HashMap<&JobId, &AvailKey> = avail_keys
+    let avail: HashMap<&JobId, &AvailEntry> = avail_entries
         .iter()
-        .filter(|key| members.contains(&key.job_id))
-        .map(|key| (&key.job_id, key))
+        .map(|entry| (&entry.job_id, entry))
         .collect();
 
-    // A key that does not parse names no job and is skipped; other passes warn.
     // Where the recycle race shows two leases, the live one wins.
-    let mut leases: HashMap<JobId, Lease> = HashMap::new();
-    for key in leased_keys {
-        let Ok(lease) = parse_leased_key(&key) else {
-            continue;
-        };
-        if !members.contains(&lease.job_id) {
-            continue;
-        }
-        match leases.get(&lease.job_id) {
-            Some(held) if held.lease_expiry > now || lease.lease_expiry <= now => {}
-            _ => {
-                leases.insert(lease.job_id.clone(), lease);
-            }
-        }
-    }
+    let leases: HashMap<JobId, Lease> =
+        page_leases
+            .into_iter()
+            .fold(HashMap::new(), |mut leases, lease| {
+                match leases.get(&lease.job_id) {
+                    Some(held) if held.lease_expiry > now || lease.lease_expiry <= now => {}
+                    _ => {
+                        leases.insert(lease.job_id.clone(), lease);
+                    }
+                }
+                leases
+            });
 
     // This fan-out is the page's whole cost. Only a server with no `[duckdb]` reads a submission
     // record, a `find_job` that downloads it whole. `buffered`, not

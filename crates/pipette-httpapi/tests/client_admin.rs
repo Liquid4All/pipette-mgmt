@@ -92,10 +92,6 @@ async fn the_device_writes_are_gated_on_manage_clients() -> anyhow::Result<()> {
     let rival = create_org(&state, &server_admin, "rival").await?;
     let (_, client_id) = register_pending(&state).await?;
     assign(&state, &server_admin, &acme, &[client_id.as_str()]).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
     let owner_before = state.org_store.get_ownership(&client_id).await?;
     assert!(owner_before.is_some(), "the device starts out in acme");
 
@@ -128,11 +124,6 @@ async fn the_device_writes_are_gated_on_manage_clients() -> anyhow::Result<()> {
             (
                 "POST",
                 format!("/api/v1/clients/{client_id}/reject"),
-                Value::Null,
-            ),
-            (
-                "POST",
-                format!("/api/v1/clients/{client_id}/unsuspend"),
                 Value::Null,
             ),
             (
@@ -202,14 +193,6 @@ async fn the_device_writes_are_gated_on_manage_clients() -> anyhow::Result<()> {
         state.org_store.get_ownership(&client_id).await?,
         owner_before
     );
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_some(),
-        "the suspension is still there"
-    );
     assert_eq!(
         stored_permissions(&state, &client_id).await?,
         ["submit_results"]
@@ -241,10 +224,6 @@ async fn an_account_out_of_good_standing_is_refused_every_device_write(
     let rival = create_org(&state, &server_admin, "rival").await?;
     let (_, client_id) = register_pending(&state).await?;
     assign(&state, &server_admin, &acme, &[client_id.as_str()]).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
     let owner_before = state.org_store.get_ownership(&client_id).await?;
     assert!(owner_before.is_some(), "the device starts out in acme");
 
@@ -267,11 +246,6 @@ async fn an_account_out_of_good_standing_is_refused_every_device_write(
         (
             "POST",
             format!("/api/v1/clients/{client_id}/reject"),
-            Value::Null,
-        ),
-        (
-            "POST",
-            format!("/api/v1/clients/{client_id}/unsuspend"),
             Value::Null,
         ),
         (
@@ -324,14 +298,6 @@ async fn an_account_out_of_good_standing_is_refused_every_device_write(
         state.org_store.get_ownership(&client_id).await?,
         owner_before
     );
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_some(),
-        "the suspension is still there"
-    );
     assert_eq!(
         stored_permissions(&state, &client_id).await?,
         ["submit_results"],
@@ -356,13 +322,12 @@ async fn an_account_out_of_good_standing_is_refused_every_device_write(
     Ok(())
 }
 
-/// Refused at the path before any lookup; else the fleet-scope unsuspend, which
+/// Refused at the path before any lookup; else the fleet-scope delete, which
 /// skips the record, would answer `204`.
 #[rstest]
 #[case::rename("PATCH", "/api/v1/clients/a.b", json!({ "client_details": "renamed" }))]
 #[case::approve("POST", "/api/v1/clients/a.b/approve", Value::Null)]
 #[case::reject("POST", "/api/v1/clients/a.b/reject", Value::Null)]
-#[case::unsuspend("POST", "/api/v1/clients/a.b/unsuspend", Value::Null)]
 #[case::delete("DELETE", "/api/v1/clients/a.b", Value::Null)]
 #[case::owner("PUT", "/api/v1/clients/a.b/owner", json!({ "owner": null }))]
 #[case::set_permissions("PUT", "/api/v1/clients/a.b/permissions", json!({ "permissions": [] }))]
@@ -578,217 +543,6 @@ async fn an_unknown_device_is_a_404_rather_than_a_write() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A repeat, or a device never suspended, is a `200` with `changed: false`.
-/// Each answer is the device as `PATCH` answers it.
-#[tokio::test]
-async fn unsuspending_clears_the_suspension_and_reports_whether_there_was_one() -> anyhow::Result<()>
-{
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let admin = device_admin(&state).await?;
-    let (_, client_id) = register_and_approve(&state).await?;
-    let (_, never) = register_and_approve(&state).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
-    let uri = format!("/api/v1/clients/{client_id}/unsuspend");
-    let (key, user_id, key_id) = &admin;
-    let row = format!("/api/v1/clients/{client_id}");
-    let resp = authed_user_get(&state, key, user_id, key_id, &row).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let read = body_json(resp).await?;
-    assert_eq!(read["suspended"], true, "the fleet read sees the marker");
-
-    let resp = signed_empty(&state, &admin, "POST", &uri).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    assert_eq!(json_str(&body, "client_id")?, client_id.as_str());
-    assert_eq!(body["changed"], true);
-    assert_eq!(json_str(&body, "status")?, "approved");
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none(),
-        "the suspension is cleared"
-    );
-    let resp = authed_user_get(&state, key, user_id, key_id, &row).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let read = body_json(resp).await?;
-    assert_eq!(read["suspended"], false, "the fleet read sees it cleared");
-    assert_eq!(
-        stored_status(&state, client_id.as_str()).await?,
-        Some(ClientStatus::Approved),
-        "the identity record is not this verb's concern"
-    );
-
-    for (id, why) in [
-        (&client_id, "a repeat"),
-        (&never, "a device never suspended"),
-    ] {
-        let resp = signed_empty(
-            &state,
-            &admin,
-            "POST",
-            &format!("/api/v1/clients/{id}/unsuspend"),
-        )
-        .await?;
-        assert_eq!(resp.status(), StatusCode::OK, "{why}");
-        let body = body_json(resp).await?;
-        assert_eq!(json_str(&body, "client_id")?, id.as_str(), "{why}");
-        assert_eq!(body["changed"], false, "{why} is a successful no-op");
-        assert_eq!(
-            noop_patch(&state, &admin, id.as_str()).await?,
-            body,
-            "{why} answers what a no-op PATCH does"
-        );
-    }
-    Ok(())
-}
-
-/// Its own device clears; an unowned or another organization's is a `403`, and
-/// an id with no record a `404`.
-#[tokio::test]
-async fn a_scoped_unsuspend_is_held_to_the_device_record() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let server_admin = fleet_admin(&state).await?;
-    let acme = create_org(&state, &server_admin, "acme").await?;
-    let rival = create_org(&state, &server_admin, "rival").await?;
-    let org_admin = registered_user(
-        &state,
-        &[UserPermission::ManageClients, UserPermission::ReadClients],
-    )
-    .await?;
-    let resp = signed_json(
-        &state,
-        &server_admin,
-        "PUT",
-        &format!("/api/v1/users/{}/org", org_admin.1),
-        &json!({ "org_id": acme }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK, "the org admin joins acme");
-    let unaffiliated = registered_user(
-        &state,
-        &[UserPermission::ManageClients, UserPermission::ReadClients],
-    )
-    .await?;
-
-    let (_, ours) = register_and_approve(&state).await?;
-    let (_, theirs) = register_and_approve(&state).await?;
-    let (_, unowned) = register_and_approve(&state).await?;
-    assign(&state, &server_admin, &acme, &[ours.as_str()]).await?;
-    assign(&state, &server_admin, &rival, &[theirs.as_str()]).await?;
-    // A marker with no device record behind it.
-    let nobody = ClientId::try_new("ev1_nobody")?;
-    for client_id in [&ours, &theirs, &unowned, &nobody] {
-        state
-            .todo_store
-            .write_suspension(client_id, chrono::Utc::now(), &job("job-stuck")?)
-            .await?;
-    }
-
-    let outside = "this device is outside your organization";
-    for (who, caller, client_id, status, error) in [
-        (
-            "an org admin",
-            &org_admin,
-            &theirs,
-            StatusCode::FORBIDDEN,
-            outside,
-        ),
-        (
-            "an org admin",
-            &org_admin,
-            &unowned,
-            StatusCode::FORBIDDEN,
-            outside,
-        ),
-        (
-            "an org admin",
-            &org_admin,
-            &nobody,
-            StatusCode::NOT_FOUND,
-            "no client ev1_nobody",
-        ),
-        (
-            "an unaffiliated admin",
-            &unaffiliated,
-            &unowned,
-            StatusCode::FORBIDDEN,
-            outside,
-        ),
-    ] {
-        let uri = format!("/api/v1/clients/{client_id}/unsuspend");
-        let resp = signed_empty(&state, caller, "POST", &uri).await?;
-        assert_eq!(resp.status(), status, "{who}: {uri}");
-        assert_eq!(
-            json_str(&body_json(resp).await?, "error")?,
-            error,
-            "{who}: {uri}"
-        );
-        assert!(
-            state.todo_store.read_suspension(client_id).await?.is_some(),
-            "{who}: {uri} must leave the suspension in place"
-        );
-    }
-
-    let uri = format!("/api/v1/clients/{ours}/unsuspend");
-    for changed in [true, false] {
-        let resp = signed_empty(&state, &org_admin, "POST", &uri).await?;
-        assert_eq!(resp.status(), StatusCode::OK, "{uri} changed: {changed}");
-        let body = body_json(resp).await?;
-        assert_eq!(json_str(&body, "client_id")?, ours.as_str());
-        assert_eq!(body["changed"], changed, "{uri}");
-        assert_eq!(body["owner"], json!({ "type": "org", "org_id": acme }));
-    }
-    assert!(
-        state.todo_store.read_suspension(&ours).await?.is_none(),
-        "{uri} clears the suspension"
-    );
-    Ok(())
-}
-
-/// Without consulting the record, so a stranded marker needs no shell access;
-/// with no device to answer with, it and its repeat are `204`, not `404`.
-#[tokio::test]
-async fn the_fleet_scope_clears_a_suspension_no_device_record_answers_to() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let admin = device_admin(&state).await?;
-    let gone = ClientId::try_new("ev1_gone")?;
-    state
-        .todo_store
-        .write_suspension(&gone, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
-
-    let (state, admin) = (&state, &admin);
-    futures::stream::iter(["the clearing", "a repeat"].map(anyhow::Ok))
-        .try_for_each(|attempt| async move {
-            let resp =
-                signed_empty(state, admin, "POST", "/api/v1/clients/ev1_gone/unsuspend").await?;
-            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{attempt}");
-            Ok(())
-        })
-        .await?;
-    assert!(
-        state.todo_store.read_suspension(&gone).await?.is_none(),
-        "the stranded marker is cleared"
-    );
-    assert_eq!(
-        stored_status(state, "ev1_gone").await?,
-        None,
-        "clearing a marker invents no device"
-    );
-    Ok(())
-}
-
 /// It also reports whether anything moved, and refuses a body naming nothing.
 #[tokio::test]
 async fn an_update_writes_only_what_it_names() -> anyhow::Result<()> {
@@ -905,13 +659,8 @@ async fn a_reject_or_a_delete_frees_the_keypair_ownership_and_queue_state() -> a
     let (_, pending) = register_pending(&state).await?;
     let (_, working) = register_and_approve(&state).await?;
     assign(&state, &admin, &acme, &[pending.as_str(), working.as_str()]).await?;
-    state
-        .todo_store
-        .write_suspension(&working, chrono::Utc::now(), &job("job-1")?)
-        .await?;
     state.todo_store.write_pending_reindex(&working).await?;
     // Read back through the same calls the purge is checked with below.
-    assert!(state.todo_store.read_suspension(&working).await?.is_some());
     assert!(
         state
             .todo_store
@@ -958,10 +707,6 @@ async fn a_reject_or_a_delete_frees_the_keypair_ownership_and_queue_state() -> a
         );
     }
 
-    assert!(
-        state.todo_store.read_suspension(&working).await?.is_none(),
-        "a delete purges the suspension"
-    );
     assert!(
         !state
             .todo_store

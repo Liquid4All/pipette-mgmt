@@ -312,6 +312,50 @@ pub struct SuccessInput {
     pub observation_output_digest: Option<Sha256>,
 }
 
+/// What kind of failure a client reported, for grouping failures without
+/// parsing `failure_reason`. Spelled the same in request bodies, retry records,
+/// `queue_denials` and the warehouse; renaming a variant needs a backfill of
+/// all four.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::AsRefStr,
+    strum::EnumIter,
+)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum FailureCode {
+    /// The client sent no code, or the server wrote the failure with no client
+    /// code to carry (an expiry, a lost lease, an unmatchable job).
+    #[default]
+    Unspecified,
+    /// The runtime's output shows an allocation failure, or the OS killed the
+    /// app. Wins over [`Self::RuntimeError`] when both apply.
+    OutOfMemory,
+    /// An attempt ran past the job's `attempt_timeout_seconds`.
+    AttemptTimeout,
+    /// The runtime or the app's engine crashed, exited, aborted, refused the
+    /// model or an op, answered with something other than what was asked, or
+    /// ran past a limit other than `attempt_timeout_seconds`.
+    RuntimeError,
+    /// The device or its host failed: a reboot, a readiness wait, an
+    /// unreachable device.
+    DeviceError,
+    /// The client around the runtime failed before or after it ran: a vault
+    /// fetch, an install, the spec, a missing model, the submit, or a download
+    /// or wait that timed out.
+    HarnessError,
+}
+
 /// A `message_type: "failure"` submission: the benchmark, model and runtime
 /// that could not be run, with its `failure_reason` and `retriable` flag.
 #[derive(Debug, Deserialize, Serialize)]
@@ -326,6 +370,11 @@ pub struct FailureInput {
     /// Why the benchmark could not be run. Typically includes a
     /// timestamp and the runtime's own error output.
     pub failure_reason: NonEmptyTrimmedString,
+
+    /// What kind of failure this is; `unspecified` when absent. A value
+    /// outside [`FailureCode`] refuses the body.
+    #[serde(default)]
+    pub failure_code: FailureCode,
 
     pub model_name: Option<NonEmptyTrimmedString>,
     pub model_quant: Option<NonEmptyTrimmedString>,

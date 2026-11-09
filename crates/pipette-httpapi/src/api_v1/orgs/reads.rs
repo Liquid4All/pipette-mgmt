@@ -1,17 +1,17 @@
 //! The organization reads behind the overview, through [`crate::api_v1::orgs`]
 //! as the JSON routes read them.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use strum::IntoEnumIterator;
 
-use pipette_core::client::{Client, ClientStatus};
+use pipette_core::client::ClientStatus;
 use pipette_pipeline::org::OrgRef;
 use pipette_plan_types::{
-    ClientId, ClientPreauthKeyView, Highlights, OrgId, OrgOverview, UserPermission, UserStatus,
+    ClientPreauthKeyView, Highlights, OrgId, OrgOverview, UserPermission, UserStatus,
 };
 
 use crate::api_v1::orgs::{OrgPath, roster_reach};
@@ -33,11 +33,11 @@ async fn overview(
     let rights = caller.rights;
     let org_id = &org.org_id;
     let reads_devices = rights.holds(UserPermission::ReadClients);
-    let (client_status_counts, pending_clients, suspended_clients) = if reads_devices {
-        let (by_status, pending, suspended) = device_highlights(state, caller, reference).await?;
-        (Some(by_status), Some(pending), Some(suspended))
+    let (client_status_counts, pending_clients) = if reads_devices {
+        let (by_status, pending) = device_highlights(state, caller, reference).await?;
+        (Some(by_status), Some(pending))
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     // Each mirrors its listing route's filter, so a count matches the leaf it links to.
@@ -89,7 +89,6 @@ async fn overview(
         pending_members,
         client_status_counts,
         pending_clients,
-        suspended_clients,
         campaigns,
         vault_resource_count,
         benchmark_count,
@@ -137,11 +136,9 @@ fn unless_refused<T>(listed: Result<T, AppError>) -> Result<Option<T>, AppError>
     }
 }
 
-/// The organization's device statuses by count, then its pending and its
-/// suspended devices.
+/// The organization's device statuses by count, then its pending devices.
 type DeviceHighlights = (
     BTreeMap<pipette_plan_types::ClientStatus, usize>,
-    Highlights<pipette_plan_types::Client>,
     Highlights<pipette_plan_types::Client>,
 );
 
@@ -152,14 +149,6 @@ async fn device_highlights(
 ) -> Result<DeviceHighlights, AppError> {
     let (org, owned) = crate::api_v1::orgs::devices(state, caller, reference).await?;
     let administered = crate::api_v1::orgs::administers_org(state, caller, &org.org_id).await?;
-    let view = |client: &Client| client.clone().view(administered);
-    let suspended: HashSet<ClientId> = state
-        .todo_store
-        .list_suspended_ids()
-        .await
-        .map_err(|e| AppError::internal(e.context("failed to list the suspensions")))?
-        .into_iter()
-        .collect();
     let status_counts = ClientStatus::iter()
         .map(|status| {
             let count = owned.iter().filter(|(c, _)| c.status == status).count();
@@ -167,19 +156,14 @@ async fn device_highlights(
         })
         .filter(|(_, count)| *count > 0)
         .collect();
-    let clients = || owned.iter().map(|(client, _)| client);
     Ok((
         status_counts,
         Highlights::of(
-            clients()
+            owned
+                .iter()
+                .map(|(client, _)| client)
                 .filter(|client| client.status == ClientStatus::Pending)
-                .map(view),
-            HIGHLIGHTS,
-        ),
-        Highlights::of(
-            clients()
-                .filter(|client| suspended.contains(&client.client_id))
-                .map(view),
+                .map(|client| client.clone().view(administered)),
             HIGHLIGHTS,
         ),
     ))

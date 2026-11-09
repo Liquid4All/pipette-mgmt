@@ -177,4 +177,19 @@ impl TestDb {
     pub fn db(&self) -> &SqlDatabase {
         &self.db
     }
+
+    /// Run `sql` in this schema. Tests use it to create otherwise unreachable
+    /// states or install triggers that inject faults.
+    pub async fn execute(&self, sql: &'static str) -> anyhow::Result<()> {
+        sqlx::raw_sql(sql).execute(self.db.pool()).await?;
+        Ok(())
+    }
+
+    /// `stores` with the record stores and the queue in this schema, as a
+    /// `[database]` deployment builds them.
+    pub fn stores(&self, stores: pipette_store::Stores) -> pipette_store::Stores {
+        let mut stores = crate::overlay(&self.db, stores);
+        stores.todo = std::sync::Arc::new(crate::SqlTodoStore::new(self.db.clone()));
+        stores
+    }
 }

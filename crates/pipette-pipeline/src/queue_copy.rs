@@ -17,8 +17,7 @@ use pipette_core::todo_filename::{
 };
 use pipette_plan_types::{ClientId, ExpiresAt, JobId};
 use pipette_store::{
-    ClaimResult, LivenessImport, STORAGE_CONCURRENCY, SuspensionRecord, TodoStore,
-    reject_unmigrated_avail_keys,
+    ClaimResult, LivenessImport, STORAGE_CONCURRENCY, TodoStore, reject_unmigrated_avail_keys,
 };
 
 use crate::record_copy::{KeyspaceReport, LISTING_SKIPPED, Outcome, unreadable};
@@ -66,24 +65,25 @@ impl QueueCopyReport {
 /// writers for an exact copy. It writes one entry at a time through the trait,
 /// [`STORAGE_CONCURRENCY`] entries at once.
 ///
-/// With `liveness`, each copied last-seen time keeps the source's instant.
-/// Without it, the target stamps its own clock on each device that it lacks.
+/// A database target preserves copied last-seen times. An object-store target
+/// stamps its own clock on each device that it lacks.
 #[tracing::instrument(skip_all, fields(dry_run))]
 pub async fn copy_queue(
     from: &dyn TodoStore,
-    to: &dyn TodoStore,
-    liveness: Option<&dyn LivenessImport>,
+    target: QueueCopyTarget<'_>,
     dry_run: bool,
 ) -> anyhow::Result<QueueCopyReport> {
     let started = Instant::now();
+    let (to, liveness, match_deadlines) = match target {
+        QueueCopyTarget::Database { store, liveness } => (store, Some(liveness), false),
+        QueueCopyTarget::Objects(store) => (store, None, true),
+    };
     let copy = QueueCopy { from, to, dry_run };
     let mut keyspaces = copy.jobs().await?;
     keyspaces.push(timed(copy.denied()).await?);
-    keyspaces.push(timed(copy.eligible()).await?);
+    keyspaces.push(timed(copy.eligible(match_deadlines)).await?);
     keyspaces.push(timed(copy.lost()).await?);
     keyspaces.push(timed(copy.pending_reindex()).await?);
-    keyspaces.push(timed(copy.pending_reindex_jobs()).await?);
-    keyspaces.push(timed(copy.suspended()).await?);
     keyspaces.push(timed(copy.liveness(liveness)).await?);
     keyspaces.push(timed(copy.tmp()).await?);
     keyspaces.push(timed(copy.run_state()).await?);
@@ -100,6 +100,15 @@ pub async fn copy_queue(
         "queue copy finished"
     );
     Ok(report)
+}
+
+/// The destination's eligibility and last-seen storage rules.
+pub enum QueueCopyTarget<'a> {
+    Database {
+        store: &'a dyn TodoStore,
+        liveness: &'a dyn LivenessImport,
+    },
+    Objects(&'a dyn TodoStore),
 }
 
 #[derive(Clone, Copy)]
@@ -294,11 +303,18 @@ impl QueueCopy<'_> {
 
     /// The SQL index holds one marker for each client and job. So, as for a
     /// job, the copy keeps the latest deadline of a client and job.
-    async fn eligible(self) -> anyhow::Result<KeyspaceReport> {
+    /// SQL reads deadlines from jobs and compares pairs only. Object-store
+    /// markers carry deadlines, so the copy also replaces obsolete deadlines.
+    async fn eligible(self, match_deadlines: bool) -> anyhow::Result<KeyspaceReport> {
         let mut report = KeyspaceReport::new("eligible");
         let source = self.from.list_all_eligible().await?;
-        let target: BTreeSet<(ClientId, JobId, ExpiresAt)> =
-            self.to.list_all_eligible().await?.into_iter().collect();
+        let target = self.to.list_all_eligible().await?.into_iter().fold(
+            BTreeMap::<(ClientId, JobId), BTreeSet<ExpiresAt>>::new(),
+            |mut grouped, (client, job, exp)| {
+                grouped.entry((client, job)).or_default().insert(exp);
+                grouped
+            },
+        );
         let id =
             |(client, job, exp): &(ClientId, JobId, ExpiresAt)| format!("{client}/{job}.{exp}");
 
@@ -309,7 +325,7 @@ impl QueueCopy<'_> {
                 grouped
             },
         );
-        let mut kept = BTreeSet::new();
+        let mut kept = BTreeMap::new();
         let writes: Vec<_> = grouped
             .into_iter()
             .filter_map(|((client, job), mut exps)| {
@@ -328,14 +344,27 @@ impl QueueCopy<'_> {
                         Outcome::Skipped(DUPLICATE.to_owned()),
                     );
                 });
+                let pair = (client.clone(), job.clone());
+                let present = target
+                    .get(&pair)
+                    .is_some_and(|exps| !match_deadlines || exps.contains(&exp));
+                kept.insert(pair, exp);
                 let marker = (client, job, exp);
-                let present = target.contains(&marker);
                 report.record(id(&marker), unchanged_or_written(present));
-                kept.insert(marker.clone());
                 (!present).then_some(marker)
             })
             .collect();
-        let deletes: Vec<_> = target.difference(&kept).cloned().collect();
+        let deletes: Vec<_> = target
+            .into_iter()
+            .flat_map(|((client, job), exps)| {
+                exps.into_iter()
+                    .map(move |exp| (client.clone(), job.clone(), exp))
+            })
+            .filter(|(client, job, exp)| {
+                kept.get(&(client.clone(), job.clone()))
+                    .is_none_or(|kept_exp| match_deadlines && kept_exp != exp)
+            })
+            .collect();
         deletes
             .iter()
             .for_each(|marker| report.record(id(marker), Outcome::Deleted));
@@ -474,81 +503,6 @@ impl QueueCopy<'_> {
         Ok(report)
     }
 
-    async fn pending_reindex_jobs(self) -> anyhow::Result<KeyspaceReport> {
-        let mut report = KeyspaceReport::new("pending-reindex-jobs");
-        let source: BTreeSet<JobId> = self
-            .from
-            .list_pending_reindex_jobs()
-            .await?
-            .into_iter()
-            .collect();
-        let target: BTreeSet<JobId> = self
-            .to
-            .list_pending_reindex_jobs()
-            .await?
-            .into_iter()
-            .collect();
-        source.iter().for_each(|job| {
-            report.record(job.to_string(), unchanged_or_written(target.contains(job)));
-        });
-        let deletes: Vec<_> = target.difference(&source).cloned().collect();
-        deletes
-            .iter()
-            .for_each(|job| report.record(job.to_string(), Outcome::Deleted));
-
-        apply(self.dry_run, deletes, |job| async move {
-            self.to.delete_pending_reindex_job(&job).await
-        })
-        .await?;
-        apply(self.dry_run, source.difference(&target), |job| {
-            self.to.write_pending_reindex_job(job)
-        })
-        .await?;
-        Ok(report)
-    }
-
-    async fn suspended(self) -> anyhow::Result<KeyspaceReport> {
-        let mut report = KeyspaceReport::new("suspended");
-        let source = self.from.list_suspensions().await?;
-        let target: BTreeMap<ClientId, SuspensionRecord> =
-            self.to.list_suspensions().await?.into_iter().collect();
-        let listed: BTreeSet<ClientId> = source.iter().map(|(client, _)| client.clone()).collect();
-
-        let reads = source
-            .into_iter()
-            .map(|(client, record)| Read {
-                target: target.get(&client).cloned().map(|held| Ok(Some(held))),
-                source: Ok(Some(record)),
-                key: client,
-            })
-            .collect();
-        let (writes, _) = decide(&mut report, reads, ClientId::to_string, same_suspension);
-
-        let unlisted = target.keys().filter(|client| !listed.contains(*client));
-        let reads = each(unlisted, |client| async move {
-            let held = self.from.read_suspension(client).await.map(|r| r.is_some());
-            (client.clone(), held)
-        })
-        .await;
-        let deletes = gone(&mut report, reads, ClientId::to_string);
-
-        apply(self.dry_run, deletes, |client| async move {
-            self.to.delete_suspension(&client).await
-        })
-        .await?;
-        apply(self.dry_run, writes, |write| async move {
-            self.to
-                .write_suspension(
-                    &write.key,
-                    write.value.suspended_at,
-                    &write.value.conflicting_job_id,
-                )
-                .await
-        })
-        .await?;
-        Ok(report)
-    }
-
     /// An object store cannot take a given modification time. So without
     /// `setter`, a device the target holds counts as unchanged at any time.
     async fn liveness(self, setter: Option<&dyn LivenessImport>) -> anyhow::Result<KeyspaceReport> {
@@ -602,31 +556,15 @@ impl QueueCopy<'_> {
         Ok(report)
     }
 
-    /// The five run-state blobs of `queue-maintenance`. A missing key set reads
-    /// as empty, so the copy writes an empty set for it.
+    /// The three run-state blobs of `queue-maintenance`. A missing key set reads
+    /// as empty, so the copy writes an empty set for it. The copy excludes the
+    /// reindex flags and worker set. The database queue flags each imported
+    /// job. The next run indexes it.
     async fn run_state(self) -> anyhow::Result<KeyspaceReport> {
         let mut report = KeyspaceReport::new("state");
         let (from, to) = (self.from, self.to);
         let write = !self.dry_run;
 
-        let indexed = (
-            from.read_eligible_indexed().await,
-            to.read_eligible_indexed().await,
-        );
-        if let Some(set) = compare(&mut report, "eligible-indexed", indexed.0, indexed.1)
-            && write
-        {
-            to.write_eligible_indexed(&set).await?;
-        }
-        let workers = (
-            from.read_eligible_workers().await,
-            to.read_eligible_workers().await,
-        );
-        if let Some(set) = compare(&mut report, "eligible-workers", workers.0, workers.1)
-            && write
-        {
-            to.write_eligible_workers(&set).await?;
-        }
         let candidates = (
             from.read_gc_candidates().await,
             to.read_gc_candidates().await,
@@ -976,11 +914,6 @@ fn same_denial(a: &DenialRecord, b: &DenialRecord) -> bool {
     normal(a) == normal(b)
 }
 
-fn same_suspension(a: &SuspensionRecord, b: &SuspensionRecord) -> bool {
-    to_micros(a.suspended_at) == to_micros(b.suspended_at)
-        && a.conflicting_job_id == b.conflicting_job_id
-}
-
 fn to_lost_set(lost: Vec<(ClientId, DateTime<Utc>)>) -> BTreeSet<(ClientId, DateTime<Utc>)> {
     lost.into_iter()
         .map(|(client, at)| (client, to_second(at)))
@@ -1125,20 +1058,10 @@ mod tests {
             .write_lost_lease(&job("job-dated")?, &b, now()? - TimeDelta::hours(1))
             .await?;
         store.write_pending_reindex(&a).await?;
-        store.write_pending_reindex_job(&job("job-never")?).await?;
-        store
-            .write_suspension(&b, now()?, &job("job-leased")?)
-            .await?;
         store.stamp_liveness(&a).await?;
         store.stamp_liveness(&b).await?;
         store
             .write_tmp(&job("job-staged")?, &body("job-staged"))
-            .await?;
-        store
-            .write_eligible_indexed(&HashSet::from(["job-never/never.json".to_owned()]))
-            .await?;
-        store
-            .write_eligible_workers(&HashSet::from([a.clone()]))
             .await?;
         store
             .write_gc_candidates(&HashSet::from(["plans:old".to_owned()]))
@@ -1164,14 +1087,10 @@ mod tests {
     struct QueueState {
         jobs: BTreeMap<String, Option<Value>>,
         denied: BTreeMap<(JobId, ClientId), Option<DenialRecord>>,
-        eligible: BTreeSet<(ClientId, JobId, ExpiresAt)>,
+        eligible: BTreeSet<(ClientId, JobId)>,
         lost: BTreeMap<JobId, BTreeSet<(ClientId, DateTime<Utc>)>>,
         pending_reindex: BTreeSet<ClientId>,
-        pending_reindex_jobs: BTreeSet<JobId>,
-        suspended: BTreeSet<(ClientId, DateTime<Utc>, JobId)>,
         liveness: BTreeSet<ClientId>,
-        indexed: HashSet<String>,
-        workers: HashSet<ClientId>,
         gc_candidates: HashSet<String>,
         backlog: Option<BacklogSnapshot>,
         campaign_backlog: Option<CampaignBacklogSnapshot>,
@@ -1200,7 +1119,12 @@ mod tests {
         Ok(QueueState {
             jobs,
             denied,
-            eligible: store.list_all_eligible().await?.into_iter().collect(),
+            eligible: store
+                .list_all_eligible()
+                .await?
+                .into_iter()
+                .map(|(client, job, _)| (client, job))
+                .collect(),
             lost,
             pending_reindex: store
                 .list_pending_reindex()
@@ -1208,25 +1132,12 @@ mod tests {
                 .into_iter()
                 .map(|(client, _)| client)
                 .collect(),
-            pending_reindex_jobs: store
-                .list_pending_reindex_jobs()
-                .await?
-                .into_iter()
-                .collect(),
-            suspended: store
-                .list_suspensions()
-                .await?
-                .into_iter()
-                .map(|(c, r)| (c, r.suspended_at, r.conflicting_job_id))
-                .collect(),
             liveness: store
                 .list_liveness()
                 .await?
                 .into_iter()
                 .map(|(client, _)| client)
                 .collect(),
-            indexed: store.read_eligible_indexed().await?,
-            workers: store.read_eligible_workers().await?,
             gc_candidates: store.read_gc_candidates().await?,
             backlog: store.read_backlog().await?,
             campaign_backlog: store.read_campaign_backlog().await?,
@@ -1282,7 +1193,15 @@ mod tests {
         let sql = SqlTodoStore::new(test_db.db().clone());
         seed(&*source).await?;
 
-        let import = copy_queue(&*source, &sql, Some(&sql), false).await?;
+        let import = copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            false,
+        )
+        .await?;
         assert_eq!(import.unreadable(), 0);
         assert_eq!(keyspace(&import, "tmp")?.skipped.len(), 1);
         let source_times: BTreeMap<_, _> = source
@@ -1293,12 +1212,22 @@ mod tests {
             .collect();
         let sql_times: BTreeMap<_, _> = sql.list_liveness().await?.into_iter().collect();
         assert_eq!(sql_times, source_times);
-        assert_quiet(&copy_queue(&*source, &sql, Some(&sql), false).await?);
+        assert_quiet(
+            &copy_queue(
+                &*source,
+                QueueCopyTarget::Database {
+                    store: &sql,
+                    liveness: &sql,
+                },
+                false,
+            )
+            .await?,
+        );
 
-        let export = copy_queue(&sql, &*back, None, false).await?;
+        let export = copy_queue(&sql, QueueCopyTarget::Objects(&*back), false).await?;
         assert_eq!(export.unreadable(), 0);
         assert_eq!(state(&*back).await?, state(&*source).await?);
-        assert_quiet(&copy_queue(&sql, &*back, None, false).await?);
+        assert_quiet(&copy_queue(&sql, QueueCopyTarget::Objects(&*back), false).await?);
         Ok(())
     }
 
@@ -1307,10 +1236,54 @@ mod tests {
         let (a, b) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let (source, target) = (fs_queue(a.path())?, fs_queue(b.path())?);
         seed(&*source).await?;
-        let first = copy_queue(&*source, &*target, None, false).await?;
+        let first = copy_queue(&*source, QueueCopyTarget::Objects(&*target), false).await?;
         assert!(first.written() > 0);
         assert_eq!(state(&*target).await?, state(&*source).await?);
-        assert_quiet(&copy_queue(&*source, &*target, None, false).await?);
+        assert_quiet(&copy_queue(&*source, QueueCopyTarget::Objects(&*target), false).await?);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::stale_marker(false)]
+    #[case::stale_and_current_markers(true)]
+    #[tokio::test]
+    async fn an_export_replaces_stale_eligibility_deadlines(
+        #[case] current_marker_exists: bool,
+    ) -> anyhow::Result<()> {
+        let Some(test_db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let target = fs_queue(dir.path())?;
+        let sql = SqlTodoStore::new(test_db.db().clone());
+        let worker = client("ev1_a")?;
+        let id = job("job-redated")?;
+        seed_avail(&sql, id.as_str(), ExpiresAt::Never, &body(id.as_str())).await?;
+        sql.write_eligible(&worker, &id, ExpiresAt::Never).await?;
+        seed_avail(&*target, id.as_str(), dated()?, &body(id.as_str())).await?;
+        target.write_eligible(&worker, &id, dated()?).await?;
+        if current_marker_exists {
+            target
+                .write_eligible(&worker, &id, ExpiresAt::Never)
+                .await?;
+        }
+
+        let report = copy_queue(&sql, QueueCopyTarget::Objects(&*target), false).await?;
+        let eligible = keyspace(&report, "eligible")?;
+        assert_eq!(eligible.deleted, 1);
+        assert_eq!(eligible.written, usize::from(!current_marker_exists));
+        assert_eq!(
+            target.list_all_eligible().await?,
+            vec![(worker.clone(), id.clone(), ExpiresAt::Never)]
+        );
+        assert!(target.get_avail(&id, ExpiresAt::Never).await?.is_some());
+        assert_quiet(&copy_queue(&sql, QueueCopyTarget::Objects(&*target), false).await?);
+        assert!(matches!(
+            target
+                .claim_job(&id, ExpiresAt::Never, &worker, now()?)
+                .await?,
+            ClaimResult::Claimed(_)
+        ));
         Ok(())
     }
 
@@ -1325,7 +1298,6 @@ mod tests {
         EligibilityDropped,
         LostLeasesCleared,
         ReindexDone,
-        SuspensionLifted,
         LivenessGone,
         StateRewritten,
     }
@@ -1376,12 +1348,10 @@ mod tests {
                 for (_, key) in store.list_pending_reindex().await? {
                     store.delete_pending_reindex(&key).await?;
                 }
-                store.delete_pending_reindex_job(&job("job-never")?).await?;
             }
-            Change::SuspensionLifted => store.delete_suspension(&b).await?,
             Change::LivenessGone => store.delete_liveness(&b).await?,
             Change::StateRewritten => {
-                store.write_eligible_indexed(&HashSet::new()).await?;
+                store.write_gc_candidates(&HashSet::new()).await?;
                 store
                     .write_backlog(&BacklogSnapshot {
                         counted_at: now()? + TimeDelta::minutes(1),
@@ -1403,7 +1373,6 @@ mod tests {
     #[case::eligibility_dropped(Change::EligibilityDropped)]
     #[case::lost_leases_cleared(Change::LostLeasesCleared)]
     #[case::reindex_done(Change::ReindexDone)]
-    #[case::suspension_lifted(Change::SuspensionLifted)]
     #[case::liveness_gone(Change::LivenessGone)]
     #[case::state_rewritten(Change::StateRewritten)]
     #[tokio::test]
@@ -1417,17 +1386,43 @@ mod tests {
         let source = fs_queue(dir.path())?;
         let sql = SqlTodoStore::new(test_db.db().clone());
         seed(&*source).await?;
-        copy_queue(&*source, &sql, Some(&sql), false).await?;
+        copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            false,
+        )
+        .await?;
 
         apply_change(&*source, change).await?;
-        let delta = copy_queue(&*source, &sql, Some(&sql), false).await?;
+        let delta = copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            false,
+        )
+        .await?;
         assert!(
             delta.written() + delta.deleted() > 0,
             "{:?}",
             counts(&delta)
         );
         assert_eq!(state(&sql).await?, state(&*source).await?);
-        assert_quiet(&copy_queue(&*source, &sql, Some(&sql), false).await?);
+        assert_quiet(
+            &copy_queue(
+                &*source,
+                QueueCopyTarget::Database {
+                    store: &sql,
+                    liveness: &sql,
+                },
+                false,
+            )
+            .await?,
+        );
         Ok(())
     }
 
@@ -1508,7 +1503,15 @@ mod tests {
             }
         };
 
-        let report = copy_queue(&*source, &sql, Some(&sql), false).await?;
+        let report = copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            false,
+        )
+        .await?;
         assert_eq!(keyspace(&report, dropped_from)?.skipped.len(), 1);
         match kept {
             Some(entry) => {
@@ -1520,7 +1523,17 @@ mod tests {
                 vec![(a, job(id)?, ExpiresAt::Never)]
             ),
         }
-        assert_quiet(&copy_queue(&*source, &sql, Some(&sql), false).await?);
+        assert_quiet(
+            &copy_queue(
+                &*source,
+                QueueCopyTarget::Database {
+                    store: &sql,
+                    liveness: &sql,
+                },
+                false,
+            )
+            .await?,
+        );
         Ok(())
     }
 
@@ -1535,10 +1548,26 @@ mod tests {
         seed(&*source).await?;
         let empty = state(&sql).await?;
 
-        let dry = copy_queue(&*source, &sql, Some(&sql), true).await?;
+        let dry = copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            true,
+        )
+        .await?;
         assert_eq!(state(&sql).await?, empty);
         assert!(sql.list_liveness().await?.is_empty());
-        let real = copy_queue(&*source, &sql, Some(&sql), false).await?;
+        let real = copy_queue(
+            &*source,
+            QueueCopyTarget::Database {
+                store: &sql,
+                liveness: &sql,
+            },
+            false,
+        )
+        .await?;
         assert!(real.written() > 0);
         assert_eq!(counts(&dry), counts(&real));
         Ok(())
@@ -1551,7 +1580,8 @@ mod tests {
         seed(&*source).await?;
         std::fs::write(a.path().join("todo/avail/job-flat.never.json"), b"{}")?;
 
-        let Err(error) = copy_queue(&*source, &*target, None, false).await else {
+        let Err(error) = copy_queue(&*source, QueueCopyTarget::Objects(&*target), false).await
+        else {
             anyhow::bail!("the copy took a flat avail/ key");
         };
         assert!(error.is::<UnmigratedAvailKeyError>(), "{error:#}");
@@ -1565,13 +1595,13 @@ mod tests {
         let (a, b) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let (source, target) = (fs_queue(a.path())?, fs_queue(b.path())?);
         seed(&*source).await?;
-        copy_queue(&*source, &*target, None, false).await?;
+        copy_queue(&*source, QueueCopyTarget::Objects(&*target), false).await?;
         std::fs::write(
             a.path().join("todo/avail/job-never/never.json"),
             b"not json",
         )?;
 
-        let report = copy_queue(&*source, &*target, None, false).await?;
+        let report = copy_queue(&*source, QueueCopyTarget::Objects(&*target), false).await?;
         assert_eq!(keyspace(&report, "avail")?.unreadable.len(), 1);
         assert_eq!(report.deleted(), 0);
         assert_eq!(

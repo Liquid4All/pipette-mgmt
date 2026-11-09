@@ -78,8 +78,8 @@ use pipette_store::{
     CreateOutcome, EvalPackageStore, EvalSampleResultStore, FinalizeProbe, JobPlanMarker, JobState,
     ORG_BENCHMARKS_PREFIX, OutcomeProbe, PLANS_PREFIX, Page, PendingSourceMarker, PlanFilter,
     PlanPage, PlanStore, RecycleResult, RedateResult, RenewLeaseResult, ScoreQueueStage, Stores,
-    SubmissionRecord, SubmissionStore, SuspensionRecord, TodoStore, UnreadableObjectError,
-    UserStore, WarehouseStore, find_outcomes_per_job, is_content_digest, page_matching_plans,
+    SubmissionRecord, SubmissionStore, TodoStore, UnreadableObjectError, UserStore, WarehouseStore,
+    find_outcomes_per_job, is_content_digest, page_matching_plans,
 };
 
 #[expect(
@@ -2979,33 +2979,6 @@ impl TodoStore for S3TodoStore {
             .any(|(flagged, _)| flagged == client_id))
     }
 
-    async fn write_pending_reindex_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        self.put_empty(&self.key(&format!("pending-reindex-jobs/{}", job_id.as_str())))
-            .await
-    }
-
-    async fn list_pending_reindex_jobs(&self) -> anyhow::Result<Vec<JobId>> {
-        // Listing errors propagate (a lost flag is lost reindex debt); an unparseable
-        // name is warned and skipped rather than wedge every run.
-        Ok(self
-            .list_keys(&self.list_prefix("pending-reindex-jobs/"))
-            .await?
-            .into_iter()
-            .filter_map(|name| match JobId::try_new(&name) {
-                Ok(job_id) => Some(job_id),
-                Err(_) => {
-                    tracing::warn!(key = %name, "skipping unparseable pending-reindex-jobs entry");
-                    None
-                }
-            })
-            .collect())
-    }
-
-    async fn delete_pending_reindex_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        self.delete_key(&self.key(&format!("pending-reindex-jobs/{}", job_id.as_str())))
-            .await
-    }
-
     async fn write_lost_lease(
         &self,
         job_id: &JobId,
@@ -3108,22 +3081,6 @@ impl TodoStore for S3TodoStore {
         self.delete_key(&self.key(&format!("tmp/{key}"))).await
     }
 
-    async fn read_eligible_indexed(&self) -> anyhow::Result<HashSet<String>> {
-        self.read_key_set("eligible-indexed").await
-    }
-
-    async fn write_eligible_indexed(&self, indexed: &HashSet<String>) -> anyhow::Result<()> {
-        self.write_key_set("eligible-indexed", indexed).await
-    }
-
-    async fn read_eligible_workers(&self) -> anyhow::Result<HashSet<ClientId>> {
-        self.read_key_set("eligible-workers").await
-    }
-
-    async fn write_eligible_workers(&self, workers: &HashSet<ClientId>) -> anyhow::Result<()> {
-        self.write_key_set("eligible-workers", workers).await
-    }
-
     async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>> {
         Ok(self
             .get_bytes(&self.key(".backlog"))
@@ -3160,53 +3117,6 @@ impl TodoStore for S3TodoStore {
 
     async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
         self.write_key_set("gc-candidates", candidates).await
-    }
-
-    async fn write_suspension(
-        &self,
-        client_id: &ClientId,
-        suspended_at: DateTime<Utc>,
-        conflicting_job_id: &JobId,
-    ) -> anyhow::Result<()> {
-        let record = SuspensionRecord {
-            suspended_at,
-            conflicting_job_id: conflicting_job_id.clone(),
-        };
-        let body = serde_json::to_vec(&record)?;
-        self.put_bytes(
-            &self.key(&format!("suspended/{}.json", client_id.as_str())),
-            body,
-        )
-        .await
-    }
-
-    async fn read_suspension(
-        &self,
-        client_id: &ClientId,
-    ) -> anyhow::Result<Option<SuspensionRecord>> {
-        match self
-            .get_bytes(&self.key(&format!("suspended/{}.json", client_id.as_str())))
-            .await?
-        {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn delete_suspension(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        self.delete_key(&self.key(&format!("suspended/{}.json", client_id.as_str())))
-            .await
-    }
-
-    async fn list_suspended_ids(&self) -> anyhow::Result<Vec<ClientId>> {
-        let mut ids: Vec<ClientId> = self
-            .list_keys(&self.list_prefix("suspended/"))
-            .await?
-            .iter()
-            .filter_map(|name| pipette_store::flat_keyspace_id(name, ClientId::try_new))
-            .collect();
-        ids.sort();
-        Ok(ids)
     }
 
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
@@ -3258,25 +3168,6 @@ impl TodoStore for S3TodoStore {
     async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
         self.delete_key(&self.key(&format!("liveness/{}", client_id.as_str())))
             .await
-    }
-
-    async fn list_suspensions(&self) -> anyhow::Result<Vec<(ClientId, SuspensionRecord)>> {
-        let names = self.list_keys(&self.list_prefix("suspended/")).await?;
-        let mut result = Vec::new();
-        for name in names {
-            let Some(id_str) = name.strip_suffix(".json") else {
-                continue;
-            };
-            let client_id = id_from_key(id_str, ClientId::try_new)?;
-            let Some(bytes) = self
-                .get_bytes(&self.key(&format!("suspended/{name}")))
-                .await?
-            else {
-                continue;
-            };
-            result.push((client_id, serde_json::from_slice(&bytes)?));
-        }
-        Ok(result)
     }
 
     async fn validate_backend(&self) -> anyhow::Result<()> {
@@ -5705,39 +5596,17 @@ mod todo_mock_tests {
         Ok(())
     }
 
-    /// One persisted `queue-maintenance` key set, so one test covers all three.
-    #[derive(Debug, Clone, Copy)]
-    enum KeySet {
-        GcCandidates,
-        EligibleIndexed,
-        EligibleWorkers,
-    }
-
-    impl KeySet {
-        async fn reads_empty(self, store: &S3TodoStore) -> anyhow::Result<bool> {
-            Ok(match self {
-                Self::GcCandidates => store.read_gc_candidates().await?.is_empty(),
-                Self::EligibleIndexed => store.read_eligible_indexed().await?.is_empty(),
-                Self::EligibleWorkers => store.read_eligible_workers().await?.is_empty(),
-            })
-        }
-    }
-
-    /// A missing key set reads as empty, not an error; the next run re-indexes,
-    /// rebuilds, or re-stages from scratch.
-    #[rstest]
-    #[case::gc_candidates(KeySet::GcCandidates)]
-    #[case::eligible_indexed(KeySet::EligibleIndexed)]
-    #[case::eligible_workers(KeySet::EligibleWorkers)]
+    /// A missing key set reads as empty, not an error; the next run re-stages
+    /// from scratch.
     #[tokio::test]
-    async fn read_key_set_missing_key_is_empty(#[case] set: KeySet) -> anyhow::Result<()> {
+    async fn read_key_set_missing_key_is_empty() -> anyhow::Result<()> {
         let missing = mock!(aws_sdk_s3::Client::get_object).then_error(get_no_such_key);
         let s = store(aws_smithy_mocks::mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
             &[&missing]
         ));
-        assert!(set.reads_empty(&s).await?);
+        assert!(s.read_gc_candidates().await?.is_empty());
         Ok(())
     }
 
@@ -5873,33 +5742,6 @@ mod todo_mock_tests {
             &[&list]
         ));
         assert_eq!(s.has_pending_reindex(&cid(client)?).await?, expected);
-        Ok(())
-    }
-
-    /// One stray object must not wedge the maintenance run.
-    #[tokio::test]
-    async fn list_pending_reindex_jobs_skips_cruft() -> anyhow::Result<()> {
-        let list = mock!(aws_sdk_s3::Client::list_objects_v2)
-            .match_requests(|r| r.prefix() == Some("todo/pending-reindex-jobs/"))
-            .then_output(|| {
-                ListObjectsV2Output::builder()
-                    .set_contents(Some(vec![
-                        Object::builder()
-                            .key("todo/pending-reindex-jobs/job1")
-                            .build(),
-                        Object::builder()
-                            .key("todo/pending-reindex-jobs/.DS_Store")
-                            .build(),
-                    ]))
-                    .is_truncated(false)
-                    .build()
-            });
-        let s = store(aws_smithy_mocks::mock_client!(
-            aws_sdk_s3,
-            RuleMode::Sequential,
-            &[&list]
-        ));
-        assert_eq!(s.list_pending_reindex_jobs().await?, vec![job("job1")]);
         Ok(())
     }
 
@@ -6071,6 +5913,11 @@ mod plan_store_tests {
             async move { put_bytes(&handle, &path, bytes).await }
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn job_holders_meet_the_shared_contract() -> anyhow::Result<()> {
+        pipette_store_testkit::assert_job_holders_contract(&plan_store("root")).await
     }
 
     #[tokio::test]

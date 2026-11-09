@@ -103,7 +103,7 @@ describe("the Overview's checks", () => {
     ]));
     expect(counts.map((c) => [c.label, c.lines, c.jobs])).toEqual([
       ["failed", 1, 1], ["stddev over 5%", 0, 0], ["swapped", 2, 1], ["ran hot", 0, 0], ["corpus mismatch", 0, 0],
-      ["power save or low battery", 0, 0], ["no parameter count", 1, 1], ["beyond the model's audio limit", 0, 0],
+      ["power save or low battery", 0, 0], ["no parameter count", 1, 1], ["beyond the model's audio limit", 0, 0], ["TTFT over E2E latency", 0, 0],
     ]);
   });
 });

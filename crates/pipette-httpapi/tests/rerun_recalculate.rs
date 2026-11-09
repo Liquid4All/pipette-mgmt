@@ -1009,12 +1009,17 @@ async fn assert_a_kept_re_run_reads_its_history_once() -> anyhow::Result<()> {
 
 /// A page holding a re-run and a recalculation carries both histories, each
 /// parent read once and named with the newest plan holding it.
+#[rstest]
+#[case::newer_plan(false)]
+#[case::tied_creation_time(true)]
 #[test]
-fn test_a_page_of_a_re_run_and_a_recalculation_carries_both_histories() -> anyhow::Result<()> {
-    run_mocked(assert_a_page_carries_both_histories())
+fn test_a_page_of_a_re_run_and_a_recalculation_carries_both_histories(
+    #[case] tied_creation_time: bool,
+) -> anyhow::Result<()> {
+    run_mocked(assert_a_page_carries_both_histories(tied_creation_time))
 }
 
-async fn assert_a_page_carries_both_histories() -> anyhow::Result<()> {
+async fn assert_a_page_carries_both_histories(tied_creation_time: bool) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let server = MockServer::start_async().await;
     let state = with_runs(seeded_state(dir.path()).await?, &server)?;
@@ -1039,6 +1044,20 @@ async fn assert_a_page_carries_both_histories() -> anyhow::Result<()> {
     // `b` and carries the re-run's job.
     let (middle, _) = revised_over(&state, &owner, &campaign_id, "rerun", a).await?;
     let (last, _) = revised_over(&state, &owner, &campaign_id, "recalculate", b).await?;
+    if tied_creation_time {
+        let first_manifest = state
+            .plan_store
+            .get_plan(&first)
+            .await?
+            .context("first plan")?;
+        let mut middle_manifest = state
+            .plan_store
+            .get_plan(&middle)
+            .await?
+            .context("middle plan")?;
+        middle_manifest.created_at = first_manifest.created_at;
+        state.plan_store.put_plan(&middle_manifest).await?;
+    }
     let held = jobs_in(&middle).await?;
     let fresh = jobs_in(&last).await?;
     let again = held
@@ -1079,8 +1098,13 @@ async fn assert_a_page_carries_both_histories() -> anyhow::Result<()> {
     };
     let (again_row, rescored_row) = (row(again)?, row(rescored)?);
     let a_run = json!({"job_id": a.as_str(), "plan_id": first.as_str()});
-    // `b` is held by the first plan and, carried, by the re-run's: the newer names it.
-    let b_run = json!({"job_id": b.as_str(), "plan_id": middle.as_str()});
+    // `b` belongs to both plans. Equal creation times resolve by plan id.
+    let b_holder = if tied_creation_time {
+        std::cmp::max(&first, &middle)
+    } else {
+        &middle
+    };
+    let b_run = json!({"job_id": b.as_str(), "plan_id": b_holder.as_str()});
     assert_eq!(again_row.pointer("/plan/rerun_of"), Some(&a_run), "{body}");
     assert_eq!(
         earlier(again_row),

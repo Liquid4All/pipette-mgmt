@@ -7,8 +7,8 @@ pub use asr::{AsrAudioTokensSource, AsrClientExtras, AsrClientExtrasError, AsrCo
 
 mod upload;
 pub use upload::{
-    BatchItem, BatchSubmitted, FailureInput, JobAccepted, SampleCompletion, Submission,
-    SubmissionInput, SuccessInput,
+    BatchItem, BatchSubmitted, FailureCode, FailureInput, JobAccepted, SampleCompletion,
+    Submission, SubmissionInput, SuccessInput,
 };
 
 use nutype::nutype;
