@@ -363,26 +363,11 @@ async fn probe_upstream_pins(
     if built.is_empty() {
         return not_ok;
     }
-    let reached = match scratch_dir() {
-        Ok(scratch) => {
-            match tokio::time::timeout(
-                deadline,
-                probe_upstream(upstreams, scratch.path(), &upstream),
-            )
-            .await
-            {
-                Ok(reached) => reached,
-                Err(_) => Reached::Failed(
-                    ProbeState::Unavailable,
-                    format!("probe timed out after {}s", deadline.as_secs()),
-                ),
-            }
-        }
-        Err(e) => Reached::Failed(
-            ProbeState::Unavailable,
-            format!("no scratch directory: {e:#}"),
-        ),
-    };
+    let was_ok = built
+        .iter()
+        .any(|b| b.artifact.probe.state == ProbeState::Ok);
+    let digests = built.iter().map(|b| &b.artifact.digest).collect::<Vec<_>>();
+    let reached = reach(upstreams, &upstream, &digests, deadline, was_ok).await;
     let now = Utc::now();
     let recorded = futures::stream::iter(built)
         .then(|mut built| {
@@ -412,6 +397,86 @@ async fn probe_upstream_pins(
         }
     }));
     not_ok
+}
+
+/// Probe `upstream` within `deadline`. If an artifact of the upstream `was_ok`
+/// and the first attempt finds the upstream unavailable, a second attempt
+/// runs. The first attempt then gets half of the deadline, and the second
+/// attempt gets the rest. Thus one stalled fetch does not refuse the
+/// benchmarks until the next run.
+async fn reach(
+    upstreams: &impl Upstreams,
+    upstream: &DatasetUpstream,
+    digests: &[&Sha256],
+    deadline: Duration,
+    was_ok: bool,
+) -> Reached {
+    let end = tokio::time::Instant::now() + deadline;
+    let first_end = if was_ok { end - deadline / 2 } else { end };
+    let first = attempt(upstreams, upstream, digests, 1, first_end).await;
+    match &first {
+        Reached::Failed(ProbeState::Unavailable, first_detail) if was_ok => {
+            let second = attempt(upstreams, upstream, digests, 2, end).await;
+            tracing::info!(
+                event = "dataset_probe_retried",
+                upstream = upstream.reference(),
+                first_detail,
+                saved = matches!(second, Reached::Observed(_)),
+                "dataset upstream probe retried after an unavailable attempt"
+            );
+            second
+        }
+        Reached::Failed(..) | Reached::Observed(_) => first,
+    }
+}
+
+/// One probe of `upstream` in a new scratch directory, stopped at `until`.
+/// A git probe initializes its scratch repository, so each attempt needs its
+/// own directory.
+async fn attempt(
+    upstreams: &impl Upstreams,
+    upstream: &DatasetUpstream,
+    digests: &[&Sha256],
+    attempt: u8,
+    until: tokio::time::Instant,
+) -> Reached {
+    let started = tokio::time::Instant::now();
+    let reached = match scratch_dir() {
+        Ok(scratch) => {
+            tokio::time::timeout_at(until, probe_upstream(upstreams, scratch.path(), upstream))
+                .await
+                .unwrap_or_else(|_| {
+                    Reached::Failed(
+                        ProbeState::Unavailable,
+                        format!(
+                            "probe timed out after {}s",
+                            until.saturating_duration_since(started).as_secs()
+                        ),
+                    )
+                })
+        }
+        Err(e) => Reached::Failed(
+            ProbeState::Unavailable,
+            format!("no scratch directory: {e:#}"),
+        ),
+    };
+    let outcome = match &reached {
+        Reached::Observed(_) => "observed".to_owned(),
+        Reached::Failed(state, _) => state.to_string(),
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+    for digest in digests {
+        tracing::debug!(
+            event = "dataset_probe_attempt",
+            upstream = upstream.reference(),
+            digest = digest.as_ref(),
+            attempt,
+            elapsed_ms,
+            outcome,
+            "dataset upstream probe attempt finished"
+        );
+    }
+    reached
 }
 
 /// What one probe of an upstream found.
@@ -1419,6 +1484,66 @@ digest   = "{digest}"
         Ok(())
     }
 
+    /// The first fetch goes to a listener that never answers, so it stalls;
+    /// every later fetch reaches the local repository.
+    struct StallsOnce {
+        local: Local,
+        stall: String,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Upstreams for StallsOnce {
+        fn remote(&self, url: &DatasetRepositoryUrl) -> String {
+            if self
+                .fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                self.stall.clone()
+            } else {
+                self.local.remote(url)
+            }
+        }
+
+        fn evals_server(&self) -> &str {
+            self.local.evals_server()
+        }
+
+        fn http(&self) -> &reqwest::Client {
+            self.local.http()
+        }
+    }
+
+    /// A stalled fetch of an `ok` upstream times out, and the second attempt,
+    /// in a new scratch directory, keeps the artifact `ok`.
+    #[tokio::test]
+    async fn a_stalled_fetch_of_an_ok_upstream_is_retried() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (origin, revision) = origin(dir.path())?;
+        let remotes = Local::new(origin.clone());
+        let pins = local_pins(&remotes, dir.path(), &revision, Some("GQA")).await?;
+        let stores = stores(dir.path(), &revision, &[("GQA", &pins)])?;
+        build_all(&remotes, Duration::from_secs(60), &stores).await?;
+        probe_all(&remotes, Duration::from_secs(60), &stores).await?;
+
+        // The kernel accepts the connection and nothing answers it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let stalls = StallsOnce {
+            local: Local::new(origin),
+            stall: format!("http://{}/corpus.git", listener.local_addr()?),
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        probe_all(&stalls, Duration::from_secs(4), &stores).await?;
+        assert_eq!(stalls.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let artifact = stores
+            .dataset_cache
+            .get_artifact(&pins.digest)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("a probe never deletes"))?;
+        assert_eq!(artifact.probe.state, ProbeState::Ok);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // evals-server upstream
     // -----------------------------------------------------------------------
@@ -1448,6 +1573,8 @@ digest   = "{digest}"
             /// Answer every request with this status instead.
             status: Option<StatusCode>,
             digest_requests: AtomicUsize,
+            /// Answer this many more requests with `503`.
+            fail_first: usize,
         }
 
         /// An evals server reporting the digest of MMStar 2026.10.1's samples
@@ -1501,9 +1628,13 @@ digest   = "{digest}"
             version: &str,
             query: &HashMap<String, String>,
         ) -> Result<Vec<EvalSample>, StatusCode> {
-            let served = lock(served);
+            let mut served = lock(served);
             if let Some(status) = served.status {
                 return Err(status);
+            }
+            if served.fail_first > 0 {
+                served.fail_first -= 1;
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
             let profile = query.get("prompt_profile").map(String::as_str);
             match (eval, version, profile) {
@@ -2005,6 +2136,50 @@ sources = ["https://huggingface.co/org/repo"]
                 artifact(&stores, &pin.digest).await?.probe.state,
                 ProbeState::Unavailable
             );
+            Ok(())
+        }
+
+        /// Retry an unavailable probe once in the same run only if the artifact
+        /// was `ok`. Do not retry a `gone` result.
+        #[rstest::rstest]
+        #[case::one_fault_is_retried(false, 1, None, ProbeState::Ok, 2)]
+        #[case::two_faults_are_unavailable(false, 2, None, ProbeState::Unavailable, 2)]
+        #[case::gone_is_not_retried(false, 0, Some(StatusCode::NOT_FOUND), ProbeState::Gone, 1)]
+        #[case::down_before_is_not_retried(true, 1, None, ProbeState::Unavailable, 1)]
+        #[tokio::test]
+        async fn an_unavailable_probe_of_an_ok_upstream_is_retried_once(
+            #[case] down_before: bool,
+            #[case] faults: usize,
+            #[case] status: Option<StatusCode>,
+            #[case] state: ProbeState,
+            #[case] requests: usize,
+        ) -> anyhow::Result<()> {
+            let served = samples()?;
+            let evals = mock_evals(served.clone()).await?;
+            let dir = tempfile::tempdir()?;
+            let pin = put_package(
+                &dir.path().join("data"),
+                CorpusFormat::VlmEvalCorpusV1,
+                mmstar(),
+                &served,
+            )?;
+            let stores = vlm_stores(dir.path(), &pin)?;
+            let deadline = Duration::from_secs(60);
+            build_all(&evals, deadline, &stores).await?;
+            if down_before {
+                lock(&evals.served).status = Some(StatusCode::SERVICE_UNAVAILABLE);
+                assert!(probe_all(&evals, deadline, &stores).await.is_err());
+            }
+            {
+                let mut served = lock(&evals.served);
+                served.fail_first = faults;
+                served.status = status;
+            }
+            let before = digest_requests(&evals);
+            let probed = probe_all(&evals, deadline, &stores).await;
+            assert_eq!(probed.is_ok(), state == ProbeState::Ok, "{probed:?}");
+            assert_eq!(artifact(&stores, &pin.digest).await?.probe.state, state);
+            assert_eq!(digest_requests(&evals) - before, requests);
             Ok(())
         }
 

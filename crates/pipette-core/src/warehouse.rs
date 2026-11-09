@@ -13,8 +13,8 @@ use serde::de::{DeserializeOwned, IntoDeserializer};
 
 use pipette_plan_types::{
     AndroidTemperatureSensor, AndroidThermalStatus, AppleThermalState, BatteryLevel, BenchmarkId,
-    BenchmarkType, ClientId, DeviceFormFactor, DevicePowerState, FailureSource, JobId, JobMetric,
-    LinuxThermalZone,
+    BenchmarkType, ClientId, DeviceFormFactor, DevicePowerState, FailureCode, FailureSource, JobId,
+    JobMetric, LinuxThermalZone,
 };
 
 use crate::parquet_utils::{
@@ -230,6 +230,7 @@ pub fn parquet_schema() -> Schema {
         Field::new("failed_reason", DataType::Utf8, true),
         Field::new("failure_source", DataType::Utf8, true),
         Field::new("failure_retriable", DataType::Boolean, true),
+        Field::new("failure_code", DataType::Utf8, true),
         // Derivable from `result_id`, but a per-cell tally counts distinct
         // `job_id`: a job has several rows, and a re-score appends copies.
         Field::new("job_id", DataType::Utf8, true),
@@ -484,6 +485,9 @@ pub struct MetricRow {
     pub failure_source: Option<FailureSource>,
     /// `Some(false)` on every `"system"` failure, which is terminal.
     pub failure_retriable: Option<bool>,
+    /// The failure body's `failure_code`. `None` on a success row, and on rows
+    /// from files written before the column.
+    pub failure_code: Option<FailureCode>,
     /// `None` only on rows from files written before the column. Count distinct
     /// `job_id` for a per-cell tally.
     pub job_id: Option<String>,
@@ -677,6 +681,7 @@ impl Default for MetricRow {
             failed_reason: None,
             failure_source: None,
             failure_retriable: None,
+            failure_code: None,
             client_configuration: None,
             client_extras: None,
             parameter_audio_duration_ms: None,
@@ -1751,6 +1756,7 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
         .transpose()?;
     let failed_reason_col = optional_string_column(batch, "failed_reason")?;
     let failure_source_col = optional_string_column(batch, "failure_source")?;
+    let failure_code_col = optional_string_column(batch, "failure_code")?;
     let job_id_col = optional_string_column(batch, "job_id")?;
     let client_configuration_col = optional_string_column(batch, "client_configuration")?;
     let client_extras_col = optional_string_column(batch, "client_extras")?;
@@ -2003,6 +2009,13 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
                 .transpose()?,
             failure_retriable: failure_retriable_col
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
+            failure_code: failure_code_col
+                .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                .map(|s| {
+                    s.parse::<FailureCode>()
+                        .map_err(|e| anyhow::anyhow!("row {i}: failure_code: {e}"))
+                })
+                .transpose()?,
             job_id: job_id_col.and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
             client_configuration: client_configuration_col
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
@@ -2297,6 +2310,10 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
         .collect();
     let failure_retriable_col: Vec<Option<bool>> =
         rows.iter().map(|r| r.failure_retriable).collect();
+    let failure_code_col: Vec<Option<&str>> = rows
+        .iter()
+        .map(|r| r.failure_code.as_ref().map(|c| c.as_ref()))
+        .collect();
 
     let job_ids: Vec<Option<&str>> = rows.iter().map(|r| r.job_id.as_deref()).collect();
     let client_configurations: Vec<Option<&str>> = rows
@@ -2493,6 +2510,7 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
             Arc::new(StringArray::from(failed_reason_col)),
             Arc::new(StringArray::from(failure_source_col)),
             Arc::new(BooleanArray::from(failure_retriable_col)),
+            Arc::new(StringArray::from(failure_code_col)),
             Arc::new(StringArray::from(job_ids)),
             Arc::new(StringArray::from(client_configurations)),
             Arc::new(Int32Array::from(draft_lengths)),
@@ -3693,6 +3711,7 @@ mod tests {
         assert_eq!(rows[0].failed_reason, None);
         assert_eq!(rows[0].failure_source, None);
         assert_eq!(rows[0].failure_retriable, None);
+        assert_eq!(rows[0].failure_code, None);
         // `job_id` is the same case: a row from before the column reads NULL, so
         // a per-cell tally over a table spanning the boundary must expect it.
         assert_eq!(rows[0].job_id, None);
@@ -3712,6 +3731,7 @@ mod tests {
                 job_id: Some("550e8400-job-a".to_string()),
                 failure_source: Some(FailureSource::Expired),
                 failure_retriable: Some(true),
+                failure_code: Some(FailureCode::OutOfMemory),
                 failed: Some(true),
                 failed_reason: Some("expired".to_string()),
                 ..Default::default()
@@ -3732,6 +3752,7 @@ mod tests {
         assert_eq!(back[0].result_id, "550e8400-job-a_0");
         // The columns either side of `job_id` in the schema keep their own values.
         assert_eq!(back[0].failure_retriable, Some(true));
+        assert_eq!(back[0].failure_code, Some(FailureCode::OutOfMemory));
         assert_eq!(back[0].failure_source, Some(FailureSource::Expired));
         assert_eq!(back[1].job_id, None);
         assert_eq!(back[1].result_id, "550e8400-job-b_0");

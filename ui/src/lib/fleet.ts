@@ -129,7 +129,7 @@ export function needsRequires(filters: FleetFilters): boolean {
 
 /** A row's standing column, as the classic `standing` worded it. */
 export const standing = (row: ClientListRow): string =>
-  [row.suspended && "suspended", row.reindex_pending && "reindexing"].filter(Boolean).join(", ") || "ok";
+  row.reindex_pending ? "reindexing" : "ok";
 
 /** How recent a device's last-seen time must be for the device to count as active. */
 export const ACTIVE_WINDOW_MS = 10 * 60_000;

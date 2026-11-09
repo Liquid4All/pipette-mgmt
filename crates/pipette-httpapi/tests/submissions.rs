@@ -20,8 +20,9 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientId, ClientPermission, RuntimeOutput};
 use pipette_store_testkit::TEST_LIST_LIMIT;
 use pipette_web_testkit::{
-    authed_get, authed_post, body_json, denied_clients, job, make_state, register_and_approve,
-    seed_leased, setup_benchmarks, submit_benchmark, unauthed_post, valid_submission,
+    QueueBackend, authed_get, authed_post, body_json, denied_clients, job, make_state,
+    register_and_approve, seed_leased, seeded_queue_state, setup_benchmarks, submit_benchmark,
+    unauthed_post, valid_submission,
 };
 
 /// A claimed `job_id` in the server-minted shape (`job-{uuid}`).
@@ -1506,21 +1507,24 @@ async fn test_submit_retriable_failure_all_denied_escalates_via_queue_maintenanc
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (sk, client_id) = register_and_approve(&state).await?;
+    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (sk, client_id) = register_and_approve(state).await?;
 
     let claimed = CLAIMED_JOB_ID;
     let body = leased_job_body(claimed, &[client_id.as_str()]);
     seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
     let failure = valid_failure("prefill_throughput_256", claimed, true);
-    let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &failure).await?;
+    let resp = authed_post(state, &sk, &client_id, "/benchmarks", &failure).await?;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     let job = job(claimed)?;
     // The request records the denial and recycles the job; no record yet.
     assert!(state.submission_store.find_job(&job).await?.is_none());
-    assert!(denied_clients(&state, &job).await?.contains(&client_id));
+    assert!(denied_clients(state, &job).await?.contains(&client_id));
     assert!(state.todo_store.get_avail_by_job(&job).await?.is_some());
 
     // The next queue-maintenance run escalates.

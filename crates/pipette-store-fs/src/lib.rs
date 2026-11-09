@@ -59,8 +59,8 @@ use pipette_store::{
     CreateOutcome, EvalPackageStore, EvalSampleResultStore, FinalizeProbe, JobPlanMarker, JobState,
     ORG_BENCHMARKS_PREFIX, OutcomeProbe, Page, PendingSourceMarker, PlanFilter, PlanPage,
     PlanStore, RecycleResult, RedateResult, RenewLeaseResult, ScoreQueueStage, Stores,
-    SubmissionRecord, SubmissionStore, SuspensionRecord, TodoStore, UnreadableObjectError,
-    UserStore, WarehouseStore, find_outcomes_per_job, is_content_digest, page_matching_plans,
+    SubmissionRecord, SubmissionStore, TodoStore, UnreadableObjectError, UserStore, WarehouseStore,
+    find_outcomes_per_job, is_content_digest, page_matching_plans,
 };
 
 pub fn build_local_fs_client_store(
@@ -195,10 +195,8 @@ pub fn build_local_fs_todo_store(
     std::fs::create_dir_all(todo_dir.join("denied"))?;
     std::fs::create_dir_all(todo_dir.join("eligible").join("clients"))?;
     std::fs::create_dir_all(todo_dir.join("pending-reindex"))?;
-    std::fs::create_dir_all(todo_dir.join("pending-reindex-jobs"))?;
     std::fs::create_dir_all(todo_dir.join("lost"))?;
     std::fs::create_dir_all(todo_dir.join("tmp"))?;
-    std::fs::create_dir_all(todo_dir.join("suspended"))?;
     std::fs::create_dir_all(todo_dir.join("liveness"))?;
     Ok(Arc::new(LocalFsTodoStore::new(todo_dir)))
 }
@@ -1856,13 +1854,9 @@ pub struct LocalFsTodoStore {
     denied_dir: PathBuf,
     eligible_clients_dir: PathBuf,
     pending_reindex_dir: PathBuf,
-    pending_reindex_jobs_dir: PathBuf,
     lost_dir: PathBuf,
     tmp_dir: PathBuf,
-    suspended_dir: PathBuf,
     liveness_dir: PathBuf,
-    indexed_path: PathBuf,
-    workers_path: PathBuf,
     gc_candidates_path: PathBuf,
     backlog_path: PathBuf,
     campaign_backlog_path: PathBuf,
@@ -1876,22 +1870,13 @@ impl LocalFsTodoStore {
             denied_dir: todo_dir.join("denied"),
             eligible_clients_dir: todo_dir.join("eligible").join("clients"),
             pending_reindex_dir: todo_dir.join("pending-reindex"),
-            pending_reindex_jobs_dir: todo_dir.join("pending-reindex-jobs"),
             lost_dir: todo_dir.join("lost"),
             tmp_dir: todo_dir.join("tmp"),
-            suspended_dir: todo_dir.join("suspended"),
             liveness_dir: todo_dir.join("liveness"),
-            indexed_path: todo_dir.join(".eligible-indexed"),
-            workers_path: todo_dir.join(".eligible-workers"),
             gc_candidates_path: todo_dir.join(".gc-candidates"),
             backlog_path: todo_dir.join(".backlog"),
             campaign_backlog_path: todo_dir.join(".backlog-campaigns"),
         }
-    }
-
-    /// Path to a client's `suspended/{client_id}.json` marker.
-    fn suspension_path(&self, client_id: &ClientId) -> PathBuf {
-        self.suspended_dir.join(format!("{}.json", client_id))
     }
 
     /// Path to a client's `liveness/{client_id}` marker.
@@ -2540,40 +2525,6 @@ impl TodoStore for LocalFsTodoStore {
         .await
     }
 
-    async fn write_pending_reindex_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        let path = self.pending_reindex_jobs_dir.join(job_id.as_str());
-        run_blocking(move || Ok(std::fs::write(&path, b"")?)).await
-    }
-
-    async fn list_pending_reindex_jobs(&self) -> anyhow::Result<Vec<JobId>> {
-        let pending_reindex_jobs_dir = self.pending_reindex_jobs_dir.clone();
-        run_blocking(move || {
-            // Read errors propagate (a lost flag is lost reindex debt); an
-            // unparseable name is warned and skipped rather than wedge every run.
-            std::fs::read_dir(&pending_reindex_jobs_dir)?
-                .map(|e| anyhow::Ok(e?.file_name().to_string_lossy().into_owned()))
-                .filter_map(|r| {
-                    r.map(|name| match JobId::try_new(&name) {
-                        Ok(job_id) => Some(job_id),
-                        Err(_) => {
-                            tracing::warn!(
-                                key = %name,
-                                "skipping unparseable pending-reindex-jobs entry"
-                            );
-                            None
-                        }
-                    })
-                    .transpose()
-                })
-                .collect()
-        })
-        .await
-    }
-
-    async fn delete_pending_reindex_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        remove_file_idempotent(self.pending_reindex_jobs_dir.join(job_id.as_str())).await
-    }
-
     async fn write_lost_lease(
         &self,
         job_id: &JobId,
@@ -2696,22 +2647,6 @@ impl TodoStore for LocalFsTodoStore {
         remove_file_idempotent(self.tmp_dir.join(key)).await
     }
 
-    async fn read_eligible_indexed(&self) -> anyhow::Result<HashSet<String>> {
-        read_key_set(self.indexed_path.clone(), "eligible-indexed").await
-    }
-
-    async fn write_eligible_indexed(&self, indexed: &HashSet<String>) -> anyhow::Result<()> {
-        write_key_set(self.indexed_path.clone(), indexed).await
-    }
-
-    async fn read_eligible_workers(&self) -> anyhow::Result<HashSet<ClientId>> {
-        read_key_set(self.workers_path.clone(), "eligible-workers").await
-    }
-
-    async fn write_eligible_workers(&self, workers: &HashSet<ClientId>) -> anyhow::Result<()> {
-        write_key_set(self.workers_path.clone(), workers).await
-    }
-
     async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>> {
         let path = self.backlog_path.clone();
         run_blocking(move || {
@@ -2751,94 +2686,6 @@ impl TodoStore for LocalFsTodoStore {
 
     async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
         write_key_set(self.gc_candidates_path.clone(), candidates).await
-    }
-
-    async fn write_suspension(
-        &self,
-        client_id: &ClientId,
-        suspended_at: DateTime<Utc>,
-        conflicting_job_id: &JobId,
-    ) -> anyhow::Result<()> {
-        let path = self.suspension_path(client_id);
-        let record = SuspensionRecord {
-            suspended_at,
-            conflicting_job_id: conflicting_job_id.clone(),
-        };
-        let body = serde_json::to_string(&record)?;
-        run_blocking(move || Ok(std::fs::write(&path, body.as_bytes())?)).await
-    }
-
-    async fn read_suspension(
-        &self,
-        client_id: &ClientId,
-    ) -> anyhow::Result<Option<SuspensionRecord>> {
-        let path = self.suspension_path(client_id);
-        run_blocking(move || match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn delete_suspension(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        remove_file_idempotent(self.suspension_path(client_id)).await
-    }
-
-    async fn list_suspended_ids(&self) -> anyhow::Result<Vec<ClientId>> {
-        let suspended_dir = self.suspended_dir.clone();
-        run_blocking(move || {
-            if !suspended_dir.exists() {
-                return Ok(Vec::new());
-            }
-            let mut ids: Vec<ClientId> = std::fs::read_dir(&suspended_dir)?
-                .filter_map(|entry| readable_entry(&suspended_dir, entry))
-                .filter_map(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| pipette_store::flat_keyspace_id(name, ClientId::try_new))
-                })
-                .collect();
-            ids.sort();
-            Ok(ids)
-        })
-        .await
-    }
-
-    async fn list_suspensions(&self) -> anyhow::Result<Vec<(ClientId, SuspensionRecord)>> {
-        let suspended_dir = self.suspended_dir.clone();
-        run_blocking(move || {
-            // A malformed marker is logged and skipped: one bad file must not
-            // hide every other suspended client.
-            let mut result = Vec::new();
-            for entry in
-                std::fs::read_dir(&suspended_dir)?.filter_map(|e| readable_entry(&suspended_dir, e))
-            {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(id_str) = name.strip_suffix(".json") else {
-                    continue;
-                };
-                let client_id = match id_from_key(id_str, ClientId::try_new) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!(marker = %name, error = %e, "skipping suspension marker with invalid client_id");
-                        continue;
-                    }
-                };
-                let record = || -> anyhow::Result<SuspensionRecord> {
-                    Ok(serde_json::from_str(&std::fs::read_to_string(entry.path())?)?)
-                };
-                match record() {
-                    Ok(record) => result.push((client_id, record)),
-                    Err(e) => {
-                        tracing::warn!(client_id = %client_id, error = %e, "skipping unreadable suspension record")
-                    }
-                }
-            }
-            Ok(result)
-        })
-        .await
     }
 
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
@@ -4082,10 +3929,8 @@ parameter_prefill_tokens = 256"#,
             "denied",
             "eligible/clients",
             "pending-reindex",
-            "pending-reindex-jobs",
             "lost",
             "tmp",
-            "suspended",
             "liveness",
         ]
         .into_iter()
@@ -4159,6 +4004,12 @@ parameter_prefill_tokens = 256"#,
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn test_localfs_job_holders_meet_the_shared_contract() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        pipette_store_testkit::assert_job_holders_contract(&LocalFsPlanStore::new(dir.path())).await
     }
 
     #[tokio::test]
@@ -4849,31 +4700,6 @@ parameter_prefill_tokens = 256"#,
         Ok(())
     }
 
-    /// One malformed file must not hide every other suspended client.
-    #[tokio::test]
-    async fn test_localfs_todo_list_suspensions_skips_malformed() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let good = ClientId::try_new("good-client")?;
-        store
-            .write_suspension(
-                &good,
-                dt("2026-06-17T09:00:00Z")?,
-                &JobId::new_unchecked("j"),
-            )
-            .await?;
-        // A file that parses as a client id but holds invalid JSON.
-        std::fs::write(
-            todo_dir.join("suspended").join("bad-client.json"),
-            b"{not json",
-        )?;
-
-        let listed = store.list_suspensions().await?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].0, good);
-
-        Ok(())
-    }
-
     /// An empty marker body reads as the default record. A `write_denied`
     /// staging file is not a marker.
     #[tokio::test]
@@ -4882,7 +4708,13 @@ parameter_prefill_tokens = 256"#,
         let (store, _dir, _todo_dir) = todo_store()?;
         let job = JobId::new_unchecked("jobd");
         let client = ClientId::try_new("ca")?;
-        let record = DenialRecord::new(Utc::now(), "runtime OOM", Some("1.4.2"), None);
+        let record = DenialRecord::new(
+            Utc::now(),
+            "runtime OOM",
+            pipette_plan_types::FailureCode::OutOfMemory,
+            Some("1.4.2"),
+            None,
+        );
         store.write_denied(&job, &client, &record).await?;
 
         std::fs::write(store.denied_path(&job, &client), b"")?;
@@ -4916,18 +4748,6 @@ parameter_prefill_tokens = 256"#,
         Ok(())
     }
 
-    /// The listing skips foreign files.
-    #[tokio::test]
-    async fn test_localfs_todo_pending_reindex_jobs_skip_cruft() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("job-1");
-        std::fs::write(todo_dir.join("pending-reindex-jobs").join(".DS_Store"), b"")?;
-
-        store.write_pending_reindex_job(&job).await?;
-        assert_eq!(store.list_pending_reindex_jobs().await?, vec![job]);
-        Ok(())
-    }
-
     /// The listing skips foreign names in `lost/` and in a job's directory.
     #[tokio::test]
     async fn test_localfs_todo_lost_leases_skip_cruft() -> anyhow::Result<()> {
@@ -4944,22 +4764,30 @@ parameter_prefill_tokens = 256"#,
         Ok(())
     }
 
+    /// The incremental index lives in the database queue only.
+    #[tokio::test]
+    async fn test_localfs_todo_index_needs_the_database() -> anyhow::Result<()> {
+        let (store, _dir, _) = todo_store()?;
+        let Err(error) = store.jobs_needing_reindex(&[]).await else {
+            anyhow::bail!("local_fs listed jobs that need a reindex");
+        };
+        assert!(
+            error
+                .downcast_ref::<pipette_store::QueueNeedsDatabaseError>()
+                .is_some(),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
     /// A corrupt state file reads as empty.
     #[tokio::test]
     async fn test_localfs_todo_corrupt_state_reads_as_empty() -> anyhow::Result<()> {
         let (store, _dir, todo_dir) = todo_store()?;
-        [
-            ".eligible-indexed",
-            ".eligible-workers",
-            ".gc-candidates",
-            ".backlog",
-            ".backlog-campaigns",
-        ]
-        .into_iter()
-        .try_for_each(|name| std::fs::write(todo_dir.join(name), b"not json"))?;
+        [".gc-candidates", ".backlog", ".backlog-campaigns"]
+            .into_iter()
+            .try_for_each(|name| std::fs::write(todo_dir.join(name), b"not json"))?;
 
-        assert!(store.read_eligible_indexed().await?.is_empty());
-        assert!(store.read_eligible_workers().await?.is_empty());
         assert!(store.read_gc_candidates().await?.is_empty());
         assert_eq!(store.read_backlog().await?, None);
         assert_eq!(store.read_campaign_backlog().await?, None);

@@ -16,8 +16,8 @@ use pipette_plan_types::{
 use pipette_store::{CampaignBacklog, CampaignBacklogSnapshot};
 use pipette_web_testkit::{
     QueueBackend, approved_client, approved_queue_client, authed_get, authed_post, authed_user_get,
-    body_json, filter_fleet, fleet_ids, job, put_idle_campaign, register_and_approve,
-    registered_user, registered_user_with_detail, run_qm, seed_avail, submit_plan_as, unauthed_get,
+    body_json, filter_fleet, fleet_ids, put_idle_campaign, register_and_approve, registered_user,
+    registered_user_with_detail, run_qm, seed_avail, submit_plan_as, unauthed_get,
 };
 
 fn row<'a>(body: &'a Value, client_id: &str) -> anyhow::Result<&'a Value> {
@@ -363,7 +363,6 @@ async fn test_list_fleet_carries_the_operator_view() -> anyhow::Result<()> {
         client["permissions"],
         json!(["perform_work", "submit_results"])
     );
-    assert_eq!(client["suspended"], json!(false));
     // The fixture registers the client, which queues a reindex.
     assert!(client["reindex_pending"].is_boolean());
     Ok(())
@@ -376,20 +375,12 @@ async fn test_list_fleet_surfaces_why_a_client_takes_no_work() -> anyhow::Result
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadClients]).await?;
 
     pipette_web_testkit::clear_pending_reindex(state.todo_store.as_ref(), &client_id).await?;
-    state
-        .todo_store
-        .write_suspension(
-            &client_id,
-            chrono::Utc::now(),
-            &pipette_web_testkit::job("job-stuck")?,
-        )
-        .await?;
+    state.todo_store.write_pending_reindex(&client_id).await?;
 
     let resp = authed_user_get(&state, &key, &user_id, &key_id, "/api/v1/clients").await?;
     let body = body_json(resp).await?;
     let client = row(&body, client_id.as_str())?;
-    assert_eq!(client["suspended"], json!(true));
-    assert_eq!(client["reindex_pending"], json!(false));
+    assert_eq!(client["reindex_pending"], json!(true));
     Ok(())
 }
 
@@ -589,29 +580,18 @@ async fn test_get_fleet_client_with_an_unreadable_record_is_a_redacted_500() -> 
     Ok(())
 }
 
-/// Two clients in opposite states catch a swap of the flags or one client's
-/// marker read as another's.
+/// Two clients in opposite states catch one client's marker read as another's.
 #[tokio::test]
 async fn test_get_fleet_client_says_why_it_takes_no_work() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, suspended) = approved_client(dir.path()).await?;
+    let (state, _key, idle) = approved_client(dir.path()).await?;
     let (_second_key, reindexing) = pipette_web_testkit::register_and_approve(&state).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadClients]).await?;
 
-    pipette_web_testkit::clear_pending_reindex(state.todo_store.as_ref(), &suspended).await?;
-    state
-        .todo_store
-        .write_suspension(
-            &suspended,
-            chrono::Utc::now(),
-            &pipette_web_testkit::job("job-stuck")?,
-        )
-        .await?;
+    pipette_web_testkit::clear_pending_reindex(state.todo_store.as_ref(), &idle).await?;
     state.todo_store.write_pending_reindex(&reindexing).await?;
 
-    for (client_id, is_suspended, is_reindexing) in
-        [(&suspended, true, false), (&reindexing, false, true)]
-    {
+    for (client_id, is_reindexing) in [(&idle, false), (&reindexing, true)] {
         let resp = authed_user_get(
             &state,
             &key,
@@ -622,7 +602,6 @@ async fn test_get_fleet_client_says_why_it_takes_no_work() -> anyhow::Result<()>
         .await?;
         assert_eq!(resp.status(), StatusCode::OK, "{client_id}");
         let body = body_json(resp).await?;
-        assert_eq!(body["suspended"], json!(is_suspended), "{client_id}");
         assert_eq!(body["reindex_pending"], json!(is_reindexing), "{client_id}");
     }
     Ok(())
@@ -681,15 +660,12 @@ async fn test_a_signed_request_sets_last_seen_at(
 }
 
 /// A device the count does not name reads zero; before the first run, `null`.
-#[rstest]
-#[case::local_fs(QueueBackend::LocalFs)]
-#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_a_maintenance_run_sets_the_backlog(
-    #[case] backend: QueueBackend,
-) -> anyhow::Result<()> {
+async fn test_a_maintenance_run_sets_the_backlog() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _, listed)) = approved_queue_client(dir.path(), backend).await? else {
+    let Some((queue, _, listed)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
         return Ok(());
     };
     let state = &queue.state;
@@ -740,10 +716,15 @@ async fn test_a_maintenance_run_sets_the_backlog(
 #[tokio::test]
 async fn test_a_maintenance_run_counts_the_backlog_by_campaign() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _, client) = approved_client(dir.path()).await?;
-    run_qm(&state).await?;
-    let (key, user_id, key_id) = registered_user_with_detail(&state, true).await?;
-    let plan_id = submit_plan_as(&state, &key, &user_id, &key_id, &client, "Queued", 1).await?;
+    let Some((queue, _, client)) =
+        approved_queue_client(dir.path(), QueueBackend::Database).await?
+    else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    run_qm(state).await?;
+    let (key, user_id, key_id) = registered_user_with_detail(state, true).await?;
+    let plan_id = submit_plan_as(state, &key, &user_id, &key_id, &client, "Queued", 1).await?;
     let campaign_id = state
         .plan_store
         .get_plan(&plan_id)
@@ -751,10 +732,10 @@ async fn test_a_maintenance_run_counts_the_backlog_by_campaign() -> anyhow::Resu
         .context("the filed plan exists")?
         .campaign_id
         .context("the filed plan names its campaign")?;
-    run_qm(&state).await?;
+    run_qm(state).await?;
 
     let record = read_conforming(
-        &state,
+        state,
         &(key, user_id, key_id),
         &format!("/api/v1/clients/{client}"),
         "ClientDetail",
@@ -833,39 +814,6 @@ async fn test_the_backlog_by_campaign_shows_the_readable_campaigns(
             "unreadable_job_count": unreadable,
             "counted_at": "2027-01-15T08:00:00Z",
         })
-    );
-    Ok(())
-}
-
-/// The count does not check suspension (`docs/queue.md`, "Device backlog").
-#[tokio::test]
-async fn test_the_backlog_counts_a_suspended_device() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, _, client) = approved_client(dir.path()).await?;
-    let user = registered_user(&state, &[UserPermission::ReadClients]).await?;
-    seed_avail(
-        state.todo_store.as_ref(),
-        "job-1",
-        ExpiresAt::Never,
-        &json!({"clients": [client.as_str()]}),
-    )
-    .await?;
-    state
-        .todo_store
-        .write_suspension(&client, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
-    run_qm(&state).await?;
-
-    let listing = read_conforming(
-        &state,
-        &user,
-        "/api/v1/clients?status=",
-        "ClientListRowPage",
-    )
-    .await?;
-    assert_eq!(
-        row(&listing, client.as_str())?["backlog"]["job_count"],
-        json!(1)
     );
     Ok(())
 }

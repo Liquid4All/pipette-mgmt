@@ -132,7 +132,7 @@ Each object's fields, lifecycle and routes have one home:
   [Campaigns](api/campaigns.md), [Vault](api/vault.md),
   [benchmarks.md §1.1](benchmarks.md#11-private-benchmarks), and the records in
   [storage.md §3.3](storage.md#33-campaigns) and [§3.4](storage.md#34-the-vault).
-- **Operational flags** (suspension, reindex flag, held submission): [queue.md](queue.md)
+- **Operational flags** (reindex flag, held submission): [queue.md](queue.md)
   and [storage.md §4.1](storage.md#41-unverified-submissions).
 - **Server settings that change the rules**: the config reference in
   [`crates/pipette-core/src/config.rs`](../crates/pipette-core/src/config.rs).
@@ -156,7 +156,6 @@ Each object's fields, lifecycle and routes have one home:
 | Plan | cancel | cancel | with `cancel_plans`: plans of its org's campaigns (`org_admin` alone holds none) | with `cancel_plans`: its own plans filed outside a campaign and the plans of its org's campaigns, and, holding `submit_plans` too, the plans of its own campaigns | - |
 | Vault resource | delete | upload, delete | org-owned: upload, delete; for a member: upload, theirs alone after | its own: upload, delete; may upload one for its org, which it cannot then delete | - (fetches its owning user's, and those of the org it rolls up to) |
 | Private benchmark | put, delete | put, delete | put, delete | - (members read it) | - (devices of its org read it) |
-| Suspension | clear | clear | clear | - | - |
 | Held submission | promote, delete, prune | - | - | - | - |
 
 The org admin column skips any account holding an `_any_` name the org admin
@@ -287,10 +286,6 @@ erDiagram
         id benchmark_id "one id, one definition"
         id org_id "the org that keeps it"
     }
-    SUSPENSION {
-        time suspended_at
-        id conflicting_job_id
-    }
     REINDEX_FLAG {
         id client_id
     }
@@ -315,7 +310,6 @@ erDiagram
     JOB }o--o{ VAULT_RESOURCE : "may name"
     JOB }o--o| PRIVATE_BENCHMARK : "may name"
     CLIENT }o..o{ JOB : "claims and reports"
-    CLIENT ||--o| SUSPENSION : "is flagged by"
     CLIENT ||--o| REINDEX_FLAG : "while eligibility is rebuilt"
     CLIENT ||--o{ HELD_SUBMISSION : "while pending"
     CLIENT ||--o| SIGNATURE_MIGRATION : "once it signs v1"
@@ -846,7 +840,7 @@ sequenceDiagram
     M->>M: look up the client, which holds its one public key
     M->>M: timestamp inside 5 minutes, verify the v1 signature, spend it
     M->>M: approved, and holds perform_work
-    M->>M: suspended? flagged for reindex? (each: no job)<br/>a live lease already? an eligible job?
+    M->>M: flagged for reindex? (no job)<br/>a live lease already? an eligible job?
     M-->>D: a job, or none
 ```
 
@@ -1040,40 +1034,30 @@ sequenceDiagram
 The vault gates an organization's artifacts the same way: at the fetch, not at
 the claim.
 
-### 8.13. A crash-looping device is suspended
+### 8.13. A device that crashes on every run
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant D as rack-01
     participant M as mgmt
-    actor A as alice (org_admin of acme)
 
     D->>M: POST /plans/claim
-    alt it already holds exactly one live lease
-        M-->>D: that same job again: a lost response, so the claim is idempotent
-    else it holds more than one: a crash loop piled them up
-        Note over M: suspend it, recording when and one conflicting job
-        M-->>D: no job, the same answer as no work
-    end
-    A->>M: GET /api/v1/clients, where the device shows as suspended
-    A->>M: POST /api/v1/clients/{client_id}/unsuspend
-    Note over M: clears the flag alone, and touches no lease
+    M-->>D: a job, under a lease
+    Note over D: crashes and reboots before it reports
     D->>M: POST /plans/claim
-    alt two or more of its leases are still live
-        M-->>D: no job: suspended again
-    else at most one
-        M-->>D: that job again, or the next one
+    alt the lease is still live
+        M-->>D: that same job again, and the hand-back counts a lost lease
+    else the lease lapsed
+        Note over M: the claim settles it as lost, and the job goes back to the queue
+        M-->>D: a job, under a new lease
     end
+    Note over M: at plan_lost_lease_limit losses the job is retired<br/>with a lease_lost failure
 ```
 
-While suspended, the device's heartbeats and reclaims are refused with `403`,
-so its leases lapse. A claim, heartbeat or reclaim that leaves it a second live
-lease, as racing claims can, suspends it the same way.
-
-The device needs no change: it keeps polling, and resumes once the flag is gone
-and at most one of its leases is live. Source:
-[queue.md](queue.md#claiming-a-job).
+The claim settles the lapsed leases of the device first. On the database queue,
+the claim handles the claims of a device one at a time, so the device never
+holds two live leases. Source: [queue.md](queue.md#claiming-a-job).
 
 ### 8.14. Offboarding an account
 

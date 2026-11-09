@@ -1,9 +1,9 @@
 <script lang="ts">
   // The Overview's summary of the results: what the checks found, each linked to the page or the Jobs filter that
   // lists it.
-  import { e2eText, pairingText } from "../findings";
+  import { e2eText, pairingText, ttftText } from "../findings";
   import { cellsWith, linesOf, listedText } from "../jobs";
-  import { E2E, MISSING, shortLabel, SPEC, SWAP, VL_E2E } from "../report";
+  import { E2E, MISSING, shortLabel, SPEC, SWAP, TTFT_E2E, VL_E2E } from "../report";
   import { issueCounts, type IssueCount } from "../summary";
   import { tabLink, type TabBase } from "../tabs";
   import type { Results } from "../results.svelte";
@@ -32,6 +32,10 @@
   {#if index.vlE2e}
     <div><dt>{shortLabel(VL_E2E)}</dt>
       <dd>{e2eText(index.vlE2e)} <a href={tabLink(base, "analysis", VL_E2E)}>See the check</a></dd></div>
+  {/if}
+  {#if index.ttft}
+    <div><dt>{shortLabel(TTFT_E2E)}</dt>
+      <dd>{ttftText(index.ttft)} <a href={tabLink(base, "analysis", TTFT_E2E)}>See the check</a></dd></div>
   {/if}
   {#if index.pairing}
     <div><dt>VL speculative pairs</dt>

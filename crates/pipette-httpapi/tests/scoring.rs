@@ -25,9 +25,9 @@ use pipette_store::ScoreQueueStage;
 use pipette_store_fs::build_local_fs_stores;
 use pipette_store_testkit::TEST_LIST_LIMIT;
 use pipette_web_testkit::{
-    authed_get, authed_post, body_json, job, make_state, make_state_with_evals_url,
+    QueueBackend, authed_get, authed_post, body_json, job, make_state, make_state_with_evals_url,
     register_and_approve, run_full_score, run_mocked, run_qm, seed_avail, seed_leased,
-    setup_benchmarks, setup_models, submit_benchmark,
+    seeded_queue_state, setup_benchmarks, setup_models, submit_benchmark,
 };
 
 /// Small enough that a run spans several chunks.
@@ -4841,8 +4841,11 @@ async fn test_synthetic_failure_records_its_source(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (_, client_id) = register_and_approve(&state).await?;
+    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (_, client_id) = register_and_approve(state).await?;
 
     let body = failure_job_body("job-1", "prefill_throughput_256", &[client_id.as_str()]);
     let expires_at = match retirement {
@@ -4888,12 +4891,12 @@ async fn test_synthetic_failure_records_its_source(
         }
     }
 
-    run_qm(&state).await?;
+    run_qm(state).await?;
     score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
 
     // A synthetic failure is attributed to the reserved `system` client.
     let system = pipette_plan_types::ClientId::try_new("system")?;
-    let partition = today_partition(&state, "prefill_throughput_256", &system)?;
+    let partition = today_partition(state, "prefill_throughput_256", &system)?;
     assert!(partition.exists(), "expected a synthetic failure partition");
 
     let checked = assert_string_column(&partition, "failure_source", Some(expected_source))?;

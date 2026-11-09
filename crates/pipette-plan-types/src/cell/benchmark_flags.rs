@@ -54,6 +54,14 @@ pub enum BenchmarkFlagsError {
 /// Per-cell run-driving knobs, one variant per supported cell. Distinct from
 /// `ModelFlags` (generation *identity*): these tune how pipette *drives, gates,
 /// and monitors* the run.
+///
+/// `attempt_timeout_seconds` is the wall-clock limit on each attempt: one
+/// warm-up or one measured rep (on `vl_spec_decode`, one sample), each timed
+/// on its own. The warm-up is an uncounted attempt with the same limit, and
+/// model load and server start count against it. Calibration and
+/// readiness-gate waits do not count; each gate has its own
+/// `readiness.max_wait_secs`. An attempt past the limit is stopped and the run
+/// fails. Unset, the client's default applies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, strum::EnumCount)]
 #[cfg_attr(test, derive(strum::IntoStaticStr))]
 // As on `RuntimeFlags`: the variants, their name tags turned into axis keys.
@@ -67,13 +75,16 @@ pub enum BenchmarkFlags {
     // llama.cpp CLI timing cells. End-to-end goes through llama-server, so it
     // also bounds the `/completion` call.
     PrefillThroughputLlamacppCliStockToolsGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputLlamacppCliStockToolsGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyLlamacppCliStockToolsGgufText {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     // llama.cpp CLI — server cells.
@@ -82,26 +93,28 @@ pub enum BenchmarkFlags {
     },
     VlThroughputLlamacppCliStockToolsGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    /// Speech recognition through llama-server: the same two knobs as
+    /// Speech recognition through llama-server: the same knobs as
     /// `vl_throughput`, since it is the same request shape and the same gate.
     AsrThroughputLlamacppCliStockToolsGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     /// Peak-memory VL cell: `http_timeout_seconds` bounds one request,
-    /// `bench_timeout_seconds` the whole workload. No `readiness`: one
+    /// `attempt_timeout_seconds` the whole attempt. No `readiness`: one
     /// unrepeated, thermal-independent measurement.
     VlMaxMemoryLlamacppCliStockToolsGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     /// Peak-memory cell for speech recognition: the same two timeouts and no
     /// `readiness`, for the reasons the VL cell gives.
     AsrMaxMemoryLlamacppCliStockToolsGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     /// The HTTP timeout plus the readiness gate, as on `vl_throughput`: the
     /// vision tower runs thousands of images back to back.
@@ -115,33 +128,35 @@ pub enum BenchmarkFlags {
         http_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    /// A server-driven corpus traversal. `bench_timeout_seconds` bounds it end
-    /// to end, gate waits included (100 on an MMSpec `test` subset): a budget
-    /// sized from generation alone kills a healthy run.
+    /// A server-driven corpus traversal. `attempt_timeout_seconds` bounds each
+    /// sample, all its turns together.
     VlSpecDecodeLlamacppCliStockToolsGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     /// The same traversal with the drafter on, and the same knobs.
     VlSpecDecodeLlamacppCliStockToolsGgufVisionSpeculative {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     // llama.cpp CLI — peak memory. A bare `llama-bench` subprocess, so the
     // wall-clock deadline is the whole surface.
     MaxMemoryUsageLlamacppCliStockToolsGgufText {
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     // MLX (macOS).
     PrefillThroughputMlxMacosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputMlxMacosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyMlxMacosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EvalMlxMacosPipetteMlx {
@@ -150,23 +165,25 @@ pub enum BenchmarkFlags {
     /// The MLX twin of the llama.cpp CLI `vl_throughput` cell, with its knobs.
     VlThroughputMlxMacosPipetteMlx {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     /// The MLX twins of the llama.cpp CLI corpus cells, with the same knobs.
     VlSpecDecodeMlxMacosPipetteMlx {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlSpecDecodeMlxMacosPipetteMlxSpeculative {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // iOS (in-process): `readiness` only, with no HTTP client to bound or
-    // server to watch. `eval` is absent for that reason, the memory kinds
-    // because they do not gate.
+    // iOS (in-process): the attempt limit and `readiness`, with no HTTP client
+    // to bound or server to watch. `eval` is absent for that reason; the
+    // memory cells take the attempt limit alone, since they do not gate.
     PrefillThroughputLlamacppIosPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     /// The iOS twins of the corpus cells: `readiness` only.
@@ -177,88 +194,111 @@ pub enum BenchmarkFlags {
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputLlamacppIosPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyLlamacppIosPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlThroughputLlamacppIosPipetteGgufVision {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     AsrThroughputLlamacppIosPipetteGgufVision {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     PrefillThroughputMlxIosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputMlxIosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyMlxIosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // Android (in-process, as iOS): `readiness` alone. `max_memory_usage` does
-    // not gate, and the app offers no `eval`.
+    // Android (in-process, as iOS): the attempt limit and `readiness`.
+    // `max_memory_usage` does not gate, and the app offers no `eval`.
     PrefillThroughputLlamacppApkPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputLlamacppApkPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyLlamacppApkPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlThroughputLlamacppApkPipetteGgufVision {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     // Torch servers, all over HTTP. Throughput cells are one streamed request
     // per rep, so they bound and gate as the latency cell does.
     PrefillThroughputDockerVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputDockerVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     PrefillThroughputUvVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputUvVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     PrefillThroughputDockerSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputDockerSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     PrefillThroughputUvSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputUvSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyDockerVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyUvVllmTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyDockerSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyUvSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EvalDockerVllmTorch {
@@ -283,81 +323,164 @@ pub enum BenchmarkFlags {
     /// ones.
     VlSpecDecodeDockerSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlSpecDecodeDockerSglangTorchSpeculative {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlSpecDecodeUvSglangTorch {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlSpecDecodeUvSglangTorchSpeculative {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // OpenVINO (uv venv): a rep is a one-shot driver subprocess, so `readiness`
-    // is the whole surface. `max_memory_usage` neither gates nor takes a
-    // deadline, so it has no variant; `eval` and `vl` are unimplemented.
+    // OpenVINO (uv venv): a rep is a one-shot driver subprocess, so the attempt
+    // limit and `readiness` are the whole surface. `max_memory_usage` does not
+    // gate; `eval` and `vl` are unimplemented.
     PrefillThroughputUvOpenvinoOpenvino {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputUvOpenvinoOpenvino {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyUvOpenvinoOpenvino {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     // OVMS — timing cells. An HTTP server like the torch ones, so the same
     // bound and gate. `eval` and the `vl` cells are unimplemented.
     PrefillThroughputOvmsOpenvino {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputOvmsOpenvino {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyOvmsOpenvino {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // ONNX Runtime GenAI (uv venv): as OpenVINO, `readiness` alone; `eval` and
-    // the `vl` cells are unimplemented.
+    // ONNX Runtime GenAI (uv venv): as OpenVINO; `eval` and the `vl` cells are unimplemented.
     PrefillThroughputUvOnnxGenaiOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputUvOnnxGenaiOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyUvOnnxGenaiOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // ONNX Runtime GenAI (iOS, in-process): `readiness` alone. No `eval`:
+    // ONNX Runtime GenAI (iOS, in-process): as the other iOS cells. No `eval`:
     // `OGATokenizer` applies no chat template, so the app cannot produce it.
     PrefillThroughputOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     DecodeThroughputOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     // TensorRT Edge-LLM: the llama.cpp CLI VL cells' knobs. The engine build
     // runs before the server starts, so neither timeout covers it.
     VlThroughputTrtEdgellmGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
     VlMaxMemoryTrtEdgellmGgufVision {
         http_timeout_seconds: Option<PositiveSeconds>,
-        bench_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    // The attempt limit alone: memory cells, which do not gate.
+    MaxMemoryUsageMlxMacosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageDockerVllmTorch {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageUvVllmTorch {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageDockerSglangTorch {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageUvSglangTorch {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageUvOpenvinoOpenvino {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageOvmsOpenvino {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageUvOnnxGenaiOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageLlamacppIosPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageMlxIosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageLlamacppApkPipetteGgufText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    VlMaxMemoryMlxMacosPipetteMlx {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    VlMaxMemoryLlamacppIosPipetteGgufVision {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    AsrMaxMemoryLlamacppIosPipetteGgufVision {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    // Core AI and Apple Foundation timing cells: no HTTP server, so the attempt
+    // limit and `readiness`.
+    PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    DecodeThroughputAppleFoundationAppleFoundationText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    EndToEndLatencyAppleFoundationAppleFoundationText {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
     },
 }
 
@@ -568,6 +691,81 @@ impl BenchmarkFlags {
             BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision { .. } => {
                 (B::VlMaxMemory, R::TrtEdgellm, M::GgufVision)
             }
+            BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx { .. } => {
+                (B::MaxMemoryUsage, R::MlxMacosPipette, M::Mlx)
+            }
+            BenchmarkFlags::MaxMemoryUsageDockerVllmTorch { .. } => {
+                (B::MaxMemoryUsage, R::DockerVllm, M::Torch)
+            }
+            BenchmarkFlags::MaxMemoryUsageUvVllmTorch { .. } => {
+                (B::MaxMemoryUsage, R::UvVllm, M::Torch)
+            }
+            BenchmarkFlags::MaxMemoryUsageDockerSglangTorch { .. } => {
+                (B::MaxMemoryUsage, R::DockerSglang, M::Torch)
+            }
+            BenchmarkFlags::MaxMemoryUsageUvSglangTorch { .. } => {
+                (B::MaxMemoryUsage, R::UvSglang, M::Torch)
+            }
+            BenchmarkFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. } => {
+                (B::MaxMemoryUsage, R::UvOpenvino, M::Openvino)
+            }
+            BenchmarkFlags::MaxMemoryUsageOvmsOpenvino { .. } => {
+                (B::MaxMemoryUsage, R::Ovms, M::Openvino)
+            }
+            BenchmarkFlags::MaxMemoryUsageUvOnnxGenaiOnnxGenai { .. } => {
+                (B::MaxMemoryUsage, R::UvOnnxGenai, M::OnnxGenai)
+            }
+            BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText { .. } => {
+                (B::MaxMemoryUsage, R::LlamacppIosPipette, M::GgufText)
+            }
+            BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx { .. } => {
+                (B::MaxMemoryUsage, R::MlxIosPipette, M::Mlx)
+            }
+            BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. } => {
+                (B::MaxMemoryUsage, R::OnnxGenaiIosPipette, M::OnnxGenai)
+            }
+            BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. } => {
+                (B::MaxMemoryUsage, R::LlamacppApkPipette, M::GgufText)
+            }
+            BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi { .. } => (
+                B::MaxMemoryUsage,
+                R::AppleCoreAiMacosPipette,
+                M::AppleCoreAi,
+            ),
+            BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx { .. } => {
+                (B::VlMaxMemory, R::MlxMacosPipette, M::Mlx)
+            }
+            BenchmarkFlags::VlMaxMemoryLlamacppIosPipetteGgufVision { .. } => {
+                (B::VlMaxMemory, R::LlamacppIosPipette, M::GgufVision)
+            }
+            BenchmarkFlags::AsrMaxMemoryLlamacppIosPipetteGgufVision { .. } => {
+                (B::AsrMaxMemory, R::LlamacppIosPipette, M::GgufVision)
+            }
+            BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi { .. } => (
+                B::PrefillThroughput,
+                R::AppleCoreAiMacosPipette,
+                M::AppleCoreAi,
+            ),
+            BenchmarkFlags::DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi { .. } => (
+                B::DecodeThroughput,
+                R::AppleCoreAiMacosPipette,
+                M::AppleCoreAi,
+            ),
+            BenchmarkFlags::EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi { .. } => (
+                B::EndToEndLatency,
+                R::AppleCoreAiMacosPipette,
+                M::AppleCoreAi,
+            ),
+            BenchmarkFlags::DecodeThroughputAppleFoundationAppleFoundationText { .. } => (
+                B::DecodeThroughput,
+                R::AppleFoundation,
+                M::AppleFoundationText,
+            ),
+            BenchmarkFlags::EndToEndLatencyAppleFoundationAppleFoundationText { .. } => (
+                B::EndToEndLatency,
+                R::AppleFoundation,
+                M::AppleFoundationText,
+            ),
         }
     }
 
@@ -773,120 +971,347 @@ impl BenchmarkFlags {
             | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { .. }
             | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
             | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
-            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { .. } => None,
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx { .. }
+            | BenchmarkFlags::MaxMemoryUsageDockerVllmTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvVllmTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageDockerSglangTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvSglangTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | BenchmarkFlags::MaxMemoryUsageOvmsOpenvino { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvOnnxGenaiOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText { .. }
+            | BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx { .. }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. }
+            | BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi { .. }
+            | BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx { .. }
+            | BenchmarkFlags::VlMaxMemoryLlamacppIosPipetteGgufVision { .. }
+            | BenchmarkFlags::AsrMaxMemoryLlamacppIosPipetteGgufVision { .. }
+            | BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi { .. }
+            | BenchmarkFlags::DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi { .. }
+            | BenchmarkFlags::EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi { .. }
+            | BenchmarkFlags::DecodeThroughputAppleFoundationAppleFoundationText { .. }
+            | BenchmarkFlags::EndToEndLatencyAppleFoundationAppleFoundationText { .. } => None,
         }
     }
 
-    /// The whole-workload wall-clock deadline, on the cells that take one;
-    /// `None` keeps the engine's default. [`Self::http_timeout`] bounds one
+    /// The wall-clock limit on one attempt at the cell, on the cells that take
+    /// one; `None` keeps the client's default. [`Self::http_timeout`] bounds one
     /// request.
-    pub fn bench_timeout(&self) -> Option<PositiveSeconds> {
+    pub fn attempt_timeout(&self) -> Option<PositiveSeconds> {
         match self {
-            BenchmarkFlags::MaxMemoryUsageLlamacppCliStockToolsGgufText {
-                bench_timeout_seconds,
+            BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputLlamacppCliStockToolsGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision {
+                attempt_timeout_seconds,
+                ..
             }
             | BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeLlamacppCliStockToolsGgufVision {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeLlamacppCliStockToolsGgufVisionSpeculative {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::PrefillThroughputMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeMlxMacosPipetteMlx {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeMlxMacosPipetteMlxSpeculative {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputLlamacppIosPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputLlamacppIosPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyLlamacppIosPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputLlamacppIosPipetteGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::AsrThroughputLlamacppIosPipetteGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputMlxIosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputMlxIosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyMlxIosPipetteMlx {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputDockerVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputDockerVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputUvVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputUvVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputDockerSglangTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputDockerSglangTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputUvSglangTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputUvSglangTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyDockerVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyUvVllmTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyDockerSglangTorch {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyUvSglangTorch {
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeDockerSglangTorch {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeDockerSglangTorchSpeculative {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeUvSglangTorch {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlSpecDecodeUvSglangTorchSpeculative {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputOvmsOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputOvmsOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyOvmsOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputUvOnnxGenaiOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputTrtEdgellmGgufVision {
+                attempt_timeout_seconds,
                 ..
             }
             | BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision {
-                bench_timeout_seconds,
+                attempt_timeout_seconds,
                 ..
-            } => *bench_timeout_seconds,
-            BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText { .. }
-            | BenchmarkFlags::DecodeThroughputLlamacppCliStockToolsGgufText { .. }
-            | BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText { .. }
-            | BenchmarkFlags::EvalLlamacppCliStockToolsGgufText { .. }
-            | BenchmarkFlags::VlThroughputLlamacppCliStockToolsGgufVision { .. }
-            | BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision { .. }
+            }
+            | BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageDockerVllmTorch {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageUvVllmTorch {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageDockerSglangTorch {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageUvSglangTorch {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageOvmsOpenvino {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageUvOnnxGenaiOnnxGenai {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::VlMaxMemoryLlamacppIosPipetteGgufVision {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::AsrMaxMemoryLlamacppIosPipetteGgufVision {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecodeThroughputAppleFoundationAppleFoundationText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyAppleFoundationAppleFoundationText {
+                attempt_timeout_seconds,
+                ..
+            } => *attempt_timeout_seconds,
+            BenchmarkFlags::EvalLlamacppCliStockToolsGgufText { .. }
             | BenchmarkFlags::VlmEvalLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::AsrEvalLlamacppCliStockToolsGgufVision { .. }
-            | BenchmarkFlags::PrefillThroughputMlxMacosPipetteMlx { .. }
-            | BenchmarkFlags::DecodeThroughputMlxMacosPipetteMlx { .. }
-            | BenchmarkFlags::EndToEndLatencyMlxMacosPipetteMlx { .. }
             | BenchmarkFlags::EvalMlxMacosPipetteMlx { .. }
-            | BenchmarkFlags::VlThroughputMlxMacosPipetteMlx { .. }
-            | BenchmarkFlags::PrefillThroughputLlamacppIosPipetteGgufText { .. }
-            | BenchmarkFlags::VlThroughputLlamacppIosPipetteGgufVision { .. }
-            | BenchmarkFlags::AsrThroughputLlamacppIosPipetteGgufVision { .. }
             | BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVision { .. }
             | BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVisionSpeculative { .. }
-            | BenchmarkFlags::DecodeThroughputLlamacppIosPipetteGgufText { .. }
-            | BenchmarkFlags::EndToEndLatencyLlamacppIosPipetteGgufText { .. }
-            | BenchmarkFlags::PrefillThroughputMlxIosPipetteMlx { .. }
-            | BenchmarkFlags::DecodeThroughputMlxIosPipetteMlx { .. }
-            | BenchmarkFlags::EndToEndLatencyMlxIosPipetteMlx { .. }
-            | BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText { .. }
-            | BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText { .. }
-            | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText { .. }
-            | BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision { .. }
-            | BenchmarkFlags::PrefillThroughputDockerVllmTorch { .. }
-            | BenchmarkFlags::DecodeThroughputDockerVllmTorch { .. }
-            | BenchmarkFlags::PrefillThroughputUvVllmTorch { .. }
-            | BenchmarkFlags::DecodeThroughputUvVllmTorch { .. }
-            | BenchmarkFlags::PrefillThroughputDockerSglangTorch { .. }
-            | BenchmarkFlags::DecodeThroughputDockerSglangTorch { .. }
-            | BenchmarkFlags::PrefillThroughputUvSglangTorch { .. }
-            | BenchmarkFlags::DecodeThroughputUvSglangTorch { .. }
-            | BenchmarkFlags::EndToEndLatencyDockerVllmTorch { .. }
-            | BenchmarkFlags::EndToEndLatencyUvVllmTorch { .. }
-            | BenchmarkFlags::EndToEndLatencyDockerSglangTorch { .. }
-            | BenchmarkFlags::EndToEndLatencyUvSglangTorch { .. }
             | BenchmarkFlags::EvalDockerVllmTorch { .. }
             | BenchmarkFlags::EvalUvVllmTorch { .. }
             | BenchmarkFlags::VlmEvalUvVllmTorch { .. }
             | BenchmarkFlags::AsrEvalUvVllmTorch { .. }
             | BenchmarkFlags::EvalDockerSglangTorch { .. }
-            | BenchmarkFlags::EvalUvSglangTorch { .. }
-            | BenchmarkFlags::PrefillThroughputUvOpenvinoOpenvino { .. }
-            | BenchmarkFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
-            | BenchmarkFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
-            | BenchmarkFlags::PrefillThroughputOvmsOpenvino { .. }
-            | BenchmarkFlags::DecodeThroughputOvmsOpenvino { .. }
-            | BenchmarkFlags::EndToEndLatencyOvmsOpenvino { .. }
-            | BenchmarkFlags::PrefillThroughputUvOnnxGenaiOnnxGenai { .. }
-            | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai { .. }
-            | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { .. }
-            | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
-            | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
-            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { .. }
-            | BenchmarkFlags::VlThroughputTrtEdgellmGgufVision { .. } => None,
+            | BenchmarkFlags::EvalUvSglangTorch { .. } => None,
         }
     }
 
@@ -894,8 +1319,10 @@ impl BenchmarkFlags {
     /// when the cell set no override.
     pub fn readiness(&self) -> Option<&ReadinessOverrides> {
         match self {
-            BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText { readiness }
-            | BenchmarkFlags::DecodeThroughputLlamacppCliStockToolsGgufText { readiness }
+            BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText {
+                readiness, ..
+            }
+            | BenchmarkFlags::DecodeThroughputLlamacppCliStockToolsGgufText { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText { readiness, .. }
             | BenchmarkFlags::VlThroughputLlamacppCliStockToolsGgufVision { readiness, .. }
             | BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision { readiness, .. }
@@ -913,22 +1340,22 @@ impl BenchmarkFlags {
             | BenchmarkFlags::VlSpecDecodeDockerSglangTorchSpeculative { readiness, .. }
             | BenchmarkFlags::VlSpecDecodeUvSglangTorch { readiness, .. }
             | BenchmarkFlags::VlSpecDecodeUvSglangTorchSpeculative { readiness, .. }
-            | BenchmarkFlags::PrefillThroughputMlxMacosPipetteMlx { readiness }
-            | BenchmarkFlags::DecodeThroughputMlxMacosPipetteMlx { readiness }
-            | BenchmarkFlags::EndToEndLatencyMlxMacosPipetteMlx { readiness }
+            | BenchmarkFlags::PrefillThroughputMlxMacosPipetteMlx { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputMlxMacosPipetteMlx { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyMlxMacosPipetteMlx { readiness, .. }
             | BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVision { readiness, .. }
             | BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVisionSpeculative {
                 readiness,
                 ..
             }
-            | BenchmarkFlags::PrefillThroughputLlamacppIosPipetteGgufText { readiness }
-            | BenchmarkFlags::VlThroughputLlamacppIosPipetteGgufVision { readiness }
-            | BenchmarkFlags::AsrThroughputLlamacppIosPipetteGgufVision { readiness }
-            | BenchmarkFlags::DecodeThroughputLlamacppIosPipetteGgufText { readiness }
-            | BenchmarkFlags::EndToEndLatencyLlamacppIosPipetteGgufText { readiness }
-            | BenchmarkFlags::PrefillThroughputMlxIosPipetteMlx { readiness }
-            | BenchmarkFlags::DecodeThroughputMlxIosPipetteMlx { readiness }
-            | BenchmarkFlags::EndToEndLatencyMlxIosPipetteMlx { readiness }
+            | BenchmarkFlags::PrefillThroughputLlamacppIosPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::VlThroughputLlamacppIosPipetteGgufVision { readiness, .. }
+            | BenchmarkFlags::AsrThroughputLlamacppIosPipetteGgufVision { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputLlamacppIosPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyLlamacppIosPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::PrefillThroughputMlxIosPipetteMlx { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputMlxIosPipetteMlx { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyMlxIosPipetteMlx { readiness, .. }
             | BenchmarkFlags::PrefillThroughputDockerVllmTorch { readiness, .. }
             | BenchmarkFlags::DecodeThroughputDockerVllmTorch { readiness, .. }
             | BenchmarkFlags::PrefillThroughputUvVllmTorch { readiness, .. }
@@ -941,25 +1368,41 @@ impl BenchmarkFlags {
             | BenchmarkFlags::EndToEndLatencyUvVllmTorch { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyDockerSglangTorch { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyUvSglangTorch { readiness, .. }
-            | BenchmarkFlags::PrefillThroughputUvOpenvinoOpenvino { readiness }
-            | BenchmarkFlags::DecodeThroughputUvOpenvinoOpenvino { readiness }
-            | BenchmarkFlags::EndToEndLatencyUvOpenvinoOpenvino { readiness }
+            | BenchmarkFlags::PrefillThroughputUvOpenvinoOpenvino { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputUvOpenvinoOpenvino { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyUvOpenvinoOpenvino { readiness, .. }
             | BenchmarkFlags::PrefillThroughputOvmsOpenvino { readiness, .. }
             | BenchmarkFlags::DecodeThroughputOvmsOpenvino { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyOvmsOpenvino { readiness, .. }
-            | BenchmarkFlags::PrefillThroughputUvOnnxGenaiOnnxGenai { readiness }
-            | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai { readiness }
-            | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { readiness }
-            | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { readiness }
-            | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { readiness }
-            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { readiness }
-            | BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText { readiness }
-            | BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText { readiness }
-            | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText { readiness }
-            | BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision { readiness }
-            | BenchmarkFlags::VlThroughputTrtEdgellmGgufVision { readiness, .. } => {
-                readiness.as_ref()
+            | BenchmarkFlags::PrefillThroughputUvOnnxGenaiOnnxGenai { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { readiness, .. }
+            | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText { readiness, .. }
+            | BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision { readiness, .. }
+            | BenchmarkFlags::VlThroughputTrtEdgellmGgufVision { readiness, .. }
+            | BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                readiness,
+                ..
             }
+            | BenchmarkFlags::DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                readiness,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi {
+                readiness, ..
+            }
+            | BenchmarkFlags::DecodeThroughputAppleFoundationAppleFoundationText {
+                readiness,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyAppleFoundationAppleFoundationText {
+                readiness, ..
+            } => readiness.as_ref(),
             BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision { .. }
             | BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision { .. }
@@ -971,7 +1414,23 @@ impl BenchmarkFlags {
             | BenchmarkFlags::AsrEvalUvVllmTorch { .. }
             | BenchmarkFlags::EvalDockerSglangTorch { .. }
             | BenchmarkFlags::EvalUvSglangTorch { .. }
-            | BenchmarkFlags::MaxMemoryUsageLlamacppCliStockToolsGgufText { .. } => None,
+            | BenchmarkFlags::MaxMemoryUsageLlamacppCliStockToolsGgufText { .. }
+            | BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx { .. }
+            | BenchmarkFlags::MaxMemoryUsageDockerVllmTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvVllmTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageDockerSglangTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvSglangTorch { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | BenchmarkFlags::MaxMemoryUsageOvmsOpenvino { .. }
+            | BenchmarkFlags::MaxMemoryUsageUvOnnxGenaiOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText { .. }
+            | BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx { .. }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. }
+            | BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi { .. }
+            | BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx { .. }
+            | BenchmarkFlags::VlMaxMemoryLlamacppIosPipetteGgufVision { .. }
+            | BenchmarkFlags::AsrMaxMemoryLlamacppIosPipetteGgufVision { .. } => None,
         }
     }
 }
@@ -987,7 +1446,11 @@ pub struct BenchmarkFlagRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_timeout_seconds: Option<PositiveSeconds>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bench_timeout_seconds: Option<PositiveSeconds>,
+    pub attempt_timeout_seconds: Option<PositiveSeconds>,
+    /// Obsolete, absorbed unread: queued specs and recorded results still
+    /// carry it, and `deny_unknown_fields` would refuse the cell over it.
+    #[serde(rename = "bench_timeout_seconds", default, skip_serializing)]
+    pub _bench_timeout_obsolete: Option<serde_json::Value>,
     /// Obsolete, absorbed unread: mgmt still sends `doomloop` on eval claims,
     /// and `deny_unknown_fields` would refuse the cell over it.
     #[serde(rename = "doomloop", default, skip_serializing)]
@@ -1065,10 +1528,10 @@ impl BenchmarkFlagRef {
         self.deny(self.http_timeout_seconds.is_some(), "http_timeout_seconds")
     }
 
-    fn deny_bench_timeout(&self) -> Result<(), BenchmarkFlagsError> {
+    fn deny_attempt_timeout(&self) -> Result<(), BenchmarkFlagsError> {
         self.deny(
-            self.bench_timeout_seconds.is_some(),
-            "bench_timeout_seconds",
+            self.attempt_timeout_seconds.is_some(),
+            "attempt_timeout_seconds",
         )
     }
 
@@ -1091,97 +1554,97 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             (B::VlSpecDecode, R::MlxMacosPipette, M::Mlx) => {
                 BenchmarkFlags::VlSpecDecodeMlxMacosPipetteMlx {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::MlxMacosPipette, M::MlxSpeculative) => {
                 BenchmarkFlags::VlSpecDecodeMlxMacosPipetteMlxSpeculative {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::DockerSglang, M::Torch) => {
                 BenchmarkFlags::VlSpecDecodeDockerSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::DockerSglang, M::TorchSpeculative) => {
                 BenchmarkFlags::VlSpecDecodeDockerSglangTorchSpeculative {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::UvSglang, M::Torch) => BenchmarkFlags::VlSpecDecodeUvSglangTorch {
                 http_timeout_seconds: r.http_timeout_seconds,
-                bench_timeout_seconds: r.bench_timeout_seconds,
+                attempt_timeout_seconds: r.attempt_timeout_seconds,
                 readiness: r.readiness,
             },
             (B::VlSpecDecode, R::UvSglang, M::TorchSpeculative) => {
                 BenchmarkFlags::VlSpecDecodeUvSglangTorchSpeculative {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::LlamacppCliStockTools, M::GgufVision) => {
                 BenchmarkFlags::VlSpecDecodeLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::LlamacppCliStockTools, M::GgufVisionSpeculative) => {
                 BenchmarkFlags::VlSpecDecodeLlamacppCliStockToolsGgufVisionSpeculative {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             // Timing cells.
             (B::PrefillThroughput, R::LlamacppCliStockTools, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::LlamacppCliStockTools, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputLlamacppCliStockToolsGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::LlamacppCliStockTools, M::GgufText) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::MlxMacosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputMlxMacosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::MlxMacosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputMlxMacosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::MlxMacosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyMlxMacosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
@@ -1189,290 +1652,290 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             // process this engine does not spawn.
             (B::VlSpecDecode, R::LlamacppIosPipette, M::GgufVision) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVision {
                     readiness: r.readiness,
                 }
             }
             (B::VlSpecDecode, R::LlamacppIosPipette, M::GgufVisionSpeculative) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::VlSpecDecodeLlamacppIosPipetteGgufVisionSpeculative {
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::LlamacppIosPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputLlamacppIosPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::LlamacppIosPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputLlamacppIosPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::LlamacppIosPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyLlamacppIosPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlThroughput, R::LlamacppIosPipette, M::GgufVision) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::VlThroughputLlamacppIosPipetteGgufVision {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::AsrThroughput, R::LlamacppIosPipette, M::GgufVision) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::AsrThroughputLlamacppIosPipetteGgufVision {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::MlxIosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputMlxIosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::MlxIosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputMlxIosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::MlxIosPipette, M::Mlx) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyMlxIosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::LlamacppApkPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::LlamacppApkPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::LlamacppApkPipette, M::GgufText) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlThroughput, R::LlamacppApkPipette, M::GgufVision) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::UvOpenvino, M::Openvino) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputUvOpenvinoOpenvino {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::UvOpenvino, M::Openvino) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputUvOpenvinoOpenvino {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::UvOpenvino, M::Openvino) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyUvOpenvinoOpenvino {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::Ovms, M::Openvino) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputOvmsOpenvino {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::Ovms, M::Openvino) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputOvmsOpenvino {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::Ovms, M::Openvino) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyOvmsOpenvino {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::UvOnnxGenai, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputUvOnnxGenaiOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::UvOnnxGenai, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::UvOnnxGenai, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::DockerVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputDockerVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::DockerVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputDockerVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::UvVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::UvVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::DockerSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputDockerSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::DockerSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputDockerSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::UvSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputUvSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::UvSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputUvSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::PrefillThroughput, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::DecodeThroughput, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
                 r.deny_http()?;
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::DockerVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyDockerVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::UvVllm, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::DockerSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyDockerSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::EndToEndLatency, R::UvSglang, M::Torch) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::EndToEndLatencyUvSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             // vl-throughput: HTTP timeout + readiness.
             (B::VlThroughput, R::LlamacppCliStockTools, M::GgufVision) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::VlThroughputLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             // As vl_throughput.
             (B::AsrThroughput, R::LlamacppCliStockTools, M::GgufVision) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
             (B::VlThroughput, R::MlxMacosPipette, M::Mlx) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::VlThroughputMlxMacosPipetteMlx {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
@@ -1480,7 +1943,7 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             // the vision tower runs thousands of images back-to-back, so the
             // readiness gate matters here as much as on the timing cells.
             (B::VlmEval, R::LlamacppCliStockTools, M::GgufVision) => {
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::VlmEvalLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
                     readiness: r.readiness,
@@ -1488,7 +1951,7 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             }
             // asr-eval: the vlm_eval shape, clips instead of images.
             (B::AsrEval, R::LlamacppCliStockTools, M::GgufVision) => {
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::AsrEvalLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
                     readiness: r.readiness,
@@ -1499,7 +1962,7 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                 r.deny_readiness()?;
                 BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
             }
             // As vl_max_memory.
@@ -1507,14 +1970,14 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                 r.deny_readiness()?;
                 BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
             }
             // TensorRT Edge-LLM: as the llama.cpp CLI VL cells above.
             (B::VlThroughput, R::TrtEdgellm, M::GgufVision) => {
-                r.deny_bench_timeout()?;
                 BenchmarkFlags::VlThroughputTrtEdgellmGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
             }
@@ -1522,7 +1985,7 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                 r.deny_readiness()?;
                 BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
             }
             // max_memory_usage: the subprocess deadline only (see module docs).
@@ -1530,64 +1993,211 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                 r.deny_http()?;
                 r.deny_readiness()?;
                 BenchmarkFlags::MaxMemoryUsageLlamacppCliStockToolsGgufText {
-                    bench_timeout_seconds: r.bench_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
             }
             // eval: HTTP timeout (no readiness).
             (B::Eval, R::LlamacppCliStockTools, M::GgufText) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalLlamacppCliStockToolsGgufText {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::Eval, R::MlxMacosPipette, M::Mlx) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalMlxMacosPipetteMlx {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::Eval, R::DockerVllm, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalDockerVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::Eval, R::UvVllm, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::VlmEval, R::UvVllm, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::VlmEvalUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::AsrEval, R::UvVllm, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::AsrEvalUvVllmTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::Eval, R::DockerSglang, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalDockerSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
                 }
             }
             (B::Eval, R::UvSglang, M::Torch) => {
                 r.deny_readiness()?;
-                r.deny_bench_timeout()?;
+                r.deny_attempt_timeout()?;
                 BenchmarkFlags::EvalUvSglangTorch {
                     http_timeout_seconds: r.http_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::MlxMacosPipette, M::Mlx) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::DockerVllm, M::Torch) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageDockerVllmTorch {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::UvVllm, M::Torch) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageUvVllmTorch {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::DockerSglang, M::Torch) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageDockerSglangTorch {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::UvSglang, M::Torch) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageUvSglangTorch {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::UvOpenvino, M::Openvino) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageUvOpenvinoOpenvino {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::Ovms, M::Openvino) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageOvmsOpenvino {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::UvOnnxGenai, M::OnnxGenai) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageUvOnnxGenaiOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::LlamacppIosPipette, M::GgufText) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::MlxIosPipette, M::Mlx) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::LlamacppApkPipette, M::GgufText) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::AppleCoreAiMacosPipette, M::AppleCoreAi) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::VlMaxMemory, R::MlxMacosPipette, M::Mlx) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::VlMaxMemory, R::LlamacppIosPipette, M::GgufVision) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::VlMaxMemoryLlamacppIosPipetteGgufVision {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::AsrMaxMemory, R::LlamacppIosPipette, M::GgufVision) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::AsrMaxMemoryLlamacppIosPipetteGgufVision {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::PrefillThroughput, R::AppleCoreAiMacosPipette, M::AppleCoreAi) => {
+                r.deny_http()?;
+                BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::DecodeThroughput, R::AppleCoreAiMacosPipette, M::AppleCoreAi) => {
+                r.deny_http()?;
+                BenchmarkFlags::DecodeThroughputAppleCoreAiMacosPipetteAppleCoreAi {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::EndToEndLatency, R::AppleCoreAiMacosPipette, M::AppleCoreAi) => {
+                r.deny_http()?;
+                BenchmarkFlags::EndToEndLatencyAppleCoreAiMacosPipetteAppleCoreAi {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::DecodeThroughput, R::AppleFoundation, M::AppleFoundationText) => {
+                r.deny_http()?;
+                BenchmarkFlags::DecodeThroughputAppleFoundationAppleFoundationText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::EndToEndLatency, R::AppleFoundation, M::AppleFoundationText) => {
+                r.deny_http()?;
+                BenchmarkFlags::EndToEndLatencyAppleFoundationAppleFoundationText {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
                 }
             }
             _ => {
@@ -1610,8 +2220,9 @@ impl From<BenchmarkFlags> for BenchmarkFlagRef {
             model_type,
             benchmark_type,
             http_timeout_seconds: f.http_timeout(),
-            bench_timeout_seconds: f.bench_timeout(),
+            attempt_timeout_seconds: f.attempt_timeout(),
             _doomloop_obsolete: None,
+            _bench_timeout_obsolete: None,
             readiness: f.readiness().cloned(),
         }
     }
@@ -1622,7 +2233,10 @@ mod submission_tests {
     use super::*;
 
     fn prefill_flags(readiness: Option<ReadinessOverrides>) -> BenchmarkFlags {
-        BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText { readiness }
+        BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText {
+            attempt_timeout_seconds: None,
+            readiness,
+        }
     }
 
     #[test]
@@ -1691,8 +2305,9 @@ mod submission_tests {
             runtime_type: RuntimeType::LlamacppCliStockTools,
             model_type: ModelType::GgufText,
             http_timeout_seconds: None,
-            bench_timeout_seconds: None,
+            attempt_timeout_seconds: None,
             _doomloop_obsolete: None,
+            _bench_timeout_obsolete: None,
             readiness: Some(ReadinessOverrides {
                 max_wait_secs: Some(300),
                 skip_thermal: Some(false),
@@ -1724,8 +2339,9 @@ mod tests {
             model_type,
             benchmark_type,
             http_timeout_seconds: None,
-            bench_timeout_seconds: None,
+            attempt_timeout_seconds: None,
             _doomloop_obsolete: None,
+            _bench_timeout_obsolete: None,
             readiness: None,
         }
     }
@@ -1892,6 +2508,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let flags = BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText {
             http_timeout_seconds: None,
+            attempt_timeout_seconds: None,
             readiness: None,
         };
         let (runtime, model): (Runtime, Model) = (toml::from_str(runtime)?, toml::from_str(model)?);
@@ -1947,10 +2564,13 @@ mod tests {
             ModelType::GgufVision,
         );
         r.http_timeout_seconds = Some(PositiveSeconds::try_new(900)?);
-        r.bench_timeout_seconds = Some(PositiveSeconds::try_new(2400)?);
+        r.attempt_timeout_seconds = Some(PositiveSeconds::try_new(2400)?);
         let flags = BenchmarkFlags::try_from(r)?;
         assert_eq!(flags.http_timeout(), Some(PositiveSeconds::try_new(900)?));
-        assert_eq!(flags.bench_timeout(), Some(PositiveSeconds::try_new(2400)?));
+        assert_eq!(
+            flags.attempt_timeout(),
+            Some(PositiveSeconds::try_new(2400)?)
+        );
         assert!(flags.readiness().is_none());
 
         let mut r = cell_ref(
@@ -1999,39 +2619,15 @@ mod tests {
                 ModelType::GgufText,
             ),
             cell_ref(
-                BenchmarkType::MaxMemoryUsage,
-                RuntimeType::LlamacppApkPipette,
-                ModelType::GgufText,
-            ),
-            cell_ref(
                 BenchmarkType::Eval,
                 RuntimeType::LlamacppIosPipette,
                 ModelType::GgufText,
             ),
+            // Apple Foundation runs no prefill cell.
             cell_ref(
-                BenchmarkType::VlMaxMemory,
-                RuntimeType::LlamacppIosPipette,
-                ModelType::GgufVision,
-            ),
-            cell_ref(
-                BenchmarkType::AsrMaxMemory,
-                RuntimeType::LlamacppIosPipette,
-                ModelType::GgufVision,
-            ),
-            cell_ref(
-                BenchmarkType::MaxMemoryUsage,
-                RuntimeType::MlxIosPipette,
-                ModelType::Mlx,
-            ),
-            cell_ref(
-                BenchmarkType::MaxMemoryUsage,
-                RuntimeType::UvOpenvino,
-                ModelType::Openvino,
-            ),
-            cell_ref(
-                BenchmarkType::MaxMemoryUsage,
-                RuntimeType::Ovms,
-                ModelType::Openvino,
+                BenchmarkType::PrefillThroughput,
+                RuntimeType::AppleFoundation,
+                ModelType::AppleFoundationText,
             ),
             // Only the two VL cells run on TensorRT Edge-LLM.
             cell_ref(
@@ -2054,8 +2650,8 @@ mod tests {
 
     /// A plan bypasses clap's `range(1..)`, so the type itself refuses zero.
     #[rstest::rstest]
-    #[case::text_bench("max_memory_usage", "gguf_text", "bench_timeout_seconds")]
-    #[case::vl_bench("vl_max_memory", "gguf_vision", "bench_timeout_seconds")]
+    #[case::text_bench("max_memory_usage", "gguf_text", "attempt_timeout_seconds")]
+    #[case::vl_bench("vl_max_memory", "gguf_vision", "attempt_timeout_seconds")]
     #[case::vl_http("vl_max_memory", "gguf_vision", "http_timeout_seconds")]
     #[case::eval_http("eval", "gguf_text", "http_timeout_seconds")]
     fn a_zero_timeout_is_rejected(
@@ -2077,6 +2673,61 @@ mod tests {
     }
 
     #[test]
+    fn the_old_limit_is_absorbed_and_dropped() -> anyhow::Result<()> {
+        let wire = format!(
+            "{}bench_timeout_seconds = 1200\nattempt_timeout_seconds = 300\n",
+            axes_wire("max_memory_usage", "llamacpp_cli_stock_tools", "gguf_text")
+        );
+        let flags = parse(&wire)?;
+        anyhow::ensure!(flags.attempt_timeout() == Some(PositiveSeconds::try_new(300)?));
+        let (toml, json) = (toml::to_string(&flags)?, serde_json::to_string(&flags)?);
+        anyhow::ensure!(!toml.contains("bench_timeout"), "toml: {toml}");
+        anyhow::ensure!(!json.contains("bench_timeout"), "json: {json}");
+        Ok(())
+    }
+
+    /// Results recorded before the new field carry the old key.
+    #[test]
+    fn a_stored_row_with_the_old_limit_reads_back_without_one() -> anyhow::Result<()> {
+        let read = BenchmarkFlags::from_cell_json(
+            r#"{"http_timeout_seconds":600,"bench_timeout_seconds":10800}"#,
+            RuntimeType::MlxMacosPipette,
+            ModelType::Mlx,
+            BenchmarkType::VlSpecDecode,
+        )?;
+        anyhow::ensure!(
+            read.as_ref().is_some_and(|f| f.attempt_timeout().is_none()),
+            "read back as {read:?}"
+        );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case("eval", "llamacpp_cli_stock_tools", "gguf_text")]
+    #[case("eval", "uv_vllm", "torch")]
+    #[case("vlm_eval", "llamacpp_cli_stock_tools", "gguf_vision")]
+    #[case("asr_eval", "uv_vllm", "torch")]
+    #[case("vl_spec_decode", "llamacpp_ios_pipette", "gguf_vision")]
+    fn cells_without_an_attempt_limit_refuse_it_by_name(
+        #[case] benchmark: &str,
+        #[case] runtime: &str,
+        #[case] model: &str,
+    ) -> anyhow::Result<()> {
+        let wire = format!(
+            "{}attempt_timeout_seconds = 300\n",
+            axes_wire(benchmark, runtime, model)
+        );
+        let Err(error) = parse(&wire) else {
+            anyhow::bail!("{benchmark}/{runtime}/{model} accepted the attempt limit");
+        };
+        anyhow::ensure!(
+            error.to_string().contains("attempt_timeout_seconds"),
+            "the refusal does not name the knob: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unset_knobs_omitted_from_wire() -> anyhow::Result<()> {
         let flags = BenchmarkFlags::try_from(cell_ref(
             BenchmarkType::Eval,
@@ -2094,7 +2745,7 @@ mod tests {
     /// `doomloop`, with a valid wire value.
     const PROBES: &[(&str, &str)] = &[
         ("http_timeout_seconds", "600"),
-        ("bench_timeout_seconds", "1800"),
+        ("attempt_timeout_seconds", "1800"),
         ("readiness", "{ max_wait_secs = 120 }"),
     ];
 
@@ -2102,56 +2753,56 @@ mod tests {
     /// not derived, so a variant's field change without an edit here fails.
     #[rustfmt::skip]
     const CELLS: &[(&str, &str, &str, &[&str])] = &[
-        ("prefill_throughput", "llamacpp_cli_stock_tools", "gguf_text", &["readiness"]),
-        ("decode_throughput", "llamacpp_cli_stock_tools", "gguf_text", &["readiness"]),
+        ("prefill_throughput", "llamacpp_cli_stock_tools", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "llamacpp_cli_stock_tools", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
         ("end_to_end_latency", "llamacpp_cli_stock_tools", "gguf_text",
-         &["http_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("asr_throughput", "llamacpp_cli_stock_tools", "gguf_vision",
-         &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "mlx_macos_pipette", "mlx", &["readiness"]),
-        ("decode_throughput", "mlx_macos_pipette", "mlx", &["readiness"]),
-        ("end_to_end_latency", "mlx_macos_pipette", "mlx", &["readiness"]),
-        ("prefill_throughput", "llamacpp_ios_pipette", "gguf_text", &["readiness"]),
-        ("decode_throughput", "llamacpp_ios_pipette", "gguf_text", &["readiness"]),
-        ("end_to_end_latency", "llamacpp_ios_pipette", "gguf_text", &["readiness"]),
-        ("vl_throughput", "llamacpp_ios_pipette", "gguf_vision", &["readiness"]),
-        ("asr_throughput", "llamacpp_ios_pipette", "gguf_vision", &["readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "llamacpp_ios_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "llamacpp_ios_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "llamacpp_ios_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("vl_throughput", "llamacpp_ios_pipette", "gguf_vision", &["attempt_timeout_seconds", "readiness"]),
+        ("asr_throughput", "llamacpp_ios_pipette", "gguf_vision", &["attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "llamacpp_ios_pipette", "gguf_vision", &["readiness"]),
         ("vl_spec_decode", "llamacpp_ios_pipette", "gguf_vision_speculative",
          &["readiness"]),
-        ("prefill_throughput", "mlx_ios_pipette", "mlx", &["readiness"]),
-        ("decode_throughput", "mlx_ios_pipette", "mlx", &["readiness"]),
-        ("end_to_end_latency", "mlx_ios_pipette", "mlx", &["readiness"]),
-        ("prefill_throughput", "llamacpp_apk_pipette", "gguf_text", &["readiness"]),
-        ("decode_throughput", "llamacpp_apk_pipette", "gguf_text", &["readiness"]),
-        ("end_to_end_latency", "llamacpp_apk_pipette", "gguf_text", &["readiness"]),
-        ("vl_throughput", "llamacpp_apk_pipette", "gguf_vision", &["readiness"]),
-        ("prefill_throughput", "docker_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("decode_throughput", "docker_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("end_to_end_latency", "docker_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "uv_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("decode_throughput", "uv_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("end_to_end_latency", "uv_vllm", "torch", &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "docker_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("decode_throughput", "docker_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("end_to_end_latency", "docker_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "uv_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("decode_throughput", "uv_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("end_to_end_latency", "uv_sglang", "torch", &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "uv_openvino", "openvino", &["readiness"]),
-        ("decode_throughput", "uv_openvino", "openvino", &["readiness"]),
-        ("end_to_end_latency", "uv_openvino", "openvino", &["readiness"]),
-        ("prefill_throughput", "ovms", "openvino", &["http_timeout_seconds", "readiness"]),
-        ("decode_throughput", "ovms", "openvino", &["http_timeout_seconds", "readiness"]),
-        ("end_to_end_latency", "ovms", "openvino", &["http_timeout_seconds", "readiness"]),
-        ("prefill_throughput", "uv_onnx_genai", "onnx_genai", &["readiness"]),
-        ("decode_throughput", "uv_onnx_genai", "onnx_genai", &["readiness"]),
-        ("end_to_end_latency", "uv_onnx_genai", "onnx_genai", &["readiness"]),
-        ("prefill_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["readiness"]),
-        ("decode_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["readiness"]),
-        ("end_to_end_latency", "onnx_genai_ios_pipette", "onnx_genai", &["readiness"]),
+        ("prefill_throughput", "mlx_ios_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "mlx_ios_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "mlx_ios_pipette", "mlx", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "llamacpp_apk_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "llamacpp_apk_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "llamacpp_apk_pipette", "gguf_text", &["attempt_timeout_seconds", "readiness"]),
+        ("vl_throughput", "llamacpp_apk_pipette", "gguf_vision", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "docker_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "docker_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "docker_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "uv_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "uv_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "uv_vllm", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "docker_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "docker_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "docker_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "uv_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "uv_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "uv_sglang", "torch", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "uv_openvino", "openvino", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "uv_openvino", "openvino", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "uv_openvino", "openvino", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "ovms", "openvino", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "ovms", "openvino", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "ovms", "openvino", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("vl_throughput", "llamacpp_cli_stock_tools", "gguf_vision",
-         &["http_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         // vlm-eval: an HTTP server run, same shape as vl_throughput — the
         // vision tower runs thousands of images back-to-back, so the
         // readiness gate matters here as much as on the timing cells.
@@ -2159,24 +2810,24 @@ mod tests {
          &["http_timeout_seconds", "readiness"]),
         ("asr_eval", "llamacpp_cli_stock_tools", "gguf_vision",
          &["http_timeout_seconds", "readiness"]),
-        ("vl_throughput", "mlx_macos_pipette", "mlx", &["http_timeout_seconds", "readiness"]),
+        ("vl_throughput", "mlx_macos_pipette", "mlx", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_max_memory", "llamacpp_cli_stock_tools", "gguf_vision",
-         &["http_timeout_seconds", "bench_timeout_seconds"]),
-        ("vl_throughput", "trt_edgellm", "gguf_vision", &["http_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
+        ("vl_throughput", "trt_edgellm", "gguf_vision", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_max_memory", "trt_edgellm", "gguf_vision",
-         &["http_timeout_seconds", "bench_timeout_seconds"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("asr_max_memory", "llamacpp_cli_stock_tools", "gguf_vision",
-         &["http_timeout_seconds", "bench_timeout_seconds"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("vl_spec_decode", "llamacpp_cli_stock_tools", "gguf_vision",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "llamacpp_cli_stock_tools", "gguf_vision_speculative",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "mlx_macos_pipette", "mlx",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "mlx_macos_pipette", "mlx_speculative",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("max_memory_usage", "llamacpp_cli_stock_tools", "gguf_text",
-         &["bench_timeout_seconds"]),
+         &["attempt_timeout_seconds"]),
         ("eval", "llamacpp_cli_stock_tools", "gguf_text", &["http_timeout_seconds"]),
         ("eval", "mlx_macos_pipette", "mlx", &["http_timeout_seconds"]),
         ("eval", "docker_vllm", "torch", &["http_timeout_seconds"]),
@@ -2186,13 +2837,34 @@ mod tests {
         ("eval", "docker_sglang", "torch", &["http_timeout_seconds"]),
         ("eval", "uv_sglang", "torch", &["http_timeout_seconds"]),
         ("vl_spec_decode", "docker_sglang", "torch",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "docker_sglang", "torch_speculative",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "uv_sglang", "torch",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_spec_decode", "uv_sglang", "torch_speculative",
-         &["http_timeout_seconds", "bench_timeout_seconds", "readiness"]),
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("max_memory_usage", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "docker_vllm", "torch", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "uv_vllm", "torch", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "docker_sglang", "torch", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "uv_sglang", "torch", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "uv_openvino", "openvino", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "ovms", "openvino", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "llamacpp_ios_pipette", "gguf_text", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "mlx_ios_pipette", "mlx", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "llamacpp_apk_pipette", "gguf_text", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "core_ai_macos_pipette", "core_ai", &["attempt_timeout_seconds"]),
+        ("vl_max_memory", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds"]),
+        ("vl_max_memory", "llamacpp_ios_pipette", "gguf_vision", &["attempt_timeout_seconds"]),
+        ("asr_max_memory", "llamacpp_ios_pipette", "gguf_vision", &["attempt_timeout_seconds"]),
+        ("prefill_throughput", "core_ai_macos_pipette", "core_ai", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "core_ai_macos_pipette", "core_ai", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "core_ai_macos_pipette", "core_ai", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "apple_foundation", "apple_foundation_text", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "apple_foundation", "apple_foundation_text", &["attempt_timeout_seconds", "readiness"]),
     ];
 
     fn axes_wire(benchmark: &str, runtime: &str, model: &str) -> String {

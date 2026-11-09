@@ -55,9 +55,39 @@ const campaignStatus = (row: CampaignView): string =>
 /** A campaign's own state, beside its plan's status; a record never archived carries none. */
 export const stateOf = (row: Pick<CampaignView, "state">): CampaignState => row.state ?? "active";
 
-/** A campaign's progress as the listing prints it: its plan's jobs done of all, `936/936`. */
-export const progressText = (row: CampaignView): string =>
-  (row.plan?.counts ? `${doneOf(row.plan.counts)}/${row.plan.counts.total}` : "—");
+/**
+ * A campaign's progress as the listing prints it: its plan's jobs done of all, `936/936`. A plan with failed jobs
+ * also gives their count, `936/936 (5)`.
+ */
+export function progressText(row: CampaignView): string {
+  const counts = row.plan?.counts;
+  if (!counts) return "—";
+  const failed = counts.failed ? ` (${counts.failed})` : "";
+  return `${doneOf(counts)}/${counts.total}${failed}`;
+}
+
+/**
+ * The bar behind a campaign's progress text. `finished` is the share of the plan's jobs that finished. `done` is the
+ * share that finished or failed. `phase` sets the colors: `complete` and `cancelled` for a plan in that status, and
+ * `active` for a plan in any other status.
+ */
+export interface ProgressFill {
+  phase: "active" | "complete" | "cancelled";
+  finished: number;
+  done: number;
+}
+
+/** The bar behind a campaign's progress text, or null for a plan with no counted jobs. */
+export function progressFill(row: CampaignView): ProgressFill | null {
+  const counts = row.plan?.counts;
+  if (!row.plan || !counts?.total) return null;
+  const { status } = row.plan;
+  return {
+    phase: status === "complete" || status === "cancelled" ? status : "active",
+    finished: counts.finished / counts.total,
+    done: doneOf(counts) / counts.total,
+  };
+}
 
 /** A record's labels as pairs, in key order. */
 export const labelPairs = (labels: Record<string, string> | undefined): [string, string][] =>
@@ -166,8 +196,8 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
       { key: "updated_at", label: "updated_at", raw: (row) => row.updated_at, as: "time" },
     ],
     texts: [
-      { key: "q", label: "search", placeholder: "campaign id, name or label", wide: true,
-        texts: (row) => [row.campaign_id, row.name, ...labelPairs(row.labels).map(labelText)] },
+      { key: "q", label: "search", placeholder: "campaign id, name, label or model", wide: true,
+        texts: (row) => [row.campaign_id, row.name, ...labelPairs(row.labels).map(labelText), ...row.models ?? []] },
     ],
     // `campaignQuery` sends the plan id and the state; the listing reads a job id's plans itself. Either id finds
     // its campaigns, superseded or archived, so the state is held at all beside one.
@@ -192,12 +222,13 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
 }
 
 /**
- * The `GET /api/v1/campaigns` query for `branch`, with the plan each campaign runs: with `planId`, the one campaign
- * that plan was filed into, current or superseded, in any state; else the campaigns in `state`, `all` for every one.
+ * Build the campaign query for `branch`. Include each campaign's plan and models for the search.
+ * With `planId`, select the campaign that contains that plan, in any state.
+ * Otherwise, select campaigns in `state`. Use `all` to include every state.
  */
 export const campaignQuery = (branch: OwnedBranch, cursor: string | null, limit: string, planId = "",
                               state: CampaignState | "all" = "active"): string =>
-  ownedQuery(branch, [["plan", "true"], ...(planId ? [["plan_id", planId] as [string, string]]
+  ownedQuery(branch, [["plan", "true"], ["models", "true"], ...(planId ? [["plan_id", planId] as [string, string]]
     : state === "all" ? [] : [["state", state] as [string, string]])], cursor, limit);
 
 /** The campaigns whose plans asked for a job, as `jobPlans` answers; none on its `404`, a job in no plan the reader reads. */

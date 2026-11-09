@@ -6,7 +6,7 @@ import {
   spreadPercent, stddevText,
 } from "./plans";
 import {
-  BEYOND_LIMIT, beyondAudioLimit, canonical, descriptorText, deviceNames, deviceType, knobsText, lowerIsBetter,
+  BEYOND_LIMIT, beyondAudioLimit, canonical, descriptorText, deviceNames, deviceType, knobsText, lowerIsBetter, ttftOver,
 } from "./report";
 import { offeredChoices } from "./table";
 import { tabLink, type TabBase } from "./tabs";
@@ -143,10 +143,11 @@ function swapBytes(row: ResultRow | null): number | null {
 export const swapped = ({ row }: Pick<Line, "row">): boolean => swapBytes(row) !== null;
 
 /** What may make a line's figure untrustworthy, beside a failure. */
-export type IssueKey = "failed" | "spread" | "swap" | "thermal" | "corpus" | "power" | "params" | "audio_limit";
+export type IssueKey = "failed" | "spread" | "swap" | "thermal" | "corpus" | "power" | "params" | "audio_limit" | "ttft";
 export const ISSUES: Record<IssueKey, string> = {
   failed: "failed", spread: "stddev over 5%", swap: "swapped", thermal: "ran hot", corpus: "corpus mismatch",
   power: "power save or low battery", params: "no parameter count", audio_limit: BEYOND_LIMIT,
+  ttft: "TTFT over E2E latency",
 };
 export interface Issue {
   key: IssueKey;
@@ -175,6 +176,9 @@ export function issuesOf(line: Line): Issue[] {
   else if (typeof battery === "number" && battery < 20 && row?.device.power_state === "not_charging") {
     out.push({ key: "power", text: `battery ${battery}%` });
   }
+  // On both lines of the pair, from the job's other rows: one row alone cannot tell.
+  const share = row && job.result.status === "scored" ? ttftOver(job.result.rows).get(row.metric) : undefined;
+  if (share !== undefined) out.push({ key: "ttft", text: `TTFT ${digits(share, 1, 1)}% of E2E` });
   return out;
 }
 

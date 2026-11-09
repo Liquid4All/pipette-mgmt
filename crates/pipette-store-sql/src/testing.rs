@@ -406,6 +406,18 @@ mod tests {
             .fetch_one(db.pool())
         };
         assert!(has_outcome_repairs().await?);
+        let has_incremental_eligibility = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('queue_workers') IS NOT NULL \
+                 AND to_regclass('queue_reindex_jobs') IS NULL",
+            )
+            .fetch_one(db.pool())
+        };
+        assert!(has_incremental_eligibility().await?);
+        let moved = crate::migrate::migrate(db, Some(23), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(23), vec![26, 25, 24]));
+        assert!(!has_incremental_eligibility().await?);
+        assert!(has_job_queue().await?);
         let moved = crate::migrate::migrate(db, Some(21), false).await?;
         assert_eq!((moved.to, moved.reverted), (Some(21), vec![23, 22]));
         assert!(!has_job_queue().await?);
@@ -525,9 +537,10 @@ mod tests {
         assert_eq!(
             (moved.to, moved.applied),
             (
-                Some(23),
+                Some(26),
                 vec![
-                    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+                    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                    24, 25, 26
                 ]
             )
         );
@@ -552,6 +565,7 @@ mod tests {
         assert!(has_first_clerk_sign_in().await?);
         assert!(has_run_evidence().await?);
         assert!(has_job_queue().await?);
+        assert!(has_incremental_eligibility().await?);
         crate::migrate::check(db).await
     }
 
@@ -601,6 +615,176 @@ mod tests {
         assert_eq!(body().await?, before);
         assert_eq!(store.get_plan(&plan_id).await?, Some(manifest));
         assert_eq!(store.get_plan_notes(&plan_id).await?.note.as_deref(), note);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_clause_migration_projects_existing_jobs_and_flags_denials() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(24), false).await?;
+        sqlx::query(
+            "INSERT INTO queue_jobs (job_id, body, revision, needs_reindex) VALUES \
+             ('old-denied', '{\"requires\":null,\"spec\":\"ignored\"}', 1, false), \
+             ('old-healthy', '{}', 1, false), ('old-corrupt', 'not json', 1, false)",
+        )
+        .execute(db.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO queue_jobs (job_id, body, revision, needs_reindex, leased_by, lease_expiry) VALUES \
+             ('old-leased', '{}', 1, false, 'holder', now() + interval '1 hour'), \
+             ('old-leased-denied', '{}', 1, false, 'holder', now() + interval '1 hour'), \
+             ('old-unmatchable', '{\"requires\":[\"os:linux\"],\"excludes\":[\"os:linux\"]}', 1, false, NULL, NULL)",
+        )
+        .execute(db.pool()).await?;
+        sqlx::query(
+            "INSERT INTO queue_denials (job_id, client_id) VALUES \
+             ('old-denied', 'client'), ('old-leased-denied', 'client')",
+        )
+        .execute(db.pool())
+        .await?;
+        let nul_body = serde_json::json!({
+            "requires": ["chip:chip-a"],
+            "spec": {"extra": "\u{0000}", "nested": [{"requires": ["ignored"]}]},
+        });
+        sqlx::query(
+            "INSERT INTO queue_jobs (job_id, body, revision, needs_reindex) \
+             VALUES ('old-nul', $1, 1, false)",
+        )
+        .bind(serde_json::to_string(&nul_body)?)
+        .execute(db.pool())
+        .await?;
+        crate::migrate::migrate(db, None, false).await?;
+        let preserved: String =
+            sqlx::query_scalar("SELECT body FROM queue_jobs WHERE job_id = 'old-nul'")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&preserved)?,
+            nul_body
+        );
+        let rows: Vec<(String, Option<serde_json::Value>, bool)> = sqlx::query_as(
+            "SELECT job_id, match_clauses, needs_reindex FROM queue_jobs ORDER BY job_id",
+        )
+        .fetch_all(db.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            vec![
+                ("old-corrupt".into(), None, true),
+                (
+                    "old-denied".into(),
+                    Some(serde_json::json!({"requires": null})),
+                    true
+                ),
+                ("old-healthy".into(), Some(serde_json::json!({})), true),
+                ("old-leased".into(), Some(serde_json::json!({})), false),
+                (
+                    "old-leased-denied".into(),
+                    Some(serde_json::json!({})),
+                    true
+                ),
+                (
+                    "old-nul".into(),
+                    Some(serde_json::json!({"requires": ["chip:chip-a"]})),
+                    true
+                ),
+                (
+                    "old-unmatchable".into(),
+                    Some(serde_json::json!({"requires": ["os:linux"], "excludes": ["os:linux"]})),
+                    true
+                ),
+            ]
+        );
+        crate::migrate::migrate(db, Some(24), false).await?;
+        crate::migrate::migrate(db, None, false).await?;
+        Ok(())
+    }
+
+    /// Migration `0024` moves the worker set into `queue_workers` and flags
+    /// every job. Its down script puts the worker set back, flags each leased
+    /// job that still needs a reindex, and restores each row's deadline.
+    #[rstest::rstest]
+    #[case::valid(Some(r#"["ev1_b","ev1_a"]"#), &["ev1_a", "ev1_b"])]
+    #[case::duplicates(Some(r#"["ev1_a","ev1_a"]"#), &["ev1_a"])]
+    #[case::empty(Some("[]"), &[])]
+    #[case::missing(None, &[])]
+    #[case::invalid_json(Some("not json"), &[])]
+    #[case::object(Some(r#"{"worker":"ev1_a"}"#), &[])]
+    #[case::string(Some(r#""ev1_a""#), &[])]
+    #[case::number(Some("42"), &[])]
+    #[case::null(Some("null"), &[])]
+    #[case::mixed_array(Some(r#"["ev1_a",42]"#), &[])]
+    #[case::null_element(Some(r#"["ev1_a",null]"#), &[])]
+    #[tokio::test]
+    async fn the_incremental_eligibility_migration_keeps_the_index_state(
+        #[case] legacy_workers: Option<&str>,
+        #[case] expected_workers: &[&str],
+    ) -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(23), false).await?;
+        sqlx::raw_sql(
+            "INSERT INTO queue_jobs (job_id, body, expires_at, revision) \
+             VALUES ('job-free', '{}', '2026-12-01T00:00:00Z', 1); \
+             INSERT INTO queue_jobs (job_id, body, leased_by, lease_expiry, revision) \
+             VALUES ('job-held', '{}', 'ev1_a', '2026-11-01T00:00:00Z', 1); \
+             INSERT INTO queue_eligibility (client_id, job_id, expires_at) \
+             VALUES ('ev1_a', 'job-free', '2026-01-01T00:00:00Z'); \
+             INSERT INTO queue_reindex_jobs (job_id) VALUES ('job-free'); \
+             DELETE FROM queue_maintenance_state; \
+             INSERT INTO queue_maintenance_state (name, body) VALUES \
+             ('eligible-indexed', '[\"job-free/never.json\"]'), ('gc-candidates', '[]');",
+        )
+        .execute(db.pool())
+        .await?;
+        if let Some(workers) = legacy_workers {
+            sqlx::query(
+                "INSERT INTO queue_maintenance_state (name, body) VALUES ('eligible-workers', $1)",
+            )
+            .bind(workers)
+            .execute(db.pool())
+            .await?;
+        }
+        let state_names = || {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM queue_maintenance_state ORDER BY name",
+            )
+            .fetch_all(db.pool())
+        };
+
+        crate::migrate::migrate(db, None, false).await?;
+        let workers: Vec<String> =
+            sqlx::query_scalar("SELECT client_id FROM queue_workers ORDER BY client_id")
+                .fetch_all(db.pool())
+                .await?;
+        assert_eq!(workers, expected_workers);
+        assert_eq!(state_names().await?, ["gc-candidates"]);
+        let unflagged: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM queue_jobs WHERE NOT needs_reindex")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(unflagged, 0);
+
+        crate::migrate::migrate(db, Some(23), false).await?;
+        let workers: String = sqlx::query_scalar(
+            "SELECT body FROM queue_maintenance_state WHERE name = 'eligible-workers'",
+        )
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&workers)?,
+            expected_workers
+        );
+        let flagged: Vec<String> = sqlx::query_scalar("SELECT job_id FROM queue_reindex_jobs")
+            .fetch_all(db.pool())
+            .await?;
+        assert_eq!(flagged, ["job-held"]);
+        let deadline: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT expires_at FROM queue_eligibility")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(deadline, Some("2026-12-01T00:00:00Z".parse()?));
         Ok(())
     }
 

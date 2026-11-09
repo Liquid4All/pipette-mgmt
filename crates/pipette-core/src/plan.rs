@@ -720,12 +720,10 @@ impl PlanExplanation {
                 "no approved client holds `perform_work`, so the claim path refuses all {} of them: `pipette-mgmt clients permission add <client_id> perform_work`",
                 self.fleet.approved
             ),
-            // Only the causes that apply: a fleet blocked by suspension alone
+            // Only the causes that apply: a fleet blocked by rebuilds alone
             // must not read as one that also holds denials.
             SchedulingState::ClientsBlocked => {
                 let causes = [
-                    (self.fleet.suspended > 0)
-                        .then(|| format!("{} suspended", self.fleet.suspended)),
                     (self.fleet.pending_reindex > 0).then(|| {
                         format!(
                             "{} pending an eligible-index rebuild",
@@ -772,9 +770,6 @@ pub struct PlanLeases {
     /// the job sits outside `avail/`, where `claim` cannot reach it, until a
     /// `queue-maintenance` run recycles the lease.
     pub lapsed: Vec<Lease>,
-    /// `leased/` keys that name no job, which the lists above cannot account
-    /// for; the same caveat as [`JobCensus::unparseable_leased_keys`].
-    pub unparseable_keys: usize,
     /// The instant every deadline in the two lists is measured against: a lease
     /// lapsed by seconds and one lapsed by an hour mean different things.
     pub read_at: DateTime<Utc>,
@@ -786,9 +781,10 @@ impl PlanLeases {
     ///
     /// Collapse first: a renewal renames the key, so one listing can hold both
     /// keys, and a job with one live lease must read as held, not stranded. Key
-    /// on `job_id` alone: a recycle and re-claim between two partition listings
-    /// put two clients on one job, and the later deadline names the holder.
-    pub fn new(leases: Vec<Lease>, unparseable_keys: usize, now: DateTime<Utc>) -> Self {
+    /// on `job_id` alone: a recycle and re-claim between two reads, or between
+    /// two partition listings in the file store, put two clients on one job, and
+    /// the later deadline names the holder.
+    pub fn new(leases: Vec<Lease>, now: DateTime<Utc>) -> Self {
         let latest: BTreeMap<JobId, Lease> =
             leases
                 .into_iter()
@@ -812,7 +808,6 @@ impl PlanLeases {
         Self {
             live,
             lapsed,
-            unparseable_keys,
             read_at: now,
         }
     }
@@ -947,14 +942,11 @@ pub fn starved_report(live_matches: &[usize], claimable: usize) -> PlanExplanati
             lapsed_leases: 0,
             gone: 0,
             denied: 0,
-            unparseable_avail_keys: 0,
-            unparseable_leased_keys: 0,
         },
         fleet: FleetStanding {
             registered: 1,
             approved: 1,
             working: 1,
-            suspended: 0,
             pending_reindex: 0,
             unblocked: 1,
         },
@@ -973,7 +965,7 @@ pub fn starved_report(live_matches: &[usize], claimable: usize) -> PlanExplanati
             .collect(),
         starved_by_live_scan: false,
         verdict: SchedulingState::Starved,
-        leases: PlanLeases::new(vec![], 0, Utc::now()),
+        leases: PlanLeases::new(vec![], Utc::now()),
     }
 }
 
@@ -1006,7 +998,7 @@ mod tests {
     #[rstest]
     #[case::nobody_approved(0, 0, "await approval")]
     #[case::nobody_granted(3, 0, "no approved client holds `perform_work`")]
-    #[case::blocked_by_suspension(3, 3, "no client can take a claimable job")]
+    #[case::blocked_by_rebuilds(3, 3, "no client can take a claimable job")]
     fn clients_blocked_headline_names_the_gate(
         #[case] approved: usize,
         #[case] working: usize,
@@ -1018,8 +1010,7 @@ mod tests {
             registered: 4,
             approved,
             working,
-            suspended: working,
-            pending_reindex: 0,
+            pending_reindex: working,
             unblocked: 0,
         };
         let headline = report.headline(FleetDetail::Full);
@@ -1476,14 +1467,13 @@ mod tests {
     /// from `now`; `None` skips the check.
     #[rstest]
     // A deadline ahead of `now` is work in flight.
-    #[case::live(&[("ev1_a", "job-1", 30)], &[("ev1_a", "job-1")], &[], 0, None)]
+    #[case::live(&[("ev1_a", "job-1", 30)], &[("ev1_a", "job-1")], &[], None)]
     // Past its deadline the holder stopped heartbeating, so the job is stranded.
-    #[case::lapsed(&[("ev1_a", "job-1", -30)], &[], &[("ev1_a", "job-1")], 0, None)]
+    #[case::lapsed(&[("ev1_a", "job-1", -30)], &[], &[("ev1_a", "job-1")], None)]
     #[case::one_of_each(
         &[("ev1_a", "job-1", 30), ("ev1_b", "job-2", -30)],
         &[("ev1_a", "job-1")],
         &[("ev1_b", "job-2")],
-        0,
         None
     )]
     // A renewal renames the key, so one listing can return both. The job is
@@ -1492,7 +1482,6 @@ mod tests {
         &[("ev1_a", "job-1", -30), ("ev1_a", "job-1", 30)],
         &[("ev1_a", "job-1")],
         &[],
-        0,
         None
     )]
     // The same pair in the other listing order. `list_leased` fixes no order,
@@ -1501,7 +1490,6 @@ mod tests {
         &[("ev1_a", "job-1", 30), ("ev1_a", "job-1", -30)],
         &[("ev1_a", "job-1")],
         &[],
-        0,
         None
     )]
     // Two clients can hold two of the plan's jobs, and one client can hold
@@ -1510,31 +1498,25 @@ mod tests {
         &[("ev1_c", "job-3", 30), ("ev1_a", "job-2", 30), ("ev1_a", "job-1", 30)],
         &[("ev1_a", "job-1"), ("ev1_a", "job-2"), ("ev1_c", "job-3")],
         &[],
-        0,
         None
     )]
-    #[case::nothing_held(&[], &[], &[], 0, None)]
+    #[case::nothing_held(&[], &[], &[], None)]
     // A deadline exactly at `now` is past: the split keeps a lease live only
     // while its deadline is ahead. `JobCensus::lapsed_leases` reads these same
     // lists, so the two agree at the boundary.
-    #[case::due_now(&[("ev1_a", "job-1", 0)], &[], &[("ev1_a", "job-1")], 0, None)]
+    #[case::due_now(&[("ev1_a", "job-1", 0)], &[], &[("ev1_a", "job-1")], None)]
     // The collapse keeps the renewal, not the key that it replaced, so the row
     // reports the deadline that the holder currently heartbeats against.
     #[case::renewal_keeps_the_later_deadline(
         &[("ev1_a", "job-1", 5), ("ev1_a", "job-1", 45)],
         &[("ev1_a", "job-1")],
         &[],
-        0,
         Some(45)
     )]
-    // A key that names no job joins no list. The count carries it instead, so
-    // the report can say what the lists do not cover.
-    #[case::unparseable_keys_are_not_rows(&[], &[], &[], 2, None)]
     fn plan_leases_collapses_splits_and_sorts(
         #[case] held: &[(&str, &str, i64)],
         #[case] expect_live: &[(&str, &str)],
         #[case] expect_lapsed: &[(&str, &str)],
-        #[case] unparseable: usize,
         #[case] expect_retained: Option<i64>,
     ) -> anyhow::Result<()> {
         let now: DateTime<Utc> = "2026-09-04T12:00:00Z".parse()?;
@@ -1542,7 +1524,6 @@ mod tests {
             held.iter()
                 .map(|(client, job, minutes)| lease(client, job, *minutes, now))
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            unparseable,
             now,
         );
         assert_eq!(rows(&leases.live), expected(expect_live), "live rows");
@@ -1551,10 +1532,6 @@ mod tests {
             leases.is_empty(),
             expect_live.is_empty() && expect_lapsed.is_empty(),
             "`is_empty` agrees with the two lists"
-        );
-        assert_eq!(
-            leases.unparseable_keys, unparseable,
-            "the count reaches the report"
         );
         assert_eq!(
             leases.read_at, now,

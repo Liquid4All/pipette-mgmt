@@ -5,7 +5,8 @@
 
 import { channel, exactText, finite, HUES, median, SHAPES, valueText } from "./chart";
 import {
-  BAND, e2eText, pairingText, UNESTIMABLE, type E2eFinding, type Pairing, type Spread,
+  BAND, e2eText, pairingText, SHORT, shortText, ttftText, UNESTIMABLE, type E2eFinding, type Pairing, type Short,
+  type Spread, type TtftFinding,
 } from "./findings";
 import { textOrder } from "./format";
 import { nameOf as catalogNameOf, type DescriptorNames } from "./descriptor-names";
@@ -271,6 +272,8 @@ function counts<T>(items: Iterable<T>): Map<T, number> {
 export const E2E = "e2e_check";
 /** The VL check's family key: each vl_throughput job's span against its own prompt + decode time. */
 export const VL_E2E = "vl_e2e_check";
+/** The TTFT check's family key: each job's time to first token against its own end-to-end latency. */
+export const TTFT_E2E = "ttft_check";
 export const SPEC = "vl_spec_decode";
 /** The swap chart's family key: the swap each job's run held, over every benchmark type that reports it. */
 export const SWAPPED = "max_swap";
@@ -293,12 +296,13 @@ const FAMILIES: [string, string, string][] = [
   [VL_E2E, "VL E2E latency vs prompt + decode", "VL E2E latency vs prompt + decode"],
   ["vl_max_memory", "VL peak memory", "VL memory"], [SPEC, "VL speculative decoding", "VL spec decode"],
   ["asr_throughput", "ASR throughput", "ASR throughput"], ["asr_max_memory", "ASR peak memory", "ASR memory"],
+  [TTFT_E2E, "time to first token vs E2E latency", "TTFT vs E2E latency"],
   ["eval", "eval accuracy", "Eval"], ["asr_eval", "ASR error rate", "ASR eval"],
   [SWAPPED, "swap", "Swap"], [VL_SWAPPED, "VL swap", "VL swap"],
   [ASR_SWAPPED, "ASR swap", "ASR swap"],
 ];
 /** The families derived across rows, not one benchmark type's: the checks and swap, in the page's order. */
-export const DERIVED_FAMILIES = [E2E, VL_E2E, SWAPPED, VL_SWAPPED, ASR_SWAPPED];
+export const DERIVED_FAMILIES = [E2E, VL_E2E, TTFT_E2E, SWAPPED, VL_SWAPPED, ASR_SWAPPED];
 /** The swap charts, text first. */
 const SWAPS = [SWAPPED, VL_SWAPPED, ASR_SWAPPED];
 /** Each VL and ASR type's own swap chart: its prompt is not a text length, so it charts apart from Swap, over its own
@@ -539,6 +543,8 @@ export class ReportIndex {
   declare readonly e2e: E2eFinding | null;
   /** The VL check, as `e2e`; null where no vl_throughput job measured end-to-end latency. */
   declare readonly vlE2e: E2eFinding | null;
+  /** The TTFT check; null where no job measured both a time to first token and an end-to-end latency. */
+  declare readonly ttft: TtftFinding | null;
   /** How vl_spec_decode's speculative and baseline jobs paired; null where none measured a job. */
   declare readonly pairing: Pairing | null;
   /** Whether a run held swap, as the `swap` issue of Jobs reads it: Swap lists those lines. */
@@ -547,7 +553,7 @@ export class ReportIndex {
   declare readonly missing: Missing | null;
 
   constructor(fields: Pick<ReportIndex, "families" | "benchmarks" | "columns" | "devices" | "deviceNames" | "e2e"
-    | "vlE2e" | "pairing" | "swapped" | "missing">) {
+    | "vlE2e" | "ttft" | "pairing" | "swapped" | "missing">) {
     Object.assign(this, fields);
   }
 }
@@ -578,6 +584,8 @@ interface Point {
   values: number[];
   /** The result rows it is drawn from. */
   rows: ResultRow[];
+  /** A check's measured E2E and prefill time, in ms, which say whether it ran too short to judge. */
+  times?: { e2e: number; prefill: number };
 }
 
 /** One kind of panel a family draws per column (the E2E check draws two). */
@@ -648,12 +656,12 @@ interface Internal {
   runtimeNames: Map<string, NamedPart>;
   /** Measured model descriptors by family, sorted. */
   models: Map<string, string[]>;
-  rungs: Point[];
-  /** E2E rungs with all three inputs, estimated or not. */
-  complete: number;
+  /** The E2E check's rungs; null where it is not offered. */
+  check: Rungs | null;
   /** The VL check's, a job each. */
-  vlRungs: Point[];
-  vlComplete: number;
+  vlCheck: Rungs | null;
+  /** The TTFT check's, a job each: its time to first token as % of its end-to-end latency, per clock of `CLOCKS`. */
+  ttftPoints: Point[];
   pairs: { decode: Point[]; e2e: Point[] } | null;
   layouts: Map<string, Layout | null>;
   splitsCharts: boolean | null;
@@ -688,6 +696,7 @@ const DERIVED: Record<string, Metric> = {
   decode_speedup: { key: "decode_speedup", label: "decode speedup", unit: "×", factor: 1, lower: false },
   e2e_speedup: { key: "e2e_speedup", label: "E2E speedup", unit: "×", factor: 1, lower: false },
   excess: { key: "excess", label: "extra E2E time", unit: "%", factor: 1, lower: true },
+  ttft_share: { key: "ttft_share", label: "time to first token as % of E2E latency", unit: "%", factor: 1, lower: true },
   // Ranked most first: the models that swapped hardest lead the first chart.
   max_swap: { key: "max_swap", label: "max swap", unit: "GB", factor: 1e-9, lower: false },
   // Observations, not results: drawn because a VL prefill rate reads across models only beside them. Ranked
@@ -797,7 +806,7 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
     runtimeNames: runtimeNamesOf(runtimes, named),
     ids: new Set(measured.map((e) => e.model.id)),
     models: new Map(),
-    rungs: [], complete: 0, vlRungs: [], vlComplete: 0, pairs: null, layouts: new Map(), splitsCharts: null,
+    check: null, vlCheck: null, ttftPoints: [], pairs: null, layouts: new Map(), splitsCharts: null,
   };
 
   const families: Family[] = [];
@@ -853,12 +862,10 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
       // A plan that measured no end-to-end latency has nothing to check.
       if (has(LATENCY)) e2e = fleet === "withheld" ? { kind: "withheld" } : { kind: "lacking", types: missing };
     } else {
-      const check = rungs(measured);
-      internal.rungs = check.points;
-      internal.complete = check.complete;
-      e2e = e2eFinding(check, false);
+      internal.check = rungs(measured);
+      e2e = e2eFinding(internal.check, false, SHORT);
     }
-    const columns = [...new Set(internal.rungs.map((p) => p.column))].sort(byColumn);
+    const columns = [...new Set((internal.check?.points ?? []).map((p) => p.column))].sort(byColumn);
     families.push({
       key: E2E, label, short: shortLabel(E2E), types: [PREFILL, DECODE, LATENCY], measured: 0, failed: 0, causes: [],
       models: 0, metrics: disabled ? [] : [DERIVED.excess!], metric: disabled ? null : "excess",
@@ -869,14 +876,28 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
   let vlE2e: E2eFinding | null = null;
   if ((typeEntries.get(VL) ?? []).some((e) => e.measured && e.row.metric === LATENCY)) {
     const check = vlRungs(measured);
-    internal.vlRungs = check.points;
-    internal.vlComplete = check.complete;
-    vlE2e = e2eFinding(check, true);
+    internal.vlCheck = check;
+    vlE2e = e2eFinding(check, true, SHORT);
     const columns = [...new Set(check.points.map((p) => p.column))].sort(byColumn);
     families.push({
       key: VL_E2E, label: FAMILY_LABEL.get(VL_E2E)!, short: shortLabel(VL_E2E), types: [VL], measured: 0, failed: 0,
       causes: [], models: 0, metrics: [DERIVED.excess!], metric: "excess", columns, devices: devicesOf(columns),
       disabled: null,
+    });
+  }
+  const typeOrder = (a: string, b: string) =>
+    (FAMILY_RANK.get(a) ?? FAMILIES.length) - (FAMILY_RANK.get(b) ?? FAMILIES.length) || textOrder(a, b);
+  // One job measures both, so the check needs no device names.
+  internal.ttftPoints = ttftPoints(measured);
+  let ttft: TtftFinding | null = null;
+  if (internal.ttftPoints.length) {
+    ttft = ttftFinding(internal.ttftPoints);
+    const columns = [...new Set(internal.ttftPoints.map((p) => p.column))].sort(byColumn);
+    families.push({
+      key: TTFT_E2E, label: FAMILY_LABEL.get(TTFT_E2E)!, short: shortLabel(TTFT_E2E),
+      types: [...new Set(internal.ttftPoints.map((p) => p.rows[0]!.benchmark_type))].sort(typeOrder),
+      measured: 0, failed: 0, causes: [], models: 0, metrics: [DERIVED.ttft_share!], metric: "ttft_share",
+      columns, devices: devicesOf(columns), disabled: null,
     });
   }
   // Swap, where any run held some: every benchmark type whose rows read it, a panel each, text, VL and ASR apart as
@@ -889,8 +910,7 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
     const columns = [...new Set(swapping.map((e) => e.column))].sort(byColumn);
     families.push({
       key, label: FAMILY_LABEL.get(key)!, short: shortLabel(key),
-      types: [...new Set(swapping.map((e) => e.row.benchmark_type))].sort((a, b) =>
-        (FAMILY_RANK.get(a) ?? FAMILIES.length) - (FAMILY_RANK.get(b) ?? FAMILIES.length) || textOrder(a, b)),
+      types: [...new Set(swapping.map((e) => e.row.benchmark_type))].sort(typeOrder),
       measured: 0, failed: 0, causes: [], models: 0, metrics: [DERIVED.max_swap!], metric: "max_swap",
       columns, devices: devicesOf(columns), disabled: null,
     });
@@ -899,7 +919,8 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
   families.sort((a, b) => rank(a) - rank(b) || textOrder(a.key, b.key));
 
   // A check lists the models it checked, so the model filter offers none it draws nothing for.
-  const checked = new Map([[E2E, internal.rungs], [VL_E2E, internal.vlRungs]]);
+  const checked = new Map([[E2E, internal.check?.points], [VL_E2E, internal.vlCheck?.points],
+                           [TTFT_E2E, internal.ttftPoints]]);
   for (const family of families) {
     // An ASR family counts only the models its rule keeps, where one rule holds for each of its metrics.
     const rules = new Set(family.metrics.map((m) => asrRule(family.key, m.key)));
@@ -920,6 +941,7 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
     deviceNames: typeNames,
     e2e,
     vlE2e,
+    ttft,
     pairing: typeEntries.has(SPEC) ? pairing(typeEntries.get(SPEC)!, fleet) : null,
     swapped: rows.some((row) => (swapOf(row) ?? 0) > 0),
     missing: missingOf(entries),
@@ -1013,14 +1035,16 @@ function rungs(measured: readonly Entry[]): Rungs {
     if (!prefill) missing.prefill++;
     if (!rung.e2e.length || !rung.decode.length || !prefill) continue;
     complete++;
-    const excess = estimate(rung.tokens, median(rung.ttft), median(rung.tps), median(rung.decode), median(rung.d),
-                            median(rung.e2e));
+    const e2e = median(rung.e2e);
+    const excess = estimate(rung.tokens, median(rung.ttft), median(rung.tps), median(rung.decode), median(rung.d), e2e);
     if (!excess) {
       unestimated++;
       continue;
     }
+    const [ms, pct, prefillMs] = excess;
     const params = batched ? { prefill_tokens: rung.tokens, batch_size: rung.batch } : { prefill_tokens: rung.tokens };
-    points.push({ model: rung.model, runtime: rung.runtime, column: rung.column, params, values: excess, rows: rung.rows });
+    points.push({ model: rung.model, runtime: rung.runtime, column: rung.column, params, values: [ms, pct],
+                  rows: rung.rows, times: { e2e: e2e!, prefill: prefillMs } });
   }
   return { points, total, complete, unestimated, missing, batches: batches.size };
 }
@@ -1055,35 +1079,95 @@ function vlRungs(measured: readonly Entry[]): Rungs {
       unestimated++;
       continue;
     }
-    points.push({ model, runtime: variant, column, params, values: excess, rows: inputs.map((e) => e.row) });
+    points.push({ model, runtime: variant, column, params, values: excess.slice(0, 2), rows: inputs.map((e) => e.row),
+                  times: { e2e, prefill: excess[2] } });
   }
   return { points, total, complete, unestimated, missing, batches: 1 };
 }
 
-/** The E2E check's finding; each excess is classed as rounded for print, so an outlier never reads as `5.0 %`. */
-function e2eFinding(c: Rungs, vl: boolean): E2eFinding {
-  const excess = c.points.map((p) => Math.round(p.values[1]! * 10) / 10);
+const isShort = (p: Point, under: Short): boolean =>
+  !!p.times && p.times.e2e < under.e2e * 1000 && p.times.prefill < under.prefill * 1000;
+
+/**
+ * The E2E check's finding, too-short runs (`under`) counted apart; each other excess is classed as rounded for print,
+ * so an outlier never reads as `5.0 %`.
+ */
+function e2eFinding(c: Rungs, vl: boolean, under: Short): E2eFinding {
+  const judged = c.points.filter((p) => !isShort(p, under));
+  const excess = judged.map((p) => Math.round(p.values[1]! * 10) / 10);
   const spread = (off: number[]): Spread | null => (off.length ? { n: off.length, max: Math.max(...off) } : null);
   const slower = excess.filter((r) => r > BAND);
   const faster = excess.filter((r) => r < -BAND).map((r) => -r);
   return {
     kind: "checked", vl, total: c.total, complete: c.complete, unestimated: c.unestimated, missing: c.missing,
-    batched: c.batches > 1, within: excess.length - slower.length - faster.length, slower: spread(slower),
+    batched: c.batches > 1, short: c.points.length - judged.length, under,
+    within: excess.length - slower.length - faster.length, slower: spread(slower),
     faster: spread(faster),
   };
 }
 
+/** The TTFT check's clocks, each the time to first token and end-to-end latency metrics a job reports on it. */
+const CLOCKS: [string, [string, string][]][] = [
+  ["client", [["ttft", LATENCY], ["ttft_ms", "e2e_ms"]]],
+  ["runtime", [["runtime_ttft", "runtime_e2e_ms"]]],
+];
+const CLOCK_METRICS = new Set(CLOCKS.flatMap(([, pairs]) => pairs.flat()));
+
+/** A job's time to first token and end-to-end latency on one clock, each the median of its rows, and their metrics. */
+interface ClockPair { first: string; end: string; ttft: number; e2e: number }
+
+/** A job's first pair per clock that its measured rows hold both of, the end above 0; null where it has none. */
+function clockPairs(rows: readonly ResultRow[]): (ClockPair | null)[] {
+  const value = (metric: string) =>
+    median(rows.filter((row) => row.metric === metric && !row.failed && row.value !== null).map((row) => row.value!));
+  return CLOCKS.map(([, pairs]) => pairs.map(([first, end]) => ({ first, end, ttft: value(first), e2e: value(end) }))
+    .find((p): p is ClockPair => p.ttft !== null && p.e2e !== null && p.e2e > 0) ?? null);
+}
+
+/** Each job's time to first token as % of its end-to-end latency, a value per clock, NaN where it lacks the pair. */
+function ttftPoints(measured: readonly Entry[]): Point[] {
+  const jobs = new Map<string, Entry[]>();
+  for (const e of measured) push(jobs, e.row.job_id, e);
+  return [...jobs.values()].flatMap((of) => {
+    const shares = clockPairs(of.map((e) => e.row));
+    if (!shares.some(Boolean)) return [];
+    const { model, variant, column, params } = of[0]!;
+    return [{ model, runtime: variant, column, params, rows: of.filter((e) => CLOCK_METRICS.has(e.row.metric)).map((e) => e.row),
+              values: shares.map((pair) => (pair ? (pair.ttft / pair.e2e) * 100 : Number.NaN)) }];
+  });
+}
+
+/** A share's excess over 100 %, rounded for print, so a job listed or counted over never reads as `0.0 %`. */
+const overBy = (share: number) => Math.round((share - 100) * 10) / 10;
+
+/** The TTFT check's finding; each job's excess over 100 % is classed as rounded for print, as `e2eFinding`'s. */
+function ttftFinding(points: readonly Point[]): TtftFinding {
+  const over = points.map((p) => Math.max(...p.values.filter(finite).map(overBy))).filter((r) => r > 0);
+  return { jobs: points.length, over: over.length ? { n: over.length, max: Math.max(...over) } : null };
+}
+
+/**
+ * Where a job's time to first token exceeds its end-to-end latency, as the TTFT check counts it: the share in % by
+ * each metric of the clock pair over 100.
+ */
+export function ttftOver(rows: readonly ResultRow[]): Map<string, number> {
+  return new Map(clockPairs(rows).flatMap((pair) => {
+    const share = pair ? (pair.ttft / pair.e2e) * 100 : 0;
+    return pair && overBy(share) > 0 ? [[pair.first, share], [pair.end, share]] as const : [];
+  }));
+}
+
 /**
  * E2E latency over its estimate, prefill time plus `d` decode tokens, as
- * `[ms, % of the estimate]`; null at a gap. Inputs are cell medians.
+ * `[ms, % of the estimate, prefill ms]`; null at a gap. Inputs are cell medians.
  */
 export function estimate(tokens: number, ttft: number | null, prefillTps: number | null, decodeTps: number | null,
-                         d: number | null, e2e: number | null): [number, number] | null {
+                         d: number | null, e2e: number | null): [number, number, number] | null {
   const prefill = finite(ttft) ? ttft : finite(prefillTps) && prefillTps > 0 ? (tokens * 1000) / prefillTps : null;
   if (prefill === null || !finite(decodeTps) || decodeTps <= 0 || !finite(d) || !finite(e2e) || e2e <= 0) return null;
   const expected = prefill + (d * 1000) / decodeTps;
   if (!finite(expected) || expected <= 0) return null;
-  return [e2e - expected, ((e2e - expected) / expected) * 100];
+  return [e2e - expected, ((e2e - expected) / expected) * 100, prefill];
 }
 
 interface Job {
@@ -1311,10 +1395,16 @@ function layoutOf(I: Internal, family: Family, metric: Metric): Layout | null {
   let rank = 0;
   if (family.key === E2E || family.key === VL_E2E) {
     // Drawn as a share of the expected total alone: milliseconds read large on a long prompt, the same share or not.
-    points = (family.key === E2E ? I.rungs : I.vlRungs).map((p) => ({ ...p, values: [p.values[1]!] }));
+    points = ((family.key === E2E ? I.check : I.vlCheck)?.points ?? []).map((p) => ({ ...p, values: [p.values[1]!] }));
     if (family.key === E2E) word = "combinations";
     layers = [{ ...layer("%", false), title: `Extra E2E time as % of expected total (shaded: within ±${BAND} %)`,
                 band: BAND, reference: 0 }];
+  } else if (family.key === TTFT_E2E) {
+    // A panel per clock some job reports both on: vl_spec_decode's runtime clock beside every type's client one.
+    const clocks = CLOCKS.map((_, i) => i).filter((i) => I.ttftPoints.some((p) => finite(p.values[i])));
+    points = I.ttftPoints.map((p) => ({ ...p, values: clocks.map((i) => p.values[i]!) }));
+    layers = clocks.map((i) => ({ ...layer("%"), reference: 100,
+      title: `Time to first token as % of E2E latency, ${CLOCKS[i]![0]} clock (over 100: TTFT exceeds E2E latency)` }));
   } else if (SWAPS.includes(family.key)) {
     // A job's swap once, in its benchmark type's panel, for the models that swapped somewhere on a column; an ASR job's
     // only from an exact-sized context, as `asrRule` says.
@@ -1436,14 +1526,19 @@ export interface ReportFilters {
   params: Record<string, string>;
   /** Which outcome a chart's rows link narrows Jobs to; the charts ignore it. */
   status: string;
+  /** The checks' too-short thresholds, in seconds as typed ([`Short`]); empty for the defaults. */
+  e2eUnder: string;
+  prefillUnder: string;
 }
 
 const PER = ["4", "8", "12", "all"];
 const PER_DEFAULT = "8";
 const STATUS = ["measured", "failed"];
 
-/** The filters a select writes, one value each. */
-const SELECTS = ["per", "status"];
+/** The filters a select or a field writes, one value each, by address key. */
+const SELECTS: Record<string, keyof ReportFilters> = {
+  per: "per", status: "status", e2e_under: "e2eUnder", prefill_under: "prefillUnder",
+};
 
 /** The address keys every results tab shares, which a link to another tab carries. */
 export const SHARED = ["device", "model", "per", "status"];
@@ -1451,7 +1546,8 @@ export const SHARED = ["device", "model", "per", "status"];
 export const PICKED = ["device", "model"];
 
 const NONE: ReportFilters = {
-  benchmark: "", metric: "", device: [], drop: [], model: [], per: "", params: {}, status: "",
+  benchmark: "", metric: "", device: [], drop: [], model: [], per: "", params: {}, status: "", e2eUnder: "",
+  prefillUnder: "",
 };
 
 /** The filters the address asks for, as given, on the tab of `benchmark`; `view(…).filters` drops stale ones. */
@@ -1464,7 +1560,8 @@ export function reportFilters(query: URLSearchParams, benchmark: string): Report
   const picked = (key: string) => [...new Set(query.getAll(key).filter(Boolean))];
   return {
     benchmark, metric: asked("metric"), device: picked("device"), drop: picked("drop"), model: picked("model"),
-    per: asked("per"), params, status: asked("status"),
+    per: asked("per"), params, status: asked("status"), e2eUnder: asked("e2e_under"),
+    prefillUnder: asked("prefill_under"),
   };
 }
 
@@ -1474,7 +1571,7 @@ export const reportPairs = (filters: ReportFilters): [string, string][] => [
   ...filters.drop.map((variant): [string, string] => ["drop", variant]), ...modelPairs(filters.model),
   ["per", filters.per],
   ...Object.keys(filters.params).sort(textOrder).map((name): [string, string] => [`p.${name}`, filters.params[name]!]),
-  ["status", filters.status],
+  ["status", filters.status], ["e2e_under", filters.e2eUnder], ["prefill_under", filters.prefillUnder],
 ];
 
 /** The address pairs of the chosen models: one `model` each, its descriptor as stored. */
@@ -1499,7 +1596,7 @@ export function toggledRuntime(index: ReportIndex, filters: ReportFilters, varia
 export function withFilter(filters: ReportFilters, key: string, value: string): ReportFilters {
   if (key === "benchmark") return { ...filters, benchmark: value, metric: "", params: {} };
   // The device, runtime and model choices are lists; a key no select writes changes nothing.
-  if (!key.startsWith("p.")) return SELECTS.includes(key) ? { ...filters, [key]: value } : filters;
+  if (!key.startsWith("p.")) return Object.hasOwn(SELECTS, key) ? { ...filters, [SELECTS[key]!]: value } : filters;
   const params = { ...filters.params };
   if (value) params[key.slice(2)] = value;
   else delete params[key.slice(2)];
@@ -1526,7 +1623,11 @@ interface Resolved {
   /** The varying parameters left unpinned, which split series (line form) or charts (bar form). */
   split: string[];
   per: number;
+  /** The checks' too-short thresholds, the defaults where the address asks none or no number. */
+  under: Short;
 }
+
+const seconds = (asked: string): number | null => (asked.trim() !== "" && Number(asked) >= 0 ? Number(asked) : null);
 
 /**
  * The runtimes of `own`, a chart's, that `asked` names: each asked one it ran, and for one it ran with other flags
@@ -1553,6 +1654,7 @@ function resolve(I: Internal, index: ReportIndex, asked: ReportFilters): Resolve
     params[name] = value;
   }
   const per = PER.includes(asked.per) ? asked.per : "";
+  const [e2eUnder, prefillUnder] = [seconds(asked.e2eUnder), seconds(asked.prefillUnder)];
   const measured = I.models.get(family?.key ?? "") ?? [];
   return {
     filters: {
@@ -1561,6 +1663,7 @@ function resolve(I: Internal, index: ReportIndex, asked: ReportFilters): Resolve
       drop: asked.drop.filter((variant) => I.variants.has(variant)),
       model: asked.model.filter((id) => I.ids.has(id)), per, params,
       status: STATUS.includes(asked.status) ? asked.status : "",
+      e2eUnder: e2eUnder === null ? "" : asked.e2eUnder, prefillUnder: prefillUnder === null ? "" : asked.prefillUnder,
     },
     family, layout,
     // The address keeps a choice another family measured; this one draws by its own, every one where none are.
@@ -1569,6 +1672,7 @@ function resolve(I: Internal, index: ReportIndex, asked: ReportFilters): Resolve
     dropped: matchedRuntimes(I, layout?.runtimes ?? [], asked.drop),
     pins, split: (layout?.rest ?? []).filter((name) => !pins.has(name)),
     per: per === "all" ? Infinity : Number(per || PER_DEFAULT),
+    under: { e2e: e2eUnder ?? SHORT.e2e, prefill: prefillUnder ?? SHORT.prefill },
   };
 }
 
@@ -1584,6 +1688,8 @@ export interface Cell {
   whole?: true;
   /** A row behind it ran a clip past the model's documented audio limit ([`beyondAudioLimit`]): drawn, but marked. */
   beyond?: true;
+  /** Every check point on it ran too short to judge: drawn hollow. */
+  short?: true;
 }
 
 /** A cell as tooltips and tables print it: `137.7 (n=6: 103.6, …)`, a range past 8 values. */
@@ -1607,11 +1713,12 @@ export function drawnRows(charts: readonly Chart[], hidden: ReadonlySet<string>)
   return new Set(marks.filter((mark) => !hidden.has(mark.key)).flatMap((mark) => mark.rows));
 }
 
-/** The cell of `values`, marked where a row behind it (`rows`) ran a clip past the model's audio limit. */
-function cellOf(values: number[], whole = false, rows: readonly ResultRow[] = []): Cell {
+/** The cell of `values`, marked where a row behind it (`rows`) ran a clip past the model's audio limit, or `short`. */
+function cellOf(values: number[], whole = false, rows: readonly ResultRow[] = [], short = false): Cell {
   const sorted = [...values].sort((a, b) => a - b);
   return { median: median(sorted)!, n: sorted.length, min: sorted[0]!, max: sorted[sorted.length - 1]!, values: sorted,
-           ...(whole ? { whole: true } : {}), ...(rows.some(beyondAudioLimit) ? { beyond: true } : {}) };
+           ...(whole ? { whole: true } : {}), ...(rows.some(beyondAudioLimit) ? { beyond: true } : {}),
+           ...(short ? { short: true } : {}) };
 }
 
 /** A series' legend entry: its hue (`--series-{hue}`) and marker shape, by its slot in the chart. */
@@ -1745,6 +1852,8 @@ export interface ReportView {
   /** What every series in view shares, drawn under the chart's heading. */
   caption: Label;
   notes: string[];
+  /** A check's too-short thresholds in effect, which its fields show; null for any other family. */
+  under: Short | null;
 }
 
 const MULTI = "cells hold more than one result: variants the result row cannot tell apart (runtime flags, sampling, "
@@ -1786,6 +1895,8 @@ const ASR_CALIBRATED: AsrRule = {
 };
 const VL_E2E_NOTE = "One job measures all three, so each point checks a run against its own time to first token, image "
   + "encoding included, and decode time.";
+const TTFT_NOTE = "Each point is one job's time to first token over its own end-to-end latency on one clock. Text "
+  + "models time the two in separate jobs, so E2E latency vs prefill + decode checks them instead.";
 const PAIR_NOTE = "Pairs a speculative and a baseline job of one benchmark on one device; other launch settings are not "
   + "on a result row.";
 /** Panels the report draws before it opens on one column. */
@@ -1810,6 +1921,7 @@ export function view(index: ReportIndex, filters: ReportFilters): ReportView {
   const I = internal(index);
   const r = resolve(I, index, filters);
   const { family, layout } = r;
+  const check = family?.key === E2E || family?.key === VL_E2E;
   let devices = r.devices;
   let drawn: Drawn | null = null;
   const notes: string[] = [];
@@ -1836,6 +1948,7 @@ export function view(index: ReportIndex, filters: ReportFilters): ReportView {
   }
   if (family?.key === E2E && drawn) notes.push(E2E_NOTE);
   if (family?.key === VL_E2E && drawn) notes.push(VL_E2E_NOTE);
+  if (family?.key === TTFT_E2E && drawn) notes.push(TTFT_NOTE);
   if (family?.key === VL && layout?.metric.key === PREFILL) {
     notes.push(family.metrics.some((m) => m.key === "prompt_tokens") ? VL_PREFILL_TOKENS_NOTE : VL_PREFILL_NOTE);
   }
@@ -1857,14 +1970,19 @@ export function view(index: ReportIndex, filters: ReportFilters): ReportView {
     ? chart.bars.map((bar) => bar.cell) : chart.panels.flatMap((panel) => panel.series.flatMap((s) => s.cells))
       .filter((c): c is Cell => c !== null)));
   if (cellsDrawn.some((c) => c.beyond)) notes.push(BEYOND_NOTE);
+  if (cellsDrawn.some((c) => c.short)) {
+    notes.push(`Faded hollow points ${shortText(r.under)}: a fixed cost per request is a large share of so short a run, so `
+      + "the finding counts them apart from the band.");
+  }
   if (family && SWAPS.includes(family.key) && layout) {
     const drawnModels = new Set(layout.points.map((p) => p.model.id)).size;
     notes.push(`Only models that swapped on a device type and runtime are drawn: ${drawnModels} of `
       + `${I.models.get(family.key)?.length ?? drawnModels}. A run's swap is read once per job, 0 where it held none.`);
   }
-  // The finding leads, plan-wide: no filter changes it.
-  if (family?.key === E2E && layout && index.e2e?.kind === "checked") notes.unshift(e2eText(index.e2e));
-  if (family?.key === VL_E2E && layout && index.vlE2e) notes.unshift(e2eText(index.vlE2e));
+  // The finding leads, plan-wide: only the too-short thresholds change it.
+  if (family?.key === E2E && layout && I.check) notes.unshift(e2eText(e2eFinding(I.check, false, r.under)));
+  if (family?.key === VL_E2E && layout && I.vlCheck) notes.unshift(e2eText(e2eFinding(I.vlCheck, true, r.under)));
+  if (family?.key === TTFT_E2E && layout && index.ttft) notes.unshift(ttftText(index.ttft));
   if (family?.key === SPEC && layout && index.pairing) notes.unshift(pairingText(index.pairing));
   if (layout && (layout.metric.key === "decode_speedup" || layout.metric.key === "e2e_speedup")) notes.push(PAIR_NOTE);
   return {
@@ -1879,14 +1997,15 @@ export function view(index: ReportIndex, filters: ReportFilters): ReportView {
        ...layout!.params.get(name)!.values.map((v) => ({ value: pinOf(v), label: v.text, disabled: false }))])),
     unmeasured: family && !family.metrics.length && family.key !== E2E ? family.failed : null,
     empty: family?.key === E2E && !layout
-      ? (I.complete ? `No combination could be estimated: ${UNESTIMABLE}.` : "No combination has all three measurements.")
+      ? (I.check?.complete ? `No combination could be estimated: ${UNESTIMABLE}.` : "No combination has all three measurements.")
       : family?.key === VL_E2E && !layout
-        ? (I.vlComplete ? `No job could be estimated: ${UNESTIMABLE}.` : "No job has all three measurements.")
+        ? (I.vlCheck?.complete ? `No job could be estimated: ${UNESTIMABLE}.` : "No job has all three measurements.")
         : rule && family?.metrics.length && !layout ? rule.empty
           : layout && !drawn ? "No results match these filters." : null,
     charts: drawn?.charts ?? [],
     caption: drawn?.caption ?? [],
     notes,
+    under: check ? r.under : null,
   };
 }
 
@@ -2068,6 +2187,8 @@ interface Group {
   rows: Map<string, ResultRow[]>;
   /** The result rows behind each point, by `cellKey`. */
   at: Map<string, ResultRow[]>;
+  /** Whether every point on a cell ran too short to judge, by `cellKey`. */
+  short: Map<string, boolean>;
 }
 
 const cellKey = (layer: number, column: string, x: number) => `${layer}\n${column}\n${x}`;
@@ -2159,7 +2280,7 @@ function drawLines(r: Resolved, layout: Layout, points: Point[], columns: string
     let group = groups.get(key);
     if (!group) {
       group = { key, model: p.model, params: p.params, parts: [], cells: new Map(), columns: new Set(), rows: new Map(),
-                at: new Map() };
+                at: new Map(), short: new Map() };
       groups.set(key, group);
     }
     group.columns.add(p.column);
@@ -2170,6 +2291,7 @@ function drawLines(r: Resolved, layout: Layout, points: Point[], columns: string
       const at = cellKey(i, p.column, p.params[x] as number);
       push(group.cells, at, value);
       for (const row of p.rows) push(group.at, at, row);
+      group.short.set(at, (group.short.get(at) ?? true) && isShort(p, r.under));
     }
   }
   const all = [...groups.values()];
@@ -2190,7 +2312,8 @@ function drawLines(r: Resolved, layout: Layout, points: Point[], columns: string
   const rungs = xs.map((at) => ({ x: at, text: layout.rungText.get(at) ?? String(at) }));
   const cells = (group: Group, i: number, column: string) => xs.map((at) => {
     const values = group.cells.get(cellKey(i, column, at));
-    return values ? cellOf(values, layout.metric.whole, group.at.get(cellKey(i, column, at))) : null;
+    const key = cellKey(i, column, at);
+    return values ? cellOf(values, layout.metric.whole, group.at.get(key), group.short.get(key)) : null;
   });
 
   // Folded, each column's only series is drawn as one series of a single panel, named by its column.

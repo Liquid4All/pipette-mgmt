@@ -70,29 +70,67 @@ the job's directory, and only while that deadline is already lapsed
 
 `queue-maintenance` materializes the matching rules
 ([plan-ingestion.md §5](plan-ingestion.md#5-capability-matching)) as
-`eligible/clients/{client_id}/{job_id}.{expires_at}` markers. It is the sole
-writer; `claim` and `reclaim` read them and trust a marker without re-running
-the matcher.
+eligibility markers, one per client and job. Only `queue-maintenance` writes
+eligibility markers. `claim` and `reclaim` trust each marker without another
+match check. On the
+database queue a marker is a `queue_eligibility` row, and a read takes the
+deadline from the job.
 
 - The index covers the **workers** only: approved clients that hold
   `perform_work`, the two checks `claim` makes.
-- A job promoted into `avail/` is indexed on the first run after at least one
-  of its plans leaves `creating`. A job with no plan marker keeps the existing
-  indexing behavior.
-- A change in the workers (an approval, a grant, a revocation) reaches the index
-  within one cron interval, whichever code path made it.
-- A job out on lease while a client was re-indexed is re-matched against every
-  client once it returns to `avail/`. This waits for the job to come back
-  rather than re-matching it eagerly, because most leased jobs finish and their
-  markers become garbage anyway.
-- A job's markers go when the job leaves the queue for good.
+- Each job carries a reindex flag, `queue_jobs.needs_reindex`. These events set
+  the flag:
+  - the job enters the queue
+  - a recycle returns the job to the queue
+  - a re-date changes the job's deadline
+  - the store records a client denial
+  - a client reindex runs while the job is out on lease
+- Each run reads the bodies of the flagged available jobs only. It matches each
+  job against every worker, replaces the job's markers, and clears the flag, in
+  one transaction per job. If a claim or re-date occurs between the read and the
+  write, the job keeps its flag for the next run.
+- The first run indexes a promoted job after at least one of its plans leaves
+  `creating`. Until then, the job keeps its flag. The next run indexes a job
+  with no plan marker.
+- The run compares the workers with the set that the last run indexed
+  (`queue_workers`). It deletes the markers of a worker that left, and matches a
+  worker that joined against every available job. So a change in the workers
+  (an approval, a grant, a revocation) reaches the index within one cron
+  interval, whichever code path made it.
+- A job out on lease keeps its flag until it returns to the queue. The run
+  defers the match check until the job returns. Most leased jobs finish, so
+  their markers need no update.
+- The run deletes a job's markers when the job permanently leaves the queue.
+- The index needs the database queue. On a local_fs or S3 queue,
+  `queue-maintenance` and `plans status --explain` stop with an error.
 
 The cost is up to one cron interval between a change and the index. Jobs run for
 many minutes, so that latency is acceptable.
 
-Each `queue-maintenance` run lists all of `avail/`, because Express has no
-server-side `start-after`. The indexed set saves the body read and the match
-per job, not the listing, so a run's listing cost grows with the queue.
+A run reads each flagged available body once. Retirement, escalation for a
+closed roster, and the index pass share that body. Failed retirement or
+escalation keeps the flag for a retry. A denial write sets the flag and
+advances the job revision. A denial that arrives during the index pass retains
+its retry.
+
+Retirement does not check an indexed job again. A build that makes the
+retirement rules stricter must ship a migration that flags every available
+job. `flag-reindex` flags clients, not jobs, so it does not cause this check.
+
+Plan starvation follows the eligible index. An available job is starved if
+no eligible row belongs to a client without a denial for that job. The run
+reads only starved bodies to group their requirements before it chooses the
+plan status. If a job leaves availability before that read, the run excludes
+it from starvation. The run treats that job as matched for the plan status.
+
+The run uses the cached body and the worker snapshot for a job that the index
+withholds or that changes during the index pass. The run excludes denied
+clients. After a client changes, the starvation check can follow the index
+and not the client snapshot for one run.
+
+A client rebuild reads each distinct set of stored matcher clauses. It
+matches each set once and inserts eligibility rows for those jobs in a batch.
+It reads no job bodies. The run still lists every available job.
 
 ### The reindex gate
 
@@ -127,31 +165,35 @@ update relinquished it. The gate costs at most one cron interval.
 `POST /plans/claim` ([httpapi.md §2.9](httpapi.md#29-post-plansclaim)) checks
 two things before it selects a job.
 
-1. **Suspension.** A client with a `todo/suspended/{client_id}.json` marker gets
-   `204` until an operator clears it with `pipette-mgmt clients unsuspend`
-   (`clients list-suspended` lists them).
-2. **An existing lease.** Claim is **idempotent**. A client that already holds
-   exactly one live lease gets that same job back, with `time_window` set to the
+1. **Lapsed leases.** The claim settles each lapsed lease of the client as
+   `queue-maintenance` does ([Heartbeat timeout](#heartbeat-timeout-dead-device)).
+   The server deletes a lease if its job has a record. Any other lease counts as lost,
+   and its job goes back to `avail/`, or retires once its losses reach the
+   limit. A heartbeat on a settled lease finds no lease,
+   so it cannot give the client a second live lease.
+2. **An existing lease.** Claim is **idempotent**. A client that holds a live
+   lease gets that same job back, with `time_window` set to the
    lease's *remaining* life. The lease is not renewed. The innocent cause is a
    claim whose response was lost: the client never learned the `job_id`, so it
    cannot `reclaim`. Leaving the expiry alone keeps a crash-looping client from
    extending the job: the lease lapses on schedule and a healthy client gets it.
-   Each hand-back counts the lease as lost, once per lease, and a job out of
+   The server checks vault access before it counts a hand-back as lost. A vault
+   refusal recycles the lease without another loss. Each permitted hand-back
+   counts the lease as lost, once per lease, and a job out of
    losses is withheld with `204` ([Heartbeat timeout](#heartbeat-timeout-dead-device)).
-
-   A client with **more than one** live lease is an anomaly the protocol never
-   produces, typically a fast-rebooting client. The server suspends it, records
-   one conflicting `job_id` for triage, and answers `204`. List
-   `todo/leased/{client_id}/` for the rest. A suspended client's heartbeats and
-   reclaims are refused with `403`, so those leases lapse on their own;
-   unsuspend once they have, or the next claim suspends the client again.
-
-   Every claim, heartbeat and reclaim checks the rule again after its rename,
-   so racing claims or a renewed lapsed lease cannot slip a second lease past
-   it. A grant that leaves the client two live leases is put back in `avail/`.
 
    Each claim lists all of `leased/` once to build the set of jobs other clients
    hold; that is bounded by the number of benchmarks running at once.
+
+A device that crashes or disconnects on every run needs no operator action.
+Each idempotent hand-back counts one lost lease against the job. The server
+withholds the job, then retires it at `plan_lost_lease_limit`
+([Heartbeat timeout](#heartbeat-timeout-dead-device)).
+On the database queue, the claim cannot grant a second live lease: one
+transaction handles the claims of a device one at a time. On the local_fs and
+S3 queues, two overlapping claims can each grant a lease. There, the guarantee
+depends on the client. It must not have two `claim` or `reclaim` requests in
+flight ([client-integration.md §4](client-integration.md#4-the-work-loop)).
 
 Otherwise the server selects among the client's `eligible/` markers. It skips a
 job the client denied (`denied/{job_id}.{client_id}`) and a job past its
@@ -170,6 +212,20 @@ each marker. One ingest stamps many jobs with the same deadline, so **within a
 tier the order is random**, which keeps idle clients from stampeding one
 `job_id`.
 
+**One lease per client.** A client holds at most one live lease. On the
+database queue, loss accounting and new grants use a transaction. It takes a
+lock for the client, settles the client's lapsed leases, then returns the live
+lease or leases one job. Recycling and the lost-lease row commit with the grant.
+A job with a pending record repair or enough losses to retire stays leased
+while the server resolves its record outside the transaction. The server then
+retries the claim. The
+deadline comes from the job row, and the transaction skips the jobs that other
+claims lock. The server processes two concurrent claims from one client sequentially. The
+second returns the job that the first leased. A reclaim takes the same lock, and leases
+no job while the client holds a live lease on another. The `local_fs` and S3
+queues run the same steps one call at a time. Two concurrent claims can give a client two leases on these backends. The next
+claim returns the lease with the later expiry.
+
 The claim renames `avail/{job_id}/{expires_at}.json` to
 `leased/{client_id}/{job_id}.{expires_at}.{lease_expiry}.json`, where
 `lease_expiry` is now plus the lease length. The rename is atomic, so at most
@@ -180,12 +236,11 @@ cadence after a `204` is the client's ([client-integration.md §5](client-integr
 
 Ingestion promotes a job into `avail/` before its plan leaves `creating`.
 `queue-maintenance` reads the plan manifests and job memberships before it
-builds the eligible index. When every membership names a plan that is still
-`creating` or whose manifest is missing, the run leaves that job out of all
-three index passes and the persisted indexed set. The first run after a plan
-leaves `creating` evaluates the job. A job also held by an active plan is
-indexed at once. Jobs without membership markers retain the existing indexing
-behavior.
+builds the eligible index. The run excludes a job if all its memberships name
+plans with missing manifests or `creating` status. The job keeps its reindex
+flag. The first run after a plan
+leaves `creating` evaluates the job. The run immediately indexes a job that an
+active plan also holds. The next run indexes a job without membership markers.
 
 The run also removes any eligible markers it finds for a withheld job. A lease
 already held by a device remains valid until the usual lease or teardown path
@@ -355,11 +410,9 @@ turns the count off.
 The idempotent claim feeds the same count: a client that re-polls inside its
 lease gets the job back, each hand-back counts once per lease, and once the
 job's losses reach the limit `claim` answers `204` and lets the lease lapse.
-Suspension is reserved for a client that holds more than one live lease.
 
 A device away for longer than `time_window` (a slow reboot, maintenance, a long
-outage) finds its lease already recycled. There is nothing to detect, and no
-suspension fires: from the queue's side the device was absent and is back.
+outage) finds its lease already recycled, or the next claim recycles it. The queue treats the device as available again.
 
 #### Expiration
 

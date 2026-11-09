@@ -115,6 +115,28 @@ transaction that committed first fails with the PostgreSQL error code (SQLSTATE)
 statement. The loser sees the row of the winner. A racing claim then reads as
 taken, and a lost swap reads as lost.
 
+The queue claim is the one exception. It runs at `READ COMMITTED` with
+`SELECT … FOR UPDATE SKIP LOCKED`, without `retry`. Idle devices poll one tier
+of jobs with one deadline, so their claims race for the same rows. At
+`REPEATABLE READ`, a claim that reads a row changed after its snapshot fails
+with `40001`, even with `SKIP LOCKED`. With many devices, the retries run out.
+At `READ COMMITTED`, a claim skips the rows that other claims lock, so it does
+not fail with `40001`. A lock for each client (`pg_advisory_xact_lock`) ensures that the client
+acquires at most one job lease. Under that lock, claim and reclaim settle the
+client's other lapsed leases before they grant work. Recycling and the lost-lease
+row commit with the new grant. The transaction deletes leases whose jobs have a
+record in `submission_outcomes`. A pending outcome repair or a job at the
+lost-lease limit needs object-store work: the transaction keeps its lease and
+returns without a grant. The server resolves it with queue-maintenance's
+settlement helper, then retries the transaction. A reclaim leaves its named
+job available for renewal.
+
+A held job first returns for a vault check outside the transaction. The caller
+then supplies the checked lease to another claim transaction. Under the client
+lock, the store requires an exact match before it counts the hand-back as a
+loss or withholds the job at the limit. A changed lease requires another vault
+check. A vault refusal recycles the lease without another loss.
+
 Nothing outside the database happens inside a retried transaction. The race test
 of each store requires the outcome that the object store gives.
 

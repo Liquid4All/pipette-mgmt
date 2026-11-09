@@ -66,7 +66,7 @@ registration time would read every record on every request.
 The [pagination](../../httpapi.md#13-pagination) envelope, whose `items` are `ClientListRow`s in
 the OpenAPI document ([the OpenAPI document](../../httpapi.md#15-the-openapi-document)): the stored client
 record, plus what the server reads beside it (derived capabilities, tags,
-permissions, reindex and suspension flags, `last_seen_at` and `backlog`; see
+permissions, the reindex flag, `last_seen_at` and `backlog`; see
 [what a device row carries](../devices.md#what-a-device-row-carries)).
 `contact_email` is there only for a caller that administers the device:
 `manage_clients` over its organization's devices, or `manage_any_clients`

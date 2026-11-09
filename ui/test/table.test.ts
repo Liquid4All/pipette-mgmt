@@ -168,7 +168,7 @@ describe("the listings' tables", () => {
     const found = (query: string) => tableView(spec, tableState(spec, new URLSearchParams(query)), named).map((r) => r.campaign_id);
     expect([found("q=NIGHT"), found("q=paign_2"), found("id=campaign_1")])
       .toEqual([["campaign_1"], ["campaign_2"], ["campaign_1", "campaign_2"]]);
-    expect(spec.texts).toMatchObject([{ key: "q", label: "search", placeholder: "campaign id, name or label", wide: true }]);
+    expect(spec.texts).toMatchObject([{ key: "q", label: "search", placeholder: "campaign id, name, label or model", wide: true }]);
     expect(ids("status=not_started")).toEqual(["c2"]);
     expect(choicesOf(spec, rows, {}).status!.map((c) => c.label)).toEqual(["active", "complete", "not started"]);
     expect(choicesOf(spec, rows, {}).owner).toEqual([{ value: "org_a", label: "Acme", count: 3 }]);
@@ -188,7 +188,7 @@ describe("the listings' tables", () => {
     expect(tableView(ORG_TABLE, tableState(ORG_TABLE, new URLSearchParams("sort=-member_count")),
                      [org("a", 2), org("b", 9)]).map((o) => o.slug)).toEqual(["b", "a"]);
     const device = (client_id: string, device_os_name: string) =>
-      ({ client_id, device_os_name, permissions: [], suspended: false, reindex_pending: false }) as unknown as ClientListRow;
+      ({ client_id, device_os_name, permissions: [], reindex_pending: false }) as unknown as ClientListRow;
     const devices = deviceTable(false, {}, 0);
     expect(choicesOf(devices, [device("c1", "iOS"), device("c2", "iOS"), device("c3", "Android")], {}).os)
       .toEqual([{ value: "Android", label: "Android", count: 1 }, { value: "iOS", label: "iOS", count: 2 }]);

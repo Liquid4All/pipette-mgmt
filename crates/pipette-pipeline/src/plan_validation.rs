@@ -703,6 +703,30 @@ mod tests {
         Ok(())
     }
 
+    /// Parsing drops the retired limit, so only this warning tells its author.
+    #[tokio::test]
+    async fn the_retired_limit_is_warned_at_its_variant() -> anyhow::Result<()> {
+        let text = document(&[
+            "requires = [\"os:macos\"]",
+            "requires = [\"os:macos\"]\nbenchmark_flags = [{ benchmark_type = \"decode_throughput\", \
+             runtime_type = \"mlx_macos_pipette\", model_type = \"mlx\", bench_timeout_seconds = 600 }]",
+        ]);
+        let verdict = checked(&text).await?;
+        let placed: Vec<(IssueSeverity, Option<usize>, bool)> = verdict
+            .issues
+            .iter()
+            .map(|issue| {
+                let named = issue.message.contains("`bench_timeout_seconds` is retired");
+                (issue.severity, issue.line, named)
+            })
+            .collect();
+        assert_eq!(
+            (verdict.job_count, placed),
+            (Some(2), vec![(IssueSeverity::Warning, Some(8), true)])
+        );
+        Ok(())
+    }
+
     /// A gated model counts once however many jobs run it, and the verdict
     /// never holds its token, refused or not.
     #[rstest]

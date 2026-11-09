@@ -7,8 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::results::ResultRow;
 use crate::{
-    BenchmarkId, BenchmarkType, ChatMessage, ClientId, ClientRunSpec, JobId, NonEmptyTrimmedString,
-    PlanId,
+    BenchmarkId, BenchmarkType, ChatMessage, ClientId, ClientRunSpec, FailureCode, JobId,
+    NonEmptyTrimmedString, PlanId,
 };
 
 /// Where a submitted job stands.
@@ -69,6 +69,8 @@ pub struct FailedJob {
     pub status: JobStatus,
     pub submitted_at: DateTime<Utc>,
     pub failure_reason: NonEmptyTrimmedString,
+    #[serde(default)]
+    pub failure_code: FailureCode,
     pub model_name: Option<NonEmptyTrimmedString>,
     pub model_quant: Option<NonEmptyTrimmedString>,
     pub runtime_name: Option<NonEmptyTrimmedString>,

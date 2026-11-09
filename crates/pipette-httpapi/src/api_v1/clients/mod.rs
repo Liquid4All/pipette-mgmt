@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 
 use pipette_core::client::{Client, ClientStatus};
 use pipette_core::organization::Organization;
@@ -254,53 +254,6 @@ async fn reject(
     )
     .await?;
     Ok(())
-}
-
-// POST /api/v1/clients/{client_id}/unsuspend
-pub async fn unsuspend_client(
-    State(state): State<AppState>,
-    caller: HumanUser,
-    audit: Audit,
-    ApiPath(Parsed(client_id)): ApiPath<Parsed<ClientId>>,
-) -> Result<Response, AppError> {
-    let (changed, client) = unsuspend(&state, &caller, &client_id).await?;
-    audit.changed(changed);
-    // The fleet scope clears a marker no record answers to; with no device to
-    // show, it answers as `DELETE` does for one that is not there.
-    let Some(client) = client else {
-        return Ok(StatusCode::NO_CONTENT.into_response());
-    };
-    Ok(Json(Changed {
-        record: written_view(&state, client).await?,
-        changed,
-    })
-    .into_response())
-}
-
-/// Clear the suspension on `client_id`, reporting whether there was one, with
-/// the device's record, which only the fleet scope may find absent.
-async fn unsuspend(
-    state: &AppState,
-    caller: &HumanUser,
-    client_id: &ClientId,
-) -> Result<(bool, Option<Client>), AppError> {
-    let scope = device_scope(state, &caller.user, &caller.rights).await?;
-    // A suspension is queue state, so a stranded marker has no record; a scoped
-    // caller still needs one to show the device was ever theirs.
-    let client = if scope == DeviceScope::Fleet {
-        state
-            .client_store
-            .get_client(client_id)
-            .await
-            .map_err(|e| AppError::internal(e.context("failed to read the device")))?
-    } else {
-        Some(in_scope(state, &scope, client_id).await?)
-    };
-
-    let changed = client_admin::unsuspend(&*state.todo_store, client_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to clear the suspension: {e:#}")))?;
-    Ok((changed, client))
 }
 
 // DELETE /api/v1/clients/{client_id}

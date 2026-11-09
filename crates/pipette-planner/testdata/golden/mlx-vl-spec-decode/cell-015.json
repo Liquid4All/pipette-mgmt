@@ -40,8 +40,7 @@
       "runtime_type": "mlx_macos_pipette",
       "model_type": "mlx_speculative",
       "benchmark_type": "vl_spec_decode",
-      "http_timeout_seconds": 600,
-      "bench_timeout_seconds": 10800
+      "http_timeout_seconds": 600
     }
   }
 }

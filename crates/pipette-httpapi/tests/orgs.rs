@@ -1958,12 +1958,8 @@ async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyh
         let (_key, client_id) = register_pending(&state).await?;
         own_client_by_org(&state, &client_id, &org_id).await?;
     }
-    let (_key, stuck) = register_and_approve(&state).await?;
-    own_client_by_org(&state, &stuck, &org_id).await?;
-    state
-        .todo_store
-        .write_suspension(&stuck, chrono::Utc::now(), &job("job-stuck")?)
-        .await?;
+    let (_key, approved) = register_and_approve(&state).await?;
+    own_client_by_org(&state, &approved, &org_id).await?;
     // Another organization's registration waits on somebody else.
     let rival = OrgId::try_new(create_org(&state, &root, "rival").await?)?;
     let (_key, theirs) = register_pending(&state).await?;
@@ -2043,11 +2039,6 @@ async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyh
         "the first five: {body}"
     );
     assert!(!body.to_string().contains(theirs.as_str()), "{body}");
-    assert_eq!(body["suspended_clients"]["total"], 1, "{body}");
-    assert_eq!(
-        json_str(&body["suspended_clients"]["first"][0], "client_id")?,
-        stuck.as_str()
-    );
 
     assert_eq!(body["campaigns"]["total"], 6, "acme's alone: {body}");
     let shown: Vec<&str> = body["campaigns"]["first"]
@@ -2108,19 +2099,15 @@ async fn test_the_overview_leaves_out_what_the_reader_may_not_read() -> anyhow::
     let body = body_json(resp).await?;
     crate::api_schema::assert_conforms("OrgOverview", &body)?;
     assert_eq!(body["client_count"], 1, "the count stands: {body}");
-    [
-        "client_status_counts",
-        "pending_clients",
-        "suspended_clients",
-    ]
-    .into_iter()
-    .for_each(|field| {
-        assert_eq!(
-            body.get(field),
-            Some(&Value::Null),
-            "{field} is null: {body}"
-        )
-    });
+    ["client_status_counts", "pending_clients"]
+        .into_iter()
+        .for_each(|field| {
+            assert_eq!(
+                body.get(field),
+                Some(&Value::Null),
+                "{field} is null: {body}"
+            )
+        });
     assert!(
         !body.to_string().contains(client_id.as_str()),
         "a device leaked: {body}"

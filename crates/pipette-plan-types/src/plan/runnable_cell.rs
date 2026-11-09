@@ -132,10 +132,9 @@ impl RunnableCell {
                 argv.push("--readiness-skin-below-c".into());
                 argv.push(celsius.to_string());
             }
-            // Forward the whole-workload deadline; unforwarded, the peak-memory
-            // cells ran on the client default and `vl_spec_decode` ran unbounded.
-            if let Some(secs) = bf.bench_timeout() {
-                argv.push("--bench-timeout-seconds".into());
+            // Forward the attempt limit; unforwarded, the client's default applies.
+            if let Some(secs) = bf.attempt_timeout() {
+                argv.push("--attempt-timeout-seconds".into());
                 argv.push(secs.to_string());
             }
         }
@@ -718,14 +717,14 @@ shell = "posix"
 clients         = ["t1"]
 models          = [{ type = "gguf_text", source = "huggingface", org = "o", repo_name = "r", path = "a.gguf" }]
 runtimes        = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repository_url = "github.com/ggml-org/llama.cpp", version = "b9050", flavor = "macos-arm64" }]
-benchmark_flags = [{ benchmark_type = "max_memory_usage", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_text", bench_timeout_seconds = 1200 }]
+benchmark_flags = [{ benchmark_type = "max_memory_usage", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_text", attempt_timeout_seconds = 1200 }]
 "#;
         let plan = Plan::parse(toml_str)?;
         let cells = plan.runnable_cells()?;
         let argv = single(&cells)?.build_argv(&local_transport()?)?;
         assert!(
             argv.windows(2)
-                .any(|w| w == ["--bench-timeout-seconds", "1200"]),
+                .any(|w| w == ["--attempt-timeout-seconds", "1200"]),
             "{argv:?}"
         );
         Ok(())

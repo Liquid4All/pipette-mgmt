@@ -5,8 +5,8 @@
   // filtered, sorted and paged in `DataTable`, the plan id and the state by the server,
   // a job id by the campaigns of the plans that asked for it.
   import { campaigns, jobPlans } from "../api";
-  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, progressText,
-    soughtEmpty } from "../campaigns";
+  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, progressFill,
+    progressText, soughtEmpty } from "../campaigns";
   import { ownedEmpty, type OwnedBranch } from "../owned";
   import { shownStatus } from "../plans";
   import { here, href } from "../route.svelte";
@@ -68,7 +68,16 @@
   {:else if row.plan}<StatusPill status={shownStatus(row.plan.status, row.plan.counts)} />{#if row.plan.cancel_requested}{" "}(cancel requested){/if}
   {:else}—{/if}
 {/snippet}
-{#snippet progress(row: CampaignView)}{progressText(row)}{/snippet}
+<!-- A bar fills the cell behind the text: the finished jobs, then the failed ones, in the colors of the plan's phase.
+     The text's tooltip names the failed count. -->
+{#snippet progress(row: CampaignView)}
+  {@const fill = progressFill(row)}
+  {@const failed = row.plan?.counts?.failed}
+  {#if fill}<span class="fill" data-phase={fill.phase} data-failed={fill.done > fill.finished || undefined}
+                  style:--finished="{fill.finished * 100}%"
+                  style:--done="{fill.done * 100}%"></span>{/if}<span
+    title={failed ? `${failed} failed` : undefined}>{progressText(row)}</span>
+{/snippet}
 <!-- The rows stay drawn while a new label is read back. -->
 {#snippet labels(row: CampaignView)}
   <LabelsInline campaign={row} listing={path} {vocabulary} onchange={() => load(asked, jobId, true)}

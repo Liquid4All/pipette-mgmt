@@ -262,8 +262,9 @@ than base64.
 - **`dataset_probe_max_age_secs`.** Three minutes tolerates one or two missed
   runs before refusing; lower is stricter, higher rides out a slow scheduler.
 - **Probe fan-out.** One blobless fetch per distinct upstream per minute
-  (~1 s each), four upstreams at a time, each bounded by
-  `dataset_probe_timeout_secs`. The lock lease is sized from the pin count, so a
+  (~1 s each), and a second fetch only after an `ok` upstream is unavailable.
+  Four upstreams run at a time, and `dataset_probe_timeout_secs` bounds both
+  fetches of an upstream together. The lock lease is sized from the pin count, so a
   catalog of many slow upstreams lengthens the run rather than letting the next
   tick overlap it; past a few dozen upstreams the minute cadence itself would
   need revisiting.

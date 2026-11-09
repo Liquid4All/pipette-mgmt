@@ -5,7 +5,7 @@
   import { SvelteSet } from "svelte/reactivity";
   import { cellsWith, drawnLink } from "../jobs";
   import {
-    chartRefs, familyOf, pageControls, reportFilters, reportPairs, toggledRuntime, view, withFilter,
+    chartRefs, familyOf, pageControls, reportFilters, reportPairs, toggledRuntime, TTFT_E2E, view, withFilter,
     type ChartRef, type ReportFilters,
   } from "../report";
   import { rerunIds, rerunQuestion, rowOffers } from "../rerun";
@@ -121,9 +121,23 @@
       {@const drawn = view(results.index, filters)}
       <div class="body">
         {#if drawn.pins.length}<FilterBar controls={drawn.pins} {change} />{/if}
+        {#if drawn.under}
+          <!-- An emptied field reads as its default. -->
+          <div class="under">Too short to judge: under
+            <label>E2E <input type="number" min="0" step="0.1" value={drawn.under.e2e}
+                              onchange={(e) => change("e2e_under", e.currentTarget.value)} /> s</label>
+            with <label>prefill <input type="number" min="0" step="0.1" value={drawn.under.prefill}
+                                       onchange={(e) => change("prefill_under", e.currentTarget.value)} /> s</label>
+            <span class="muted">(0 judges every run)</span>
+          </div>
+        {/if}
         <ReportFamily view={drawn} names={results.names} failed={cellsWith(base, { benchmark: ids(chart), result: ["failed"] })}
                       runtime={runtime(filters)} jobs={(rows) => drawnLink(base, rows, results.view.results)}
                       job={(jobId) => cellsWith(base, { q: jobId })} {checked} {rerunnable} />
+        {#if chart.family.key === TTFT_E2E && results.index.ttft?.over}
+          {@const n = results.index.ttft.over.n}
+          <p><a href={cellsWith(base, { issue: ["ttft"] })}>See the {n} {n === 1 ? "job" : "jobs"} over E2E latency on Jobs</a></p>
+        {/if}
       </div>
     {/if}
   </details>
@@ -153,6 +167,9 @@
   .chart > summary::marker { color: var(--text-muted); }
   h2 { display: inline; margin: 0 0 0 2px; padding: 0; border: 0; }
   .body { padding: 0 14px 10px; }
+  .under { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 10px 0; font-size: 12px;
+           color: var(--text-muted); }
+  .under input { width: 5em; }
   .top { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between;
          margin: 14px 0 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
   .top :global(nav.tabs) { flex: 1 1 auto; margin: 0; }

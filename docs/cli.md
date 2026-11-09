@@ -108,7 +108,7 @@ Credentials stay out of the file, with one exception:
 | [`plans`](#pipette-mgmt-plans-liststatusresultscancel) | Read and cancel plans |
 | [`campaigns`](#pipette-mgmt-campaigns-createingestvariantsrevisererunrevertlistshowrenameownerdelete) | File and revise plans through campaigns |
 | [`catalog`](#pipette-mgmt-catalog) | Manage readable names for runtime and model descriptors |
-| [`clients`](#pipette-mgmt-clients-list---tag-tag) | Devices: lifecycle, tags, permissions, owners, pre-auth keys, suspensions |
+| [`clients`](#pipette-mgmt-clients-list---tag-tag) | Devices: lifecycle, tags, permissions, owners, pre-auth keys |
 | [`users`](#pipette-mgmt-users-createlistshowapproveset-typeset-campaignsdisableenabledeleterelease-claimset-org) | Accounts: lifecycle, permissions, keys, pre-auth keys |
 | [`orgs`](#pipette-mgmt-orgs-createlistshowupdatedisableenabledeleterelease-claimmembersclientsbenchmarks) | Organizations, their rosters and private benchmarks |
 | [`vault`](#pipette-mgmt-vault-listshowdeleteprune) | Read and delete vault records and files |
@@ -707,18 +707,6 @@ markers, ownership and tag markers; `queue-maintenance` and
 the cleanup. An absent record is not an error, so the command reports whether it
 found one. Submissions and warehouse rows naming the client stay.
 
-### `pipette-mgmt clients list-suspended`
-
-Lists the suspended clients, with `suspended_at` and the `conflicting_job_id`
-that triggered each suspension: a target for an alerting script.
-
-### `pipette-mgmt clients unsuspend <client_id>`
-
-Clears a client's suspension so it may claim again. A client is suspended when
-it holds more than one unexpired lease, a sign of a reboot or
-crash loop ([queue.md](queue.md#claiming-a-job)). Unsuspending changes nothing
-else about the client, and is a no-op for a client that is not suspended.
-
 ### `pipette-mgmt clients update <client_id> [flags]`
 
 `--organization` is **free text the device sent about itself**, with no record
@@ -901,6 +889,16 @@ sum of the artifacts' deadlines, an eval corpus counted only while it is
 unregistered. A benchmark that pins a digest another pins with different fields
 is skipped and reported.
 
+`probe` reaches each upstream once per run. If the upstream was `ok` and the
+probe finds it unavailable (a timeout or a network fault), `probe` tries again
+in the same run. The first attempt gets half of `dataset_probe_timeout_secs`,
+and the second attempt gets the rest. Thus one stalled fetch does not refuse
+the benchmarks of the upstream until the next run. `gone` and `moved` are
+answers from the upstream and get no second attempt. Each attempt logs
+`dataset_probe_attempt` at `debug` for each affected artifact, with `upstream`,
+`digest` and `elapsed_ms`. Each second attempt logs `dataset_probe_retried` at
+`info`, with `saved` set when it reached the upstream.
+
 `probe` exits non-zero while any upstream is not `ok` (`unavailable`, `gone`,
 `moved`) or could not be probed, and `build` when any build failed, so a failed
 run pages until the state clears. Each state change is logged once with a stable
@@ -1035,9 +1033,9 @@ one that blocks every outstanding job:
 | leases lapsed | Every outstanding job sits behind a lapsed lease. The holders stopped heartbeating, and a claim cannot reach a job outside `avail/`. |
 | nothing outstanding | No job is in `avail/`. Each one is held under a live lease, finished, or retired. |
 | expired | Every available job is past its deadline. The claim path refuses it. |
-| not indexed | No claimable job is in `todo/.eligible-indexed`, so no client carries an `eligible/` marker. |
+| not indexed | Every claimable job still carries its reindex flag, so no client carries an eligibility marker for it. |
 | starved | Every claimable job matches no working client. |
-| clients blocked | No claimable job has a client that can take it: no approved client holds `perform_work`, or every working client that matches a job is suspended, waits on a rebuild, or denied that job. |
+| clients blocked | No claimable job has a client that can take it: no approved client holds `perform_work`, or every working client that matches a job waits on a rebuild, or has a denial for that job. |
 | schedulable | At least one claimable job matches an unblocked client that holds no `denied/` marker for it. |
 
 One further answer is not a gate: **queue moved** means every claimable job left
@@ -1058,7 +1056,7 @@ Why these jobs are not scheduled
   Verdict   all 4 claimable job(s) match no working client — read the starved groups below
   Jobs      4 in the plan: 4 available, 0 leased, 0 finished or retired
             4 claimable (0 past their deadline); 4 indexed; 0 denied
-  Fleet     41 registered, 37 approved, 37 holding `perform_work`, 0 suspended, 0 pending an eligible-index rebuild, 37 unblocked
+  Fleet     41 registered, 37 approved, 37 holding `perform_work`, 0 pending an eligible-index rebuild, 37 unblocked
 
 Starved groups — clause sets from the snapshot, client counts read live:
   4 job(s) requiring os:ios excluding flags chip:a15 with any-of [gpu:a17pro, gpu:a18pro]
@@ -1088,9 +1086,11 @@ roster standing for a job naming clients by id (registered, approved, holding
 the fix); and a live match, which means a client registered after the last pass
 and the next run clears the group.
 
-`--explain` reads the fleet and the queue listings, so its cost grows with the
-fleet; it never reads the `eligible/` marker tree. `--explain --leases` costs no
-more than `--explain`, and both blocks date from one listing.
+`--explain` reads availability, leases, and denials only for this plan's jobs.
+It also reads the fleet and the shared indexed-state snapshot. It does not read
+the `eligible/` marker tree. `--explain --leases` costs the same as `--explain`.
+Both blocks use the same lease read. The reports count only the jobs of this
+plan. Queue maintenance logs malformed queue keys.
 
 **`results`** prints one row per metric of each job's latest scoring run,
 carried-over jobs included, with how many of the plan's jobs reported. A failed
@@ -1640,24 +1640,31 @@ This command is the cutover of the queue
 ([design/sql-job-queue.md](design/sql-job-queue.md#the-cutover)). It requires
 `[database]` and runs `db check` first. It refuses a config with
 `[todo_storage] backend = "database"`, because that config names no object-store
-queue. So run the cold pass before the switch of the config.
+queue. So run the cold pass before the switch of the config. Follow the
+[production cutover runbook](operations.md#311-moving-the-queue-to-postgresql)
+for the timing gate, task commands, and restart order.
 
 The copy goes through the two `TodoStore` implementations, so the server reads
 each copied entry as any other. It copies these keyspaces:
 
 - `avail/` and `leased/` with their bodies, deadlines, holders and lease
   expiries.
-- `denied/` with the denial records, and `suspended/` with the suspension
-  records.
-- `eligible/`, `lost/`, `pending-reindex/` and `pending-reindex-jobs/`.
+- `denied/` with the denial records.
+- `eligible/`, `lost/` and `pending-reindex/`. An eligibility marker compares by
+  client and job, because the database queue takes each marker's deadline from
+  its job.
 - `liveness/`, with the last-seen time of each device, to the second.
-- The five blobs of `queue-maintenance`: `.eligible-indexed`,
-  `.eligible-workers`, `.gc-candidates`, `.backlog` and `.backlog-campaigns`.
+- The three blobs of `queue-maintenance`: `.gc-candidates`, `.backlog` and
+  `.backlog-campaigns`.
+
+The copy does not carry the reindex flags or the worker set. The database
+queue flags each job that the copy inserts, and the next `queue-maintenance`
+run indexes it.
 
 The copy counts `tmp/` and does not copy it, because ingestion stages a body
 there again. The copy writes each entry that the target lacks or holds
 differently. It deletes each entry that the source does not hold. Before it
-deletes an `avail/`, `leased/`, `denied/` or `suspended/` entry, a source read
+deletes an `avail/`, `leased/` or `denied/` entry, a source read
 must confirm that the entry is gone. A listing skips what it cannot read, so the
 copy keeps an entry that only the listing misses.
 
@@ -1698,7 +1705,8 @@ Makes the object-store queue that `[todo_storage]` names equal to the queue in
 `[database]`. This command is the rollback of `queue import`. It copies the
 keyspaces of `queue import` in the other direction, with the same rules. Before
 you run it, change `[todo_storage]` back to the object-store queue, and stop
-`serve` and the `queue-maintenance` schedule.
+`serve` and the `queue-maintenance` schedule. Follow the
+[production rollback procedure](operations.md#311-moving-the-queue-to-postgresql).
 
 An object store cannot take a given modification time. So the export stamps the
 current time on each device that the object-store queue lacks. It counts a

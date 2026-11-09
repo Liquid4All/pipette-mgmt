@@ -42,8 +42,6 @@ pub struct JobCensus {
     pub lapsed_leases: usize,
     pub gone: usize,
     pub denied: usize,
-    pub unparseable_avail_keys: usize,
-    pub unparseable_leased_keys: usize,
 }
 
 /// The fleet's standing.
@@ -53,7 +51,6 @@ pub struct FleetStanding {
     pub registered: usize,
     pub approved: usize,
     pub working: usize,
-    pub suspended: usize,
     pub pending_reindex: usize,
     pub unblocked: usize,
 }

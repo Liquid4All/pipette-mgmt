@@ -84,6 +84,18 @@ impl SqlDatabase {
         self.pool.begin_with(BEGIN).await
     }
 
+    /// The one exception to [`ISOLATION`]: the queue claim. Its `FOR UPDATE SKIP LOCKED`
+    /// skips the rows that other claims hold. At `REPEATABLE READ`, a claim fails with
+    /// `40001` if another claim changed the row after its snapshot. Concurrent claims can
+    /// exhaust the retry budget.
+    pub(crate) async fn begin_read_committed(
+        &self,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        self.pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+    }
+
     /// Run one statement in its own transaction with [`retry`], returning the
     /// rows changed. `query` rebuilds the statement for each attempt.
     pub(crate) async fn execute(

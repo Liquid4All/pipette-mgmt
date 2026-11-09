@@ -1026,6 +1026,7 @@ job itself (a terminal result).
 | `message_type` | string | yes | Must be `"failure"` |
 | `job_id` | string | yes | Job identifier from the [`POST /plans/claim`](#29-post-plansclaim) response, echoed verbatim. The descriptors are serialized from the claim's `spec.model` / `spec.runtime` (with any local HuggingFace token stripped) |
 | `failure_reason` | string | yes | Why the benchmark could not be run. Typically includes a timestamp and the runtime's own error output |
+| `failure_code` | string | no | What kind of failure this is: `unspecified`, `out_of_memory` (the runtime's output shows an allocation failure, or the OS killed the app; wins over `runtime_error`), `attempt_timeout` (an attempt ran past `attempt_timeout_seconds`), `runtime_error` (the runtime crashed, exited, aborted, refused the model or an op, answered wrongly, or ran past a limit other than `attempt_timeout_seconds`), `device_error` (a reboot, a readiness wait, an unreachable device) or `harness_error` (a vault fetch, an install, the spec, a missing model, the submit, or a download or wait that timed out). Absent reads as `unspecified`; any other value answers `400`. Kept in the denial of a retriable failure and in the `failure_code` column of a terminal one's rows |
 | `retriable` | bool | yes | Whether **another** client may still attempt this job. `true`: the failure is specific to this client (e.g. out of disk, thermal throttle, transient local fault): the server denies the job to this client and keeps it available to others. `false`: the failure is inherent to the benchmark/model/runtime and would recur anywhere: the server records it as the job's terminal result and tears the job down. See [queue.md](queue.md#consequences-of-failure) |
 | `benchmark_id` | string | yes | Benchmark that was being attempted |
 | `benchmark_type` | string or null | no | With `benchmark_params`, checked like the success variant's pair |
@@ -1046,6 +1047,7 @@ Example:
   "job_id": "job-550e8400-e29b-41d4-a716-446655440000",
   "benchmark_id": "prefill_throughput_256",
   "failure_reason": "[2026-03-10T12:04:51Z] llama-server failed to load model: out of memory",
+  "failure_code": "out_of_memory",
   "retriable": true,
   "model_descriptor": "{\"org\":\"unsloth\",\"path\":\"Qwen3.5-0.8B-Q4_0.gguf\",\"repo_name\":\"Qwen3.5-0.8B-GGUF\",\"source\":\"huggingface\",\"type\":\"gguf_text\"}",
   "runtime_descriptor": "{\"flavor\":\"macos-arm64\",\"repository_url\":\"github.com/ggml-org/llama.cpp\",\"repository_version\":\"b9050\",\"source\":\"github_release\",\"type\":\"llamacpp_cli_stock_tools\"}",
@@ -1389,11 +1391,6 @@ Returned when no job is currently available for this client. Possible reasons:
 - The client already holds a lease on a job that has lost
   `plan_lost_lease_limit` leases. The lease lapses and `queue-maintenance`
   retires the job.
-- The client is suspended (it held more than one unexpired lease; see
-  [queue.md](queue.md#claiming-a-job)), or this claim would have given it a
-  second one, which suspends it. The response is identical to the
-  no-job case. An operator clears the flag with
-  `pipette-mgmt clients unsuspend` before the client can claim again.
 
 The body is empty. How long to wait before claiming again is
 [client-integration.md §5](client-integration.md#idle-polling-cadence).
@@ -1432,14 +1429,9 @@ Two responses say the lease is no longer the caller's:
 What a client does about each is
 [client-integration.md §5](client-integration.md#5-error-handling-and-retries).
 
-A suspended client gets `403` without a renewal, so its leases lapse. A
-renewal that leaves the client a second live lease, as renewing a lapsed lease
-can, suspends it and answers `403`
-([queue.md](queue.md#claiming-a-job)). So does a lease on a job that names a
-vault resource the client may not fetch
-([Vault](api/vault.md#who-may-do-what)): it could never run the job, so its
-lease goes back to the queue at once, denied to the client, for a device that
-can.
+The server returns `403` if the client cannot fetch a job's vault resource
+([Vault](api/vault.md#who-may-do-what)). It denies that job to the client and
+recycles its lease.
 
 A heartbeat never fails because the job has passed its `expires_at`. The
 deadline governs when a job may be *assigned*, not how long a client that
@@ -1471,7 +1463,6 @@ Empty body.
 | 401 | Missing or invalid auth headers |
 | 403 | Client is pending (not approved) |
 | 403 | Client does not hold `perform_work`: `client lacks the perform_work permission` |
-| 403 | Client is suspended, or this renewal left it a second live lease and suspended it: `client is suspended` |
 | 403 | The job names a vault resource the client may not fetch; the lease goes back to the queue, denied to the client: `the job names a vault resource this client may not fetch` |
 | 404 | No active lease found for this `job_id`: the lease was reaped |
 | 404 | Client's profile re-evaluation is pending. Its leases were relinquished by the profile change ([§2.4](#24-patch-clientsme)); the lease is never renewed |
@@ -1488,9 +1479,10 @@ recycled by `queue-maintenance`), the server renews it and returns `200`.
 Otherwise it re-acquires the job from the queue under the same eligibility and
 denial checks as [`POST /plans/claim`](#29-post-plansclaim). Requires an
 approved client holding `perform_work` (403 if pending, 403 if the permission
-is missing); a suspended client receives `403`. A reclaim that would leave the
-client a second live lease suspends it: a renewal answers `403`, and a
-re-acquire puts the job back and answers `404`. A job that names a vault
+is missing). Before a re-acquire, the
+server settles the client's lapsed leases on other jobs, as a claim does. A
+client that holds a live lease on another job cannot re-acquire one, and gets
+`404` ([queue.md](queue.md#claiming-a-job)). A job that names a vault
 resource the client may not fetch is neither renewed nor re-acquired, and
 answers `403`; a re-acquired one goes back to the queue.
 
@@ -1526,11 +1518,11 @@ the client already has the job JSON from the original claim.
 |--------|-----------|
 | 400 | `job_id` in the path contains characters outside `[A-Za-z0-9-]` |
 | 401 | Missing or invalid auth headers |
-| 403 | Client is pending (not approved), or client is suspended, or this renewal left it a second live lease and suspended it |
+| 403 | Client is pending (not approved) |
 | 403 | The job names a vault resource the client may not fetch; nothing is renewed and the lease, held or re-acquired, goes back to the queue: `the job names a vault resource this client may not fetch` |
 | 403 | Client does not hold `perform_work`: `client lacks the perform_work permission` |
 | 404 | Job cannot be re-acquired and is not leased to anyone. It is past its `expires_at`, was completed, or was re-acquired and finished by another client |
-| 404 | The re-acquire would have left the client a second live lease; the job goes back to the queue and the client is suspended |
+| 404 | The client holds a live lease on another job; the job stays in the queue |
 | 404 | Client's profile re-evaluation is pending (`reindex_pending`). Its leases were relinquished by the profile change ([§2.4](#24-patch-clientsme)); prior work is forfeited |
 | 409 | Job is currently leased to a different client |
 
@@ -1580,6 +1572,7 @@ promoted: their `job_id` is a receipt, not a lookup key.
 | `score_runtime_version` | string or null | Version of the evals server that scored this job (non-null only for eval benchmarks when `status: "processed"`; absent on a failed job) |
 | `metrics` | array or null | Benchmark metrics (null unless `status: "processed"`; absent on a failed job) |
 | `failure_reason` | string | Client-supplied failure reason (only when `status: "failed"`) |
+| `failure_code` | string | The failure body's `failure_code`, `unspecified` when it sent none (only when `status: "failed"`) |
 | `model_name`, `model_quant`, `runtime_name`, `runtime_version` | string or null | Model / runtime identity echoed verbatim from the failure record (only when `status: "failed"`); each is null when the failure record omitted it |
 | `client_version` | string or null | Version of the client build that reported the failure, echoed verbatim (only when `status: "failed"`); null when the failure record omitted it. The warehouse `client_version` column carries the same value on the failure's rows |
 | `metrics[].metric` | string | Metric name (e.g. `prefill_throughput`). See [benchmarks.md](benchmarks.md) for per-type metric definitions |

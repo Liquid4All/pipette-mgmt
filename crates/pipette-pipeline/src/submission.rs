@@ -14,8 +14,8 @@ use pipette_core::warehouse;
 use pipette_plan_types::{
     AsrAudioTokensSource, AsrClientExtras, AsrClientExtrasError, AsrContextSizing,
     AsrThroughputBenchmark, BenchmarkDefinition, BenchmarkId, BenchmarkParams, BenchmarkType,
-    ClientId, Dataset, DeviceFormFactor, FailureInput, FailureSource, FleetDetail, JobId,
-    MAX_CLIENT_EXTRAS_BYTES, MAX_DEVICE_READINGS_BYTES, MAX_READINESS_GATE_WAITS_BYTES,
+    ClientId, Dataset, DeviceFormFactor, FailureCode, FailureInput, FailureSource, FleetDetail,
+    JobId, MAX_CLIENT_EXTRAS_BYTES, MAX_DEVICE_READINGS_BYTES, MAX_READINESS_GATE_WAITS_BYTES,
     NonEmptyTrimmedString, NonNegativeMillis, PositiveCount, PositiveMillis, RuntimeOutput,
     SampleCompletion, Sha256, SubmissionInput, SuccessInput, VlSpecDecodeBenchmark,
     keep_last_elements,
@@ -854,7 +854,7 @@ fn asr_regime(
     }
 }
 
-const FAILURE_ONLY_FIELDS: &[&str] = &["retriable", "failure_reason"];
+const FAILURE_ONLY_FIELDS: &[&str] = &["retriable", "failure_reason", "failure_code"];
 
 /// Not `device_time_ms`: a failed job also takes time.
 fn is_success_only_field(key: &str, measurements: &std::collections::HashSet<&str>) -> bool {
@@ -1096,6 +1096,7 @@ pub fn system_failure_from_job_body(
     job_body: &serde_json::Value,
     benchmark_type: BenchmarkType,
     failure_reason: impl Into<String>,
+    failure_code: FailureCode,
     failure_source: FailureSource,
     submitted_at: DateTime<Utc>,
 ) -> anyhow::Result<Submission> {
@@ -1119,6 +1120,7 @@ pub fn system_failure_from_job_body(
         benchmark_id,
         retriable: false,
         failure_reason: NonEmptyTrimmedString::try_new(failure_reason.into())?,
+        failure_code,
         model_name: None,
         model_quant: None,
         // Else a null model canonicalizes to `"null"` and groups as a real cell.
@@ -1242,6 +1244,7 @@ pub async fn record_system_failure(
     catalog: &HashMap<BenchmarkId, Benchmark>,
     job_body: &serde_json::Value,
     failure_reason: impl Into<String>,
+    failure_code: FailureCode,
     failure_source: FailureSource,
     now: DateTime<Utc>,
 ) -> anyhow::Result<CreateOutcome> {
@@ -1269,6 +1272,7 @@ pub async fn record_system_failure(
         job_body,
         benchmark_type,
         failure_reason,
+        failure_code,
         failure_source,
         now,
     )?;
@@ -2247,6 +2251,20 @@ parameter_decode_tokens = 256
         Ok(())
     }
 
+    /// serde writes bodies and retry records, `AsRef<str>` the warehouse and
+    /// `queue_denials` columns, so they must agree.
+    #[test]
+    fn failure_code_spells_one_value_everywhere() -> anyhow::Result<()> {
+        <FailureCode as strum::IntoEnumIterator>::iter().try_for_each(|variant| {
+            let json = serde_json::to_string(&variant)?;
+            let wire = json.trim_matches('"');
+            assert_eq!(wire, variant.as_ref(), "serde and strum disagree");
+            assert_eq!(wire.parse::<FailureCode>()?, variant);
+            assert_eq!(serde_json::from_str::<FailureCode>(&json)?, variant);
+            Ok(())
+        })
+    }
+
     #[test]
     fn parse_stored_submission_defaults_missing_tag_to_success() -> anyhow::Result<()> {
         let body = json!({
@@ -2366,6 +2384,35 @@ parameter_decode_tokens = 256
         Ok(())
     }
 
+    #[rstest]
+    #[case::absent(None, Some(FailureCode::Unspecified))]
+    #[case::known(Some("attempt_timeout"), Some(FailureCode::AttemptTimeout))]
+    #[case::unknown(Some("disk_full"), None)]
+    fn a_failure_code_parses_or_refuses_the_body(
+        #[case] code: Option<&str>,
+        #[case] expected: Option<FailureCode>,
+    ) -> anyhow::Result<()> {
+        let mut body = json!({
+            "message_type": "failure",
+            "benchmark_id": "prefill_throughput_256",
+            "benchmark_type": "prefill_throughput",
+            "client_id": "c1",
+            "job_id": "j1",
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "retriable": true,
+            "failure_reason": "OOM",
+        });
+        if let Some(code) = code {
+            body["failure_code"] = json!(code);
+        }
+        let parsed = parse_stored_submission(&body).ok().map(|s| match s {
+            Submission::Failure(f) => Ok(f.wire.failure_code),
+            Submission::Success(_) => Err(anyhow::anyhow!("parsed as a success")),
+        });
+        assert_eq!(parsed.transpose()?, expected);
+        Ok(())
+    }
+
     fn job_body_with_spec(
         model: serde_json::Value,
         runtime: serde_json::Value,
@@ -2399,6 +2446,7 @@ parameter_decode_tokens = 256
             &job_body,
             BenchmarkType::PrefillThroughput,
             "All eligible clients reported failure",
+            FailureCode::OutOfMemory,
             FailureSource::AllClientsDenied,
             at,
         )?;
@@ -2413,6 +2461,7 @@ parameter_decode_tokens = 256
             f.wire.failure_reason.as_str(),
             "All eligible clients reported failure"
         );
+        assert_eq!(f.wire.failure_code, FailureCode::OutOfMemory);
         assert_eq!(f.wire.benchmark_id.as_str(), "prefill_throughput_256");
         assert_eq!(
             f.wire.model_descriptor.as_deref(),
@@ -2464,6 +2513,7 @@ parameter_decode_tokens = 256
             &catalog,
             &job_body,
             "Job expired before any client completed it",
+            FailureCode::Unspecified,
             FailureSource::Expired,
             "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
         )
@@ -2487,6 +2537,7 @@ parameter_decode_tokens = 256
                 "spec": { "benchmark": "prefill_throughput_256" },
             }),
             "Job expired before any client completed it",
+            FailureCode::Unspecified,
             FailureSource::Expired,
             "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
         )
@@ -2512,6 +2563,7 @@ parameter_decode_tokens = 256
             &job_body,
             BenchmarkType::PrefillThroughput,
             "expired",
+            FailureCode::Unspecified,
             FailureSource::Expired,
             "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
         )?;
@@ -2556,6 +2608,7 @@ parameter_decode_tokens = 256
             &job_body,
             BenchmarkType::PrefillThroughput,
             "expired",
+            FailureCode::Unspecified,
             FailureSource::Expired,
             "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
         )?;
@@ -2737,6 +2790,7 @@ parameter_decode_tokens = 256
             &job_body,
             BenchmarkType::PrefillThroughput,
             "expired",
+            FailureCode::Unspecified,
             FailureSource::Expired,
             "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
         )?;
@@ -2776,6 +2830,7 @@ parameter_decode_tokens = 256
                 &job_body,
                 BenchmarkType::PrefillThroughput,
                 "reason",
+                FailureCode::Unspecified,
                 FailureSource::Expired,
                 at,
             )

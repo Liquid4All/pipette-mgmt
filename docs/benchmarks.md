@@ -1163,8 +1163,8 @@ under `[dataset]` (not `upstream.url`) is dropped at load and on write:
 
 **Why one benchmark per dataset.** The reference results are per dataset, and a
 job is the unit of scheduling, retry and failure: six benchmarks let six
-datasets land on different devices or days, shrink `bench_timeout_seconds`
-six-fold, and let one broken dataset fail alone. The whole-upstream number is
+datasets land on different devices or days and let one broken dataset fail
+alone. The whole-upstream number is
 not recoverable from six per-dataset ratios, so an unfiltered entry can exist
 alongside them when the pooled figure is wanted.
 
@@ -1275,9 +1275,9 @@ data, not invalid data, and `device_power_state`, `device_battery_level` and
 `device_power_save_mode` already say so on the row.
 
 Per-cell knobs (`benchmark_flags`): `http_timeout_seconds` bounds one turn's
-request, `bench_timeout_seconds` the whole traversal (gate waits included, so it
-must allow for one per sample: 100 for an MMSpec `test` subset), and
-`readiness` gates before every sample.
+request, `attempt_timeout_seconds` each sample with all its turns, the warm-up
+being one more (gate waits excluded: each has its own
+`readiness.max_wait_secs`), and `readiness` gates before every sample.
 
 Runtime knobs (`runtime_flags`) are llama-server's, plus `envs` for a fork's
 kernel switches and `speculative_enabled`, both on this benchmark alone among

@@ -112,8 +112,6 @@ data/
 │       └── {client_id}/
 │           └── {job_id}.json
 ├── todo/                                ← [todo_storage]
-│   ├── .eligible-indexed                ← avail/ keys queue-maintenance has indexed
-│   ├── .eligible-workers                ← client ids queue-maintenance indexed as workers
 │   ├── .gc-candidates                   ← keys the last run saw orphaned
 │   ├── .backlog                         ← claimable-job count of each device, and the time of the count
 │   ├── .backlog-campaigns               ← the same count, by campaign
@@ -132,13 +130,9 @@ data/
 │   │   └── {job_id}.{client_id}         ← marker: client failed this job; its reason as JSON, or empty
 │   ├── pending-reindex/
 │   │   └── {client_id}.{uuid}           ← one marker per client reindex request
-│   ├── pending-reindex-jobs/
-│   │   └── {job_id}                     ← empty marker: this job's eligible/ markers are owed a rewrite
 │   ├── lost/
 │   │   └── {job_id}/
 │   │       └── {client_id}.{lease_expiry}  ← empty marker: one lease on this job ended without a result
-│   ├── suspended/
-│   │   └── {client_id}.json             ← client suspended for operator review
 │   └── liveness/
 │       └── {client_id}                  ← empty marker: its modification time is the client's last-seen time
 ├── warehouse/
@@ -280,12 +274,13 @@ markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
   and consumed by `queue-maintenance`; the `uuid` keeps a request that arrives
   during a rebuild from collapsing into the one being served. See
   [queue.md](queue.md).
-- `todo/pending-reindex-jobs/{job_id}` is the job-scoped counterpart: this job's
-  `eligible/` markers are owed a rewrite for **every** client. A job leased
-  while a client reindex ran, and a job the expiry pass re-dated, raise it. The
-  key is the bare `job_id`, so raising the same debt twice is one marker. The
-  settle pass re-matches the job once it is back in `avail/`, then deletes the
-  marker.
+- The incremental eligibility index has no keys in this layout. The database
+  queue keeps a reindex flag and a stored projection of the six matcher fields
+  on each job row. It also keeps the indexed worker set in a table. Client
+  rebuilds group by that projection and read no bodies. Denial writes also set
+  the job's flag and advance its revision. `queue-maintenance` needs the
+  database queue
+  ([queue.md](queue.md#the-eligible-index)).
 - `todo/lost/{job_id}/{client_id}.{lease_expiry}` records one lease that ended
   without a result: it lapsed, or its holder claimed again while still holding
   it. The markers are the job's loss count, which `queue-maintenance` compares
@@ -294,18 +289,13 @@ markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
   lease, so recording one loss twice writes one marker. The markers go with the
   job, through the orphan sweep.
 - These files hold `queue-maintenance` run state, not queue records:
-  - `todo/.eligible-indexed`
-  - `todo/.eligible-workers`
   - `todo/.gc-candidates`
   - `todo/.backlog`
   - `todo/.backlog-campaigns`
 
   `queue-maintenance` rewrites each file whole. The files sit at the root so
-  no marker listing returns one. Missing **and**
-  corrupt read as empty, the safe direction for each: an empty
-  `.eligible-indexed` re-indexes everything (indexing is idempotent), an empty
-  `.eligible-workers` rebuilds every worker's markers once, and an empty
-  `.gc-candidates` delays a delete by one run. The sweep deletes a key only on a
+  no marker listing returns one. The reader treats missing or corrupt files as
+  empty. An empty `.gc-candidates` file safely delays deletion by one run. The sweep deletes a key only on a
   second consecutive sighting, so a listing that raced a write cannot delete
   live state. `.gc-candidates` also carries the plan-index orphans of the record
   store (`content-keys/v1/`, `job-plans/`, `plan-sources-pending/`) under a
@@ -316,12 +306,6 @@ markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
   Each device page view reads the whole object, so the cost of a view grows
   with the number of devices times the campaigns that hold a job for each
   device. If that product becomes large, store one object for each device.
-- `todo/suspended/{client_id}.json` flags a client that held more than one
-  live lease, as checked by claim, heartbeat and reclaim: a sign of a crash
-  loop or of racing claims. A suspended client gets no job, and its heartbeats
-  and reclaims are refused, so its leases lapse, until an operator clears the
-  flag (`clients unsuspend`). The record holds `suspended_at` and the
-  `conflicting_job_id`.
 - `todo/liveness/{client_id}` is an empty marker that each verified, signed
   device request stamps, at most once a minute per `serve` process. Its
   modification time is the device's last-seen time, so one listing of
@@ -1810,6 +1794,7 @@ device protocol, [httpapi.md §2.7](httpapi.md#27-post-benchmarks).
 | `failed_reason` | string | yes |
 | `failure_source` | string | yes |
 | `failure_retriable` | bool | yes |
+| `failure_code` | string | yes |
 | `rescored_from` | string | yes |
 | `rerun_of` | string | yes |
 | `run_submitted_at` | timestamp_utc | yes |
@@ -2341,6 +2326,7 @@ breakdown, still counting distinct `job_id`. For rows written before the
 | `failed_reason` | string | The client's `failure_reason`, or the message the server wrote when it retired the job. NULL on a measured row |
 | `failure_source` | string | Which pass produced the failure: `client`, `expired`, `all_clients_denied`, `unmatchable`, or `lease_lost`. NULL on a measured row. A body stored before the field existed resolves from its `client_id`: the reserved `"system"` id reads NULL, any other reads `client` |
 | `failure_retriable` | boolean | The client's `retriable` flag. `false` on every synthetic `"system"` failure. NULL on a measured row |
+| `failure_code` | string | The client's `failure_code`, `unspecified` when it sent none. On an `all_clients_denied` failure, the code most of the clients' denials name (`unspecified` if none names one); `unspecified` on every other synthetic `"system"` failure. NULL on a measured row and on rows written before the column |
 
 **Read the flag as `failed IS TRUE` / `failed IS NOT TRUE`.** Rows written
 before the column read NULL, so `failed = false` and `failed != true` drop them

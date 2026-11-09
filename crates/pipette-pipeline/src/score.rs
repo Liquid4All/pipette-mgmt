@@ -1426,6 +1426,7 @@ async fn score_success(
             failed_reason: None,
             failure_source: None,
             failure_retriable: None,
+            failure_code: None,
             parameter_draft_length: get_param_draft_length(benchmark),
             parameter_dataset_subset: get_param_dataset_subset(benchmark),
             parameter_batch_size: benchmark.parameter_batch_size().map(BatchSize::as_i32),
@@ -1644,6 +1645,7 @@ fn record_failure(
             failed_reason: Some(failed_reason.clone()),
             failure_source: source,
             failure_retriable: Some(failure.wire.retriable),
+            failure_code: Some(failure.wire.failure_code),
             parameter_draft_length: get_param_draft_length(benchmark),
             parameter_dataset_subset: get_param_dataset_subset(benchmark),
             parameter_batch_size: benchmark.parameter_batch_size().map(BatchSize::as_i32),
@@ -1679,6 +1681,7 @@ fn record_failure(
         benchmark_id = %failure.wire.benchmark_id,
         client_id = %failure.client_id,
         failure_source = ?source,
+        failure_code = %failure.wire.failure_code,
         retriable = failure.wire.retriable,
         rows = rows.len(),
         "recorded failure submission"
@@ -6897,6 +6900,7 @@ mod tests {
                     &prefill_catalog()?,
                     &job_body,
                     "no client claimed the job",
+                    pipette_plan_types::FailureCode::Unspecified,
                     FailureSource::Expired,
                     Utc::now(),
                 )

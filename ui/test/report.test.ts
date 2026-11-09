@@ -1,8 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { e2eText, pairingText } from "../src/lib/findings";
+import { e2eText, pairingText, ttftText } from "../src/lib/findings";
 import {
   canonical, cellText, chartNames, chartRefs, descriptorText, deviceNames, deviceType, drawnRows, effortOf, estimate, familyOf, index, modelLabels, pageControls, partText, reportFilters, reportPairs, runtimeLabels, shortLabel, thinkingOf, speculativeJobs, view,
-  ASR_SWAPPED, BEYOND_LIMIT, SWAPPED, toggledRuntime, VL_SWAPPED, withFilter, type BarChart, type LineChart, type ReportFilters,
+  ASR_SWAPPED, BEYOND_LIMIT, SWAPPED, toggledRuntime, ttftOver, VL_SWAPPED, withFilter, type BarChart, type LineChart, type ReportFilters,
 } from "../src/lib/report";
 import type { FleetDetail, Model, ModelFlags, ResultRow, Runtime } from "../src/lib/api-types";
 import type { DescriptorNames } from "../src/lib/descriptor-names";
@@ -64,7 +64,8 @@ const failedRow = (over: Partial<ResultRow> = {}) => row({
 });
 
 const none: ReportFilters = {
-  benchmark: "", metric: "", device: [], drop: [], model: [], per: "", params: {}, status: "",
+  benchmark: "", metric: "", device: [], drop: [], model: [], per: "", params: {}, status: "", e2eUnder: "",
+  prefillUnder: "",
 };
 /** What `filters` draw, on the tab of the first measured row's type unless they name one. */
 const show = (rows: ResultRow[], filters: Partial<ReportFilters> = {}, fleet: FleetDetail = "full") =>
@@ -247,10 +248,10 @@ describe("families and metrics", () => {
     expect([...chartNames(ix.benchmarks).values()]).toEqual(["Prefill throughput", "Prefill · time to first token",
       "Decode throughput", "E2E latency", "VL throughput · time to first token", "VL throughput · E2E latency",
       "Prefill + decode time"]);
-    // The page's charts are those, then the checks, text then VL.
-    expect(chartRefs(ix).map((c) => [c.name, c.family.key, c.metric?.key]).slice(-3)).toEqual([
+    // The page's charts are those, then the checks, text then VL then TTFT.
+    expect(chartRefs(ix).map((c) => [c.name, c.family.key, c.metric?.key]).slice(-4)).toEqual([
       ["Prefill + decode time", "vl_throughput", "e2e_latency"], ["E2E latency vs prefill + decode", "e2e_check", "excess"],
-      ["VL E2E latency vs prompt + decode", "vl_e2e_check", "excess"],
+      ["VL E2E latency vs prompt + decode", "vl_e2e_check", "excess"], ["TTFT vs E2E latency", "ttft_check", "ttft_share"],
     ]);
   });
 
@@ -284,6 +285,7 @@ describe("families and metrics", () => {
     expect(ix.families.map((f) => [f.key, f.label, f.metric])).toEqual([
       ["asr_throughput", "ASR throughput", "end_to_end_latency"],
       ["asr_max_memory", "ASR peak memory", "peak_memory"],
+      ["ttft_check", "time to first token vs E2E latency", "ttft_share"],
     ]);
     expect(ix.families[0]!.metrics.map((m) => m.key)).toEqual(
       ["prefill_throughput", "ttft", "decode_throughput", "end_to_end_latency"]);
@@ -1223,9 +1225,9 @@ describe("parameters, axes and series", () => {
 
 describe("E2E vs prefill + decode", () => {
   test("the estimate is prefill time plus the e2e rows' decode tokens at the decode rate", () => {
-    expect(estimate(1000, 200, null, 50, 100, 2420)).toEqual([220, 10]);
-    expect(estimate(1000, null, 5000, 50, 100, 2420)).toEqual([220, 10]);
-    expect(estimate(1000, 200, 1, 50, 100, 2420)).toEqual([220, 10]);
+    expect(estimate(1000, 200, null, 50, 100, 2420)).toEqual([220, 10, 200]);
+    expect(estimate(1000, null, 5000, 50, 100, 2420)).toEqual([220, 10, 200]);
+    expect(estimate(1000, 200, 1, 50, 100, 2420)).toEqual([220, 10, 200]);
   });
 
   test.each([
@@ -1298,10 +1300,33 @@ describe("E2E vs prefill + decode", () => {
   const e2eOf = (rows: ResultRow[]) => index(rows, "full").e2e;
   const NONE = { e2e: 0, decode: 0, prefill: 0 };
 
+  test("a run under both thresholds is drawn hollow and judged apart from the band, as the address sets them", () => {
+    // 100 ms prefill and 256 tokens at 1000 tok/s expect 356 ms, so 400 ms runs 12.4 % over in a short run.
+    const rows = [...plan, ...prefill(128, 2560, 100), ...decodeJob(128, 1000), ...e2e(128, 400)];
+    expect(e2eOf(rows)).toMatchObject({ short: 1, within: 2, slower: { n: 1, max: 10 } });
+    const shortOf = (v: ReturnType<typeof show>) => lines(v.charts)[0]!.panels[0]!.series.flatMap((s) => s.cells)
+      .filter((c) => c?.short).map((c) => Number(c!.median.toFixed(1)));
+    const drawn = show(rows, { benchmark: "e2e_check" });
+    expect([shortOf(drawn), drawn.under]).toEqual([[12.4], { e2e: 1.5, prefill: 1 }]);
+    expect(drawn.notes[0]).toBe(e2eText(e2eOf(rows)!));
+    expect(drawn.notes).toContain("Faded hollow points ran under 1.5 s end to end with prefill under 1 s, too short to "
+      + "judge: a fixed cost per request is a large share of so short a run, so the finding counts them apart from the band.");
+    // 0 judges every run; a threshold under the run's own time judges it too.
+    for (const asked of [{ e2eUnder: "0" }, { prefillUnder: "0.1" }, { e2eUnder: "0.4" }]) {
+      const judged = show(rows, { benchmark: "e2e_check", ...asked });
+      expect([shortOf(judged), judged.notes[0]]).toEqual([[], expect.stringContaining("; 2 ran slower, by up to 12.4 %.")]);
+      expect(judged.notes.some((n) => n.startsWith("Hollow"))).toBe(false);
+    }
+    expect(show(rows, { benchmark: "e2e_check", e2eUnder: "5.4" }).notes[0]).toContain("for the one combination of "
+      + "model, device, runtime and prefill length that could be checked. 3 more ran under 5.4 s end to end");
+    // Any other family offers no thresholds.
+    expect(show(rows, { benchmark: "decode_throughput" }).under).toBeNull();
+  });
+
   test("the Overview's finding counts what agreed, what strayed which way, and what could not be checked", () => {
     expect(e2eOf(plan)).toEqual({
       kind: "checked", vl: false, total: 5, complete: 3, unestimated: 0, missing: { e2e: 1, decode: 1, prefill: 1 },
-      batched: false, within: 2, slower: { n: 1, max: 10 }, faster: null,
+      batched: false, short: 0, under: { e2e: 1.5, prefill: 1 }, within: 2, slower: { n: 1, max: 10 }, faster: null,
     });
     expect(index([...memory("Mac", MAC, { host: 1 })], "full").e2e).toBeNull();
     const lacking = index(plan.filter((r) => r.benchmark_type !== "decode_throughput"), "full");
@@ -1440,7 +1465,7 @@ describe("VL E2E latency vs prompt + decode", () => {
     expect(ix.e2e).toBeNull();
     expect(ix.vlE2e).toEqual({
       kind: "checked", vl: true, total: 5, complete: 3, unestimated: 0, missing: { e2e: 1, decode: 0, prefill: 1 },
-      batched: false, within: 2, slower: { n: 1, max: 10 }, faster: null,
+      batched: false, short: 0, under: { e2e: 1.5, prefill: 1 }, within: 2, slower: { n: 1, max: 10 }, faster: null,
     });
     expect(e2eText(ix.vlE2e!)).toBe("Measured end-to-end latency is within ±5 % of prompt + decode time for 2 of 3 VL "
       + "throughput jobs; 1 ran slower, by 10.0 %. 2 more lack a measurement: end-to-end latency in 1, time to first "
@@ -1454,7 +1479,16 @@ describe("VL E2E latency vs prompt + decode", () => {
     expect(drawn.notes[0]).toBe(e2eText(ix.vlE2e!));
     expect(drawn.notes).toContain("One job measures all three, so each point checks a run against its own time to "
       + "first token, image encoding included, and decode time.");
-    expect(chartRefs(ix).at(-1)).toMatchObject({ name: "VL E2E latency vs prompt + decode", key: "vl_e2e_check\nexcess" });
+    expect(chartRefs(ix).at(-2)).toMatchObject({ name: "VL E2E latency vs prompt + decode", key: "vl_e2e_check\nexcess" });
+  });
+
+  test("a job under both thresholds is too short to judge, its prefill side the time to first token", () => {
+    // 200 ms to first token and 256 tokens at 1000 tok/s expect 456 ms, so 500 ms runs 9.6 % over in a short job.
+    const ix = index([...plan, ...vl(2, 200, 1000, 500)], "full");
+    expect(ix.vlE2e).toMatchObject({ short: 1, within: 2, slower: { n: 1, max: 10 } });
+    const cells = lines(view(ix, { ...none, benchmark: "vl_e2e_check" }).charts)[0]!.panels[0]!.series
+      .flatMap((s) => s.cells);
+    expect(cells.filter((c) => c?.short).map((c) => Number(c!.median.toFixed(1)))).toEqual([9.6]);
   });
 
   test("lists the models it checked, which the model filter draws alone", () => {
@@ -1529,7 +1563,57 @@ describe("VL E2E latency vs prompt + decode", () => {
       "Prefill throughput", "Prefill · time to first token", "Decode throughput", "E2E latency",
       "VL throughput · prefill throughput", "VL throughput · time to first token", "VL throughput · decode throughput",
       "VL throughput · E2E latency", "E2E latency vs prefill + decode", "VL E2E latency vs prompt + decode",
+      "TTFT vs E2E latency",
     ]);
+  });
+});
+
+describe("TTFT vs E2E latency", () => {
+  const vl = (images: number, ttft: number, e2e: number, over: Partial<ResultRow> = {}) => job("vl_throughput", [
+    ["ttft", ttft, "ms"], ["decode_throughput", 256, "tokens/sec"], ["end_to_end_latency", e2e, "ms"],
+  ], { parameters: { text_tokens: 1024, decode_tokens: 256, num_images: images }, ...over });
+
+  test("checks each job's time to first token against its own end-to-end latency", () => {
+    const ix = index([...vl(1, 500, 2000), ...vl(5, 2500, 2000), ...vl(16, 1000, 800)], "full");
+    expect(ix.ttft).toEqual({ jobs: 3, over: { n: 2, max: 25 } });
+    expect(ttftText(ix.ttft!))
+      .toBe("Time to first token exceeds end-to-end latency in 2 of 3 jobs that measured both, by up to 25.0 %.");
+    const drawn = view(ix, { ...none, benchmark: "ttft_check" });
+    const chart = lines(drawn.charts)[0]!;
+    expect([chart.x, medians(chart), chart.panels.map((p) => p.reference)]).toEqual(["num_images", [[25, 125, 125]], [100]]);
+    expect(drawn.notes[0]).toBe(ttftText(ix.ttft!));
+    expect(chartRefs(ix).at(-1)).toMatchObject({ name: "TTFT vs E2E latency", key: "ttft_check\nttft_share" });
+  });
+
+  test("marks a job over 100 % by both metrics of each clock it is over on, as the finding counts it", () => {
+    const spec = job("vl_spec_decode", [["ttft_ms", 300, "ms"], ["e2e_ms", 200, "ms"], ["runtime_ttft", 100, "ms"],
+                                        ["runtime_e2e_ms", 400, "ms"]], { parameters: { draft_length: 8 } });
+    expect([...ttftOver(spec)]).toEqual([["ttft_ms", 150], ["e2e_ms", 150]]);
+    expect(ttftOver(vl(1, 500, 2000))).toEqual(new Map());
+    // 100.04 % prints as 0.0 % over, so neither the finding nor the mark counts it.
+    expect(ttftOver(vl(1, 2000.8, 2000))).toEqual(new Map());
+    expect(ttftOver(vl(1, 2500, 2000).map((r) => (r.metric === "ttft" ? { ...r, failed: true } : r)))).toEqual(new Map());
+  });
+
+  test("words a clean plan and a lone job, and lists nothing where no job measured both", () => {
+    expect(ttftText(index([...vl(1, 500, 2000), ...vl(5, 600, 2000)], "full").ttft!))
+      .toBe("Time to first token is at or below end-to-end latency in all 2 jobs that measured both.");
+    expect(ttftText(index([...vl(1, 500, 2000), ...vl(5, 2200, 2000), ...vl(16, 600, 2000)], "full").ttft!))
+      .toBe("Time to first token exceeds end-to-end latency in 1 of 3 jobs that measured both, by 10.0 %.");
+    expect(ttftText(index(vl(1, 2200, 2000), "full").ttft!))
+      .toBe("Time to first token exceeds end-to-end latency in the one job that measured both, by 10.0 %.");
+    const spanless = index(vl(1, 500, 2000).filter((r) => r.metric !== "end_to_end_latency"), "full");
+    expect([spanless.ttft, spanless.families.some((f) => f.key === "ttft_check")]).toEqual([null, false]);
+  });
+
+  test("draws vl_spec_decode's runtime clock in a panel of its own, and needs no device names", () => {
+    const spec = job("vl_spec_decode", [["ttft_ms", 300, "ms"], ["e2e_ms", 200, "ms"], ["runtime_ttft", 100, "ms"],
+                                        ["runtime_e2e_ms", 400, "ms"]], { parameters: { draft_length: 8 } });
+    const ix = index(spec.map((r) => ({ ...r, device_name: null, client_id: null })), "withheld");
+    expect(ix.ttft).toEqual({ jobs: 1, over: { n: 1, max: 50 } });
+    const drawn = view(ix, { ...none, benchmark: "ttft_check" });
+    expect(drawn.charts.flatMap((c) => (c.form === "line" ? c.panels.map((p) => p.title) : [])).map((t) => / (\w+) clock/.exec(t)?.[1]))
+      .toEqual(["client", "runtime"]);
   });
 });
 
@@ -1650,14 +1734,14 @@ describe("the address", () => {
     const filters: ReportFilters = {
       benchmark: "decode_throughput", metric: "decode_throughput", device: ["Bench B", "Bench A"],
       drop: [`${MAC_RT} + {"threads":8}`], model: [D("Other-2B"), D("Tiny-1B")],
-      per: "4", params: { batch_size: "2" }, status: "failed",
+      per: "4", params: { batch_size: "2" }, status: "failed", e2eUnder: "0.5", prefillUnder: "0",
     };
     const pairs = reportPairs(filters);
     expect(pairs).toEqual([
       ["metric", "decode_throughput"], ["device", "Bench B"], ["device", "Bench A"],
       ["drop", `${MAC_RT} + {"threads":8}`], ["model", D("Other-2B")],
       ["model", D("Tiny-1B")], ["per", "4"],
-      ["p.batch_size", "2"], ["status", "failed"],
+      ["p.batch_size", "2"], ["status", "failed"], ["e2e_under", "0.5"], ["prefill_under", "0"],
     ]);
     expect(reportFilters(new URLSearchParams(pairs), "decode_throughput")).toEqual(filters);
     const device = { ...none, device: ["Bench B"] };
@@ -1668,6 +1752,7 @@ describe("the address", () => {
     const stale = new URLSearchParams([
       ["metric", "accuracy"], ["device", "Nowhere"], ["model", "nowhere"], ["per", "7"],
       ["p.nope", "1"], ["p.batch_size", "99"], ["p.prefill_tokens", "256"], ["status", "maybe"],
+      ["e2e_under", "soon"], ["prefill_under", "-1"],
     ]);
     expect(view(ix, reportFilters(stale, "nope")).filters).toEqual(none);
     // A family drops the metric another has; a retired `column` or `quant` key reads as nothing.

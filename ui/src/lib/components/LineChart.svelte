@@ -5,7 +5,9 @@
   import type { SvelteSet } from "svelte/reactivity";
   import { axis, labelled, markPath, scale, tickText, withUnit, xScale } from "../chart";
   import { when } from "../format";
-  import { BEYOND_LIMIT, cellText, type LinePanel, type LineSeries, type Rung } from "../report";
+  import { BEYOND_LIMIT, cellText, metricName, type LinePanel, type LineSeries, type Rung } from "../report";
+  import { measured } from "../plans";
+  import { SHORT_POINT } from "../findings";
   import ChartLabel from "./ChartLabel.svelte";
   import ChartTip from "./ChartTip.svelte";
   import Swatch from "./Swatch.svelte";
@@ -111,8 +113,9 @@
     const left = x + GAP + CARD <= shift + figure!.clientWidth ? x + GAP : Math.max(shift, x - GAP - CARD);
     pinned = near(at.u, at.v).length ? { ...at, left, top: Math.max(0, y - 24) } : null;
   }
-  // A point's jobs, one entry a job: a point is one job, a re-run kept beside it another.
-  const jobsOf = (rows: LineSeries["points"][number]) => [...new Map(rows.map((row) => [row.job_id, row])).values()];
+  // A point's jobs, each with its rows: a point is one job, a re-run kept beside it another.
+  const jobsOf = (rows: LineSeries["points"][number]) => [...rows.reduce((by, row) =>
+    by.set(row.job_id, [...(by.get(row.job_id) ?? []), row]), new Map<string, typeof rows>()).values()];
   // The jobs here a check may take, for the card's check-all.
   const offered = $derived([...new Set(caught.flatMap(({ s, i }) => (s.points[i] ?? []).map((row) => row.job_id)))]
     .filter(rerunnable));
@@ -168,7 +171,9 @@
     {/each}
     {#each series as s (s.key)}
       {#each s.cells as c, i (i)}
-        {#if c}<path class="mark" d={markPath(s.shape, px(rungs[i]!.x), py(c.median), 4)} fill="var(--series-{s.hue})" />{/if}
+        {#if c}<path class="mark" class:short={c.short} d={markPath(s.shape, px(rungs[i]!.x), py(c.median), 4)}
+                     fill={c.short ? "var(--bg)" : `var(--series-${s.hue})`}
+                     style:stroke={c.short ? `var(--series-${s.hue})` : undefined} />{/if}
       {/each}
     {/each}
     {#if pinned}
@@ -186,7 +191,8 @@
     <thead><tr><th>{param}</th>{#each rungs as r (r.x)}<th>{r.text}</th>{/each}</tr></thead>
     <tbody>
       {#each series as s (s.key)}
-        <tr><th>{s.label}</th>{#each s.cells as c, i (i)}<td>{c ? cellText(c) : "—"}{c?.beyond ? ` (${BEYOND_LIMIT})` : ""}</td>{/each}</tr>
+        <tr><th>{s.label}</th>{#each s.cells as c, i (i)}<td>{c ? cellText(c) : "—"}{c?.beyond ? ` (${BEYOND_LIMIT})` : ""}
+          {c?.short ? ` (${SHORT_POINT})` : ""}</td>{/each}</tr>
       {/each}
     </tbody>
   </table>
@@ -207,15 +213,18 @@
           <div class="value"><Swatch hue={s.hue} shape={s.shape} /><b>{cellText(c)}</b> <span class="muted">{panel.unit}
             · {param}={rungs[i]!.text}{jobs.length > 1 ? ` · ${jobs.length} jobs` : ""}</span></div>
           {#if c.beyond}<span class="limit">{BEYOND_LIMIT}</span>{/if}
+          {#if c.short}<span class="limit fine">{SHORT_POINT}</span>{/if}
           <div class="model"><ChartLabel label={s.parts} {names} /></div>
-          {#each jobs as row (row.job_id)}
+          {#each jobs as rows (rows[0]!.job_id)}
+            {@const row = rows[0]!}
             <div class="job">
               {#if rerunnable(row.job_id)}
                 <input type="checkbox" aria-label="Check {row.job_id} to re-run" checked={checked.has(row.job_id)}
                        onchange={(e) => (e.currentTarget.checked ? checked.add(row.job_id) : checked.delete(row.job_id))} />
               {/if}
               <span><a href={job(row.job_id)}>{row.job_id}</a><br /><span class="muted">{row.benchmark_id}
-                · {row.device_name ?? "—"} · {when(row.scored_at ?? row.submitted_at)}</span></span>
+                · {row.device_name ?? "—"} · {when(row.scored_at ?? row.submitted_at)}</span>
+                {#each rows as r, k (k)}<br />{metricName(r.metric)}: {measured(r.value, r.value_stddev, r.unit)}{/each}</span>
             </div>
           {/each}
         </div>
@@ -228,7 +237,8 @@
         <div class="row">
           <Swatch hue={s.hue} shape={s.shape} />
           <span><b>{cellText(s.cells[at!]!)}</b> {panel.unit} <span class="muted">{s.label}</span>
-            {#if s.cells[at!]!.beyond}<span class="limit">{BEYOND_LIMIT}</span>{/if}</span>
+            {#if s.cells[at!]!.beyond}<span class="limit">{BEYOND_LIMIT}</span>{/if}
+            {#if s.cells[at!]!.short}<span class="limit fine">{SHORT_POINT}</span>{/if}</span>
         </div>
       {:else}
         <div class="muted">no value here</div>
@@ -251,10 +261,13 @@
   .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .value { fill: none; stroke-width: 1.25; }
   .mark { stroke: var(--bg); stroke-width: 2; }
+  /* Faded, in its series' hue: set aside, not a problem. */
+  .mark.short { stroke-width: 1.5; stroke-opacity: .45; }
   .beyond { fill: none; stroke: var(--text); stroke-width: 1.25; stroke-dasharray: 2 2; }
   /* The same label the Jobs table's issue chip prints. */
   .limit { display: inline-block; margin-top: 2px; padding: 0 6px; border-radius: 9px; font-size: 11px;
            white-space: nowrap; background: var(--amber-soft); color: var(--amber); }
+  .limit.fine { background: var(--green-soft); color: var(--green); }
   svg { cursor: crosshair; }
   .reach { fill: var(--text); fill-opacity: .04; stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 2 2;
            pointer-events: none; }

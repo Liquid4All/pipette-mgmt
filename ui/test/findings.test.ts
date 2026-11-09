@@ -10,7 +10,7 @@ describe("the E2E check's words", () => {
   /** `n` combinations, all checked and within, unless `over` says otherwise. */
   const checked = (n: number, over: Partial<Extract<E2eFinding, { kind: "checked" }>> = {}): string => e2eText({
     kind: "checked", vl: false, total: n, complete: n, unestimated: 0, missing: NONE, batched: false, within: n,
-    slower: null, faster: null, ...over,
+    slower: null, faster: null, short: 0, under: { e2e: 1.5, prefill: 1 }, ...over,
   });
 
   test("not offered, it says why", () => {
@@ -50,6 +50,20 @@ describe("the E2E check's words", () => {
       + `checked. 2 more have all three but no estimate (${UNESTIMABLE}).`);
     expect(checked(2, { unestimated: 1, within: 1 })).toBe(`${WITHIN} the one combination of ${WHAT} that could be `
       + `checked. 1 more has all three but no estimate (${UNESTIMABLE}).`);
+  });
+
+  test("runs too short to judge are counted apart from the band", () => {
+    const SHORT = "ran under 1.5 s end to end with prefill under 1 s, too short to judge";
+    expect(checked(4, { short: 1, within: 2, slower: { n: 1, max: 10 } }))
+      .toBe(`${WITHIN} 2 of 3 combinations of ${WHAT}; 1 ran slower, by 10.0 %. 1 more ${SHORT}.`);
+    expect(checked(3, { short: 1, within: 2 }))
+      .toBe(`${WITHIN} all 2 combinations of ${WHAT} that could be checked. 1 more ${SHORT}.`);
+    expect(checked(2, { short: 2, within: 0 })).toBe(`All 2 combinations of ${WHAT} ${SHORT}.`);
+    expect(checked(1, { short: 1, within: 0, under: { e2e: 2, prefill: 0.5 } })).toBe(`The one combination of ${WHAT} `
+      + "ran under 2 s end to end with prefill under 0.5 s, too short to judge.");
+    expect(checked(3, { complete: 2, short: 2, within: 0, missing: { e2e: 0, decode: 1, prefill: 1 } }))
+      .toBe(`All 2 combinations of ${WHAT} that could be checked ${SHORT}. 1 more lacks decode throughput and `
+        + "prefill throughput.");
   });
 
   test("with nothing to check, it says what is missing in place of a finding", () => {

@@ -58,6 +58,64 @@ async fn filed(
     submit_plan_as(state, key, user_id, key_id, client_id, name, jobs).await
 }
 
+#[rstest]
+#[case::cold_cells(false)]
+#[case::cached_cells(true)]
+#[tokio::test]
+async fn test_active_all_results_overlap_queue_reads(
+    #[case] cached_cells: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (mut state, _, client_id) = approved_client(dir.path()).await?;
+    let filer = registered_user_with_detail(&state, true).await?;
+    let plan_id = filed(&state, &filer, &client_id, "concurrent reads", 1).await?;
+    if cached_cells {
+        read_ok(
+            &state,
+            &filer,
+            &format!("/api/v1/plans/{plan_id}/jobs?all=true"),
+        )
+        .await?;
+    }
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let observed = std::sync::Arc::new(
+        pipette_store_testkit::ObservedTodoStore::new(state.todo_store.clone())
+            .with_avail_barrier(barrier.clone()),
+    );
+    state.todo_store = observed.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let state = with_duckdb(state, &format!("http://{}", listener.local_addr()?))?;
+    let warehouse = axum::Router::new().route(
+        "/api/query",
+        axum::routing::post(move || {
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                axum::Json(json!({ "columns": [], "rows": [] }))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, warehouse).await });
+    // Neither read can finish until both start. The timeout detects a deadlock,
+    // rather than comparing request durations on a busy machine.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_ok(
+            &state,
+            &filer,
+            &format!("/api/v1/plans/{plan_id}/jobs?all=true&results=true"),
+        ),
+    )
+    .await;
+    server.abort();
+    let body = response.context("queue and results reads did not overlap")??;
+    assert_eq!(body["results_read"], "ok");
+    assert_eq!(body["jobs"].as_array().map(Vec::len), Some(1));
+    observed.unexpected.none()?;
+    Ok(())
+}
+
 // ── GET /api/v1/plans?order=newest&names=true ──────────────────────────────────────
 
 /// Newest first pages from the newest plan down, its cursor bounding the next
@@ -1123,7 +1181,7 @@ async fn assert_the_export_holds_every_row(full: bool, expected: String) -> anyh
     let dir = tempfile::tempdir()?;
     let duckdb = MockServer::start_async().await;
     let (state, _key, client_id) = approved_client(dir.path()).await?;
-    let state = with_duckdb(state, &duckdb.base_url())?;
+    let mut state = with_duckdb(state, &duckdb.base_url())?;
     let filer = registered_user_with_detail(&state, full).await?;
     let plan_id = filed(&state, &filer, &client_id, "exported", 1).await?;
     let mut grants = vec![UserPermission::SubmitPlans, UserPermission::ReadPlans];
@@ -1142,7 +1200,21 @@ async fn assert_the_export_holds_every_row(full: bool, expected: String) -> anyh
         })
         .await;
 
+    pipette_store_testkit::seed_avail(
+        state.todo_store.as_ref(),
+        "unrelated-export-job",
+        pipette_plan_types::ExpiresAt::Never,
+        &json!({}),
+    )
+    .await?;
+    let observed = pipette_store_testkit::ObservedTodoStore::wrap(&state.todo_store);
+    state.todo_store = observed.clone();
     let resp = exported(&state, &filer, &plan_id).await?;
+    assert!(
+        observed.take_reads().is_empty(),
+        "CSV exports read stored results without queue metadata"
+    );
+    observed.unexpected.none()?;
     assert_eq!(
         header_of(&resp, header::CONTENT_TYPE)?.as_deref(),
         Some("text/csv; charset=utf-8")

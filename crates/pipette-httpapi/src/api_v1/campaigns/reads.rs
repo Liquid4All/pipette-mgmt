@@ -6,17 +6,19 @@ use std::collections::HashMap;
 use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
+use futures::stream::{self, StreamExt};
 
 use pipette_core::campaign::Campaign;
 use pipette_core::plan::PlanManifest;
 use pipette_pipeline::campaign_chain;
+use pipette_pipeline::plan_document::{SourceRead, read_source};
 use pipette_plan_types::{
     CampaignId, CampaignListQuery, CampaignOverview, CampaignOverviewQuery, CampaignPlanRow,
     CampaignPlans, CampaignReadQuery, CampaignView, DeviceTimeTotal, Highlights, ListPage, Named,
     OrgId, OwnedListQuery, OwnerFilter, OwnerLookupQuery, PlanId, PlanReadQuery, PlanSummary,
     UserId, UserPermission,
 };
-use pipette_store::drain_campaigns;
+use pipette_store::{STORAGE_CONCURRENCY, drain_campaigns};
 
 use crate::api_v1::campaigns::{CampaignReviser, require};
 use crate::auth::{ActiveUser, Caller, user_org};
@@ -37,6 +39,10 @@ pub async fn list_campaigns(
     ApiQuery(read): ApiQuery<CampaignReadQuery>,
     ApiQuery(filter): ApiQuery<CampaignListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let with_models = filter.models.unwrap_or(false);
+    if with_models && !read.plan.unwrap_or(false) {
+        return Err(AppError::BadRequest("`models` needs `plan=true`".into()));
+    }
     let caller = active.caller();
     let user = caller.user;
     let reach = CampaignReach::over_records(&state, caller).await?;
@@ -83,6 +89,12 @@ pub async fn list_campaigns(
     } else {
         HashMap::new()
     };
+    // Only the plans the reader's scope admits are in `plans`.
+    let mut models = if with_models {
+        plan_models(&state, plans.keys().cloned().collect()).await
+    } else {
+        HashMap::new()
+    };
     let names = if read.names.unwrap_or(false) {
         Some(owner_labels(&state, page.items.iter().map(|campaign| &campaign.owner)).await)
     } else {
@@ -91,12 +103,13 @@ pub async fn list_campaigns(
     let items = page
         .items
         .into_iter()
-        .map(|campaign| CampaignView {
-            plan: campaign
-                .current_plan_id
-                .as_ref()
-                .and_then(|plan_id| plans.remove(plan_id)),
-            campaign: campaign.into(),
+        .map(|campaign| {
+            let head = campaign.current_plan_id.as_ref();
+            CampaignView {
+                plan: head.and_then(|plan_id| plans.remove(plan_id)),
+                models: head.and_then(|plan_id| models.remove(plan_id)),
+                campaign: campaign.into(),
+            }
         })
         .collect();
     Ok(Json(Named {
@@ -107,6 +120,58 @@ pub async fn list_campaigns(
         },
         names,
     }))
+}
+
+/// The models that each of `plan_ids`' documents names, by plan id.
+/// The function omits plans with absent, unreadable, or mismatched documents.
+/// Their rows omit `models`. The page still succeeds.
+async fn plan_models(state: &AppState, plan_ids: Vec<PlanId>) -> HashMap<PlanId, Vec<String>> {
+    stream::iter(plan_ids)
+        .map(|plan_id| async move {
+            let manifest = match state.plan_store.get_plan(&plan_id).await {
+                Ok(manifest) => manifest?,
+                Err(error) => {
+                    tracing::warn!(plan_id = %plan_id, error = %format!("{error:#}"),
+                        "campaign listing: the plan manifest did not read; its row has no models");
+                    return None;
+                }
+            };
+            let source = match read_source(state.plan_store.as_ref(), &manifest).await {
+                Ok(SourceRead::Present(source)) => source,
+                Ok(SourceRead::NoSource | SourceRead::Collected) => return None,
+                Ok(SourceRead::Mismatch) => {
+                    tracing::warn!(plan_id = %plan_id,
+                        "campaign listing: the plan document digest does not match; its row has no models");
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!(plan_id = %plan_id, error = %format!("{error:#}"),
+                        "campaign listing: the plan document did not read; its row has no models");
+                    return None;
+                }
+            };
+            match tokio::task::spawn_blocking(move || {
+                pipette_pipeline::plan_document::document_models(source.text())
+            })
+            .await
+            {
+                Ok(Ok(models)) => Some((plan_id, models)),
+                Ok(Err(error)) => {
+                    tracing::warn!(plan_id = %plan_id, %error,
+                        "campaign listing: the plan document is not TOML; its row has no models");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(plan_id = %plan_id, %error,
+                        "campaign listing: model extraction failed; its row has no models");
+                    None
+                }
+            }
+        })
+        .buffer_unordered(STORAGE_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
 }
 
 /// Whether `campaign` is in the state `filter` asks for; any state without one.
@@ -188,6 +253,7 @@ pub async fn get_campaign(
         body: CampaignView {
             campaign: campaign.into(),
             plan,
+            models: None,
         },
         names,
     }))
@@ -305,6 +371,7 @@ pub async fn org_campaigns(
             .current_plan_id
             .as_ref()
             .and_then(|plan_id| plans.remove(plan_id)),
+        models: None,
         campaign: campaign.clone().into(),
     }))
 }

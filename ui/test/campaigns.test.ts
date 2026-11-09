@@ -4,7 +4,7 @@ import {
   CAMPAIGN_PAGES, LABELS_MAX, NAME_MAX_CHARS, NOTE_MAX_CHARS, campaignPlan, campaignQuery, campaignTable, chosenOwner, createQuery,
   deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelLink, labelPairs, labelText, labelVocabulary, labelsBody,
   labelScope, labelsProblem, mayLabel, nameProblem, newCampaignAction, newCampaignOwners, newCampaignRefusal, noteProblem,
-  parseLabel, planTrail, progressText, renameBody, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
+  parseLabel, planTrail, progressFill, progressText, renameBody, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
   repeatedText, restoreEdit, revertOffered, revisionQuery, revisionSummary, importKey, importLine, importText, withLabel, withoutLabel, withVariantsOf,
 } from "../src/lib/campaigns";
 import { ownedEmpty, ownerBranch, underTrail } from "../src/lib/owned";
@@ -24,12 +24,12 @@ const acme = { kind: "org", org_id: "org_acme", slug: "acme" } as const;
 
 describe("the campaign listings", () => {
   test("each branch asks the newest first with each plan, and only every campaign's names owners", () => {
-    expect(campaignQuery({ kind: "all" }, null, "")).toBe("order=newest&plan=true&state=active&names=true");
-    expect(campaignQuery({ kind: "me" }, "campaign_9", "")).toBe("order=newest&plan=true&state=active&owner=mine&cursor=campaign_9");
-    expect(campaignQuery(acme, null, "5")).toBe("order=newest&plan=true&state=active&owner=org&org_id=org_acme&limit=5");
-    expect(campaignQuery({ kind: "me" }, null, "", "plan-1", "archived")).toBe("order=newest&plan=true&plan_id=plan-1&owner=mine");
+    expect(campaignQuery({ kind: "all" }, null, "")).toBe("order=newest&plan=true&models=true&state=active&names=true");
+    expect(campaignQuery({ kind: "me" }, "campaign_9", "")).toBe("order=newest&plan=true&models=true&state=active&owner=mine&cursor=campaign_9");
+    expect(campaignQuery(acme, null, "5")).toBe("order=newest&plan=true&models=true&state=active&owner=org&org_id=org_acme&limit=5");
+    expect(campaignQuery({ kind: "me" }, null, "", "plan-1", "archived")).toBe("order=newest&plan=true&models=true&plan_id=plan-1&owner=mine");
     expect([campaignQuery({ kind: "me" }, null, "", "", "archived"), campaignQuery({ kind: "me" }, null, "", "", "all")])
-      .toEqual(["order=newest&plan=true&state=archived&owner=mine", "order=newest&plan=true&owner=mine"]);
+      .toEqual(["order=newest&plan=true&models=true&state=archived&owner=mine", "order=newest&plan=true&models=true&owner=mine"]);
   });
 
   test("a job id keeps the campaigns of the plans that asked for it, and none for a job in no plan the reader reads", async () => {
@@ -120,8 +120,28 @@ describe("the campaign listings", () => {
     const spec = campaignTable({}, false);
     const raw = (key: string, of: CampaignView) => spec.columns.find((column) => column.key === key)?.raw(of);
     expect([progressText(row("active")), raw("progress", row("active")), raw("status", row("active"))])
-      .toEqual(["3/4", 0.75, "active"]);
+      .toEqual(["3/4 (1)", 0.75, "active"]);
     expect(raw("status", row("complete"))).toBe("complete_with_failures");
+  });
+
+  test.each([
+    ["a plan still at work fills in the active colors", "active", "active"],
+    ["a plan waiting on clients fills in the active colors", "pending_clients", "active"],
+    ["a cancelling plan fills in the active colors", "cancelling", "active"],
+    ["a complete plan fills in the complete colors", "complete", "complete"],
+    ["a cancelled plan fills in the cancelled colors", "cancelled", "cancelled"],
+  ] as const)("%s", (_, status, phase) => {
+    const counts = { total: 8, finished: 4, failed: 2, running: 0, available: 0, cancelled: 2 };
+    const row = { campaign_id: "campaign_1", plan: { status, cancel_requested: false, counts } } as CampaignView;
+    expect(progressFill(row)).toEqual({ phase, finished: 0.5, done: 0.75 });
+  });
+
+  test("a campaign with no plan, no counts or no jobs draws no bar", () => {
+    const row = (counts: object | null) =>
+      ({ campaign_id: "campaign_1", plan: { status: "active", cancel_requested: false, counts } }) as CampaignView;
+    const empty = { total: 0, finished: 0, failed: 0, running: 0, available: 0, cancelled: 0 };
+    expect([progressFill({ campaign_id: "campaign_1" } as CampaignView), progressFill(row(null)), progressFill(row(empty))])
+      .toEqual([null, null, null]);
   });
 
   test("a row's labels are a column, a filter and searched, each as key=value, a bare key for an empty value", () => {
@@ -140,6 +160,15 @@ describe("the campaign listings", () => {
     expect(labelLink("/app/orgs/acme/campaigns", ["Device", "S26 Ultra"]))
       .toBe("/app/orgs/acme/campaigns?label=Device%3DS26+Ultra");
     expect(labelLink("/app/campaigns", ["canary", ""])).toBe("/app/campaigns?label=canary");
+  });
+
+  test("the search matches the models a campaign's plan names, and a row without them", () => {
+    const search = campaignTable({}, false).texts![0]!;
+    const row = { campaign_id: "campaign_1", name: "Nightly",
+                  models: ["LiquidAI/LFM2-700M-MLX-4bit", "o/target+o/draft"] } as CampaignView;
+    const bare = { campaign_id: "campaign_2", name: "Plain" } as CampaignView;
+    expect(search.texts(row)).toEqual(["campaign_1", "Nightly", "LiquidAI/LFM2-700M-MLX-4bit", "o/target+o/draft"]);
+    expect(search.texts(bare)).toEqual(["campaign_2", "Plain"]);
   });
 
   test("an archived campaign's status is archived, whatever its plan is doing", () => {

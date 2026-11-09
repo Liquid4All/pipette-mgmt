@@ -121,9 +121,12 @@ fn window_secs(body: &Value) -> anyhow::Result<u64> {
 #[tokio::test]
 async fn test_claim_returns_eligible_job(#[case] backend: QueueBackend) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+    let Some((mut queue, key, client_id)) = approved_queue_client(dir.path(), backend).await?
+    else {
         return Ok(());
     };
+    let observed = pipette_store_testkit::ObservedTodoStore::wrap(&queue.state.todo_store);
+    queue.state.todo_store = observed.clone();
     let state = &queue.state;
 
     let job = seed_eligible(state, &client_id, "job-1", ExpiresAt::Never).await?;
@@ -142,6 +145,14 @@ async fn test_claim_returns_eligible_job(#[case] backend: QueueBackend) -> anyho
     assert_eq!(body["spec"]["model"]["type"], "gguf_text");
     assert_eq!(body["spec"]["runtime"]["repository_version"], "b5000");
     assert!(body.get("model").is_none(), "spec leaked into the envelope");
+    let read_client_leases = observed
+        .take_reads()
+        .iter()
+        .any(|(method, _)| *method == "leases_for_client");
+    assert!(
+        !read_client_leases,
+        "the handler must leave lease discovery to the store's claim operation"
+    );
 
     // Always present: this body has no clauses, so it admits no build.
     assert_eq!(body["client_versions"], json!([]));
@@ -157,11 +168,12 @@ async fn test_claim_returns_eligible_job(#[case] backend: QueueBackend) -> anyho
             );
         });
 
-    let leased = state.todo_store.list_leased().await?;
+    let leased = state.todo_store.leases_for_client(&client_id).await?;
     assert_eq!(leased.len(), 1);
-    let lease = parse_leased_key(&leased[0])?;
+    let lease = &leased[0];
     assert_eq!(lease.job_id, job);
     assert_eq!(lease.client_id, client_id);
+    observed.unexpected.none()?;
     Ok(())
 }
 
@@ -559,33 +571,25 @@ async fn test_claim_401_when_unauthenticated() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_claim_204_when_suspended() -> anyhow::Result<()> {
+async fn test_claim_idempotent_when_holding_single_lease(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
-
-    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, chrono::Utc::now(), &job)
-        .await?;
-
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_claim_idempotent_when_holding_single_lease() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
     // The selected expiry gives the lease 90 seconds of life. The response gives the
     // window in seconds as `PTnS`.
     let job_a = job("job-a")?;
     let expiry = Utc::now() + chrono::Duration::seconds(90);
     seed_leased_body(
-        &state,
+        state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
@@ -595,13 +599,13 @@ async fn test_claim_idempotent_when_holding_single_lease() -> anyhow::Result<()>
     .await?;
 
     // A second eligible job exists; a client holding a lease must not be handed it.
-    seed_eligible(&state, &client_id, "job-b", ExpiresAt::Never).await?;
+    seed_eligible(state, &client_id, "job-b", ExpiresAt::Never).await?;
 
     let leased_before = state.todo_store.list_leased().await?;
 
     // A lost claim response leaves the client no job_id to reclaim by, so a
     // re-poll hands the same job back.
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
     assert_eq!(body["job_id"], "job-a");
@@ -616,26 +620,26 @@ async fn test_claim_idempotent_when_holding_single_lease() -> anyhow::Result<()>
 
     // Neither renewed nor a second lease granted.
     assert_eq!(state.todo_store.list_leased().await?, leased_before);
-
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none()
-    );
     Ok(())
 }
 
 /// Once per lease, so a client that crashes and re-polls inside its lease is
 /// still bounded. At `plan_lost_lease_limit` (3) the claim withholds the job.
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_claim_hand_back_counts_the_held_lease_as_lost() -> anyhow::Result<()> {
+async fn test_claim_hand_back_counts_the_held_lease_as_lost(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let job_a = job("job-a")?;
     seed_leased_body(
-        &state,
+        state,
         &job_a,
         ExpiresAt::Never,
         &client_id,
@@ -651,16 +655,16 @@ async fn test_claim_hand_back_counts_the_held_lease_as_lost() -> anyhow::Result<
 
     // The second loss; a repeat poll on the same lease adds nothing.
     for _ in 0..2 {
-        let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+        let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await?["job_id"], "job-a");
     }
     assert_eq!(state.todo_store.list_lost_leases(&job_a).await?.len(), 2);
 
     // A heartbeat renews the lease, so the next re-poll is a third loss.
-    let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-a/heartbeat").await?;
+    let resp = authed_put_empty(state, &key, &client_id, "/plans/job-a/heartbeat").await?;
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(state.todo_store.list_lost_leases(&job_a).await?.len(), 3);
     assert_eq!(state.todo_store.list_leased().await?.len(), 1);
@@ -849,71 +853,31 @@ async fn test_claim_hand_back_carries_the_envelope_and_the_lease_keys_deadline(
     Ok(())
 }
 
+/// Two live leases on two jobs is reachable only on a backend without the claim
+/// transaction. The claim hands back the later lease and grants nothing new.
 #[tokio::test]
-async fn test_claim_suspends_client_holding_multiple_leases() -> anyhow::Result<()> {
+async fn test_claim_hands_back_the_later_of_two_held_jobs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
-
-    // Two live leases is a protocol anomaly (leases accumulated across crashes);
-    // the suspension records one held job_id for triage.
-    let future = Utc::now() + chrono::Duration::hours(1);
-    let job_a = job("job-a")?;
-    let job_b = job("job-b")?;
-    seed_leased(&state, &job_a, ExpiresAt::Never, &client_id, future).await?;
-    seed_leased(&state, &job_b, ExpiresAt::Never, &client_id, future).await?;
-
-    seed_eligible(&state, &client_id, "job-c", ExpiresAt::Never).await?;
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let suspension = state
-        .todo_store
-        .read_suspension(&client_id)
-        .await?
-        .context("client holding two live leases should be suspended")?;
-    assert!([job_a, job_b].contains(&suspension.conflicting_job_id));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_claim_not_suspended_when_one_job_appears_under_two_lease_keys() -> anyhow::Result<()>
-{
-    let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
-
-    // A renewal renames the lease key, and a non-snapshot listing can show both:
-    // one lease, not an accumulation.
-    let job_a = job("job-a")?;
     let now = Utc::now();
-    seed_leased_body(
-        &state,
-        &job_a,
-        ExpiresAt::Never,
-        &client_id,
-        now + chrono::Duration::seconds(60),
-        &job_body("job-a"),
-    )
-    .await?;
-    seed_leased_body(
-        &state,
-        &job_a,
-        ExpiresAt::Never,
-        &client_id,
-        now + chrono::Duration::seconds(120),
-        &job_body("job-a"),
-    )
-    .await?;
+    for (job_id, secs) in [("job-a", 60), ("job-b", 120)] {
+        seed_leased_body(
+            &state,
+            &job(job_id)?,
+            ExpiresAt::Never,
+            &client_id,
+            now + chrono::Duration::seconds(secs),
+            &job_body(job_id),
+        )
+        .await?;
+    }
+    seed_eligible(&state, &client_id, "job-c", ExpiresAt::Never).await?;
+    let leased_before = state.todo_store.list_leased().await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await?["job_id"], "job-a");
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none()
-    );
+    assert_eq!(body_json(resp).await?["job_id"], "job-b");
+    assert_eq!(state.todo_store.list_leased().await?, leased_before);
     Ok(())
 }
 
@@ -983,13 +947,6 @@ async fn test_claim_passes_over_unparseable_files_in_the_lease_partition() -> an
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await?["job_id"], "job-1");
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none()
-    );
     let leases: Vec<JobId> = state
         .todo_store
         .list_leased()
@@ -1009,83 +966,161 @@ async fn test_claim_passes_over_unparseable_files_in_the_lease_partition() -> an
     Ok(())
 }
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_claim_skips_job_denied_for_client() -> anyhow::Result<()> {
+async fn test_claim_skips_job_denied_for_client(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
 
-    let job = seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
+    let job = seed_eligible(state, &client_id, "job-1", ExpiresAt::Never).await?;
     state
         .todo_store
         .write_denied(&job, &client_id, &DenialRecord::default())
         .await?;
 
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     Ok(())
 }
 
+#[rstest]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_claim_skips_job_leased_to_another_client() -> anyhow::Result<()> {
+async fn test_claim_skips_job_leased_to_another_client(
+    #[case] backend: QueueBackend,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
-
-    // The lease claim removes the job from `avail/`. The next seed returns it to
-    // `avail/`, so the job has a lease and a queue entry.
-    let job = job("job-1")?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    // Eligibility can outlive another client's claim. The atomic claim must
+    // refuse that job without scanning every client's leases.
+    let job = seed_eligible(state, &client_id, "job-1", ExpiresAt::Never).await?;
     let other = ClientId::try_new("someone-else")?;
-    seed_leased(
-        &state,
-        &job,
-        ExpiresAt::Never,
-        &other,
-        chrono::Utc::now() + chrono::Duration::hours(1),
-    )
-    .await?;
-    seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
-
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    // Another client's lease must not suspend *us*.
-    assert!(
+    assert!(matches!(
         state
             .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none()
-    );
+            .claim_job(
+                &job,
+                ExpiresAt::Never,
+                &other,
+                Utc::now() + chrono::Duration::hours(1)
+            )
+            .await?,
+        pipette_store::ClaimResult::Claimed(_)
+    ));
+
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let leases = state.todo_store.leases_for_jobs(&[job]).await?;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].client_id, other);
     Ok(())
 }
 
-#[tokio::test]
-async fn test_claim_succeeds_when_own_lease_is_expired() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
+/// What the lapsed lease's job carries before the claim.
+#[derive(Clone, Copy, Debug)]
+enum LapsedJob {
+    Fresh,
+    Recorded,
+    /// Two losses already: the lapse is the third, the default limit.
+    OneLossShort,
+}
 
-    // An expired own lease is a timed-out device, not a double-claim.
+/// A lapsed own lease is a timed-out device, not a double-claim. The claim
+/// settles it as `queue-maintenance` does: a job with a record loses its
+/// lease, a job at the lost-lease limit retires, and any other job goes back
+/// to the queue with one more lost lease.
+#[rstest]
+#[tokio::test]
+async fn test_claim_settles_a_lapsed_own_lease(
+    #[values(QueueBackend::LocalFs, QueueBackend::Database)] backend: QueueBackend,
+    #[values(LapsedJob::Fresh, LapsedJob::Recorded, LapsedJob::OneLossShort)] lapsed: LapsedJob,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     let old_job = job("old-job")?;
-    seed_leased(
-        &state,
+    let lapsed_at = Utc::now() - chrono::Duration::hours(1);
+    seed_leased_body(
+        state,
         &old_job,
         ExpiresAt::Never,
         &client_id,
-        chrono::Utc::now() - chrono::Duration::hours(1),
+        lapsed_at,
+        &job_body("old-job"),
     )
     .await?;
+    match lapsed {
+        LapsedJob::Fresh => {}
+        LapsedJob::Recorded => {
+            state
+                .submission_store
+                .write_incoming(&old_job, &json!({"job_id": "old-job"}))
+                .await?;
+        }
+        LapsedJob::OneLossShort => {
+            for hours in [2, 3] {
+                state
+                    .todo_store
+                    .write_lost_lease(
+                        &old_job,
+                        &client_id,
+                        lapsed_at - chrono::Duration::hours(hours),
+                    )
+                    .await?;
+            }
+        }
+    }
+    seed_eligible(state, &client_id, "job-1", ExpiresAt::Never).await?;
 
-    seed_eligible(&state, &client_id, "job-1", ExpiresAt::Never).await?;
-
-    let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    assert_eq!(body["job_id"], "job-1");
-    assert!(
-        state
-            .todo_store
-            .read_suspension(&client_id)
-            .await?
-            .is_none()
+    assert_eq!(body_json(resp).await?["job_id"], "job-1");
+    let held: Vec<JobId> = state
+        .todo_store
+        .leases_for_client(&client_id)
+        .await?
+        .into_iter()
+        .map(|lease| lease.job_id)
+        .collect();
+    assert_eq!(held, [job("job-1")?]);
+    let (requeued, losses) = match lapsed {
+        LapsedJob::Fresh => (true, 1),
+        LapsedJob::Recorded => (false, 0),
+        LapsedJob::OneLossShort => (false, 3),
+    };
+    assert_eq!(
+        state.todo_store.get_avail_by_job(&old_job).await?.is_some(),
+        requeued
     );
+    assert_eq!(
+        state.todo_store.list_lost_leases(&old_job).await?.len(),
+        losses
+    );
+    assert_eq!(
+        state.submission_store.has_record(&old_job).await?,
+        !requeued
+    );
+    if matches!(lapsed, LapsedJob::OneLossShort) {
+        let record = state
+            .submission_store
+            .get_submission(&old_job)
+            .await?
+            .context("the third loss retires the job")?;
+        assert_eq!(record.body["failure_source"], "lease_lost");
+    }
     Ok(())
 }
 
@@ -1694,106 +1729,75 @@ async fn test_reclaim_403_when_pending() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Failing means the refusal reads like the pending or permission `403`, or the
-/// gate fired after the renewal, so a suspended client's leases never lapse.
+/// The claim that grants `job-a` settles the lapsed lease on `job-b`, so a
+/// renewal of `job-b` cannot give the client a second live lease.
 #[rstest]
-#[case::heartbeat(Method::PUT, "/plans/job-1/heartbeat")]
-#[case::reclaim(Method::POST, "/plans/job-1/reclaim")]
 #[tokio::test]
-async fn test_renewal_403_when_suspended(
-    #[case] method: Method,
-    #[case] path: &str,
+async fn test_a_settled_lapsed_lease_is_not_renewed_beside_a_grant(
+    #[values(QueueBackend::LocalFs, QueueBackend::Database)] backend: QueueBackend,
+    #[values((Method::PUT, "/plans/job-b/heartbeat"), (Method::POST, "/plans/job-b/reclaim"))]
+    renewal_route: (Method, &str),
 ) -> anyhow::Result<()> {
+    let (method, path) = renewal_route;
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
-
-    // `403`, not the `204` a claim gets, though the client holds a lease.
-    let job = job("job-1")?;
-    seed_leased(
-        &state,
-        &job,
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    seed_leased_body(
+        state,
+        &job("job-b")?,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() + chrono::Duration::hours(1),
+        Utc::now() - chrono::Duration::minutes(1),
+        &job_body("job-b"),
     )
     .await?;
-    let before = lease_expiry(&state, &job, &client_id).await?;
-    state
-        .todo_store
-        .write_suspension(&client_id, Utc::now(), &job)
-        .await?;
+    seed_eligible(state, &client_id, "job-a", ExpiresAt::Never).await?;
 
-    let resp = renewal(&state, &key, &client_id, &method, path).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_json(resp).await?,
-        json!({"error": "client is suspended"})
-    );
-    assert_eq!(
-        lease_expiry(&state, &job, &client_id).await?,
-        before,
-        "a refused renewal must not rename the lease"
-    );
+    let resp = authed_post(state, &key, &client_id, "/plans/claim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await?["job_id"], "job-a");
+
+    let resp = renewal(state, &key, &client_id, &method, path).await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let held: Vec<JobId> = state
+        .todo_store
+        .leases_for_client(&client_id)
+        .await?
+        .into_iter()
+        .map(|lease| lease.job_id)
+        .collect();
+    assert_eq!(held, [job("job-a")?]);
     Ok(())
 }
 
-/// A client holding a live lease on `job-a` gains `job-b` by renewing a lapsed
-/// lease or re-acquiring it. Failing means one client keeps several jobs.
+/// The server refuses a reclaim of a free job while the client holds another live lease.
 #[rstest]
-#[case::heartbeat_lapsed_lease(Method::PUT, "/plans/job-b/heartbeat", true, StatusCode::FORBIDDEN)]
-#[case::reclaim_lapsed_lease(Method::POST, "/plans/job-b/reclaim", true, StatusCode::FORBIDDEN)]
-#[case::reclaim_from_avail(Method::POST, "/plans/job-b/reclaim", false, StatusCode::NOT_FOUND)]
+#[case::local_fs(QueueBackend::LocalFs)]
+#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_a_second_live_lease_suspends_the_client(
-    #[case] method: Method,
-    #[case] path: &str,
-    #[case] lapsed_lease: bool,
-    #[case] status: StatusCode,
+async fn test_reclaim_404_while_holding_another_lease(
+    #[case] backend: QueueBackend,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, key, client_id) = approved_client(dir.path()).await?;
-    let held = job("job-a")?;
+    let Some((queue, key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     seed_leased(
-        &state,
-        &held,
+        state,
+        &job("job-a")?,
         ExpiresAt::Never,
         &client_id,
         Utc::now() + chrono::Duration::hours(1),
     )
     .await?;
-    let second = if lapsed_lease {
-        let second = job("job-b")?;
-        seed_leased(
-            &state,
-            &second,
-            ExpiresAt::Never,
-            &client_id,
-            Utc::now() - chrono::Duration::minutes(1),
-        )
-        .await?;
-        second
-    } else {
-        seed_eligible(&state, &client_id, "job-b", ExpiresAt::Never).await?
-    };
+    let second = seed_eligible(state, &client_id, "job-b", ExpiresAt::Never).await?;
 
-    let resp = renewal(&state, &key, &client_id, &method, path).await?;
-    assert_eq!(resp.status(), status);
-    let suspension = state
-        .todo_store
-        .read_suspension(&client_id)
-        .await?
-        .context("a client holding two live leases is suspended")?;
-    assert_eq!(suspension.conflicting_job_id, held);
-    if !lapsed_lease {
-        assert!(
-            state.todo_store.get_avail_by_job(&second).await?.is_some(),
-            "the second grant goes back to avail/"
-        );
-    }
-
-    // Suspended, the client can no longer keep the first lease alive.
-    let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-a/heartbeat").await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = authed_post(state, &key, &client_id, "/plans/job-b/reclaim", &json!({})).await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(state.todo_store.get_avail_by_job(&second).await?.is_some());
     Ok(())
 }
 

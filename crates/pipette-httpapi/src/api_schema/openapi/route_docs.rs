@@ -277,7 +277,6 @@ const OPERATIONS: &[Doc] = &[
         "set_client_permissions",
         "devices/set_client_permissions.md"
     ),
-    doc!("unsuspend_client", "devices/unsuspend_client.md"),
     doc!("update_client", "devices/update_client.md"),
     doc!("openapi_document", "document/openapi_document.md"),
     doc!("create_model_params", "model-params/create_model_params.md"),

@@ -30,11 +30,11 @@ use pipette_plan_types::{
     PublicKeyHex, Tag, UserId, UserPermission,
 };
 use pipette_web_testkit::{
-    authed_get, body_json, create_user, grant, json_request, json_str, make_state,
+    QueueBackend, authed_get, body_json, create_user, grant, json_request, json_str, make_state,
     make_state_from_config, make_state_require_client_preauth, make_state_with_auto_approve,
     raw_request, register_and_approve, register_pending, registered_user, request_user_account,
-    run_qm, seed_avail, seed_org, set_user_org, setup_benchmarks, signed_empty, signed_json,
-    test_config, unauthed_post,
+    run_qm, seed_avail, seed_org, seeded_queue_state, set_user_org, setup_benchmarks, signed_empty,
+    signed_json, test_config, unauthed_post,
 };
 
 async fn mint_stored_key(state: &AppState, params: ClientPreauthParams) -> anyhow::Result<String> {
@@ -874,7 +874,10 @@ async fn test_client_preauth_key_auto_approves_and_seeds_tags_org() -> anyhow::R
 async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
     // Indexed before either client exists, so only the reindex a registration
     // flags can offer it.
     let job = seed_avail(
@@ -884,13 +887,13 @@ async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()>
         &json!({"requires": ["tag:lab"]}),
     )
     .await?;
-    run_qm(&state).await?;
+    run_qm(state).await?;
 
     let mut p = key_params(ClientPreauthUsage::SingleUse);
     p.default_tags = BTreeSet::from([Tag::try_new("lab")?]);
     // Only a worker is indexed, so the key also grants `perform_work`.
     p.default_permissions = Some(BTreeSet::from([ClientPermission::PerformWork]));
-    let token = mint_stored_key(&state, p).await?;
+    let token = mint_stored_key(state, p).await?;
     // A reported flag, so the registration with no key flags itself too.
     let mut keyed = json!({
         "public_key": fresh_pubkey()?,
@@ -900,7 +903,7 @@ async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()>
         "capabilities": ["runtime:llama_cpp"],
         "client_preauth_key": token,
     });
-    let resp = unauthed_post(&state, "/clients/register", &keyed).await?;
+    let resp = unauthed_post(state, "/clients/register", &keyed).await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let seeded = registered_id(&body_json(resp).await?)?;
 
@@ -909,11 +912,11 @@ async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()>
         .as_object_mut()
         .context("a registration body")?
         .remove("client_preauth_key");
-    let resp = unauthed_post(&state, "/clients/register", &keyed).await?;
+    let resp = unauthed_post(state, "/clients/register", &keyed).await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let plain = registered_id(&body_json(resp).await?)?;
 
-    run_qm(&state).await?;
+    run_qm(state).await?;
 
     let offered: Vec<_> = state
         .todo_store

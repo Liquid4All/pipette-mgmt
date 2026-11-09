@@ -3,6 +3,7 @@
   // charts and a link to the rows they draw on Jobs. A legend entry's swatch hides or shows its series; a catalog
   // name beside a dot or a swatch opens its descriptor.
   import { SvelteSet } from "svelte/reactivity";
+  import { SHORT_POINT } from "../findings";
   import { drawnRows, labelText, partKey, type ReportView } from "../report";
   import type { ResultRow } from "../api-types";
   import BarChart from "./BarChart.svelte";
@@ -76,6 +77,10 @@
             <span><ChartLabel label={s.parts} {names} /></span>
           </div>
         {/each}
+        {#if chart.panels.some((p) => p.series.some((s) => !hidden.has(s.key) && s.cells.some((c) => c?.short)))}
+          <div class="entry key"><svg class="hollow" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4" /></svg>
+            <span>{SHORT_POINT}</span></div>
+        {/if}
       </div>
       <!-- One chart's panels share its series and legend, so they compare across: a device type each. -->
       <div class="panels">
@@ -120,4 +125,8 @@
   .legend .entry > span { padding: 1px 0; }
   .legend .toggle :global(.swatch) { width: 10px; height: 10px; margin-top: 1px; flex: none; }
   .legend .off .toggle :global(.swatch) { opacity: .3; }
+  /* The legend's key for LineChart's faded hollow mark. */
+  .key { color: var(--text-muted); }
+  .hollow { width: 10px; height: 10px; margin: 2px 5px 0 4px; flex: none; fill: var(--bg); stroke: currentColor;
+            stroke-width: 1.5; }
 </style>

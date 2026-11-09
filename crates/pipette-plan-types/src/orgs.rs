@@ -211,9 +211,6 @@ pub struct OrgOverview {
     /// Registrations waiting to be approved or rejected; `null` without
     /// `read_clients`.
     pub pending_clients: Option<Highlights<Client>>,
-    /// Devices the claim path passes over until their suspension is cleared;
-    /// `null` without `read_clients`.
-    pub suspended_clients: Option<Highlights<Client>>,
     /// Its campaigns the reader reads, newest first, as the listing's
     /// `plan=true` rows; `null` where the listing refuses the reader.
     pub campaigns: Option<Highlights<CampaignView>>,

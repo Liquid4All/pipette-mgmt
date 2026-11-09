@@ -361,33 +361,30 @@ fn trailing_tag_prefix_len(s: &str) -> Option<usize> {
     is_quant_tag(last).then_some(prefix.len())
 }
 
-/// The lowercase quant tags after the final `-`: `q4_k_m`, `iq3_m`, `bf16`,
-/// `mxfp4`, `4bit` and kin. The prefixed forms need a digit after the prefix,
-/// and `Nbit` all digits, so `quant`, `iqr` or `habit` survive.
+/// The lowercase quant tags after the final `-`, the same forms that the
+/// dashboard's `quantizationHints` finds:
+/// - a float type: `f16`, `f32`, `bf16`, `bf32`, `fp8`, `fp16` or `fp32`;
+/// - an MLX bit width, `Nbit`, with only digits before `bit`;
+/// - a scheme: `q`, `iq`, `tq`, `pq`, `ptq`, `mxfp`, `nvfp` or `int`, then a
+///   digit, then digits, lowercase letters and `_`: `q4_k_m`, `iq3_m`,
+///   `ptq1_0`, `mxfp4_moe`, `int4`.
+///
+/// So `quant`, `iqr`, `intel` and `habit` survive.
 fn is_quant_tag(tag: &str) -> bool {
-    if matches!(tag, "f16" | "f32" | "fp16" | "bf16" | "int4" | "int8") {
-        return true;
-    }
-    if let Some(prefix) = tag.strip_suffix("bit")
-        && !prefix.is_empty()
-        && prefix.bytes().all(|b| b.is_ascii_digit())
-    {
-        return true;
-    }
-    let Some(rest) = tag
-        .strip_prefix("iq")
-        .or_else(|| tag.strip_prefix("mxfp"))
-        .or_else(|| tag.strip_prefix("nvfp"))
-        .or_else(|| tag.strip_prefix('q'))
-    else {
-        return false;
+    const FLOATS: &[&str] = &["f16", "f32", "bf16", "bf32", "fp8", "fp16", "fp32"];
+    const SCHEMES: &[&str] = &["q", "iq", "tq", "pq", "ptq", "mxfp", "nvfp", "int"];
+    let bit_width = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    let scheme_tail = |rest: &str| {
+        rest.starts_with(|c: char| c.is_ascii_digit())
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_')
     };
-    let mut bytes = rest.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    first.is_ascii_digit()
-        && bytes.all(|b| b.is_ascii_digit() || b == b'_' || b.is_ascii_lowercase())
+    FLOATS.contains(&tag)
+        || tag.strip_suffix("bit").is_some_and(bit_width)
+        || SCHEMES
+            .iter()
+            .any(|p| tag.strip_prefix(p).is_some_and(scheme_tail))
 }
 
 #[cfg(test)]
@@ -679,6 +676,10 @@ mod tests {
             "LFM2-700M-Q4_K_M.gguf",
             "LFM2-700M-Q4_0.gguf",
             "LFM2-700M-IQ3_M.gguf",
+            "LFM2-700M-TQ1_0.gguf",
+            "LFM2-700M-TQ2_0.gguf",
+            "LFM2-700M-PQ2_0.gguf",
+            "LFM2-700M-PTQ1_0.gguf",
             "LFM2-700M-F16.gguf",
             "LFM2-700M-BF16.gguf",
         ] {
@@ -729,6 +730,27 @@ mod tests {
             "LiquidAI/LFM2-700M-MLX-nvfp4",
             "LFM2-700M-MXFP4",
             "LFM2-700M-nvfp4.gguf",
+            "LFM2-700M-MXFP4_MOE.gguf",
+        ] {
+            assert_eq!(
+                table.lookup(input).map(|e| e.total),
+                Some(742),
+                "lookup({input:?}) should resolve to LFM2-700M",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_strips_float_and_integer_suffix() -> anyhow::Result<()> {
+        let table = make_table()?;
+        for input in [
+            "LFM2-700M-FP8",
+            "LFM2-700M-fp32",
+            "LFM2-700M-BF32",
+            "LFM2-700M-int2",
+            "LFM2-700M-INT8",
+            "LFM2-700M-int4_awq",
         ] {
             assert_eq!(
                 table.lookup(input).map(|e| e.total),

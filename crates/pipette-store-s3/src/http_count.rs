@@ -1,6 +1,10 @@
 //! Count each HTTP attempt (retries too) of both S3 clients in [`S3_HTTP`], and
 //! log the host and wait of one with no response, which retry logs omit. Tests
 //! read process-wide counters, so each needs its own process (`cargo nextest`).
+//!
+//! The `object_store` connector also gives each error from the connect phase
+//! the [`HttpErrorKind::Connect`] kind. `object_store` retries that kind for
+//! every request, because the request did not leave the host.
 
 use std::time::Duration;
 
@@ -13,7 +17,8 @@ use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use object_store::ClientOptions;
 use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector,
+    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
+    ReqwestConnector,
 };
 
 use pipette_store::http_stats::{HttpOutcome, InFlight, S3_HTTP};
@@ -55,8 +60,25 @@ impl HttpService for CountingService {
                 in_flight.finish(HttpOutcome::TransportError);
             }
         }
-        response
+        response.map_err(|error| {
+            if error.kind() != HttpErrorKind::Connect && is_connect_phase(&error) {
+                HttpError::new(HttpErrorKind::Connect, error)
+            } else {
+                error
+            }
+        })
     }
+}
+
+/// True if reqwest failed `error` while it connected. `object_store` gives a
+/// connect timeout the `Timeout` kind, and it retries that kind only for an
+/// idempotent request, such as a plain PUT. A create-if-absent PUT is not one.
+fn is_connect_phase(error: &HttpError) -> bool {
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
+        error.source()
+    })
+    .filter_map(|error| error.downcast_ref::<reqwest::Error>())
+    .any(reqwest::Error::is_connect)
 }
 
 /// The `aws-sdk-s3` interceptor that counts each attempt.
@@ -191,7 +213,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::aws::AmazonS3Builder;
     use object_store::path::Path as ObjPath;
-    use object_store::{ObjectStore, RetryConfig};
+    use object_store::{ObjectStore, PutMode, RetryConfig};
     use rstest::rstest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -236,6 +258,36 @@ mod tests {
         Ok(addr)
     }
 
+    /// A resolver that never answers. A connect to a host name then times out
+    /// with no network, as a connect to an unreachable S3 host does.
+    struct SilentDns;
+
+    impl reqwest::dns::Resolve for SilentDns {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConnectTimesOut;
+
+    impl HttpConnector for ConnectTimesOut {
+        fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
+            let inner = reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_millis(200))
+                .dns_resolver(std::sync::Arc::new(SilentDns))
+                .build()
+                .map_err(|source| object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(source),
+                })?;
+            Ok(HttpClient::new(CountingService {
+                inner: HttpClient::new(inner),
+            }))
+        }
+    }
+
     /// The connector counts an answered attempt by its status, and an attempt
     /// that times out as a transport error.
     #[tokio::test]
@@ -269,6 +321,36 @@ mod tests {
         assert_eq!(counts.not_found, 1);
         assert_eq!(counts.transport_errors, 1);
         assert!(counts.wait >= Duration::from_millis(200), "{counts:?}");
+        Ok(())
+    }
+
+    /// A create-if-absent PUT is not idempotent, and it still retries after a
+    /// connect timeout, because the request did not leave the host.
+    #[tokio::test]
+    async fn a_conditional_put_retries_after_a_connect_timeout() -> anyhow::Result<()> {
+        // A host name, because reqwest does not resolve an IP address.
+        let client = builder_for("127.0.0.1:9".parse()?)
+            .with_endpoint("http://s3.test")
+            .with_http_connector(ConnectTimesOut)
+            .with_retry(RetryConfig {
+                max_retries: 2,
+                retry_timeout: Duration::from_secs(10),
+                ..RetryConfig::default()
+            })
+            .build()?;
+
+        let start = S3_HTTP.checkpoint();
+        let put = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.put_opts(&ObjPath::from("lock"), "x".into(), PutMode::Create.into()),
+        )
+        .await?;
+        assert!(put.is_err());
+
+        let counts = S3_HTTP.checkpoint().since(start);
+        assert_eq!(counts.requests, 3, "{counts:?}");
+        assert_eq!(counts.transport_errors, 3, "{counts:?}");
+        assert!(counts.wait >= Duration::from_millis(600), "{counts:?}");
         Ok(())
     }
 

@@ -267,9 +267,7 @@ for an entity caught mid-transition (a job racing `leased/ → avail/`, a client
 racing re-registration) to become visible. Two overlapping runs can both miss
 the same in-transition entity and count as two "consecutive" sightings seconds
 apart, deleting a live job's `eligible/`/`denied/` markers, which are never
-rebuilt, and leaving it permanently unclaimable. Overlap also lets an older run
-overwrite the `todo/.eligible-indexed` set a newer one wrote, causing wasteful
-re-indexing.
+rebuilt, and leaving it permanently unclaimable.
 If you deploy as a **Kubernetes CronJob**, set `concurrencyPolicy: Forbid` to
 get the same serialization the `flock -n` provides. An EventBridge schedule
 that starts an **ECS task** starts a new task at each scheduled time. Put a
@@ -309,7 +307,13 @@ carrying its figures as fields:
   phase's duration, the stored data it read (plans, probes, content keys, client
   records), the CPU time, the slowest plan, and `failed_items` for a run that
   skipped items and then exits non-zero. A run that stops on an error logs no
-  summary.
+  summary. `bodies_read` counts full job bodies that the run fetches from the
+  SQL queue. The count includes these reads:
+  - expiration
+  - lease retirement
+  - corrupt bodies, which each run reads again until the row is repaired
+
+  Cache hits and reads of matcher projections do not count.
 - `queue-maintenance: S3 and CPU work of a phase`, before the summary, once per
   phase (`queue_passes`, `reconcile_plans`, `plan_index_gc`): HTTP attempts of
   both S3 clients by outcome (`throttled` counts S3's `SlowDown`), the peak in
@@ -344,6 +348,161 @@ in-flight promotions dropped on that error have no duration. Use the next
 large filing's values to size the provisional promotion timeout. The call
 duration includes any destination read and resend, so the maximum is the
 relevant bound for the whole promotion, not one RenameObject attempt.
+
+### 3.1.1. Moving the queue to PostgreSQL
+
+This procedure moves a deployment's queue from the object store to PostgreSQL.
+It assumes a deployment that runs `serve` as 2 replicas. Each replica reads its
+config from a parameter store when it starts. A rolling restart can mix
+object-store and SQL readers, so this procedure stops both replicas before the
+switch. Changing the queue backend requires a parameter update and new
+replicas, not a new image.
+
+**Preparation.**
+
+1. Save the current config parameter. Keep this object-store config until
+   the rollback period ends. If the parameter already names
+   `backend = "database"`, stop.
+2. Calculate the heartbeat wait: half of `plan_lease_duration_secs`, rounded
+   up. If the config has no `plan_lease_duration_secs`, the server uses the
+   default of 300 seconds, and the wait is 150 seconds.
+3. Agree on a time for the pause with the campaign operators. The pause
+   starts at cutover step 3 and ends when cutover step 8 finishes. Require
+   all ingests to finish before cutover step 3. Stop administrative commands
+   that can change the queue during the pause. An ingest that spans the
+   switch can promote jobs into the old queue. Prevent other deployments and
+   config edits until cutover step 9 finishes.
+
+Run each queue command below as a one-off task of the deployment. The task
+uses the image, the config and the network of `serve`, with a different
+command. Wait for each task to stop, read its logs, and require exit code
+zero. Do not start a second copy while the first copy runs.
+
+**Cutover.** Follow these nine steps in order.
+
+1. Deploy a release that includes the SQL queue and `queue import`/`export`.
+   Keep the object-store queue config for this deployment. Run `db migrate`
+   with the new image and the old config before the deployment, because
+   `serve` checks the database before it accepts requests. After the
+   deployment, confirm that the config parameter did not change, and run
+   `db check`.
+2. Run the timing gate before you schedule the pause:
+
+   ```bash
+   pipette-mgmt queue import --dry-run
+   pipette-mgmt queue import
+   ```
+
+   Record both reports. Each report gives Read, Written, Deleted, Unchanged,
+   Skipped, Unreadable, and elapsed time per keyspace. Require exit code zero
+   and no unreadable entries. Investigate each skipped entry before you
+   continue. The dry run reads the whole queue, so its elapsed time is a lower
+   bound for the cold pass. If the dry run takes more than one minute,
+   postpone the pause and make the slow keyspaces faster. Repeat the warm pass
+   close to the pause if the gate ran earlier.
+3. Disable the `queue-maintenance` schedule. A disabled schedule does not stop
+   a task that is already running. Wait until no maintenance task runs. Do not
+   run manual maintenance during the pause.
+4. Scale `serve` to 0 replicas. Wait until no replica runs. Zero replicas
+   means that no queue writer is left. The server allows 20 seconds for
+   requests and 10 seconds for audit writes
+   ([§2.1](#21-stopping-the-server)).
+5. Make sure again that no maintenance task runs. Then run the cold copy:
+   `queue import`. Require a successful report before you change the backend.
+   A failed copy can leave a partial SQL queue. Retry only after the first
+   task stops and you fix the cause. At this point, the object store holds the
+   authoritative queue. Both copy commands reject `backend = "database"`,
+   because it names no object-store queue.
+6. Make the SQL config from the saved config. Replace the complete
+   `[todo_storage]` section, including its bucket settings, with this:
+
+   ```toml
+   [todo_storage]
+   backend = "database"
+   ```
+
+   Change nothing else. Write the SQL config to the config parameter. Then run
+   `config check` and `db check`. Keep `serve` stopped if either check fails.
+   Do not deploy during the pause.
+7. Scale `serve` back to 2 replicas. Require two healthy replicas. Look in the
+   startup logs for a failed check of the database or the storage. Confirm
+   that device requests succeed. Record the length of the outage.
+
+   Plan for an outage of about five minutes. The outage includes the drain,
+   the cold copy, the parameter checks, and the replica start. The production
+   cutover on 2026-11-05 measured these times:
+
+   - the drain: 2 minutes
+   - the cold copy: 1 minute (15 seconds of copy, plus the task start)
+   - the parameter checks: 1 minute (the two checks ran at the same time)
+   - the replica start: 1 minute
+
+   Each one-off task adds the time of its task start. The copy itself takes
+   seconds. Use the result of the timing gate to plan the outage.
+8. Wait one heartbeat interval after healthy service returns. Then enable the
+   `queue-maintenance` schedule again. Wait for a new
+   `queue-maintenance: run finished` entry with `failed_items = 0`.
+
+   A heartbeat can renew an expired lease while that lease still exists.
+   A recycle pass can remove an expired lease before the heartbeat arrives.
+   The wait lets live devices retry and renew their leases before maintenance
+   can recycle them, so the wait is mandatory. If device retries still fail,
+   keep maintenance disabled longer.
+9. Make the deployment tooling render the SQL config. A deployment that
+   renders the object-store config writes it to the parameter, and each new
+   replica then serves the old queue. After the next deployment, compare the
+   deployed parameter with the SQL config. If they differ, write the SQL
+   config back and fix the deployment tooling. Other deployments can start
+   again after this step.
+
+**Rollback.** Step 3 has two cases. Use the case that matches the last
+authoritative queue. If you are not sure that SQL accepted requests, and the
+cold import succeeded, treat SQL as authoritative. An export from a complete
+cold import changes almost nothing if SQL accepted no request.
+
+1. Disable maintenance and wait for its tasks to stop. Stop administrative
+   writers and ingestion. Scale `serve` to 0 replicas and wait for all
+   replicas to stop. Do this step also after cutover step 8, because SQL
+   maintenance can retire jobs after that step.
+2. Write the saved object-store config to the config parameter. Run
+   `config check`.
+3. Skip the export only if you know that SQL accepted no request. The object
+   store stays authoritative in these cases:
+
+   - The warm copy stopped before it finished.
+   - The cold copy failed.
+   - No SQL replica became healthy.
+
+   An export from a partial SQL queue can delete valid object-store jobs.
+
+   In all other cases, SQL is authoritative. Export its current queue with
+   all writers stopped:
+
+   ```bash
+   pipette-mgmt queue export --dry-run
+   pipette-mgmt queue export
+   ```
+
+   Review the dry-run deletion counts before the real export. Require a
+   successful export with no unreadable entries before you start `serve`.
+   The export deletes object-store jobs that SQL no longer holds. If the
+   export fails, keep the writers stopped, fix the error, and repeat the
+   export. Do not import the old object-store queue into the authoritative
+   SQL queue.
+4. Scale `serve` back to 2 replicas and confirm that the service is healthy.
+   Wait one heartbeat interval. Enable maintenance and confirm its first
+   successful run.
+5. If cutover step 9 finished, make the deployment tooling render the
+   object-store config again.
+
+**Observation.** Watch the first hour after either direction of the switch.
+Check the maintenance duration and `failed_items`. Check claim `204` rates,
+heartbeat `404` and `409` responses, and lost-lease warnings in the `serve` and
+maintenance logs. Expect connection errors during the pause, which clients
+retry. Investigate new lost leases after recovery.
+
+Keep the object-store bucket and its access grants for rollback. Restrict
+access to the saved configuration files.
 
 ### 3.2. Eligible index maintenance
 

@@ -36,8 +36,7 @@
       "runtime_type": "llamacpp_cli_stock_tools",
       "model_type": "gguf_vision",
       "benchmark_type": "vl_spec_decode",
-      "http_timeout_seconds": 600,
-      "bench_timeout_seconds": 10800
+      "http_timeout_seconds": 600
     }
   }
 }

@@ -111,12 +111,12 @@ pub use model::{
 
 mod runtime;
 pub use runtime::{
-    AppleCoreAiMacosPipette, AppleFoundation, CoreAiSwiftStack, DockerIpcMode, DockerSglang,
-    DockerShmSize, DockerShmSizeError, DockerVllm, EnvForward, EnvForwardError, LlamaCppFlavor,
-    LlamacppApkPipette, LlamacppApkPipetteFlavor, LlamacppCliStockTools,
-    LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource, LlamacppFlashAttention,
-    LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode, MlxIosPipette,
-    MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
+    AppleCoreAiMacosPipette, AppleCoreAiMacosPipetteSource, AppleFoundation, CoreAiSwiftStack,
+    DockerIpcMode, DockerSglang, DockerShmSize, DockerShmSizeError, DockerVllm, EnvForward,
+    EnvForwardError, LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor,
+    LlamacppCliStockTools, LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource,
+    LlamacppFlashAttention, LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
+    MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
     OnnxExecutionProvider, OnnxGenaiIosPipette, OnnxGenaiIosPipetteFlavor, OnnxGenaiStack,
     OpenvinoDevice, OpenvinoGenerateHint, Ovms, OvmsFlavor, OvmsSource, OvmsSourceRepository,
     PrivateApis, RepositoryUrl, Runtime, RuntimeBuildFlagError, RuntimeType, SemverWithBuild,
@@ -232,7 +232,7 @@ pub use submission::{
     AsrAudioTokensSource, AsrClientExtras, AsrClientExtrasError, AsrContextSizing, BatchItem,
     BatchSubmitted, BenchmarkEvalCompletion, BenchmarkEvalCompletionStopReason,
     BenchmarkResultData, BenchmarkSubmissionPayload, ByteCount, ByteCountError,
-    ByteCountRangeError, ELLIPSIS, FailureInput, JobAccepted, MAX_CLIENT_EXTRAS_BYTES,
+    ByteCountRangeError, ELLIPSIS, FailureCode, FailureInput, JobAccepted, MAX_CLIENT_EXTRAS_BYTES,
     MAX_DEVICE_READINGS_BYTES, MAX_READINESS_GATE_WAITS_BYTES, MAX_RUNTIME_OUTPUT_BYTES,
     MemoryObservation, NonNegativeMillis, NonNegativeMillisError, PositiveMillis,
     PositiveMillisError, RuntimeOutput, SampleCompletion, Submission, SubmissionInput,
