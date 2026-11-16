@@ -1,0 +1,2 @@
+ALTER TABLE queue_client_last_grant
+  DROP CONSTRAINT queue_client_last_grant_client_id_fkey;

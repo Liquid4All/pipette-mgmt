@@ -23,11 +23,11 @@ use pipette_plan_types::{
 use pipette_store::JobState;
 use pipette_store_testkit::an_org_benchmark;
 use pipette_web_testkit::{
-    QueueBackend, QueueState, authed_get, authed_post, benchmark_ids, body_json, denied_clients,
-    job, json_str, make_state_with_unverified, own_client_by_org, post_plan_document,
-    put_idle_campaign, register_and_approve, register_pending, registered_user, run_full_score,
-    run_qm, seed_avail, seed_leased, seed_org, seeded_queue_state, set_user_org, setup_benchmarks,
-    signed_empty, signed_json, unauthed_get, valid_submission,
+    QueueState, authed_get, authed_post, benchmark_ids, body_json, denied_clients, job, json_str,
+    make_state_with_unverified, own_client_by_org, post_plan_document, put_idle_campaign,
+    register_and_approve, register_pending, registered_user, run_full_score, run_qm, seed_avail,
+    seed_leased, seed_org, seeded_queue_state, set_user_org, setup_benchmarks, signed_empty,
+    signed_json, unauthed_get, valid_submission,
 };
 
 /// The id [`an_org_benchmark`] carries: a prefill entry, so scoring needs no
@@ -64,7 +64,7 @@ async fn world_holding(holding: bool) -> anyhow::Result<World> {
 /// It returns `None` if `TEST_DATABASE_URL` is not set and the run is not in CI.
 async fn sql_world() -> anyhow::Result<Option<World>> {
     let dir = tempfile::tempdir()?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(None);
     };
     let state = queue.state.clone();
@@ -386,7 +386,7 @@ async fn an_outsider_cannot_report_a_result_on_its_private_claim(
     let todo = &world.state.todo_store;
     assert!(todo.get_avail_by_job(&job).await?.is_none(), "not recycled");
     assert_eq!(
-        todo.list_leased_for_client(&client_id).await?.len(),
+        todo.leases_for_client(&client_id).await?.len(),
         1,
         "the lease is left in place"
     );
@@ -778,7 +778,7 @@ async fn private_results_are_scored() -> anyhow::Result<()> {
     .await?;
     assert_eq!(refused, None);
 
-    run_full_score(&world.state.config).await?;
+    run_full_score(&world.state).await?;
 
     let states: Vec<Option<JobState>> = futures::future::try_join_all(
         [&measured, &failed].map(|job_id| world.state.submission_store.find_job(job_id)),
@@ -842,7 +842,7 @@ async fn public_surfaces_are_unchanged() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    run_full_score(&state.config).await?;
+    run_full_score(state).await?;
 
     let id = BenchmarkId::try_new(PRIVATE)?;
     assert!(!state.catalog_store.load_catalog().await?.contains_key(&id));

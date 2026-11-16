@@ -151,7 +151,7 @@ describe("the controls of an org entry", () => {
   test.each([
     ["q4_0", "f16_q4_0", null],
     ["q4_0", "q4_0", "Type a label that differs from the current label."],
-    ["Q4_0", "f16_q4_0", "Use only lowercase letters, digits and '_' in the quantization label."],
+    ["Q4_0", "f16_q4_0", "Use only lowercase letters, digits, '_' and one '@' between them in the quantization label, such as q4_k_m@unsloth."],
   ])("checks the new label %j of %j", (typed, current, error) => {
     expect(relabelError(typed, current)).toBe(error);
   });

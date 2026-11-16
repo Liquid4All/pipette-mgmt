@@ -21,6 +21,22 @@ description = "k2-horizon-3.7b is a normalized model key that the model tests as
 targetRules = ["generic-api-key"]
 regexes = ['''^k2-horizon-3\.7b$''']
 
+# Another model slug: `granite-4.2-8b` is the normalized model key the model
+# params policy tests assert on as a gap's `key` (group_policies.rs, the
+# campaign group route tests, ui/test/campaign-groups.test.ts).
+[[allowlists]]
+description = "granite-4.2-8b is a normalized model key that the model params tests assert on, not a credential"
+targetRules = ["generic-api-key"]
+regexes = ['''^granite-4\.2-8b$''']
+
+# A made-up vault resource id that the console's model params tests use as a
+# gap's `key` (ui/test/campaign-groups.test.ts). A vault id names a resource
+# and grants nothing; anchored on the value so a real secret still fires.
+[[allowlists]]
+description = "vault_0195c3e2-aaaa is a made-up vault resource id in the console tests, not a credential"
+targetRules = ["generic-api-key"]
+regexes = ['''^vault_0195c3e2-aaaa$''']
+
 # A Clerk publishable key for a test instance. A publishable key is public by
 # design (the sign-in page serves it), and this one is `pk_test_` plus the base64
 # of `clerk.example.test$`, a `.test` host that cannot exist; the no-`JA` form is

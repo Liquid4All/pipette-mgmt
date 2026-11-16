@@ -8,83 +8,70 @@ pub mod storage_lock;
 
 use std::sync::Arc;
 
-use pipette_core::config::{Config, MissingDatabaseError, StorageConfig, TodoStorageRef};
-use pipette_store::{AuditStores, LivenessImport, Stores, TodoStore};
+use pipette_core::config::{Config, StorageConfig};
+use pipette_store::{AuditStores, Stores, TodoStore};
 use pipette_store_fs::{
     build_local_fs_client_store, build_local_fs_eval_package_store, build_local_fs_stores,
-    build_local_fs_todo_store, build_local_fs_user_store,
+    build_local_fs_user_store, build_local_fs_vault_store,
 };
 use pipette_store_s3::{
-    build_s3_client_store, build_s3_eval_package_store, build_s3_stores, build_s3_todo_store,
-    build_s3_user_store,
+    build_s3_client_store, build_s3_eval_package_store, build_s3_stores, build_s3_user_store,
+    build_s3_vault_store,
 };
+use pipette_store_sql::SqlDatabase;
 
-/// If `[database]` is set, the record stores come from the database. The queue
-/// follows `[todo_storage]`, the eval packages `[eval_packages_storage]`.
-/// Submissions, the warehouse, and blobs use the object store.
+/// The record stores and the queue come from `[database]`. Eval packages
+/// follow `[eval_packages_storage]` and vault blobs follow `[vault_storage]`.
+/// Submissions and the warehouse use the object store. Reject a stale database
+/// schema before initializing stores.
 pub async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
-    build_stores_with_db(config, connect_database(config).as_ref()).await
+    build_stores_with_db(config, &SqlDatabase::connect(&config.database)).await
 }
 
-async fn build_stores_with_db(
-    config: &Config,
-    db: Option<&pipette_store_sql::SqlDatabase>,
-) -> anyhow::Result<Stores> {
+async fn build_stores_with_db(config: &Config, db: &SqlDatabase) -> anyhow::Result<Stores> {
+    pipette_store_sql::check(db).await?;
     let stores = build_object_stores_with_db(config, db).await?;
-    match db {
-        None => Ok(stores),
-        Some(db) => Ok(pipette_store_sql::overlay(db, stores)),
-    }
+    Ok(pipette_store_sql::overlay(db, stores))
 }
 
-/// The stores that the audit event of a host command reads and writes, or
-/// `None` without `[database]`, which alone keeps the audit log. It opens no
-/// object storage.
-pub fn build_audit_stores(config: &Config) -> Option<AuditStores> {
-    let database = config.database.as_ref()?;
-    Some(pipette_store_sql::audit_stores(
-        &pipette_store_sql::SqlDatabase::connect(database),
-    ))
+/// The stores that the audit event of a host command reads and writes. It
+/// opens no object storage.
+pub fn build_audit_stores(config: &Config) -> AuditStores {
+    pipette_store_sql::audit_stores(&SqlDatabase::connect(&config.database))
 }
 
 /// Like [`build_stores`] but returns the object-store record stores: what
-/// `db import` reads and `db export` writes. The queue follows `[todo_storage]`.
+/// `db import` reads and `db export` writes. The queue is the database queue.
 pub async fn build_object_stores(config: &Config) -> anyhow::Result<Stores> {
-    build_object_stores_with_db(config, connect_database(config).as_ref()).await
+    build_object_stores_with_db(config, &SqlDatabase::connect(&config.database)).await
 }
 
-fn connect_database(config: &Config) -> Option<pipette_store_sql::SqlDatabase> {
-    config
-        .database
-        .as_ref()
-        .map(pipette_store_sql::SqlDatabase::connect)
-}
+async fn build_object_stores_with_db(config: &Config, db: &SqlDatabase) -> anyhow::Result<Stores> {
+    tracing::info!("initializing database todo storage");
+    let todo: Arc<dyn TodoStore> = Arc::new(pipette_store_sql::SqlTodoStore::new(db.clone()));
 
-async fn build_object_stores_with_db(
-    config: &Config,
-    db: Option<&pipette_store_sql::SqlDatabase>,
-) -> anyhow::Result<Stores> {
-    // The code resolves the queue first. The S3 builder takes it, and the
-    // `local_fs` arm replaces the seed store that `build_local_fs_stores` makes.
-    let todo = match config.todo_storage() {
-        TodoStorageRef::ObjectStore(storage) => build_object_todo_store(config, storage).await?,
-        TodoStorageRef::Database => {
-            tracing::info!("initializing database todo storage");
-            let db = db.ok_or(MissingDatabaseError)?;
-            Arc::new(pipette_store_sql::SqlTodoStore::new(db.clone()))
+    // With `[database]`, `overlay` wraps this store and keeps only its blobs.
+    let vault = match config.vault_storage() {
+        storage @ StorageConfig::LocalFs { .. } => {
+            tracing::info!("initializing local_fs vault storage");
+            build_local_fs_vault_store(storage)?
+        }
+        storage @ StorageConfig::S3 { bucket, .. } => {
+            tracing::info!(bucket, "initializing s3 vault storage");
+            build_s3_vault_store(storage).await?
         }
     };
 
     let mut stores = match &config.storage {
         StorageConfig::LocalFs { .. } => {
             tracing::info!("initializing local_fs storage");
-            let mut stores = build_local_fs_stores(config)?;
-            stores.todo = todo;
+            let mut stores = build_local_fs_stores(config, todo)?;
+            stores.vault = vault;
             stores
         }
         StorageConfig::S3 { bucket, .. } => {
             tracing::info!(bucket, "initializing s3 storage");
-            build_s3_stores(config, todo).await?
+            build_s3_stores(config, todo, vault)?
         }
     };
 
@@ -117,97 +104,80 @@ async fn build_object_stores_with_db(
     Ok(stores)
 }
 
-async fn build_object_todo_store(
-    config: &Config,
-    storage: &StorageConfig,
-) -> anyhow::Result<Arc<dyn TodoStore>> {
-    match storage {
-        StorageConfig::LocalFs { .. } => {
-            tracing::info!("initializing local_fs todo storage");
-            build_local_fs_todo_store(storage)
-        }
-        StorageConfig::S3 { bucket, .. } => {
-            tracing::info!(bucket, "initializing s3 todo storage");
-            build_s3_todo_store(
-                storage,
-                std::time::Duration::from_secs(config.todo_attempt_timeout_secs.get()),
-                std::time::Duration::from_secs(config.todo_operation_timeout_secs.get()),
-            )
-            .await
-        }
-    }
-}
-
-/// The two queues that `queue import` and `queue export` copy between.
-pub struct QueueCopyStores {
-    /// The queue that `[todo_storage]` names, or `[storage]` without it.
-    pub objects: Arc<dyn TodoStore>,
-    /// The queue in `[database]`.
-    pub database: Arc<dyn TodoStore>,
-    /// The database queue, to set each copied last-seen time.
-    pub database_liveness: Arc<dyn LivenessImport>,
-}
-
-/// A config that cannot name both queues of a copy.
-#[derive(Debug, thiserror::Error)]
-pub enum QueueCopyConfigError {
-    #[error("the queue copy needs [database]")]
-    NoDatabase,
-    #[error(
-        "[todo_storage] backend = \"database\" names no object-store queue to copy; run the \
-         command with the config that names the object-store queue in [todo_storage]"
-    )]
-    NoObjectStore,
-}
-
-/// Opens the object-store queue and the database queue of `config`.
-pub async fn build_queue_copy_stores(config: &Config) -> anyhow::Result<QueueCopyStores> {
-    let db = connect_database(config).ok_or(QueueCopyConfigError::NoDatabase)?;
-    let TodoStorageRef::ObjectStore(storage) = config.todo_storage() else {
-        return Err(QueueCopyConfigError::NoObjectStore.into());
-    };
-    let objects = build_object_todo_store(config, storage).await?;
-    let database = Arc::new(pipette_store_sql::SqlTodoStore::new(db));
-    Ok(QueueCopyStores {
-        objects,
-        database: database.clone(),
-        database_liveness: database,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use pipette_core::config::TodoStorageConfig;
     use pipette_plan_types::{ClientId, ExpiresAt, JobId};
     use pipette_store::ClaimResult;
     use pipette_store_sql::scratch::TestDb;
 
     use super::*;
 
-    #[rstest::rstest]
-    #[case::no_database(None, TodoStorageConfig::ObjectStore(StorageConfig::default()))]
-    #[case::database_queue(Some(()), TodoStorageConfig::Database)]
     #[tokio::test]
-    async fn the_queue_copy_needs_both_queues_in_the_config(
-        #[case] database: Option<()>,
-        #[case] todo_storage: TodoStorageConfig,
-    ) -> anyhow::Result<()> {
+    async fn an_unmigrated_database_is_rejected_before_initializing_stores() -> anyhow::Result<()> {
+        let Some(db) = TestDb::unmigrated().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
         let config = Config {
-            database: database.map(|()| pipette_core::config::DatabaseConfig {
-                host: None,
-                port: None,
-                user: None,
-                database: None,
-                ssl_mode: None,
-                max_connections: std::num::NonZeroU32::MIN,
-            }),
-            todo_storage: Some(todo_storage),
+            storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+            auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Config::default()
         };
-        let Err(error) = build_queue_copy_stores(&config).await else {
-            anyhow::bail!("the copy opened a config that names one queue");
+
+        let Err(error) = build_stores_with_db(&config, db.db()).await else {
+            anyhow::bail!("an unmigrated database must be rejected");
         };
-        assert!(error.is::<QueueCopyConfigError>(), "{error:#}");
+        assert!(error.to_string().contains("pipette-mgmt db migrate"));
+        assert!(std::fs::read_dir(dir.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::object_records(false)]
+    #[case::database_records(true)]
+    #[tokio::test]
+    async fn vault_blobs_land_in_vault_storage(#[case] database: bool) -> anyhow::Result<()> {
+        let Some(db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let (storage, vault) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let config = Config {
+            storage: StorageConfig::local_fs(storage.path().to_path_buf()),
+            auth_storage: StorageConfig::local_fs(storage.path().to_path_buf()),
+            vault_storage: Some(StorageConfig::local_fs(vault.path().to_path_buf())),
+            ..Config::default()
+        };
+        let stores = if database {
+            build_stores_with_db(&config, db.db()).await?
+        } else {
+            build_object_stores_with_db(&config, db.db()).await?
+        };
+        let resource = pipette_store_testkit::a_vault_resource()?;
+        let written = stores
+            .vault
+            .put_blob(
+                &resource.object_key,
+                &resource.sha256,
+                pipette_store_testkit::blob_body(pipette_store_testkit::VAULT_BLOB),
+            )
+            .await?;
+        assert!(
+            matches!(written, pipette_store::BlobWrite::Stored { .. }),
+            "{written:?}"
+        );
+        let key = format!(
+            "vault-resources/{}/blobs/{}",
+            resource.owner.label(),
+            resource.sha256
+        );
+        assert!(
+            vault.path().join(&key).is_file(),
+            "{key} must land in [vault_storage]"
+        );
+        assert!(
+            !storage.path().join(&key).exists(),
+            "{key} must not land in [storage]"
+        );
         Ok(())
     }
 
@@ -220,14 +190,16 @@ mod tests {
         let config = Config {
             storage: StorageConfig::local_fs(dir.path().to_path_buf()),
             auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            todo_storage: Some(TodoStorageConfig::Database),
             ..Config::default()
         };
-        let stores = build_stores_with_db(&config, Some(db.db())).await?;
+        let stores = build_stores_with_db(&config, db.db()).await?;
         let job = JobId::try_new("sql-queue-selected")?;
         let body = serde_json::json!({"job_id": job.as_str()});
         stores.todo.write_tmp(&job, &body).await?;
-        stores.todo.promote_avail(&job, ExpiresAt::Never).await?;
+        stores
+            .todo
+            .promote_avail(&job, ExpiresAt::Never, None)
+            .await?;
 
         let direct = pipette_store_sql::SqlTodoStore::new(db.db().clone());
         assert_eq!(direct.get_avail_by_job(&job).await?, Some(body.clone()));

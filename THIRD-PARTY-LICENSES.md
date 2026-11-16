@@ -4993,7 +4993,7 @@ Applies to:
 - regex-lite 0.1.9 — https://github.com/rust-lang/regex
 - regex-syntax 0.8.11 — https://github.com/rust-lang/regex
 - regex 1.13.1 — https://github.com/rust-lang/regex
-- rustix 1.1.5 — https://github.com/bytecodealliance/rustix
+- rustix 1.1.6 — https://github.com/bytecodealliance/rustix
 - rustls-native-certs 0.8.5 — https://github.com/rustls/rustls-native-certs
 - rustls 0.23.46 — https://github.com/rustls/rustls
 - scopeguard 1.2.0 — https://github.com/bluss/scopeguard

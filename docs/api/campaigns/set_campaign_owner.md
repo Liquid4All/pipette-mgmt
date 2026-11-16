@@ -67,6 +67,9 @@ cancelled under the new owner from the moment the hand-off lands
 ([who may do what](../campaigns.md#who-may-do-what)). The previous owner keeps what the new owner's
 reach gives it and nothing more: handing a campaign to your organization leaves
 you reading its plans, as every member does, and no longer cancelling them.
+The move takes the campaign out of its [campaign group](../campaign-groups.md),
+whose members have the group's owner; a hand-off that changes nothing does too
+when the group has another owner, so a retry finishes a removal that failed.
 Answers the same `changed` shape
 [`PATCH`](update_campaign.md) does, and `changed: false` is a success: a write asking for the state
 the record is already in is safe to retry.
@@ -79,4 +82,4 @@ the record is already in is safe to retry.
 | 400 | `owner` names an account or organization that does not exist, or an account that holds no `submit_plans`, **and** the caller could otherwise have handed it there |
 | 403 | The campaign is outside the caller's scope, or the destination is |
 | 404 | No such campaign |
-| 409 | The campaign's plans ran an organization's private benchmark or vault resource and the destination is outside that organization, or the campaign cannot be placed and the caller is not allowed to hand it over, as above |
+| 409 | The campaign's plans ran an organization's private benchmark or vault resource and the destination is outside that organization, or the campaign cannot be placed and the caller is not allowed to hand it over, as above. Or another write changed the campaign while the hand-off was checked: nothing was written; send it again |

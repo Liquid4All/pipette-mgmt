@@ -1,18 +1,23 @@
 //! What the app's re-run and recalculate controls send and read: the whole-plan
 //! selectors with `base_plan_id`, and the offers the jobs reads carry.
 
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::http::StatusCode;
+use chrono::Utc;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use httpmock::{Method::POST, Mock, MockServer};
 use rstest::rstest;
 use serde_json::{Value, json};
 
 use pipette_httpapi::state::AppState;
 use pipette_pipeline::plan_results::JOB_RESULTS_TIMEOUT;
-use pipette_plan_types::{JobId, PlanId, PlanStatus, UserPermission};
+use pipette_pipeline::queue_maintenance::fail_larger_run;
+use pipette_plan_types::{BenchmarkId, FailureCode, JobId, PlanId, PlanStatus, UserPermission};
 use pipette_web_testkit::{
     FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, ONE_EVAL_PLAN, UserSigner, approved_client,
     body_json, create_org, created_campaign, created_campaign_from, file_job_bodies, json_str,
@@ -55,6 +60,28 @@ async fn campaign_with(
         }
     }
     Ok((campaign_id, first, job))
+}
+
+/// A two-job campaign with nothing recorded: its id, the plan's and the jobs'.
+async fn two_job_campaign(
+    state: &AppState,
+    owner: &UserSigner,
+) -> anyhow::Result<(String, PlanId, [JobId; 2])> {
+    let document = ONE_CELL_PLAN.replace(
+        r#"["prefill_throughput_256"]"#,
+        r#"["prefill_throughput_256", "max_memory_usage_256"]"#,
+    );
+    let (campaign_id, first) =
+        created_campaign_from(state, owner, &[("name", "Nightly")], &document).await?;
+    let jobs = state
+        .plan_store
+        .get_plan(&first)
+        .await?
+        .context("the plan is filed")?
+        .job_ids;
+    let jobs = <[JobId; 2]>::try_from(jobs)
+        .map_err(|jobs| anyhow::anyhow!("the plan holds two jobs: {jobs:?}"))?;
+    Ok((campaign_id, first, jobs))
 }
 
 /// The runs server answers a job only once its run is mocked.
@@ -186,6 +213,24 @@ async fn revise(
     Ok((status, body_json(resp).await?))
 }
 
+/// The `rerun_job_ids` of a dry run of `answered: which` over `base`.
+async fn dry_run_answered(
+    state: &AppState,
+    owner: &UserSigner,
+    campaign_id: &str,
+    base: &PlanId,
+    which: &str,
+) -> anyhow::Result<Value> {
+    let query = format!("?base_plan_id={base}&dry_run=true");
+    let body = json!({"answered": which});
+    let (status, dry_run) = revise(state, owner, campaign_id, "rerun", &query, &body).await?;
+    anyhow::ensure!(status == StatusCode::OK, "{dry_run}");
+    dry_run
+        .get("rerun_job_ids")
+        .cloned()
+        .with_context(|| format!("a dry run lists rerun_job_ids: {dry_run}"))
+}
+
 async fn read_ok(state: &AppState, signer: &UserSigner, uri: &str) -> anyhow::Result<Value> {
     let resp = signed_empty(state, signer, "GET", uri).await?;
     let status = resp.status();
@@ -246,6 +291,266 @@ async fn test_answered_re_runs_the_jobs_it_takes(
     Ok(())
 }
 
+/// A dry run lists the jobs it would run again apart from those it would mark
+/// failed, and files nothing, so a caller can confirm `answered`'s pick by
+/// naming them. `{job}` stands for the plan's job, and `reruns` and `marks`
+/// say which list holds it.
+#[rstest]
+#[case::named(Recorded::Success, json!({"job_ids": ["{job}"]}), true, false)]
+#[case::answered_failed(Recorded::Failure, json!({"answered": "failed"}), true, false)]
+#[case::answered_all(Recorded::Success, json!({"answered": "all"}), true, false)]
+#[case::marked(Recorded::Failure, json!({"fail": {"{job}": "too slow"}}), false, true)]
+#[case::marked_unrun(Recorded::Nothing, json!({"fail": {"{job}": "too slow"}}), false, true)]
+#[tokio::test]
+async fn test_a_dry_run_lists_the_jobs_it_would_revise(
+    #[case] recorded: Recorded,
+    #[case] body: Value,
+    #[case] reruns: bool,
+    #[case] marks: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let (campaign_id, first, job) = campaign_with(&state, &owner, recorded).await?;
+    let body: Value = serde_json::from_str(&body.to_string().replace("{job}", job.as_str()))?;
+    crate::api_schema::assert_conforms("RerunJobsRequest", &body)?;
+
+    let query = format!("?base_plan_id={first}&dry_run=true");
+    let (status, dry_run) = revise(&state, &owner, &campaign_id, "rerun", &query, &body).await?;
+    assert_eq!(status, StatusCode::OK, "{dry_run}");
+    crate::api_schema::assert_conforms("RevisionDryRun", &dry_run)?;
+    let listed = |holds: bool| {
+        if holds {
+            json!([job.as_str()])
+        } else {
+            json!([])
+        }
+    };
+    assert_eq!(
+        (
+            &dry_run["rerun_job_ids"],
+            &dry_run["marked_job_ids"],
+            &dry_run["dropped_job_ids"]
+        ),
+        (&listed(reruns), &listed(marks), &json!([]))
+    );
+    assert_eq!(head(&state, &campaign_id).await?, Some(first.clone()));
+    assert!(!state.plan_store.has_cancel_marker(&first).await?);
+    assert!(
+        state
+            .submission_store
+            .list_incoming(NonZeroUsize::MAX)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// Over a failed job and a finished one, a dry run of `failed` lists the
+/// failed job alone and `all` lists both, in job id order.
+#[rstest]
+#[case::failed("failed", false)]
+#[case::all("all", true)]
+#[tokio::test]
+async fn test_a_dry_run_lists_what_answered_picks(
+    #[case] which: &str,
+    #[case] takes_finished: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let (campaign_id, first, [failed, finished]) = two_job_campaign(&state, &owner).await?;
+    let (submissions, todo) = (state.submission_store.as_ref(), state.todo_store.as_ref());
+    pipette_store_testkit::finish_job_with_failure(submissions, todo, &failed).await?;
+    pipette_store_testkit::finish_job(submissions, todo, &finished).await?;
+
+    let listed: BTreeSet<&JobId> = std::iter::once(&failed)
+        .chain(takes_finished.then_some(&finished))
+        .collect();
+    assert_eq!(
+        dry_run_answered(&state, &owner, &campaign_id, &first, which).await?,
+        json!(listed)
+    );
+    Ok(())
+}
+
+// ── marks ───────────────────────────────────────────────────────────────────
+
+/// `fail` alone files a revision that answers the job's cell with the server's
+/// failure under a new job, which names the job it replaces, finished or still
+/// queued.
+#[rstest]
+#[case::finished(Recorded::Success)]
+#[case::queued(Recorded::Nothing)]
+#[tokio::test]
+async fn test_fail_marks_a_job_failed(#[case] recorded: Recorded) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let (campaign_id, first, job) = campaign_with(&state, &owner, recorded).await?;
+
+    let body = json!({"fail": {job.as_str(): "swap after 5 runs"}});
+    crate::api_schema::assert_conforms("RerunJobsRequest", &body)?;
+    let (status, revised) = revise(&state, &owner, &campaign_id, "rerun", "", &body).await?;
+    assert_eq!(status, StatusCode::CREATED, "{revised}");
+    crate::api_schema::assert_conforms("CampaignRevised", &revised)?;
+    assert_eq!(
+        (
+            &revised["rerun_job_count"],
+            &revised["marked_job_count"],
+            &revised["dropped_job_count"]
+        ),
+        (&json!(0), &json!(1), &json!(0))
+    );
+    assert_eq!(
+        revised["plan"]["change"],
+        json!({"type": "rerun", "job_count": 0, "marked_job_count": 1})
+    );
+    let revision = PlanId::try_new(json_str(&revised["plan"], "plan_id")?)?;
+    assert_eq!(head(&state, &campaign_id).await?, Some(revision.clone()));
+    assert!(state.plan_store.has_cancel_marker(&first).await?);
+    let mark = first_job(&state, &revision).await?;
+    assert_ne!(mark, job, "a new job");
+    let manifest = state
+        .plan_store
+        .get_plan(&revision)
+        .await?
+        .context("the revision is filed")?;
+    assert_eq!(manifest.rerun_of.get(&mark), Some(&job));
+    let record = state
+        .submission_store
+        .find_job(&mark)
+        .await?
+        .context("the mark's record")?;
+    assert_eq!(
+        (
+            &record.body["client_id"],
+            &record.body["failure_source"],
+            &record.body["failure_code"],
+            &record.body["failure_reason"]
+        ),
+        (
+            &json!("system"),
+            &json!("marked"),
+            &json!("unspecified"),
+            &json!("swap after 5 runs")
+        )
+    );
+    Ok(())
+}
+
+/// `answered: failed` leaves out a job a mark answered, so the console's
+/// re-run of the failures keeps the marks, but takes a re-run that failed
+/// again; `all` takes both.
+#[rstest]
+#[case::failed("failed", false)]
+#[case::all("all", true)]
+#[tokio::test]
+async fn test_answered_failed_keeps_the_marks(
+    #[case] which: &str,
+    #[case] takes_the_mark: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let (campaign_id, _, [marked, failed]) = two_job_campaign(&state, &owner).await?;
+    let (submissions, todo) = (state.submission_store.as_ref(), state.todo_store.as_ref());
+    pipette_store_testkit::finish_job_with_failure(submissions, todo, &marked).await?;
+    pipette_store_testkit::finish_job_with_failure(submissions, todo, &failed).await?;
+    let body =
+        json!({"job_ids": [failed.as_str()], "fail": {marked.as_str(): "swap after 5 runs"}});
+    let (status, revised) = revise(&state, &owner, &campaign_id, "rerun", "", &body).await?;
+    assert_eq!(status, StatusCode::CREATED, "{revised}");
+    let revision = PlanId::try_new(json_str(&revised["plan"], "plan_id")?)?;
+    let rerun_of = state
+        .plan_store
+        .get_plan(&revision)
+        .await?
+        .context("the revision is filed")?
+        .rerun_of;
+    let replacing = |parent: &JobId| {
+        rerun_of
+            .iter()
+            .find_map(|(job_id, of)| (of == parent).then_some(job_id))
+            .with_context(|| format!("the job that replaces {parent}"))
+    };
+    let (mark, again) = (replacing(&marked)?, replacing(&failed)?);
+    pipette_store_testkit::finish_job_with_failure(submissions, todo, again).await?;
+
+    let listed: BTreeSet<&JobId> = std::iter::once(again)
+        .chain(takes_the_mark.then_some(mark))
+        .collect();
+    assert_eq!(
+        dry_run_answered(&state, &owner, &campaign_id, &revision, which).await?,
+        json!(listed)
+    );
+    Ok(())
+}
+
+/// `answered: failed` takes the jobs the server failed unrun after a smaller
+/// run failed, a re-run's job among them, though that one has a parent in
+/// `rerun_of` as a mark does.
+#[tokio::test]
+async fn test_answered_failed_takes_the_larger_runs_failed_unrun() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let (campaign_id, _, [carried, ran]) = two_job_campaign(&state, &owner).await?;
+    let (submissions, todo) = (state.submission_store.as_ref(), state.todo_store.as_ref());
+    pipette_store_testkit::finish_job_with_failure(submissions, todo, &ran).await?;
+    let body = json!({"job_ids": [ran.as_str()]});
+    let (status, revised) = revise(&state, &owner, &campaign_id, "rerun", "", &body).await?;
+    assert_eq!(status, StatusCode::CREATED, "{revised}");
+    let revision = PlanId::try_new(json_str(&revised["plan"], "plan_id")?)?;
+    let again = state
+        .plan_store
+        .get_plan(&revision)
+        .await?
+        .context("the revision is filed")?
+        .rerun_of
+        .into_iter()
+        .find_map(|(job_id, of)| (of == ran).then_some(job_id))
+        .context("the job that runs it again")?;
+
+    let catalog = &state.catalog_cache.get().await?;
+    let smaller = &JobId::try_new("job-smaller")?;
+    let benchmark = &BenchmarkId::try_new("prefill_throughput_256")?;
+    stream::iter([&carried, &again])
+        .map(anyhow::Ok)
+        .try_for_each(|job| async move {
+            let avail = todo
+                .avail_for_jobs(std::slice::from_ref(job))
+                .await?
+                .pop()
+                .with_context(|| format!("{job} is queued"))?;
+            let body = todo
+                .get_avail(job, avail.expires_at)
+                .await?
+                .with_context(|| format!("the body of {job}"))?;
+            let failed = fail_larger_run(
+                todo,
+                submissions,
+                catalog,
+                &avail,
+                &body,
+                smaller,
+                benchmark,
+                FailureCode::AttemptTimeout,
+                Utc::now(),
+            )
+            .await?;
+            assert!(failed, "no failure written for {job}");
+            Ok(())
+        })
+        .await?;
+
+    assert_eq!(
+        dry_run_answered(&state, &owner, &campaign_id, &revision, "failed").await?,
+        json!(BTreeSet::from([&carried, &again]))
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_all_evals_recalculates_the_finished_evals() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -298,25 +603,29 @@ async fn test_named_jobs_take_the_base_too(
     Ok(())
 }
 
-/// `{job}` and `{head}` stand for the plan's job and the plan.
+/// `{job}` and `{head}` stand for the plan's job and the plan, and `{other}` for
+/// a job the plan does not hold.
 #[rstest]
-#[case::rerun_neither("rerun", "?base_plan_id={head}", json!({}), StatusCode::BAD_REQUEST, "name either job_ids or answered")]
+#[case::rerun_neither(Recorded::Success, "rerun", "?base_plan_id={head}", json!({}), StatusCode::BAD_REQUEST, "name job_ids, answered or fail")]
 #[case::rerun_both(
+    Recorded::Success,
     "rerun",
     "?base_plan_id={head}",
     json!({"job_ids": ["{job}"], "answered": "all"}),
     StatusCode::BAD_REQUEST,
     "name either job_ids or answered"
 )]
-#[case::answered_without_base("rerun", "", json!({"answered": "all"}), StatusCode::BAD_REQUEST, "needs base_plan_id")]
-#[case::answered_dry_run(
+#[case::answered_without_base(Recorded::Success, "rerun", "", json!({"answered": "all"}), StatusCode::BAD_REQUEST, "needs base_plan_id")]
+#[case::answered_dry_run_none_failed(
+    Recorded::Success,
     "rerun",
     "?base_plan_id={head}&dry_run=true",
-    json!({"answered": "all"}),
-    StatusCode::BAD_REQUEST,
-    "dry_run takes job_ids"
+    json!({"answered": "failed"}),
+    StatusCode::CONFLICT,
+    "holds no failed job"
 )]
 #[case::answered_unknown(
+    Recorded::Success,
     "rerun",
     "?base_plan_id={head}",
     json!({"answered": "some"}),
@@ -324,6 +633,7 @@ async fn test_named_jobs_take_the_base_too(
     "answered"
 )]
 #[case::answered_none_failed(
+    Recorded::Success,
     "rerun",
     "?base_plan_id={head}",
     json!({"answered": "failed"}),
@@ -331,6 +641,7 @@ async fn test_named_jobs_take_the_base_too(
     "holds no failed job"
 )]
 #[case::rerun_malformed_base(
+    Recorded::Success,
     "rerun",
     "?base_plan_id=bad!id",
     json!({"job_ids": ["{job}"]}),
@@ -338,6 +649,7 @@ async fn test_named_jobs_take_the_base_too(
     "plan_id"
 )]
 #[case::recalculate_malformed_base(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id=bad!id",
     json!({"all_evals": true}),
@@ -345,6 +657,7 @@ async fn test_named_jobs_take_the_base_too(
     "plan_id"
 )]
 #[case::rerun_moved(
+    Recorded::Success,
     "rerun",
     "?base_plan_id=plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
     json!({"job_ids": ["{job}"]}),
@@ -352,13 +665,63 @@ async fn test_named_jobs_take_the_base_too(
     "not plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
 )]
 #[case::answered_moved(
+    Recorded::Success,
     "rerun",
     "?base_plan_id=plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
     json!({"answered": "all"}),
     StatusCode::CONFLICT,
     "not plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
 )]
+#[case::fail_with_answered(
+    Recorded::Failure,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"answered": "failed", "fail": {"{job}": "swap"}}),
+    StatusCode::BAD_REQUEST,
+    "fail does not combine with answered"
+)]
+#[case::fail_named_twice(
+    Recorded::Success,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"job_ids": ["{job}"], "fail": {"{job}": "swap"}}),
+    StatusCode::BAD_REQUEST,
+    "named both to re-run and to mark failed"
+)]
+#[case::fail_names_no_job(
+    Recorded::Success,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"fail": {}}),
+    StatusCode::BAD_REQUEST,
+    "name job_ids, answered or fail"
+)]
+#[case::fail_reason_too_long(
+    Recorded::Success,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"fail": {"{job}": "x".repeat(4097)}}),
+    StatusCode::BAD_REQUEST,
+    "longer than 4096 characters"
+)]
+#[case::fail_reason_with_nul(
+    Recorded::Success,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"fail": {"{job}": "swap\u{0}"}}),
+    StatusCode::BAD_REQUEST,
+    "NUL"
+)]
+#[case::fail_not_held(
+    Recorded::Success,
+    "rerun",
+    "?base_plan_id={head}",
+    json!({"fail": {"{other}": "swap"}}),
+    StatusCode::CONFLICT,
+    "holds no job"
+)]
 #[case::recalculate_neither(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id={head}",
     json!({"all_evals": false}),
@@ -366,14 +729,16 @@ async fn test_named_jobs_take_the_base_too(
     "name either job_ids or all_evals"
 )]
 #[case::recalculate_both(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id={head}",
     json!({"job_ids": ["{job}"], "all_evals": true}),
     StatusCode::BAD_REQUEST,
     "name either job_ids or all_evals"
 )]
-#[case::all_evals_without_base("recalculate", "", json!({"all_evals": true}), StatusCode::BAD_REQUEST, "needs base_plan_id")]
+#[case::all_evals_without_base(Recorded::Success, "recalculate", "", json!({"all_evals": true}), StatusCode::BAD_REQUEST, "needs base_plan_id")]
 #[case::all_evals_dry_run(
+    Recorded::Success,
     "recalculate",
     "?dry_run=true&base_plan_id={head}",
     json!({"all_evals": true}),
@@ -381,6 +746,7 @@ async fn test_named_jobs_take_the_base_too(
     "dry_run takes job_ids"
 )]
 #[case::recalculate_moved(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id=plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
     json!({"job_ids": ["{job}"]}),
@@ -388,6 +754,7 @@ async fn test_named_jobs_take_the_base_too(
     "not plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
 )]
 #[case::all_evals_moved(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id=plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
     json!({"all_evals": true}),
@@ -395,6 +762,7 @@ async fn test_named_jobs_take_the_base_too(
     "not plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
 )]
 #[case::all_evals_none(
+    Recorded::Success,
     "recalculate",
     "?base_plan_id={head}",
     json!({"all_evals": true}),
@@ -403,6 +771,7 @@ async fn test_named_jobs_take_the_base_too(
 )]
 #[tokio::test]
 async fn test_a_refused_revision_files_nothing(
+    #[case] recorded: Recorded,
     #[case] verb: &str,
     #[case] query: &str,
     #[case] body: Value,
@@ -412,9 +781,14 @@ async fn test_a_refused_revision_files_nothing(
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let owner = registered_user(&state, FULL_EDITOR).await?;
-    let (campaign_id, first, job) = campaign_with(&state, &owner, Recorded::Success).await?;
+    let (campaign_id, first, job) = campaign_with(&state, &owner, recorded).await?;
     let query = query.replace("{head}", first.as_str());
-    let body: Value = serde_json::from_str(&body.to_string().replace("{job}", job.as_str()))?;
+    let body: Value = serde_json::from_str(
+        &body
+            .to_string()
+            .replace("{job}", job.as_str())
+            .replace("{other}", "job-0199aaaa-0000-7000-8000-000000000000"),
+    )?;
 
     let (answered, refusal) = revise(&state, &owner, &campaign_id, verb, &query, &body).await?;
     assert_eq!(answered, status, "{refusal}");

@@ -97,17 +97,17 @@ pub use model_flags::{
 };
 pub use runtime_flags::{
     AsrEvalLlamacppCliStockToolsGgufVision, AsrMaxMemoryLlamacppCliStockToolsGgufVision,
-    AsrThroughputLlamacppCliStockToolsGgufVision, DecodeThroughputLlamacppCliStockToolsGgufText,
-    DecodeThroughputOvmsOpenvino, DecodeThroughputUvOpenvinoOpenvino,
-    EndToEndLatencyLlamacppCliStockToolsGgufText, EndToEndLatencyOvmsOpenvino,
-    EndToEndLatencyUvOpenvinoOpenvino, EvalLlamacppCliStockToolsGgufText,
-    MaxMemoryUsageLlamacppCliStockToolsGgufText, MaxMemoryUsageOvmsOpenvino,
-    MaxMemoryUsageUvOpenvinoOpenvino, PrefillThroughputLlamacppCliStockToolsGgufText,
-    PrefillThroughputOvmsOpenvino, PrefillThroughputUvOpenvinoOpenvino, RuntimeFlagRef,
-    RuntimeFlags, RuntimeFlagsError, TrtEdgellmGgufVision,
-    VlMaxMemoryLlamacppCliStockToolsGgufVision, VlSpecDecodeLlamacppCliStockTools,
-    VlThroughputLlamacppCliStockToolsGgufVision, VlmEvalLlamacppCliStockToolsGgufVision,
-    resolve_speculation,
+    AsrThroughputLlamacppCliStockToolsGgufVision, DecisionLlamacppCliStockTools,
+    DecodeThroughputLlamacppCliStockToolsGgufText, DecodeThroughputOvmsOpenvino,
+    DecodeThroughputUvOpenvinoOpenvino, EndToEndLatencyLlamacppCliStockToolsGgufText,
+    EndToEndLatencyOvmsOpenvino, EndToEndLatencyUvOpenvinoOpenvino,
+    EvalLlamacppCliStockToolsGgufText, MaxMemoryUsageLlamacppCliStockToolsGgufText,
+    MaxMemoryUsageOvmsOpenvino, MaxMemoryUsageUvOpenvinoOpenvino,
+    PrefillThroughputLlamacppCliStockToolsGgufText, PrefillThroughputOvmsOpenvino,
+    PrefillThroughputUvOpenvinoOpenvino, RuntimeFlagRef, RuntimeFlags, RuntimeFlagsError,
+    TrtEdgellmGgufVision, VlMaxMemoryLlamacppCliStockToolsGgufVision,
+    VlSpecDecodeLlamacppCliStockTools, VlThroughputLlamacppCliStockToolsGgufVision,
+    VlmEvalLlamacppCliStockToolsGgufVision, resolve_speculation,
 };
 
 use std::collections::HashSet;

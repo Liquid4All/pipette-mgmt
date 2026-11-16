@@ -484,7 +484,8 @@ mod tests {
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let stores = pipette_store_fs::build_local_fs_stores(&config)?;
+        let stores =
+            pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         Ok((dir, stores.vault))
     }
 

@@ -58,6 +58,15 @@ pub fn app_responses(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::Named<crate::CampaignOverview>>();
     generator.subschema_for::<crate::RevisionDryRun>();
     generator.subschema_for::<crate::CampaignRevised>();
+    generator.subschema_for::<crate::ListPage<crate::CampaignGroup>>();
+    generator.subschema_for::<crate::CampaignGroup>();
+    generator.subschema_for::<crate::CampaignGroupView>();
+    generator.subschema_for::<crate::Changed<crate::CampaignGroup>>();
+    generator.subschema_for::<crate::CampaignGroupPolicies>();
+    generator.subschema_for::<crate::CampaignGroupPolicy>();
+    generator.subschema_for::<crate::Changed<crate::CampaignGroupPolicy>>();
+    generator.subschema_for::<crate::CampaignGroupPolicyPreview>();
+    generator.subschema_for::<crate::CampaignGroupRerunResults>();
     // One line of the progress stream; `body` is the called route's answer.
     generator.subschema_for::<crate::IngestEvent<serde_json::Value>>();
     generator.subschema_for::<crate::ListPage<crate::ModelParams>>();
@@ -100,6 +109,10 @@ pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::RerunJobsRequest>();
     generator.subschema_for::<crate::RecalculateJobsRequest>();
     generator.subschema_for::<crate::RevertCampaignRequest>();
+    generator.subschema_for::<crate::CreateCampaignGroupRequest>();
+    generator.subschema_for::<crate::UpdateCampaignGroupRequest>();
+    generator.subschema_for::<crate::AddCampaignGroupMembersRequest>();
+    generator.subschema_for::<crate::SetCampaignGroupPolicyRequest>();
     generator.subschema_for::<crate::CreateModelParamsRequest>();
     generator.subschema_for::<crate::UpdateModelParamsRequest>();
 }

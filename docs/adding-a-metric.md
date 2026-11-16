@@ -159,9 +159,9 @@ Android's `rustEngine` flavour, which come from plan-types' `ThermalTelemetry`
   has no released client yet ([§2](#2-order-and-compatibility)), beside a
   `_stddev` twin if it is a mean over reps. Its Rust type is plain: `f64` for a
   time or a rate, `u32` or `u64` for a count. The range types are the server's
-  ([§4.2](#42-the-servers-wire-type)). `vl_max_memory` and `asr_max_memory`
-  have no variant of their own and send `MaxMemoryUsage`, so a field there
-  reaches all three memory types.
+  ([§4.2](#42-the-servers-wire-type)). `vl_max_memory`, `asr_max_memory` and
+  `decision_max_memory` have no variant of their own and send `MaxMemoryUsage`,
+  so a field there reaches all four memory types.
 - A field **every type may report** goes on `BenchmarkSubmissionPayload`, or on
   a struct it flattens (`MemoryObservation`, `ThermalTelemetry`, `DeviceInfo`).
 
@@ -218,10 +218,11 @@ failure body carrying a `device_` key is refused by its prefix
 
 ### 4.3. Units and names
 
-Reuse a unit already in the warehouse: `ms`, `tokens/sec`, `tokens`, `bytes`,
-`ratio`. The app reads them ([§4.5](#45-readers)), and a query that groups by
-unit expects one spelling per quantity. `value` is a Float32, so a byte count
-above 16 MiB is not stored exactly; the `observation_*` byte columns are Int64.
+Reuse a unit already in the warehouse: `ms`, `tokens/sec`, `requests/sec`,
+`tokens`, `bytes`, `ratio`. The app reads them ([§4.5](#45-readers)), and a
+query that groups by unit expects one spelling per quantity. `value` is a
+Float32, so a byte count above 16 MiB is not stored exactly; the `observation_*`
+byte columns are Int64.
 
 Name the metric for the quantity, not after its field (`ttft` from
 `prefill_time_ms`, `max_host_usage` from `max_host_bytes`), and check that the
@@ -254,6 +255,11 @@ goes in when a failure row can tell the run would have produced it:
   A failure the server declares itself, such as a job past its `expires_at` or
   one retired after `plan_lost_lease_limit` lost leases, carries no
   `runtime_flags`, so it never resolves speculation and gets only the slice.
+  A condition on the entry's own parameters goes in `intended_metrics_of`,
+  which the failure rows and the agreement test read: a `decision_latency`
+  entry with `parameter_batch_size > 1` also intends `decision_throughput`.
+  That arm lists `decision_latency` again, so a metric added to the type in
+  `intended_metrics` goes there too.
 
 `test_intended_metrics_agrees_with_derive_metrics` checks that each intended
 metric comes out of `derive_metrics`, with the same unit, for one fixed
@@ -261,11 +267,11 @@ submission per case. It misses a derived metric left out of `intended_metrics`,
 and a conditional one listed by mistake when every case of its arm sends the
 field. A new type is checked only once it has a case.
 
-`max_memory_usage`, `vl_max_memory` and `asr_max_memory` share one arm in
-`measurement_fields`, `derive_metrics` and `intended_metrics`, and all three
-require `max_host_bytes` in `validate` (where `asr_max_memory` also requires its
-context sizing and audio-limit flag), so a memory metric lands on all three
-types' rows unless you split the arm.
+`max_memory_usage`, `vl_max_memory`, `asr_max_memory` and `decision_max_memory`
+share one arm in `measurement_fields`, `derive_metrics` and `intended_metrics`,
+and all four require `max_host_bytes` in `validate` (where `asr_max_memory` also
+requires its context sizing and audio-limit flag), so a memory metric lands on
+all four types' rows unless you split the arm.
 
 **Existing rows do not gain the metric.** The scorer derives metrics once, when
 a submission is scored, and a campaign re-run is a new job, so a new metric

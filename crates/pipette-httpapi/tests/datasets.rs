@@ -13,7 +13,7 @@ use pipette_core::dataset::{DatasetArtifact, ProbeState, ProbeVerdict};
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientPermission, OrgId};
 use pipette_web_testkit::{
-    authed_get, body_json, json_str, make_state, own_client_by_org, register_and_approve,
+    authed_get, body_json, json_str, make_object_state, own_client_by_org, register_and_approve,
     register_approve_and_grant, seed_org, setup_benchmarks, unauthed_get,
 };
 
@@ -121,7 +121,7 @@ async fn setup() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     pin_benchmark(dir.path(), None)?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let (key, client_id) = register_and_approve(&state).await?;
     Ok((dir, state, key, client_id))
 }
@@ -142,7 +142,7 @@ async fn a_private_corpus_follows_its_definition(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let acme = seed_org(&state, "acme").await?;
     pin_benchmark(dir.path(), Some(&acme.org_id))?;
     let (key, client_id) = register_and_approve(&state).await?;
@@ -296,7 +296,7 @@ async fn an_asr_corpus_is_served_only_at_its_entrys_count(
         catalog_dir.join(format!("{ASR_BENCHMARK}.toml")),
         asr_fixture_toml(3),
     )?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let (key, client_id) = register_and_approve(&state).await?;
     let fixture =
         pipette_core::benchmark::Benchmark::from_toml(ASR_BENCHMARK, &asr_fixture_toml(3))?;

@@ -3,7 +3,8 @@
 Deletes the campaign record, which is only a pointer, and keeps every plan it
 named: each plan keeps its manifest, its jobs and its lifecycle, and is read
 and cancelled from then on under the `_any_` grants alone
-([who may do what](../campaigns.md#who-may-do-what)). It takes the rename's gate
+([who may do what](../campaigns.md#who-may-do-what)). It also takes the campaign
+out of its [campaign group](../campaign-groups.md). It takes the rename's gate
 ([`PATCH`](update_campaign.md)). Answers `204` with no body.
 
 The route refuses the delete while a plan the campaign filed still runs:

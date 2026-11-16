@@ -8,13 +8,13 @@ import type { Crumb } from "./crumbs";
 import { doneOf, duration, textOrder } from "./format";
 import type { OrgRef } from "./orgs";
 import { ownedQuery, ownerBranch, ownerName, principalOf, underTrail, type OwnedBranch, type OwnedScope } from "./owned";
-import { PLAN_STATUSES, bytesText, doneShare, shownStatus, statusChoices } from "./plans";
+import { bytesText, doneShare } from "./plans";
 import { reaches } from "./rights";
 import { campaignLink, campaignPlanLink, pathOf, type OwnedPages } from "./routes";
 import type { TableSpec } from "./table";
 import { percent } from "./upload";
 import type {
-  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanSummary, PlanView, PlannedImport,
+  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanStatus, PlanSummary, PlanView, PlannedImport,
   PrincipalOwner, RevisionDryRun, UpdateCampaignRequest,
 } from "./api-types";
 
@@ -44,48 +44,55 @@ export function planTrail(plan_id: string, campaign_id: string | null, detail: N
     : [campaign];
 }
 
+/** A campaign's phase: its plan's status where `complete` or `cancelled`, `active` for any other. */
+export type Phase = "active" | "complete" | "cancelled";
+export const phaseOf = (status: PlanStatus): Phase =>
+  (status === "complete" || status === "cancelled" ? status : "active");
+
+/** Every campaign status a listing filters on. */
+const CAMPAIGN_STATUSES = ["active", "complete", "cancelled", "not_started", "archived"];
+
 /**
- * A campaign's status: `archived` once archived, else what its plan is doing, `not_started` before its first and
+ * A campaign's status: `archived` once archived, else its plan's phase, `not_started` before its first plan and
  * `""` where the reader may not read it.
  */
-const campaignStatus = (row: CampaignView): string =>
+export const campaignStatus = (row: CampaignView): string =>
   (stateOf(row) === "archived" ? "archived"
-    : row.plan ? shownStatus(row.plan.status, row.plan.counts) : row.current_plan_id ? "" : "not_started");
+    : row.plan ? phaseOf(row.plan.status) : row.current_plan_id ? "" : "not_started");
 
 /** A campaign's own state, beside its plan's status; a record never archived carries none. */
 export const stateOf = (row: Pick<CampaignView, "state">): CampaignState => row.state ?? "active";
 
 /**
- * A campaign's progress as the listing prints it: its plan's jobs done of all, `936/936`. A plan with failed jobs
- * also gives their count, `936/936 (5)`.
+ * A campaign's progress as the listing prints it: its plan's finished, failed and running jobs of all,
+ * `1556 · 156 · 7 / 2040`, in the order the bar draws them. The column's header names the three counts.
  */
 export function progressText(row: CampaignView): string {
   const counts = row.plan?.counts;
-  if (!counts) return "—";
-  const failed = counts.failed ? ` (${counts.failed})` : "";
-  return `${doneOf(counts)}/${counts.total}${failed}`;
+  return counts ? `${counts.finished} · ${counts.failed} · ${counts.running} / ${counts.total}` : "—";
 }
 
 /**
  * The bar behind a campaign's progress text. `finished` is the share of the plan's jobs that finished. `done` is the
- * share that finished or failed. `phase` sets the colors: `complete` and `cancelled` for a plan in that status, and
- * `active` for a plan in any other status.
+ * share that finished or failed. `started` is the share that finished, failed or is running. `phase` sets the colors:
+ * `complete` and `cancelled` for a plan in that status, and `active` for a plan in any other status.
  */
 export interface ProgressFill {
-  phase: "active" | "complete" | "cancelled";
+  phase: Phase;
   finished: number;
   done: number;
+  started: number;
 }
 
 /** The bar behind a campaign's progress text, or null for a plan with no counted jobs. */
 export function progressFill(row: CampaignView): ProgressFill | null {
   const counts = row.plan?.counts;
   if (!row.plan || !counts?.total) return null;
-  const { status } = row.plan;
   return {
-    phase: status === "complete" || status === "cancelled" ? status : "active",
+    phase: phaseOf(row.plan.status),
     finished: counts.finished / counts.total,
     done: doneOf(counts) / counts.total,
+    started: (doneOf(counts) + counts.running) / counts.total,
   };
 }
 
@@ -96,9 +103,32 @@ export const labelPairs = (labels: Record<string, string> | undefined): [string,
 /** A label as a listing prints and filters it: `key=value`, the key alone for an empty value. */
 export const labelText = ([key, value]: readonly [string, string]): string => (value ? `${key}=${value}` : key);
 
+/** Twelve hues 30° apart, offset from the status pills' violet, green and amber. */
+const LABEL_HUES = [15, 45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345];
+
+/** A label's chip hue in degrees: an FNV-1a hash of its `labelText`, so a label has the same color on every page. */
+export function labelHue(pair: readonly [string, string]): number {
+  let hash = 0x811c9dc5;
+  for (const char of labelText(pair)) hash = Math.imul(hash ^ char.codePointAt(0)!, 0x01000193) >>> 0;
+  return LABEL_HUES[hash % LABEL_HUES.length]!;
+}
+
 /** `listing` narrowed to the campaigns that carry `pair`, as its labels filter keeps it in the address. */
 export const labelLink = (listing: string, pair: readonly [string, string]): string =>
   `${listing}?${new URLSearchParams({ label: labelText(pair) })}`;
+
+/**
+ * `listing` at `query` with `pair` added to its labels filter, or taken off where the filter has it. The other
+ * filters and the sort stay, and the pager goes back to the first page.
+ */
+export function labelToggled(listing: string, query: URLSearchParams, pair: readonly [string, string]): string {
+  const next = new URLSearchParams(query);
+  const text = labelText(pair);
+  if (next.has("label", text)) next.delete("label", text);
+  else next.append("label", text);
+  next.delete("offset");
+  return next.size ? `${listing}?${next}` : listing;
+}
 
 /** A label typed as `key=value`, split at its first `=`; a key alone has an empty value. */
 export function parseLabel(text: string): [string, string] {
@@ -210,10 +240,8 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
                                                      : "A plan id finds its campaign in every state." } } : {}) },
     ],
     choices: [
-      { key: "status", label: "status",
-        values: (row) => (row.plan && stateOf(row) !== "archived" ? statusChoices(row.plan.status, row.plan.counts)
-          : [campaignStatus(row)]),
-        name: (value) => value.replaceAll("_", " "), order: [...PLAN_STATUSES, "not_started", "archived"] },
+      { key: "status", label: "status", values: (row) => [campaignStatus(row)],
+        name: (value) => value.replaceAll("_", " "), order: CAMPAIGN_STATUSES },
       { key: "label", label: "labels", values: (row) => labelPairs(row.labels).map(labelText) },
       ...(owners ? [{ key: "owner", label: "owner", values: (row: CampaignView) => [principalOf(row.owner)],
                       name: (id: string) => names[id] ?? id }] : []),
@@ -392,10 +420,10 @@ export const headAddress = (campaign_id: string, head: string): string =>
 /** The longest campaign name the server takes, in characters (`api_v1::campaigns::NAME_MAX_CHARS`). */
 export const NAME_MAX_CHARS = 4096;
 
-/** Why `name` would be refused as a campaign's, or `""`: the route's own checks, made as it is typed. */
+/** Why `name` would be refused as a campaign's or a group's, or `""`: the route's own checks, made as it is typed. */
 export function nameProblem(name: string): string {
   const trimmed = name.trim();
-  if (!trimmed) return "Name the campaign";
+  if (!trimmed) return "Enter a name";
   if ([...trimmed].length > NAME_MAX_CHARS) return `Keep the name to ${NAME_MAX_CHARS.toLocaleString("en")} characters`;
   return "";
 }
@@ -408,13 +436,6 @@ export function noteProblem(note: string): string {
   if ([...note.trim()].length > NOTE_MAX_CHARS) return `Keep the note to ${NOTE_MAX_CHARS.toLocaleString("en")} characters`;
   if (note.includes("\0")) return "Remove the NUL character from the note";
   return "";
-}
-
-/** A rename's body, refused in the browser where the route would refuse it. */
-export function renameBody(name: string): UpdateCampaignRequest {
-  const problem = nameProblem(name);
-  if (problem) throw new Error(problem);
-  return { name };
 }
 
 /**
@@ -450,11 +471,13 @@ export function revisionSummary(preview: RevisionDryRun): string {
   if (preview.unchanged) return "Filing it files nothing: this is the document the campaign runs.";
   const stopped = preview.dropped_job_ids.length;
   const requirementsRerun = preview.requirements_rerun_job_count;
-  const again = preview.rerun_job_count + preview.recalculated_job_count + requirementsRerun;
+  const rerun = preview.rerun_job_ids.length;
+  const marked = preview.marked_job_ids.length;
+  const again = rerun + preview.recalculated_job_count + requirementsRerun;
   const restored = preview.restored_job_count;
   const inherited = preview.inherited_job_count;
   const satisfied = preview.satisfied_job_count;
-  if (!preview.new_job_count && !stopped && !again && !restored && !inherited && !satisfied) {
+  if (!preview.new_job_count && !stopped && !again && !marked && !restored && !inherited && !satisfied) {
     return "Filing it changes no job: every job carries over as it is.";
   }
   const parts = [
@@ -463,8 +486,9 @@ export function revisionSummary(preview: RevisionDryRun): string {
     ...(inherited ? [`takes ${inherited} finished from the plans it inherits from`] : []),
     ...(satisfied ? [`takes ${satisfied} finished from earlier runs of the same cell`] : []),
     ...(preview.new_job_count ? [`queues ${preview.new_job_count} new`] : []),
-    ...(preview.rerun_job_count ? [`runs ${preview.rerun_job_count} again`] : []),
-    ...(requirementsRerun ? [`runs ${requirementsRerun} finished again (failed, or their device or build is not known to meet the requirements)`] : []),
+    ...(rerun ? [`runs ${rerun} again`] : []),
+    ...(marked ? [`marks ${marked} failed`] : []),
+    ...(requirementsRerun ? [`runs ${requirementsRerun} finished again (failed, their device or build is not known to meet the requirements, or they are not known to have passed the attempt limit)`] : []),
     ...(preview.recalculated_job_count ? [`scores ${preview.recalculated_job_count} again`] : []),
     `stops ${stopped}`,
   ];

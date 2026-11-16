@@ -10,7 +10,8 @@ nonempty ordered arrays:
 - `runtimes`: each item is a runtime descriptor, as in a `catalog create` file.
 - `models`: each item is `{"quantization": "q4_0", "model": { ... }}`. The
   `model` is the model table of a plan. The `quantization` label matches
-  `[a-z0-9_]+`. The server derives the format from the model type.
+  `[a-z0-9_]+(@[a-z0-9_]+)?`, for example `q4_k_m@unsloth`. The server derives
+  the format from the model type.
 
 The optional `release_time` follows Request for Comments (RFC) 3339. Runtime
 and model members can use vault resources owned by that organization. The

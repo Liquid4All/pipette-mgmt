@@ -400,9 +400,9 @@ mod tests {
 
     #[rstest]
     #[case::virtual_host(
-        "https://bucket.s3.us-east-1.amazonaws.com/todo/avail/job-1?x-id=GetObject",
+        "https://bucket.s3.us-east-1.amazonaws.com/plans/plan-1.json?x-id=GetObject",
         "bucket.s3.us-east-1.amazonaws.com",
-        "/todo/avail/job-1"
+        "/plans/plan-1.json"
     )]
     #[case::path_style("http://localhost:9000/bucket/key", "localhost:9000", "/bucket/key")]
     #[case::no_path("https://bucket.example.com?list-type=2", "bucket.example.com", "/")]

@@ -6,15 +6,17 @@
 
 <script lang="ts">
   // The Jobs table (`jobs.ts`), shared by Jobs and Results' Swap: sorted, paged by job and exported here, with
-  // each job's re-run or recalculation and a box to check it for one re-run of several, each confirmed first.
+  // each job's re-run, mark or recalculation and a box to check it for one re-run of several, each confirmed first.
   import { untrack, type Snippet } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { failedText, keepTail } from "../plans";
-  import { boxOver, parentLink, rerunIds, rerunQuestion, rowOffers, REVISION, type Filing } from "../rerun";
+  import {
+    boxOver, markFiling, markQuestion, parentLink, rerunIds, rerunQuestion, rowOffers, REVISION, type Filing,
+  } from "../rerun";
   import { Filer } from "../rerun.svelte";
   import {
-    byJob, cellText, changeOf, clientOf, columnNameOf, earlierRows, issuesOf, linesCsv, sortLines, spreadOf, swapped,
-    tierOf, type Column, type Context, type Line,
+    byJob, cellText, changeOf, clientOf, columnNameOf, earlierRows, issuesOf, linesCsv, rerunOfText, sortLines,
+    spreadOf, swapped, tierOf, type Column, type Context, type Line,
   } from "../jobs";
   import { offsetPaging } from "../pager";
   import { here } from "../route.svelte";
@@ -76,6 +78,22 @@
       title: `Recalculate ${jobId}?`, action: "Recalculate",
       text: `Its recorded completions are scored again under a new job, which no device runs. ${REVISION}`,
     });
+  /** The reason the open mark gives, and whether it was tried without one. */
+  let reason = $state("");
+  let reasonTried = $state(false);
+  function markOne(jobId: string): Asked {
+    reason = "";
+    reasonTried = false;
+    return {
+      ...markQuestion(jobId), pending: "Filing…", fields: reasonField,
+      run: () => {
+        reasonTried = true;
+        const filing = markFiling(jobId, reason);
+        if (!filing) return Promise.resolve("");
+        return rerunIn ? filer.revise(`mark:${jobId}`, rerunIn, plan.plan_id, filing, onchange) : Promise.resolve(null);
+      },
+    };
+  }
   /** Open a confirmation, unless a filing is under way: behind `main.ts`, which drops a locked control's click. */
   const ask = (question: Asked) => filer.busy || void confirm?.ask(question);
   // Kept over every page of jobs, so the columns do not come and go with the filters.
@@ -138,11 +156,19 @@
   }
 </script>
 
-<!-- A row's controls as icons, named by their labels and titles: a circling arrow, and a calculator. -->
+<!-- A row's controls as icons, named by their labels and titles: a circling arrow, a crossed circle, and a
+     calculator. -->
 {#snippet rerunIcon()}
   <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor"
        stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
     <path d="M13.2 10a5.5 5.5 0 1 1-1.3-5.7L14 6" /><polyline points="14 2.5 14 6 10.5 6" />
+  </svg>
+{/snippet}
+
+{#snippet markIcon()}
+  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor"
+       stroke-width="1.5" stroke-linecap="round">
+    <circle cx="8" cy="8" r="6.25" /><path d="M5.75 5.75l4.5 4.5M10.25 5.75l-4.5 4.5" />
   </svg>
 {/snippet}
 
@@ -172,6 +198,13 @@
   </details>
 {/snippet}
 
+{#snippet reasonField()}
+  {@const missing = reasonTried && !reason.trim()}
+  <label><span>Reason</span>
+    <input type="text" bind:value={reason} autocomplete="off" aria-invalid={missing} /></label>
+  {#if missing}<p class="err" role="alert">Say why the job failed.</p>{/if}
+{/snippet}
+
 <div class="bar summary">
   <ColumnPicker columns={every} drawn={columns.map((column) => column.key)} {picked} {widths} />
   {#if checkable}
@@ -192,7 +225,7 @@
     <!-- The jobs it derives from, newest first, folded under its id as a value folds its earlier runs. -->
     {@const lineage = [["recalculated from", job.result.status === "scored" ? job.result.rescored_from : null,
                         job.result.status === "scored" ? job.result.earlier_runs.slice(1).map((run) => run.job) : []],
-                       ["re-run of", job.plan.rerun_of, job.plan.rerun_history]] as const}
+                       [rerunOfText(job), job.plan.rerun_of, job.plan.rerun_history]] as const}
     <!-- Its id opens its plan's Jobs narrowed to it. -->
     {@const own = { job_id: job.job_id, plan_id: plan.plan_id }}
     {#if lineage.some(([, from]) => from)}
@@ -275,14 +308,19 @@
                 onchange={(e) => check(job.job_id, e.currentTarget.checked)} />{/if}</td>
             {/if}
             {#if actionable && !i}
-              <!-- Two fixed slots, an unoffered one left empty, so each icon keeps its place down the column. -->
+              <!-- Three fixed slots, an unoffered one left empty, so each icon keeps its place down the column. A
+                   job a re-run takes may be marked failed instead. -->
               <td class="actions" rowspan={span}><div class="slots">
                 {#if offers.rerun}
                   <button type="button" class="icon" aria-disabled={filer.busy} aria-haspopup="dialog"
                           aria-busy={filer.which === `rerun:${job.job_id}`} title="Re-run"
                           aria-label={rowLabel(`rerun:${job.job_id}`, "Re-run", job.job_id)}
                           onclick={() => ask(rerunOne(job.job_id))}>{@render rerunIcon()}</button>
-                {:else}<span></span>{/if}
+                  <button type="button" class="icon" aria-disabled={filer.busy} aria-haspopup="dialog"
+                          aria-busy={filer.which === `mark:${job.job_id}`} title="Mark failed"
+                          aria-label={rowLabel(`mark:${job.job_id}`, "Mark failed", job.job_id)}
+                          onclick={() => ask(markOne(job.job_id))}>{@render markIcon()}</button>
+                {:else}<span></span><span></span>{/if}
                 {#if offers.recalculate}
                   <button type="button" class="icon" aria-disabled={filer.busy} aria-haspopup="dialog"
                           aria-busy={filer.which === `recalculate:${job.job_id}`} title="Recalculate"
@@ -318,7 +356,7 @@
   .count :global(a), .count :global(button) { margin-left: 8px; }
   .check { width: 1%; }
   .check input { margin: 0; vertical-align: middle; }
-  .slots { display: grid; grid-template-columns: 24px 24px; gap: 4px; }
+  .slots { display: grid; grid-template-columns: 24px 24px 24px; gap: 4px; }
   button.icon { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px;
                 padding: 0; color: var(--text-muted); vertical-align: middle; }
   button.icon:hover { color: var(--text); }

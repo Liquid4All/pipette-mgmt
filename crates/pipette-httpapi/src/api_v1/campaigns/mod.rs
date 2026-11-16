@@ -4,7 +4,7 @@
 
 pub mod reads;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::Json;
 use axum::extract::{FromRequest, Request, State};
@@ -26,10 +26,10 @@ use pipette_pipeline::variant_edit::VariantEdit;
 use pipette_pipeline::{campaign_admin, variant_edit};
 use pipette_plan_types::{
     Answered, AuditTarget, BenchmarkId, CampaignAnswer, CampaignCreated, CampaignDocument,
-    CampaignId, CampaignPlanDocumentQuery, CampaignRevised, CampaignVariants, CampaignView,
-    Changed, CreateCampaignQuery, FleetDetail, JobId, NonEmptyTrimmedString, PlanAnswer, PlanFiled,
-    PlanId, RecalculateJobsRequest, RerunJobsQuery, RerunJobsRequest, RevertCampaignQuery,
-    RevertCampaignRequest, ReviseCampaignQuery, RevisionAnswer, RevisionBase,
+    CampaignGroupId, CampaignId, CampaignPlanDocumentQuery, CampaignRevised, CampaignVariants,
+    CampaignView, Changed, CreateCampaignQuery, FleetDetail, JobId, NonEmptyTrimmedString,
+    PlanAnswer, PlanFiled, PlanId, RecalculateJobsRequest, RerunJobsQuery, RerunJobsRequest,
+    RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery, RevisionAnswer, RevisionBase,
     SetCampaignOwnerRequest, UpdateCampaignRequest, UserPermission, VaultPrincipalId,
 };
 
@@ -60,7 +60,7 @@ enum Selection<W> {
 }
 
 /// Exactly one of `job_ids` and the whole-plan selector `name`. The selector
-/// needs `base_plan_id`, and has no dry run.
+/// needs `base_plan_id`.
 fn selection<W>(
     query: &RerunJobsQuery,
     job_ids: Option<Vec<JobId>>,
@@ -71,9 +71,6 @@ fn selection<W>(
         (Some(job_ids), None) => Ok(Selection::Jobs(job_ids.into_iter().collect())),
         (None, Some(_)) if query.base_plan_id.is_none() => Err(AppError::BadRequest(format!(
             "{name} needs base_plan_id, the plan it was read off"
-        ))),
-        (None, Some(_)) if query.dry_run => Err(AppError::BadRequest(format!(
-            "dry_run takes job_ids, not {name}"
         ))),
         (None, Some(whole)) => Ok(Selection::Whole(whole)),
         (Some(_), Some(_)) | (None, None) => Err(AppError::BadRequest(format!(
@@ -88,7 +85,7 @@ fn base_plan_id(plan_id: PlanId) -> PlanId {
 }
 
 /// The one bound on a name the type does not carry.
-fn check_name(name: &NonEmptyTrimmedString) -> Result<(), AppError> {
+pub(crate) fn check_name(name: &NonEmptyTrimmedString) -> Result<(), AppError> {
     if name.chars().count() > NAME_MAX_CHARS {
         return Err(AppError::BadRequest(format!(
             "name must not exceed {NAME_MAX_CHARS} characters"
@@ -133,7 +130,7 @@ async fn for_record_write(
 
 /// Refuse an account owner without `submit_plans`, whoever hands the campaign
 /// over: without it the owner could neither run the campaign nor hand it back.
-async fn require_owner_files_plans(
+pub(crate) async fn require_owner_files_plans(
     state: &AppState,
     owner: &CampaignOwner,
 ) -> Result<(), AppError> {
@@ -440,7 +437,7 @@ pub async fn update_campaign(
     ApiJson(body): ApiJson<UpdateCampaignRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let caller = active.caller();
-    let (_, mut campaign) = for_record_write(&state, caller, &campaign_id).await?;
+    let (_, read) = for_record_write(&state, caller, &campaign_id).await?;
     let UpdateCampaignRequest {
         name,
         labels,
@@ -449,19 +446,15 @@ pub async fn update_campaign(
     if let Some(name) = &name {
         check_name(name)?;
     }
+    let mut campaign = read.clone();
     let now = Utc::now();
     let renamed = name.is_some_and(|name| campaign.rename(name, now));
     let relabelled = labels.is_some_and(|labels| campaign.set_labels(labels, now));
     let restated = new_state.is_some_and(|new_state| campaign.set_state(new_state, now));
     let changed = renamed || relabelled || restated;
-    // Nothing is written for a no-op, so a request that changes nothing cannot
-    // lose a concurrent edit to a last-writer-wins PUT.
     if changed {
-        state
-            .campaign_store
-            .put_campaign(&campaign)
-            .await
-            .map_err(|e| AppError::internal(e.context("failed to write the campaign")))?;
+        // The caller was checked on `read`, so a record changed since is a `409`.
+        campaign_admin::replace(state.campaign_store.as_ref(), &read, &campaign).await?;
         if renamed {
             tracing::info!("campaign renamed");
         }
@@ -489,24 +482,29 @@ pub async fn set_campaign_owner(
     ApiJson(body): ApiJson<SetCampaignOwnerRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let caller = active.caller();
-    let (campaign, changed) = hand_over(&state, caller, &campaign_id, body.owner).await?;
-    if !changed {
-        audit.unchanged();
-    }
+    let (campaign, changed, left) = hand_over(&state, caller, &campaign_id, body.owner).await?;
+    // Leaving a group is a write the record does not show.
+    audit.changed(changed || left.is_some());
+    audit
+        .involve(
+            &state,
+            left.map(|group_id| AuditTarget::CampaignGroup { group_id }),
+        )
+        .await;
     Ok(Json(Changed {
         record: view(campaign),
         changed,
     }))
 }
 
-/// Hand a campaign to `owner`, checked at both ends, and say whether anything
-/// changed.
+/// Hand a campaign to `owner`, checked at both ends, and say whether the record
+/// changed and which group of another owner the campaign left, if any.
 async fn hand_over(
     state: &AppState,
     caller: Caller<'_>,
     campaign_id: &CampaignId,
     owner: CampaignOwner,
-) -> Result<(Campaign, bool), AppError> {
+) -> Result<(Campaign, bool, Option<CampaignGroupId>), AppError> {
     // The campaign must be this caller's to give before the destination is
     // considered, so a refused hand-off discloses nothing about where it was headed.
     let (authority, mut campaign) = for_record_write(state, caller, campaign_id).await?;
@@ -523,16 +521,21 @@ async fn hand_over(
         require_owner_holds_private_run(state, caller.rights, &campaign, &owner).await?;
     }
 
+    let read = campaign.clone();
     let changed = campaign.set_owner(owner, Utc::now());
     if changed {
-        state
-            .campaign_store
-            .put_campaign(&campaign)
-            .await
-            .map_err(|e| AppError::internal(e.context("failed to write the campaign")))?;
+        // The checks above passed on `read`, so a record changed since is a `409`.
+        campaign_admin::replace(state.campaign_store.as_ref(), &read, &campaign).await?;
         tracing::info!(owner = %campaign.owner.label(), "campaign owner set");
     }
-    Ok((campaign, changed))
+    let left = campaign_admin::leave_group(
+        state.campaign_store.as_ref(),
+        state.campaign_group_store.as_deref(),
+        campaign_id,
+    )
+    .await
+    .map_err(|e| AppError::internal(e.context("failed to leave the campaign group")))?;
+    Ok((campaign, changed, left))
 }
 
 // POST /api/v1/campaigns/{campaign_id}/plans
@@ -621,12 +624,11 @@ pub async fn file_plan(
                 )
                 .await;
 
-            // The record above predates the ingest, so the advance re-reads it
-            // rather than writing that copy back.
+            // Only from the head and owner the import read.
             campaign_admin::advance(
                 state.campaign_store.as_ref(),
                 state.plan_store.as_ref(),
-                &campaign_id,
+                &campaign,
                 report.plan_id.clone(),
             )
             .await?;
@@ -654,7 +656,9 @@ pub async fn edit_variants(
     let add_from = query.add_from.unwrap_or_default();
     let restore = query.restore.unwrap_or_default();
     let inherit_from = inheriting(&query.inherit_from.unwrap_or_default(), &add_from, &restore);
-    let offer = offer(&state, caller, query.carry_earlier, &inherit_from).await?;
+    let offer = offer(&state, caller, query.carry_earlier, &inherit_from)
+        .await?
+        .across_limit(query.carry_across_limit);
 
     // Read only now, so a refused caller costs no body.
     let stream = progress_stream::requested(request.headers());
@@ -681,7 +685,7 @@ pub async fn edit_variants(
             .await?;
         Ok::<_, AppError>((StatusCode::CREATED, RevisionAnswer::Revised(revised)))
     };
-    progress_stream::answer(stream, held, edit_variants).await
+    Box::pin(progress_stream::answer(stream, held, edit_variants)).await
 }
 
 // GET /api/v1/campaigns/{campaign_id}/variants
@@ -730,7 +734,9 @@ pub async fn revise_document(
         ));
     }
     let inherit_from = query.inherit_from.unwrap_or_default();
-    let offer = offer(&state, caller, query.carry_earlier, &inherit_from).await?;
+    let offer = offer(&state, caller, query.carry_earlier, &inherit_from)
+        .await?
+        .across_limit(query.carry_across_limit);
 
     // Read only now, so a refused caller costs no plan-sized body.
     let stream = progress_stream::requested(request.headers());
@@ -810,7 +816,7 @@ fn unchanged(campaign: &Campaign) -> RevisionAnswer {
 }
 
 /// A write's answer: the record alone, as an unasked read answers it.
-fn view(campaign: Campaign) -> CampaignView {
+pub(crate) fn view(campaign: Campaign) -> CampaignView {
     CampaignView {
         campaign: campaign.into(),
         plan: None,
@@ -849,14 +855,39 @@ pub async fn rerun_jobs(
 
     // Read only now, so a refused caller costs no body.
     let ApiJson(body) = ApiJson::<RerunJobsRequest>::from_request(request, &state).await?;
-    let response = match selection(&query, body.job_ids, body.answered, "answered")? {
-        Selection::Jobs(job_ids) if query.dry_run => {
-            let report = reviser.dry_run_rerun(&state, job_ids, body.note).await?;
-            audit.unchanged();
-            return Ok(Json(pipette_plan_types::RevisionDryRun::from(report)).into_response());
-        }
-        Selection::Jobs(job_ids) => reviser.rerun(&state, job_ids, body.note).await?,
-        Selection::Whole(which) => reviser.rerun_answered(&state, which, body.note).await?,
+    let RerunJobsRequest {
+        job_ids,
+        answered,
+        fail,
+        note,
+    } = body;
+    fail.iter().try_for_each(|(job_id, reason)| {
+        crate::api_v1::plans::check_text(&format!("the fail reason of {job_id}"), reason)
+    })?;
+    if !fail.is_empty() && answered.is_some() {
+        return Err(AppError::BadRequest(
+            "fail does not combine with answered: name the jobs to re-run in job_ids".into(),
+        ));
+    }
+    // `fail` alone marks its jobs and re-runs none.
+    let job_ids = job_ids.or_else(|| (!fail.is_empty()).then(Vec::new));
+    if job_ids.is_none() && answered.is_none() {
+        return Err(AppError::BadRequest(
+            "name job_ids, answered or fail".into(),
+        ));
+    }
+    let selected = selection(&query, job_ids, answered, "answered")?;
+    if query.dry_run {
+        let report = match selected {
+            Selection::Jobs(job_ids) => reviser.dry_run_rerun(&state, job_ids, fail, note).await?,
+            Selection::Whole(which) => reviser.dry_run_rerun_answered(&state, which, note).await?,
+        };
+        audit.unchanged();
+        return Ok(Json(pipette_plan_types::RevisionDryRun::from(report)).into_response());
+    }
+    let response = match selected {
+        Selection::Jobs(job_ids) => reviser.rerun(&state, job_ids, fail, note).await?,
+        Selection::Whole(which) => reviser.rerun_answered(&state, which, note).await?,
     };
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -878,14 +909,21 @@ pub async fn recalculate_jobs(
     // Read only now, so a refused caller costs no body.
     let ApiJson(body) = ApiJson::<RecalculateJobsRequest>::from_request(request, &state).await?;
     let all_evals = body.all_evals.then_some(());
-    let response = match selection(&query, body.job_ids, all_evals, "all_evals")? {
-        Selection::Jobs(job_ids) if query.dry_run => {
-            let report = reviser
-                .dry_run_recalculate(&state, job_ids, body.note)
-                .await?;
-            audit.unchanged();
-            return Ok(Json(pipette_plan_types::RevisionDryRun::from(report)).into_response());
-        }
+    let selected = selection(&query, body.job_ids, all_evals, "all_evals")?;
+    if query.dry_run {
+        // The preview names no recalculated job, so `all_evals` has nothing to list.
+        let Selection::Jobs(job_ids) = selected else {
+            return Err(AppError::BadRequest(
+                "dry_run takes job_ids, not all_evals".into(),
+            ));
+        };
+        let report = reviser
+            .dry_run_recalculate(&state, job_ids, body.note)
+            .await?;
+        audit.unchanged();
+        return Ok(Json(pipette_plan_types::RevisionDryRun::from(report)).into_response());
+    }
+    let response = match selected {
         Selection::Jobs(job_ids) => reviser.recalculate(&state, job_ids, body.note).await?,
         Selection::Whole(()) => reviser.recalculate_evals(&state, body.note).await?,
     };
@@ -1112,12 +1150,13 @@ impl CampaignReviser {
             .map(Some)
     }
 
-    /// Check `job_ids` as [`Self::rerun`] does and expand the head's document,
-    /// and file nothing.
+    /// Check `job_ids` and `fail` as [`Self::rerun`] does and expand the
+    /// head's document, and file nothing.
     pub async fn dry_run_rerun(
         self,
         state: &AppState,
         job_ids: BTreeSet<JobId>,
+        fail: BTreeMap<JobId, NonEmptyTrimmedString>,
         note: Option<NonEmptyTrimmedString>,
     ) -> Result<RevisionDryRun, AppError> {
         let revision = self
@@ -1126,6 +1165,7 @@ impl CampaignReviser {
                 state.plan_store.as_ref(),
                 state.submission_store.as_ref(),
                 job_ids,
+                fail,
             )
             .await?;
         self.filer.dry_run(state, revision, note).await
@@ -1148,12 +1188,13 @@ impl CampaignReviser {
         self.filer.file(state, revision, note, progress).await
     }
 
-    /// File the head's document running `job_ids` again, advance the campaign
-    /// onto it, and cancel the head.
+    /// File the head's document running `job_ids` again and marking the
+    /// `fail` jobs failed, advance the campaign onto it, and cancel the head.
     pub async fn rerun(
         self,
         state: &AppState,
         job_ids: BTreeSet<JobId>,
+        fail: BTreeMap<JobId, NonEmptyTrimmedString>,
         note: Option<NonEmptyTrimmedString>,
     ) -> Result<CampaignRevised, AppError> {
         let revision = self
@@ -1162,6 +1203,7 @@ impl CampaignReviser {
                 state.plan_store.as_ref(),
                 state.submission_store.as_ref(),
                 job_ids,
+                fail,
             )
             .await?;
         self.filer
@@ -1255,6 +1297,25 @@ impl CampaignReviser {
             .await
     }
 
+    /// Pick the jobs as [`Self::rerun_answered`] does and expand the head's
+    /// document, and file nothing.
+    pub async fn dry_run_rerun_answered(
+        self,
+        state: &AppState,
+        which: Answered,
+        note: Option<NonEmptyTrimmedString>,
+    ) -> Result<RevisionDryRun, AppError> {
+        let revision = self
+            .head
+            .rerun_answered(
+                state.plan_store.as_ref(),
+                state.submission_store.as_ref(),
+                which,
+            )
+            .await?;
+        self.filer.dry_run(state, revision, note).await
+    }
+
     /// [`Self::rerun`] over every answered job of the head `which` takes.
     pub async fn rerun_answered(
         self,
@@ -1322,6 +1383,7 @@ impl Filer {
                 membership,
                 &preview_bodies,
                 state.plan_store.as_ref(),
+                state.todo_store.as_ref(),
                 state.submission_store.as_ref(),
                 state.org_store.as_ref(),
             )
@@ -1423,7 +1485,19 @@ fn head_grants(
     campaign: &Campaign,
     head: &PlanManifest,
 ) -> [UserPermission; 2] {
-    if authority.runs(&campaign.owner) && head.campaign_id.as_ref() == Some(&campaign.campaign_id) {
+    if head.campaign_id.as_ref() == Some(&campaign.campaign_id) {
+        owner_grants(authority, &campaign.owner)
+    } else {
+        [UserPermission::ReadAnyPlans, UserPermission::CancelAnyPlans]
+    }
+}
+
+/// The grants to read and cancel the plans of `owner`'s campaigns.
+pub(crate) fn owner_grants(
+    authority: &CampaignAuthority,
+    owner: &CampaignOwner,
+) -> [UserPermission; 2] {
+    if authority.runs(owner) {
         [UserPermission::ReadPlans, UserPermission::CancelPlans]
     } else {
         [UserPermission::ReadAnyPlans, UserPermission::CancelAnyPlans]
@@ -1436,10 +1510,25 @@ fn head_grants(
 pub async fn delete_campaign(
     State(state): State<AppState>,
     active: ActiveUser,
+    audit: Audit,
     ApiPath(Parsed(campaign_id)): ApiPath<Parsed<CampaignId>>,
 ) -> Result<impl IntoResponse, AppError> {
     let caller = active.caller();
     let (_, campaign) = for_record_write(&state, caller, &campaign_id).await?;
+    // Read first: the delete's cascade takes the campaign out of its group.
+    let group = match state.campaign_group_store.as_deref() {
+        Some(groups) => groups
+            .group_of(&campaign_id)
+            .await
+            .map_err(|e| AppError::internal(e.context("failed to read the campaign's group")))?,
+        None => None,
+    };
+    audit
+        .involve(
+            &state,
+            group.map(|group_id| AuditTarget::CampaignGroup { group_id }),
+        )
+        .await;
     campaign_admin::delete(&*state.campaign_store, &*state.plan_store, &campaign).await?;
     Ok(StatusCode::NO_CONTENT)
 }

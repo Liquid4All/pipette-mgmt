@@ -1194,14 +1194,25 @@ fn page_ids(cells: &[(JobId, Option<PlanCell>)], window: JobWindow) -> Vec<JobId
 
 /// The jobs one read answers: a page of the plan's, or every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JobWindow {
+pub(crate) enum JobWindow {
     Page { offset: usize, limit: usize },
     All,
 }
 
 impl JobWindow {
+    pub(crate) fn of(all: Option<bool>, offset: Option<usize>, limit: Option<usize>) -> Self {
+        if all.unwrap_or(false) {
+            return Self::All;
+        }
+        // A `limit` over the ceiling is clamped, not refused; `0` asks for the count alone.
+        Self::Page {
+            offset: offset.unwrap_or(0),
+            limit: limit.unwrap_or(JOBS_PAGE_DEFAULT).min(JOBS_PAGE_MAX),
+        }
+    }
+
     /// `(offset, limit)` over a plan of `total` jobs.
-    fn bounds(self, total: usize) -> (usize, usize) {
+    pub(crate) fn bounds(self, total: usize) -> (usize, usize) {
         match self {
             Self::Page { offset, limit } => (offset, limit),
             Self::All => (0, total),
@@ -1219,14 +1230,7 @@ impl JobWindow {
 
 /// One window for a page of jobs and for its results, so the two cannot drift.
 fn job_window(query: &PlanJobsQuery) -> JobWindow {
-    if query.all.unwrap_or(false) {
-        return JobWindow::All;
-    }
-    // A `limit` over the ceiling is clamped, not refused; `0` asks for the count alone.
-    JobWindow::Page {
-        offset: query.offset.unwrap_or(0),
-        limit: query.limit.unwrap_or(JOBS_PAGE_DEFAULT).min(JOBS_PAGE_MAX),
-    }
+    JobWindow::of(query.all, query.offset, query.limit)
 }
 
 /// Each of `manifest`'s jobs and its cell, in the order its document lists
@@ -1298,7 +1302,23 @@ pub(crate) async fn all_results(
         .all_plan_results(plan_id)
         .await
         .map_err(results_error)?;
-    fill_model_params(state, rows.iter_mut()).await;
+    let job_cells = if rows
+        .iter()
+        .any(|row| row.model_params_total_millions.is_none() && row.records_no_model())
+    {
+        cells(state, &manifest).await.unwrap_or_else(|error| {
+            tracing::warn!(
+                plan_id = %manifest.plan_id,
+                error = %error,
+                "could not read plan cells for model counts; exporting the available results"
+            );
+            JobCells::default()
+        })
+    } else {
+        JobCells::default()
+    };
+    let requested = requested_models(&job_cells, rows.iter());
+    fill_model_params(state, rows.iter_mut(), &requested).await;
     if read.fleet == FleetDetail::Withheld {
         rows.iter_mut().for_each(ResultRow::withhold_fleet);
     }
@@ -1786,16 +1806,36 @@ async fn read_plan_results(
     );
     // Each history read its own parents whole, so a job both reached is the same in each.
     history.extend(rescores);
-    fill_model_params(state, runs.values_mut().flatten()).await;
+    let cells = cells?;
+    let requested = requested_models(&cells, runs.values().flatten());
+    fill_model_params(state, runs.values_mut().flatten(), &requested).await;
     if let Some(timing) = timing {
         timing.set(|s| s.results_ms = elapsed_ms(started));
     }
     Ok(PlanJobResults {
-        cells: cells?,
+        cells,
         read,
         runs,
         history,
     })
+}
+
+fn requested_models<'c, 'r>(
+    cells: &'c [(JobId, Option<PlanCell>)],
+    rows: impl Iterator<Item = &'r ResultRow>,
+) -> HashMap<&'c JobId, &'c Model> {
+    let needed: HashSet<&JobId> = rows
+        .filter(|row| row.model_params_total_millions.is_none() && row.records_no_model())
+        .map(|row| &row.job_id)
+        .collect();
+    if needed.is_empty() {
+        return HashMap::new();
+    }
+    cells
+        .iter()
+        .filter(|(job_id, _)| needed.contains(job_id))
+        .filter_map(|(job_id, cell)| Some((job_id, &cell.as_ref()?.spec().model)))
+        .collect()
 }
 
 /// `campaign_id`, the campaign of `plan_id`, when `user` may re-run its jobs
@@ -2094,7 +2134,8 @@ async fn earlier_rows(
         );
         found.extend(read);
     }
-    fill_model_params(state, found.values_mut().flatten()).await;
+    // Historical rows without a recorded model need their original plan cells to fill missing counts.
+    fill_model_params(state, found.values_mut().flatten(), &HashMap::new()).await;
     (found, whole)
 }
 

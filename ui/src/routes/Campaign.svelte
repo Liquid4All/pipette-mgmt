@@ -15,7 +15,7 @@
   // `PlanTabs` with the campaign's details, history and Settings. Its own address
   // opens on the plan it runs, as the classic redirect did.
   import { tick, untrack } from "svelte";
-  import { campaignOverview, campaigns, plan as planOf } from "../lib/api";
+  import { campaignOverview, campaigns, plan as planOf, updateCampaign } from "../lib/api";
   import { auditAction } from "../lib/audit";
   import { catalogOrgOf } from "../lib/catalog-entry";
   import {
@@ -40,7 +40,7 @@
   import { when } from "../lib/format";
   import { ownedQuery, ownerBranch, underTrail } from "../lib/owned";
   import { here, redirect } from "../lib/route.svelte";
-  import { campaignLink, campaignPlanLink, type RouteOf } from "../lib/routes";
+  import { campaignGroupLink, campaignLink, campaignPlanLink, type RouteOf } from "../lib/routes";
   import { session } from "../lib/session.svelte";
   import { ROUTE_PAGE_MAX, everyPage } from "../lib/table";
   import { baseOf, legacyReports, tabLink, tabOf, type CampaignTabRoute } from "../lib/tabs";
@@ -198,7 +198,8 @@
       {@render history()}
     {/snippet}
     {#snippet general()}
-      <CampaignRename {detail} onchange={reread} />
+      <CampaignRename title="Campaign name" name={detail.name}
+                      save={(to) => updateCampaign(session.signer, detail.campaign_id, { name: to }).then(reread)} />
       <CampaignLabels {detail} {vocabulary} onopen={suggest} onchange={reread} />
       <CampaignArchive {detail} onchange={reread} />
     {/snippet}
@@ -209,10 +210,11 @@
     {#if stateOf(detail) === "archived"}
       <p class="notice">This campaign is archived, so the listings hide it.</p>
     {/if}
-    <!-- On every tab; nothing where there is no label and the reader may add none. -->
-    {#if detail.may_administer || labelPairs(detail.labels).length}
-      <p><LabelsInline campaign={detail} listing={under?.href} {vocabulary} onopen={suggest} onchange={reread}
-                                      editable={detail.may_administer} /></p>
+    <!-- On every tab; nothing where there is no group, no label and the reader may add none. -->
+    {#if detail.group || detail.may_administer || labelPairs(detail.labels).length}
+      <p>{#if detail.group}<a class="pill lead" href={campaignGroupLink(detail.group.group_id)}>group {detail.group.name}</a>{/if}
+        <LabelsInline campaign={detail} listing={under?.href} {vocabulary} onopen={suggest} onchange={reread}
+                      editable={detail.may_administer} /></p>
     {/if}
 
     <!-- Every plan the campaign ran has an address under it; the campaign's own opens what it runs now. -->
@@ -260,3 +262,7 @@
   {/snippet}
 </Loaded>
 {/if}
+
+<style>
+  .lead { margin-left: 0; }
+</style>

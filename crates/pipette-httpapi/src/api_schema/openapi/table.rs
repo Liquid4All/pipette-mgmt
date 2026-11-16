@@ -19,8 +19,8 @@ use super::{
 use crate::api_v1::plans::csv::columns_description;
 use crate::gate::Gate::{Active, Needs};
 use crate::router::{
-    ADMINISTER_CAMPAIGN, CREATE_ORGS, EDIT_ORG_CATALOG, FILE_PLANS, READ_CAMPAIGN, READ_FLEET,
-    READ_ORG_DEVICES,
+    ADMINISTER_CAMPAIGN, CREATE_ORGS, EDIT_ORG_CATALOG, FILE_PLANS, PREVIEW_POLICIES,
+    READ_CAMPAIGN, READ_FLEET, READ_ORG_DEVICES,
 };
 
 /// [`Auth::Gated`] by the gate's expression, as `router.rs` spells it.
@@ -84,7 +84,8 @@ const FLEET_FILTERS: &[(&str, &str)] = &[
 pub(super) fn operations() -> Vec<Operation> {
     use Method as M;
     use Tag::{
-        Campaigns, DescriptorCatalog, Devices, Document, Models, Organizations, Plans, Users, Vault,
+        CampaignGroups, Campaigns, DescriptorCatalog, Devices, Document, Models, Organizations,
+        Plans, Users, Vault,
     };
 
     vec![
@@ -914,6 +915,7 @@ pub(super) fn operations() -> Vec<Operation> {
             gated!(ADMINISTER_CAMPAIGN),
         )
         .summary("Rename, label or archive a campaign")
+        .errors(&[409])
         .body(json_body::<pt::UpdateCampaignRequest>())
         .reply(
             200,
@@ -1059,7 +1061,7 @@ pub(super) fn operations() -> Vec<Operation> {
             Campaigns,
             gated!(FILE_PLANS),
         )
-        .summary("Run a campaign's jobs again")
+        .summary("Run a campaign's jobs again or mark them failed")
         .errors(&[409])
         .query::<pt::RerunJobsQuery>()
         .body(json_body::<pt::RerunJobsRequest>())
@@ -1118,6 +1120,143 @@ pub(super) fn operations() -> Vec<Operation> {
             200,
             "The campaign, and whether it changed",
             [json::<pt::Changed<pt::CampaignView>>()],
+        ),
+        op(
+            M::GET,
+            "/api/v1/campaign-groups",
+            "list_campaign_groups",
+            CampaignGroups,
+            gated!(READ_CAMPAIGN),
+        )
+        .summary("List the campaign groups in scope, a page at a time")
+        .errors(&[404])
+        .query::<pt::OwnedListQuery>()
+        .reply(
+            200,
+            "A page of campaign groups",
+            [json::<pt::ListPage<pt::CampaignGroup>>()],
+        ),
+        op(
+            M::POST,
+            "/api/v1/campaign-groups",
+            "create_campaign_group",
+            CampaignGroups,
+            gated!(FILE_PLANS),
+        )
+        .summary("Create a campaign group")
+        .errors(&[404])
+        .body(json_body::<pt::CreateCampaignGroupRequest>())
+        .reply(201, "The campaign group", [json::<pt::CampaignGroup>()]),
+        op(
+            M::GET,
+            "/api/v1/campaign-groups/{group_id}",
+            "get_campaign_group",
+            CampaignGroups,
+            gated!(READ_CAMPAIGN),
+        )
+        .summary("Read a campaign group and its members")
+        .reply(
+            200,
+            "The campaign group and its members",
+            [json::<pt::CampaignGroupView>()],
+        ),
+        op(
+            M::PATCH,
+            "/api/v1/campaign-groups/{group_id}",
+            "update_campaign_group",
+            CampaignGroups,
+            gated!(ADMINISTER_CAMPAIGN),
+        )
+        .summary("Rename a campaign group")
+        .body(json_body::<pt::UpdateCampaignGroupRequest>())
+        .reply(
+            200,
+            "The campaign group, and whether it changed",
+            [json::<pt::Changed<pt::CampaignGroup>>()],
+        ),
+        op(
+            M::DELETE,
+            "/api/v1/campaign-groups/{group_id}",
+            "delete_campaign_group",
+            CampaignGroups,
+            gated!(ADMINISTER_CAMPAIGN),
+        )
+        .summary("Delete a campaign group, keeping its campaigns")
+        .empty(204, "Deleted"),
+        op(
+            M::POST,
+            "/api/v1/campaign-groups/{group_id}/members",
+            "add_campaign_group_members",
+            CampaignGroups,
+            gated!(FILE_PLANS),
+        )
+        .summary("Add campaigns to a campaign group")
+        .errors(&[409])
+        .body(json_body::<pt::AddCampaignGroupMembersRequest>())
+        .empty(204, "Added, or each was a member already"),
+        op(
+            M::DELETE,
+            "/api/v1/campaign-groups/{group_id}/members/{campaign_id}",
+            "remove_campaign_group_member",
+            CampaignGroups,
+            gated!(FILE_PLANS),
+        )
+        .summary("Take a campaign out of a campaign group")
+        .empty(204, "Removed, or it was not a member"),
+        op(
+            M::GET,
+            "/api/v1/campaign-groups/{group_id}/policies",
+            "list_campaign_group_policies",
+            CampaignGroups,
+            gated!(READ_CAMPAIGN),
+        )
+        .summary("Read a campaign group's policies, one per check")
+        .reply(
+            200,
+            "Every check's policy",
+            [json::<pt::CampaignGroupPolicies>()],
+        ),
+        op(
+            M::PUT,
+            "/api/v1/campaign-groups/{group_id}/policies/{kind}",
+            "set_campaign_group_policy",
+            CampaignGroups,
+            gated!(FILE_PLANS),
+        )
+        .summary("Write a campaign group's policy for one check")
+        .errors(&[409])
+        .body(json_body::<pt::SetCampaignGroupPolicyRequest>())
+        .reply(
+            200,
+            "The policy as stored, and whether it changed",
+            [json::<pt::Changed<pt::CampaignGroupPolicy>>()],
+        ),
+        op(
+            M::GET,
+            "/api/v1/campaign-groups/{group_id}/policy-preview",
+            "preview_campaign_group_policies",
+            CampaignGroups,
+            gated!(PREVIEW_POLICIES),
+        )
+        .summary("Preview what a campaign group's policies would re-run and mark")
+        .reply(
+            200,
+            "Each member's preview",
+            [json::<pt::CampaignGroupPolicyPreview>()],
+        ),
+        op(
+            M::GET,
+            "/api/v1/campaign-groups/{group_id}/rerun-results",
+            "list_campaign_group_rerun_results",
+            CampaignGroups,
+            gated!(PREVIEW_POLICIES),
+        )
+        .summary("Read how the re-runs a campaign group's policies filed answered")
+        .query::<pt::RerunResultsQuery>()
+        .reply(
+            200,
+            "A summary per policy, and a page of the re-runs",
+            [json::<pt::CampaignGroupRerunResults>()],
         ),
         op(
             M::PUT,

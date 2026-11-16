@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    BenchmarkFlags, ElapsedMillis, FleetDetail, JobId, Model, ModelFlags, PlanId, Runtime,
-    RuntimeFlags,
+    BenchmarkFlags, ElapsedMillis, FailureCode, FleetDetail, JobId, Model, ModelFlags, PlanId,
+    Runtime, RuntimeFlags,
 };
 
 /// Where a failed run's failure came from.
@@ -40,6 +40,11 @@ pub enum FailureSource {
     Unmatchable,
     /// Its lease was lost too many times.
     LeaseLost,
+    /// A campaign re-run marked its cell failed (`fail`), so no device ran it.
+    Marked,
+    /// A smaller run of its family failed for good with `attempt_timeout` or
+    /// `out_of_memory` while it was queued, so no device ran it.
+    SmallerRunFailed,
 }
 
 /// A stored value as the type it decodes to, or as stored where it does not
@@ -167,8 +172,16 @@ pub struct ResultRow {
     pub device_time_ms: Option<ElapsedMillis>,
     /// Which pass declared the failure; `null` on a measured row, and on one
     /// whose source this build does not know.
-    #[serde(default, deserialize_with = "known_source")]
+    #[serde(default, deserialize_with = "known_variant")]
     pub failure_source: Option<FailureSource>,
+    /// What kind of failure the client reported, `unspecified` where it named
+    /// none. An `all_clients_denied` failure takes the code most of its
+    /// denials name, and a `smaller_run_failed` one the code of the smaller
+    /// run's failure; any other failure the server declared is `unspecified`.
+    /// `null` on a measured row, on a row scored before the warehouse recorded
+    /// it, and on one whose code this build does not know.
+    #[serde(default, deserialize_with = "known_variant")]
+    pub failure_code: Option<FailureCode>,
     /// The job whose recorded completions a re-scored copy scores again;
     /// `null` on any other row.
     pub rescored_from: Option<JobId>,
@@ -183,9 +196,10 @@ pub struct ResultRow {
     /// value. It is `null` on every other row and on an eval row whose scoring
     /// failed.
     pub score_runtime_version: Option<String>,
-    /// The model's parameter counts in millions, as the catalog had them when
-    /// the row was scored or `fix-model-param` filled them in, else from the
-    /// catalog when the results are read; `null` while it has no entry.
+    /// The model's parameter counts in millions. Preserve stored counts from the
+    /// scorer or `fix-model-param`. Otherwise, use current catalog counts.
+    /// For a row without a model, use the model that its job requested.
+    /// `null` while the catalog has no entry.
     pub model_params_total_millions: Option<i32>,
     /// Of those, the parameters a token activates: the total for a dense
     /// model, fewer for a mixture of experts.
@@ -207,18 +221,19 @@ pub struct ResultListView {
     pub offset: usize,
     pub limit: usize,
     /// One row per metric of each job's latest scoring run, in the plan's job
-    /// order. At the withheld fleet tier any `failure_source` but `expired` and
-    /// `lease_lost` is `null`.
+    /// order. At the withheld fleet tier any `failure_source` but `expired`,
+    /// `lease_lost`, `marked` and `smaller_run_failed` is `null`.
     pub results: Vec<ResultRow>,
 }
 
-/// A source this build does not know reads as none rather than failing the row.
-fn known_source<'de, D>(deserializer: D) -> Result<Option<FailureSource>, D::Error>
+/// A variant this build does not know reads as none rather than failing the row.
+fn known_variant<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     let raw = Option::<Value>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| FailureSource::deserialize(value).ok()))
+    Ok(raw.and_then(|value| T::deserialize(value).ok()))
 }
 
 #[cfg(test)]

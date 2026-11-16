@@ -14,9 +14,9 @@ use pipette_core::canonical_json::sort_keys;
 use pipette_core::config::DuckDbConfig;
 use pipette_core::warehouse::SYSTEM_CLIENT_ID;
 use pipette_plan_types::{
-    BenchmarkFlags, BenchmarkType, DeviceTimeTotal, ElapsedMillis, FailureSource, FleetDetail,
-    JobId, Model, ModelFlags, ModelType, OrUnknown, PlanId, Runtime, RuntimeFlags, RuntimeType,
-    UnknownValue,
+    BenchmarkFlags, BenchmarkType, DeviceTimeTotal, ElapsedMillis, FailureCode, FailureSource,
+    FleetDetail, JobId, Model, ModelFlags, ModelType, OrUnknown, PlanId, Runtime, RuntimeFlags,
+    RuntimeType, UnknownValue,
 };
 
 use crate::model_params::ModelParamTable;
@@ -101,9 +101,14 @@ pub struct ResultRow {
     /// one scoring run carries the same value.
     pub device_time_ms: Option<i64>,
     /// Which pass declared the failure; `null` on a measured row, an older or
-    /// unknown source, and below `read_clients` for any but `expired` and `lease_lost`.
-    #[serde(default, deserialize_with = "known_source")]
+    /// unknown source, and below `read_clients` for any but `expired`,
+    /// `lease_lost`, `marked` and `smaller_run_failed`.
+    #[serde(default, deserialize_with = "known_variant")]
     pub failure_source: Option<FailureSource>,
+    /// `null` on a measured row, an older row and an unknown code. Kept below
+    /// `read_clients`: a code names no machine.
+    #[serde(default, deserialize_with = "known_variant")]
+    pub failure_code: Option<FailureCode>,
     /// The job whose recorded completions a re-scored copy scores again.
     #[serde(default, deserialize_with = "valid_job_id")]
     pub rescored_from: Option<JobId>,
@@ -156,6 +161,7 @@ impl From<ResultRow> for pipette_plan_types::ResultRow {
             scored_at,
             device_time_ms,
             failure_source: source,
+            failure_code,
             rescored_from,
             run_submitted_at,
             score_runtime_version,
@@ -224,6 +230,7 @@ impl From<ResultRow> for pipette_plan_types::ResultRow {
             // Scoring writes it from an `ElapsedMillis`; anything else is no reading.
             device_time_ms: device_time_ms.and_then(|ms| ElapsedMillis::try_new(ms).ok()),
             failure_source: source,
+            failure_code,
             rescored_from,
             run_submitted_at,
             score_runtime_version,
@@ -299,18 +306,46 @@ fn stored_json(stored: &str) -> Value {
 
 impl ResultRow {
     /// Fill counts the warehouse lacks from the table, matched as the scorer
-    /// matches. A stored count is kept even where the table now disagrees.
-    pub fn fill_model_params(&mut self, table: &ModelParamTable) {
-        if self.model_params_total_millions.is_some() {
-            return;
+    /// matches. For a row without a model, the function uses `requested`, the
+    /// model that the job requested. A plan-attached failure can produce this row.
+    /// The function preserves a stored count even if the table now contains a
+    /// different count.
+    pub fn fill_model_params(&mut self, table: &ModelParamTable, requested: Option<&Model>) {
+        (
+            self.model_params_total_millions,
+            self.model_params_active_millions,
+        ) = self.filled_model_params(table, requested);
+    }
+
+    /// The total and active counts [`Self::fill_model_params`] leaves on the
+    /// row.
+    pub fn filled_model_params(
+        &self,
+        table: &ModelParamTable,
+        requested: Option<&Model>,
+    ) -> (Option<i32>, Option<i32>) {
+        let stored = (
+            self.model_params_total_millions,
+            self.model_params_active_millions,
+        );
+        if stored.0.is_some() {
+            return stored;
         }
-        if let Some((_, entry)) = table.resolve_recorded(
-            self.model_descriptor.as_deref(),
-            self.model_vault_descriptor.as_deref(),
-        ) {
-            self.model_params_total_millions = Some(entry.total);
-            self.model_params_active_millions = Some(entry.active);
-        }
+        let resolved = if self.records_no_model() {
+            requested.and_then(|model| table.resolve_model(model))
+        } else {
+            table.resolve_recorded(
+                self.model_descriptor.as_deref(),
+                self.model_vault_descriptor.as_deref(),
+            )
+        };
+        resolved.map_or(stored, |(_, entry)| (Some(entry.total), Some(entry.active)))
+    }
+
+    /// Whether the row names no model of its own: its counts can only come
+    /// from the model its job requested.
+    pub fn records_no_model(&self) -> bool {
+        self.model_descriptor.is_none() && self.model_vault_descriptor.is_none()
     }
 
     /// Drop what names a fleet member, for a reader below `read_clients`. The
@@ -325,16 +360,24 @@ impl ResultRow {
         self.failed_reason = None;
         // Keep only what describes the job itself, so a null source also covers
         // `client` and does not single out a roster denial or a bad clause.
-        self.failure_source = self
-            .failure_source
-            .filter(|source| matches!(source, FailureSource::Expired | FailureSource::LeaseLost));
+        self.failure_source = self.failure_source.filter(|source| {
+            matches!(
+                source,
+                FailureSource::Expired
+                    | FailureSource::LeaseLost
+                    | FailureSource::Marked
+                    | FailureSource::SmallerRunFailed
+            )
+        });
     }
 }
 
-/// A source this build does not name reads as none: the scorer deploys apart from
-/// the server, and a newer one's source must not fail the page.
-fn known_source<'de, D: Deserializer<'de>>(source: D) -> Result<Option<FailureSource>, D::Error> {
-    Ok(Option::<String>::deserialize(source)?.and_then(|source| source.parse().ok()))
+/// A variant this build does not name reads as none: the scorer deploys apart
+/// from the server, and a newer one's variant must not fail the page.
+fn known_variant<'de, D: Deserializer<'de>, T: std::str::FromStr>(
+    cell: D,
+) -> Result<Option<T>, D::Error> {
+    Ok(Option::<String>::deserialize(cell)?.and_then(|cell| cell.parse().ok()))
 }
 
 /// A stored id outside the `JobId` charset reads as none: the earlier-runs
@@ -376,6 +419,7 @@ const COLUMNS: &[&str] = &[
     "w.scored_at",
     "w.device_time_ms",
     "w.failure_source",
+    "w.failure_code",
     "w.rescored_from",
     "w.run_submitted_at",
     "w.score_runtime_version",
@@ -1019,6 +1063,16 @@ mod tests {
         None
     )]
     #[case::unmatchable(r#""unmatchable""#, Some(FailureSource::Unmatchable), None)]
+    #[case::marked(
+        r#""marked""#,
+        Some(FailureSource::Marked),
+        Some(FailureSource::Marked)
+    )]
+    #[case::smaller_run_failed(
+        r#""smaller_run_failed""#,
+        Some(FailureSource::SmallerRunFailed),
+        Some(FailureSource::SmallerRunFailed)
+    )]
     #[case::unnamed(r#""rebooted""#, None, None)]
     #[case::null("null", None, None)]
     fn a_failure_source_parses_and_withholds(
@@ -1030,6 +1084,24 @@ mod tests {
         assert_eq!(row.failure_source, parsed);
         row.withhold_fleet();
         assert_eq!(row.failure_source, withheld);
+        Ok(())
+    }
+
+    /// A code names no machine, so the withheld tier keeps it.
+    #[rstest::rstest]
+    #[case::known(r#""out_of_memory""#, Some(FailureCode::OutOfMemory))]
+    #[case::unspecified(r#""unspecified""#, Some(FailureCode::Unspecified))]
+    #[case::unnamed(r#""thermal_limit""#, None)]
+    #[case::null("null", None)]
+    fn a_failure_code_parses_and_is_kept_when_withheld(
+        #[case] cell: &str,
+        #[case] parsed: Option<FailureCode>,
+    ) -> anyhow::Result<()> {
+        let mut row = row_with("failure_code", cell)?;
+        assert_eq!(row.failure_code, parsed);
+        row.withhold_fleet();
+        let body = pipette_plan_types::ResultRow::from(row);
+        assert_eq!(body.failure_code, parsed);
         Ok(())
     }
 

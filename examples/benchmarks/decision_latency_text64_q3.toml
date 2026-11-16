@@ -1,0 +1,4 @@
+# Three questions over the same short state, in one request.
+benchmark_type        = "decision_latency"
+parameter_text_tokens = 64
+parameter_questions   = 3

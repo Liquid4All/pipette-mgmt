@@ -57,6 +57,7 @@ runs is `409`. A dry run off such a plan is `409` too.
 | `note` | no | The note for the revision, as [the request body of a filing](../campaigns.md#request-body) describes. The server records the change that the revision makes in `change` |
 | `dry_run` | no | `true` expands the document, and files nothing |
 | `carry_earlier`, `inherit_from` | no | As on a [variant edit](edit_variants.md). With either, the plan's own document files a revision rather than nothing |
+| `carry_across_limit` | no | As on a [variant edit](edit_variants.md). It changes no job of the plan's own document, so that document still files nothing |
 
 Responds `201 Created` with the body of a [variant edit](edit_variants.md):
 what became of the replaced

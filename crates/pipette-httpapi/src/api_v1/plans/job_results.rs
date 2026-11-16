@@ -131,6 +131,7 @@ mod tests {
             scored_at: None,
             device_time_ms: None,
             failure_source: None,
+            failure_code: None,
             rescored_from: None,
             run_submitted_at: None,
             score_runtime_version: None,

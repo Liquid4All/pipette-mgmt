@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use pipette_core::canonical_json::sha256_hex;
 use pipette_core::matching::REQUIRED_FLAGS;
-use pipette_plan_types::canonical_json as canonicalize;
+use pipette_plan_types::{BenchmarkFlags, canonical_json as canonicalize};
 
 use crate::vault_check::drop_custom_labels;
 
@@ -52,8 +52,8 @@ pub fn content_digest(body: &Value) -> String {
 }
 
 /// [`content_digest`] without the eligibility clauses: the cell a job measures,
-/// whoever runs it. A revision's carry reads it to find a finished run whose
-/// requirements changed, and the job-cell index keys on it. Nothing merges on it.
+/// whoever runs it. The job-cell index keys on it, and the reuse of an earlier
+/// run reads it. Nothing merges on it.
 pub fn cell_digest(body: &Value) -> String {
     let mut content = body.clone();
     if let Some(fields) = content.as_object_mut() {
@@ -69,6 +69,17 @@ pub fn cell_digest(body: &Value) -> String {
     drop_custom_labels(&mut content);
     let preimage = serde_json::json!({"v": CELL_VERSION, "body": content});
     sha256_hex(&canonicalize(&preimage))
+}
+
+/// [`cell_digest`] without the attempt limit. A revision's carry reads it to
+/// find the superseded plan's run of a cell whose requirements or limit
+/// changed. Nothing is stored under it.
+pub fn cell_digest_across_limit(body: &Value) -> String {
+    let mut content = body.clone();
+    if let Some(flags) = content.pointer_mut("/spec/benchmark_flags") {
+        BenchmarkFlags::drop_attempt_timeout(flags);
+    }
+    cell_digest(&content)
 }
 
 /// The former digest, used only to recognize a manifest written under v1.
@@ -347,6 +358,76 @@ mod tests {
         other["spec"]["benchmark"] = json!("bench-2");
         assert_ne!(cell_digest(&other), cell_digest(&body()));
         assert_ne!(cell_digest(&body()), digest(&body()));
+    }
+
+    /// A flags value as a typed cell serializes it: the axis keys, and `knobs`
+    /// beside them.
+    fn flags(knobs: Value) -> Value {
+        let mut flags = json!({
+            "runtime_type": "mlx_macos_pipette",
+            "model_type": "mlx",
+            "benchmark_type": "decode_throughput",
+        });
+        knobs
+            .as_object()
+            .into_iter()
+            .flatten()
+            .for_each(|(knob, value)| {
+                flags[knob.as_str()] = value.clone();
+            });
+        flags
+    }
+
+    /// Two bodies that differ in the limit alone are one cell across it, and
+    /// two cells once anything else differs. [`cell_digest`] keeps the limit.
+    #[rstest]
+    #[case::set_on_a_body_with_no_flags(
+        json!(null),
+        flags(json!({"attempt_timeout_seconds": 180})),
+        true
+    )]
+    #[case::raised(
+        flags(json!({"attempt_timeout_seconds": 180})),
+        flags(json!({"attempt_timeout_seconds": 300})),
+        true
+    )]
+    #[case::taken_off_beside_another_flag(
+        flags(json!({"http_timeout_seconds": 60, "attempt_timeout_seconds": 180})),
+        flags(json!({"http_timeout_seconds": 60})),
+        true
+    )]
+    #[case::another_flag_changed_too(
+        flags(json!({"http_timeout_seconds": 60, "attempt_timeout_seconds": 180})),
+        flags(json!({"http_timeout_seconds": 90, "attempt_timeout_seconds": 300})),
+        false
+    )]
+    #[case::another_flag_set_too(
+        json!(null),
+        flags(json!({"http_timeout_seconds": 60, "attempt_timeout_seconds": 180})),
+        false
+    )]
+    fn a_cell_digest_across_the_limit_leaves_out_the_limit_only(
+        #[case] one: Value,
+        #[case] other: Value,
+        #[case] same_cell: bool,
+    ) {
+        let flagged = |flags: Value| {
+            let mut body = body();
+            body["spec"]["benchmark_flags"] = flags;
+            body
+        };
+        let (one, mut other) = (flagged(one), flagged(other));
+        assert_eq!(
+            cell_digest_across_limit(&one) == cell_digest_across_limit(&other),
+            same_cell
+        );
+        assert_ne!(cell_digest(&one), cell_digest(&other));
+
+        other["spec"]["benchmark"] = json!("bench-2");
+        assert_ne!(
+            cell_digest_across_limit(&one),
+            cell_digest_across_limit(&other)
+        );
     }
 
     #[test]

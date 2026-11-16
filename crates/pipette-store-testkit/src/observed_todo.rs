@@ -1,14 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use pipette_core::denial::DenialRecord;
-use pipette_plan_types::{ClientId, ExpiresAt, JobId};
+use pipette_plan_types::{CachedArtifacts, ClientId, ExpiresAt, JobId};
 use pipette_store::{
-    BacklogSnapshot, CampaignBacklogSnapshot, ClaimOutcome, ClaimResult, ReclaimOutcome,
-    RecycleResult, RedateResult, ReindexBatch, RenewLeaseResult, TodoStore,
+    CampaignBacklog, ClaimOutcome, ClaimResult, ReclaimOutcome, RecycleResult, RedateResult,
+    ReindexBatch, RenewLeaseResult, TodoStore,
 };
 
 use crate::UnexpectedCalls;
@@ -80,11 +80,11 @@ impl TodoStore for ObservedTodoStore {
         self.inner.queue_body_reads()
     }
 
-    async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
+    async fn list_avail_entries(&self) -> anyhow::Result<Vec<pipette_store::AvailEntry>> {
         if self.allow_listings {
-            return self.inner.list_avail().await;
+            return self.inner.list_avail_entries().await;
         }
-        Err(self.unexpected.record("list_avail"))
+        Err(self.unexpected.record("list_avail_entries"))
     }
     async fn get_avail(
         &self,
@@ -103,9 +103,6 @@ impl TodoStore for ObservedTodoStore {
     async fn get_avail_by_job(&self, job_id: &JobId) -> anyhow::Result<Option<serde_json::Value>> {
         self.inner.get_avail_by_job(job_id).await
     }
-    async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>> {
-        self.inner.avail_key_for_job(job_id).await
-    }
     async fn redate_avail(
         &self,
         job_id: &JobId,
@@ -114,14 +111,14 @@ impl TodoStore for ObservedTodoStore {
     ) -> anyhow::Result<RedateResult> {
         self.inner.redate_avail(job_id, from, to).await
     }
-    async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
-        if self.allow_listings {
-            return self.inner.list_leased().await;
-        }
-        Err(self.unexpected.record("list_leased"))
+    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64> {
+        self.inner.restamp_avail_deadlines(now).await
     }
-    async fn list_leased_for_client(&self, client_id: &ClientId) -> anyhow::Result<Vec<String>> {
-        self.inner.list_leased_for_client(client_id).await
+    async fn list_leases(&self) -> anyhow::Result<Vec<pipette_core::todo_filename::Lease>> {
+        if self.allow_listings {
+            return self.inner.list_leases().await;
+        }
+        Err(self.unexpected.record("list_leases"))
     }
     async fn get_leased(
         &self,
@@ -171,6 +168,7 @@ impl TodoStore for ObservedTodoStore {
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&pipette_core::todo_filename::Lease>,
+        cached: Option<&CachedArtifacts>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<ClaimOutcome> {
         self.inner
@@ -180,9 +178,13 @@ impl TodoStore for ObservedTodoStore {
                 lost_lease_limit,
                 passed_over,
                 checked_lease,
+                cached,
                 now,
             )
             .await
+    }
+    async fn forget_last_grant(&self, job_id: &JobId, client_id: &ClientId) -> anyhow::Result<()> {
+        self.inner.forget_last_grant(job_id, client_id).await
     }
     async fn reclaim_for_client(
         &self,
@@ -272,11 +274,14 @@ impl TodoStore for ObservedTodoStore {
     async fn write_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<()> {
         self.inner.write_pending_reindex(client_id).await
     }
-    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<(ClientId, String)>> {
+    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<pipette_store::ReindexRequest>> {
         self.inner.list_pending_reindex().await
     }
-    async fn delete_pending_reindex(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.delete_pending_reindex(key).await
+    async fn delete_pending_reindex(
+        &self,
+        request: &pipette_store::ReindexRequest,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_pending_reindex(request).await
     }
     async fn has_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<bool> {
         self.inner.has_pending_reindex(client_id).await
@@ -306,29 +311,34 @@ impl TodoStore for ObservedTodoStore {
     async fn write_tmp(&self, job_id: &JobId, body: &serde_json::Value) -> anyhow::Result<()> {
         self.inner.write_tmp(job_id, body).await
     }
-    async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()> {
-        self.inner.promote_avail(job_id, expires_at).await
-    }
-    async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>> {
-        self.inner.list_stale_tmp(age).await
-    }
-    async fn delete_tmp_object(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.delete_tmp_object(key).await
-    }
-    async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>> {
-        self.inner.read_backlog().await
-    }
-    async fn write_backlog(&self, snapshot: &BacklogSnapshot) -> anyhow::Result<()> {
-        self.inner.write_backlog(snapshot).await
-    }
-    async fn read_campaign_backlog(&self) -> anyhow::Result<Option<CampaignBacklogSnapshot>> {
-        self.inner.read_campaign_backlog().await
-    }
-    async fn write_campaign_backlog(
+    async fn promote_avail(
         &self,
-        snapshot: &CampaignBacklogSnapshot,
+        job_id: &JobId,
+        expires_at: ExpiresAt,
+        family: Option<(&str, &[i64])>,
     ) -> anyhow::Result<()> {
-        self.inner.write_campaign_backlog(snapshot).await
+        self.inner.promote_avail(job_id, expires_at, family).await
+    }
+    async fn queued_larger_runs(
+        &self,
+        job_id: &JobId,
+    ) -> anyhow::Result<Vec<(pipette_store::AvailEntry, serde_json::Value)>> {
+        self.inner.queued_larger_runs(job_id).await
+    }
+    async fn delete_stale_tmp(&self, age: Duration) -> anyhow::Result<u64> {
+        self.inner.delete_stale_tmp(age).await
+    }
+    async fn backlog(&self) -> anyhow::Result<BTreeMap<ClientId, u64>> {
+        self.inner.backlog().await
+    }
+    async fn campaign_backlog(
+        &self,
+        client_id: &ClientId,
+        creating_before: DateTime<Utc>,
+    ) -> anyhow::Result<CampaignBacklog> {
+        self.inner
+            .campaign_backlog(client_id, creating_before)
+            .await
     }
     async fn jobs_needing_reindex(&self, jobs: &[JobId]) -> anyhow::Result<ReindexBatch> {
         // Requests include failed batches and jobs whose bodies were not read.
@@ -377,11 +387,8 @@ impl TodoStore for ObservedTodoStore {
     async fn write_workers(&self, workers: &HashSet<ClientId>) -> anyhow::Result<()> {
         self.inner.write_workers(workers).await
     }
-    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
-        self.inner.read_gc_candidates().await
-    }
-    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
-        self.inner.write_gc_candidates(candidates).await
+    async fn delete_worker(&self, client_id: &ClientId) -> anyhow::Result<()> {
+        self.inner.delete_worker(client_id).await
     }
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
         self.inner.stamp_liveness(client_id).await
@@ -394,9 +401,6 @@ impl TodoStore for ObservedTodoStore {
     }
     async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
         self.inner.delete_liveness(client_id).await
-    }
-    async fn validate_backend(&self) -> anyhow::Result<()> {
-        self.inner.validate_backend().await
     }
     async fn avail_for_jobs(
         &self,

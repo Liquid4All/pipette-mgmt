@@ -1,5 +1,5 @@
 //! Plan ingestion: validate a set of job bodies as a unit, mint identities, and
-//! stage them into the `todo/` queue gated by a plan manifest. The CLI and the
+//! stage them into the job queue gated by a plan manifest. The CLI and the
 //! HTTP routes are thin transports over [`ingest_jobs`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -21,18 +21,20 @@ use pipette_core::matching::{
     job_matches_client,
 };
 use pipette_core::plan::{JobExpiry, PlanManifest, PlanNotes, PlanSource, StarvedGroup, past_gate};
-use pipette_core::todo_filename::{Lease, parse_avail_filename};
+use pipette_core::todo_filename::Lease;
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
-    BenchmarkId, BenchmarkType, CampaignId, ClientRunSpec, EvalContextError, ExpiresAt,
-    FleetDetail, GgufVision, GgufVisionSource, HeldJob, JobId, Model, ModelFlags, ModelSource,
-    NonEmptyTrimmedString, PlanId, PlanStatus, RunSpecError, RuntimeType, Torch, UserId,
-    VaultResourceId, VlmEvalRecipeError, Warning, WarningKind, unmatched_warning,
+    BenchmarkId, BenchmarkType, CampaignId, ClientRunSpec, DecisionLlamacppCliStockTools,
+    EvalContextError, ExpiresAt, FailureCode, FailureSource, FleetDetail, GgufVision,
+    GgufVisionSource, HeldJob, JobId, Model, ModelFlags, ModelSource, ModelType,
+    NonEmptyTrimmedString, PlanId, PlanStatus, RunSpecError, RuntimeFlagRef, RuntimeFlagsError,
+    RuntimeType, Torch, UserId, VaultResourceId, VlmEvalRecipeError, Warning, WarningKind,
+    unmatched_warning,
 };
 use pipette_store::{
     CellResult, CellScope, ClientStore, ContentKeyCas, ContentKeyClaim, ContentKeyRecord,
-    ContentKeyVersion, CreateOutcome, OrgStore, PLAN_JOB_CONCURRENCY, PlanStore, RecordedRun,
-    Stores, SubmissionStore, TagStore, TodoStore, VaultStore, drain_clients,
+    ContentKeyVersion, CreateOutcome, JobJoin, OrgStore, PLAN_JOB_CONCURRENCY, PlanStore,
+    RecordedRun, Stores, SubmissionStore, TagStore, TodoStore, VaultStore, drain_clients,
     warn_unreadable_clients,
 };
 
@@ -318,6 +320,25 @@ pub enum JobRejectionError {
         benchmark: BenchmarkId,
         field: &'static str,
         reason: String,
+    },
+    /// Only for a spec this build parses.
+    #[error(
+        "`spec` runs decision benchmark {benchmark} without the `parallel` runtime flag: \
+         tasks per request depend on the model, so the cell sets llama-server's slot count"
+    )]
+    DecisionParallelUnset { benchmark: BenchmarkId },
+    /// Only for a spec this build parses.
+    #[error(
+        "`spec` runs decision benchmark {benchmark}, whose entry sends images, on a gguf_text \
+         model: images need a gguf_vision model, whose projector encodes them"
+    )]
+    DecisionImagesOnTextModel { benchmark: BenchmarkId },
+    /// Only for a spec this build parses: flags for another cell, or a runtime
+    /// and model no decision cell takes.
+    #[error("`spec` cannot run decision benchmark {benchmark}: {reason}")]
+    DecisionCellUnrunnable {
+        benchmark: BenchmarkId,
+        reason: RuntimeFlagsError,
     },
     /// `value` is the offending JSON, so the message distinguishes the string
     /// `"false"` from the boolean `false`.
@@ -606,15 +627,16 @@ impl CampaignMembership {
 
     /// A variant edit, re-run or recalculation of `campaign`: [`of`](Self::of),
     /// taking over the jobs of `previous` (the head, which the caller checks)
-    /// except the `rerun` and `recalculate` ones.
+    /// except the `rerun`, `recalculate` and `fail` ones.
     pub(crate) fn carrying(
         campaign: &pipette_core::campaign::Campaign,
         previous: &PlanManifest,
         rerun: &BTreeSet<JobId>,
         recalculate: &BTreeSet<JobId>,
+        fail: &BTreeMap<JobId, NonEmptyTrimmedString>,
     ) -> Self {
         Self {
-            carry: Carryover::from_manifest(previous, rerun, recalculate),
+            carry: Carryover::from_manifest(previous, rerun, recalculate, fail),
             ..Self::of(campaign)
         }
     }
@@ -641,15 +663,31 @@ pub struct Carryover {
     /// The jobs a recalculation withheld from `pool`, by digest, that no
     /// placement has drawn yet.
     recalculate: HashMap<String, VecDeque<JobId>>,
+    /// The jobs a re-run marks failed, withheld from `pool` as `recalculate`
+    /// is, each with its reason.
+    fail: HashMap<String, VecDeque<(JobId, NonEmptyTrimmedString)>>,
     /// The superseded plan's [`PlanManifest::rerun_of`], which a job it
     /// carries keeps.
     rerun_of: BTreeMap<JobId, JobId>,
     /// The body each job of `pool` was filed under, for a cell whose clauses
-    /// changed ([`Unclaimed`]). Empty where the job sources were not read.
+    /// or attempt limit changed ([`Unclaimed`]). Empty where the job sources
+    /// were not read.
     sources: HashMap<JobId, Value>,
+    /// The body the superseded plan holds a job of `pool` for, where it took
+    /// the job's run for another body than the job was filed under
+    /// ([`Self::with_held_for`]).
+    held_for: HashMap<JobId, Value>,
     /// Other plans' jobs on offer, in the order to take them
     /// ([`Self::with_offered`]).
     offered: Vec<Offered>,
+    /// The digests the plans on offer list each job under.
+    listed: HashMap<JobId, HashSet<String>>,
+    /// Runs the offered plans gave up; automatic reuse must exclude them too.
+    excluded_runs: HashSet<JobId>,
+    /// Whether the filer lets a finished run of `pool` or of a plan on offer
+    /// answer its cell under an attempt limit it is not known to have passed
+    /// (`carry_across_limit`).
+    across_limit: bool,
 }
 
 /// A job of a plan other than the superseded one, offered to a revision's
@@ -684,8 +722,12 @@ enum Inherited {
     /// A cell a recalculation named: a new job, answered from the record of
     /// that plan's job.
     Recalculate(JobId),
-    /// That plan's finished job for the cell under other clauses, whose run
-    /// still answers this one's ([`Unclaimed::answer`]).
+    /// A cell a re-run marked failed: a new job, answered by a failure that
+    /// gives the reason and names that plan's job.
+    Fail(JobId, NonEmptyTrimmedString),
+    /// That plan's finished job for the cell under other clauses or another
+    /// attempt limit, whose run still answers this one's
+    /// ([`Unclaimed::answer`]).
     Answered(JobId),
     /// Any plan's finished job for the cell, whose run answers this one's
     /// ([`satisfy_from_earlier_runs`]).
@@ -694,12 +736,13 @@ enum Inherited {
 
 impl Carryover {
     /// Every job `previous` recorded a digest for, less the ones that lapsed
-    /// for it, which never answered it, and the `rerun` and `recalculate`
-    /// ones: the cells of all three are placed afresh.
+    /// for it, which never answered it, and the `rerun`, `recalculate` and
+    /// `fail` ones: the cells of all four are placed afresh.
     fn from_manifest(
         previous: &PlanManifest,
         rerun: &BTreeSet<JobId>,
         recalculate: &BTreeSet<JobId>,
+        fail: &BTreeMap<JobId, NonEmptyTrimmedString>,
     ) -> Self {
         let carry = Self {
             rerun_of: previous.rerun_of.clone(),
@@ -722,6 +765,12 @@ impl Carryover {
                         .entry(digest.clone())
                         .or_default()
                         .push_back(job_id.clone());
+                } else if let Some(reason) = fail.get(job_id) {
+                    carry
+                        .fail
+                        .entry(digest.clone())
+                        .or_default()
+                        .push_back((job_id.clone(), reason.clone()));
                 } else if !previous.expired_jobs.contains_key(job_id) {
                     carry
                         .pool
@@ -746,6 +795,9 @@ impl Carryover {
         {
             return Inherited::Recalculate(job_id);
         }
+        if let Some((job_id, reason)) = self.fail.get_mut(digest).and_then(VecDeque::pop_front) {
+            return Inherited::Fail(job_id, reason);
+        }
         match self.rerun.get_mut(digest) {
             Some(cell) => {
                 cell.drawn = true;
@@ -760,32 +812,71 @@ impl Carryover {
         Self { sources, ..self }
     }
 
-    /// Offer `offered`, jobs of plans other than the superseded one, to the
-    /// cells that would otherwise run.
-    pub(crate) fn with_offered(self, offered: Vec<Offered>) -> Self {
-        Self { offered, ..self }
+    /// The body the superseded plan lists each job under, for a job it took
+    /// for a cell under other clauses or another attempt limit than the job
+    /// was filed under. Its limit vouches for the run as the source's does
+    /// ([`Unclaimed::answer`]).
+    pub(crate) fn with_held_for(self, held_for: HashMap<JobId, Value>) -> Self {
+        Self { held_for, ..self }
     }
 
-    /// One draw per unit, refused when a re-run or a recalculation leaves a
-    /// cell of its plan behind.
+    /// Offer `offered`, jobs of plans other than the superseded one, to the
+    /// cells that would otherwise run. `listed` holds the digests those plans
+    /// list each job under, the superseded plan's jobs included. `excluded_runs`
+    /// also blocks automatic reuse of runs those plans gave up.
+    pub(crate) fn with_offered(
+        self,
+        offered: Vec<Offered>,
+        listed: HashMap<JobId, HashSet<String>>,
+        excluded_runs: HashSet<JobId>,
+    ) -> Self {
+        Self {
+            offered,
+            listed,
+            excluded_runs,
+            ..self
+        }
+    }
+
+    /// Let a finished run of the superseded plan or of a plan on offer answer
+    /// its cell under another attempt limit, whatever limit it ran under
+    /// (`carry_across_limit`).
+    pub(crate) fn across_limit(self, across_limit: bool) -> Self {
+        Self {
+            across_limit,
+            ..self
+        }
+    }
+
+    /// One draw per unit, refused when a re-run, a mark or a recalculation
+    /// leaves a cell of its plan behind.
     fn draw(mut self, units: &[Unit]) -> Result<Draw, RejectionError> {
         let inherited = units.iter().map(|unit| self.take(&unit.digest)).collect();
         self.require_named_placed()?;
         Ok(Draw {
             inherited,
             rerun_of: self.rerun_of,
-            unclaimed: Unclaimed::of(self.pool, self.sources, self.offered),
+            excluded_runs: self.excluded_runs,
+            unclaimed: Unclaimed::of(
+                self.pool,
+                self.sources,
+                self.held_for,
+                self.offered,
+                self.listed,
+                self.across_limit,
+            ),
         })
     }
 
-    /// Refuse a re-run or a recalculation whose draw left a cell of the plan it
-    /// revises behind: its unchanged document now expands differently.
+    /// Refuse a re-run, a mark or a recalculation whose draw left a cell of the
+    /// plan it revises behind: its unchanged document now expands differently.
     fn require_named_placed(&self) -> Result<(), RejectionError> {
-        if self.rerun.is_empty() && self.recalculate.is_empty() {
+        if self.rerun.is_empty() && self.recalculate.is_empty() && self.fail.is_empty() {
             return Ok(());
         }
         let left = self.pool.values().map(VecDeque::len).sum::<usize>()
             + self.recalculate.values().map(VecDeque::len).sum::<usize>()
+            + self.fail.values().map(VecDeque::len).sum::<usize>()
             + self.rerun.values().filter(|cell| !cell.drawn).count();
         match left {
             0 => Ok(()),
@@ -799,11 +890,13 @@ impl Carryover {
 struct Draw {
     inherited: Vec<Inherited>,
     rerun_of: BTreeMap<JobId, JobId>,
+    excluded_runs: HashSet<JobId>,
     unclaimed: Unclaimed,
 }
 
-/// The jobs a unit may take by [`crate::content_key::cell_digest`]: the
-/// superseded plan's that no unit drew, oldest first, then the other plans'
+/// The jobs a unit may take by
+/// [`crate::content_key::cell_digest_across_limit`]: the superseded plan's
+/// that no unit drew, oldest first, then the other plans'
 /// ([`Carryover::with_offered`]), in the order offered.
 #[derive(Debug)]
 struct Unclaimed {
@@ -811,14 +904,29 @@ struct Unclaimed {
     /// Whether other plans' jobs are on offer, which lets one stand in for a
     /// queued job of the superseded plan.
     offers: bool,
+    /// [`Carryover::listed`].
+    listed: HashMap<JobId, HashSet<String>>,
+    /// [`Carryover::across_limit`].
+    across_limit: bool,
 }
 
 #[derive(Debug)]
 struct Candidate {
     job_id: JobId,
     body: Value,
+    /// [`Carryover::held_for`]. `None` where the superseded plan holds the job
+    /// for the body it was filed under, and for another plan's job.
+    held_for: Option<Value>,
     /// The plan that offered it, `None` for the superseded one.
     from: Option<PlanId>,
+}
+
+impl Candidate {
+    /// The bodies whose attempt limit vouches for the run: the one it was
+    /// requested with, then the one the superseded plan holds it for.
+    fn vouching(&self) -> impl Iterator<Item = &Value> {
+        std::iter::once(&self.body).chain(&self.held_for)
+    }
 }
 
 /// What [`Unclaimed::answer`] gave the units beyond their draws.
@@ -835,55 +943,85 @@ impl Unclaimed {
     fn of(
         pool: HashMap<String, VecDeque<JobId>>,
         mut sources: HashMap<JobId, Value>,
+        mut held_for: HashMap<JobId, Value>,
         offered: Vec<Offered>,
+        listed: HashMap<JobId, HashSet<String>>,
+        across_limit: bool,
     ) -> Self {
         let mut cells: HashMap<String, Vec<Candidate>> = HashMap::new();
-        let mut offer = |job_id: JobId, body: Value, from: Option<PlanId>| {
-            cells
-                .entry(crate::content_key::cell_digest(&body))
-                .or_default()
-                .push(Candidate { job_id, body, from });
-        };
+        let mut offer =
+            |job_id: JobId, body: Value, held_for: Option<Value>, from: Option<PlanId>| {
+                cells
+                    .entry(crate::content_key::cell_digest_across_limit(&body))
+                    .or_default()
+                    .push(Candidate {
+                        job_id,
+                        body,
+                        held_for,
+                        from,
+                    });
+            };
         let mut head: Vec<(JobId, Value)> = pool
             .into_values()
             .flatten()
             .filter_map(|job_id| sources.remove(&job_id).map(|body| (job_id, body)))
             .collect();
         head.sort_by(|(a, _), (b, _)| a.cmp(b));
-        head.into_iter()
-            .for_each(|(job_id, body)| offer(job_id, body, None));
+        head.into_iter().for_each(|(job_id, body)| {
+            let held_for = held_for.remove(&job_id);
+            offer(job_id, body, held_for, None);
+        });
         let offers = !offered.is_empty();
         offered.into_iter().for_each(
             |Offered {
                  plan_id,
                  job_id,
                  body,
-             }| offer(job_id, body, Some(plan_id)),
+             }| offer(job_id, body, None, Some(plan_id)),
         );
-        Self { cells, offers }
+        Self {
+            cells,
+            offers,
+            listed,
+            across_limit,
+        }
     }
 
     /// Give each unit that drew nothing a finished job of its cell whose run
-    /// still answers it ([`matching::run_answers`]). With other plans on
-    /// offer, a unit that drew a queued job takes one in its place.
+    /// still answers it ([`matching::run_answers`]). A run under another
+    /// attempt limit answers when the body it was requested with, or the one
+    /// the superseded plan holds it for, shows that it passed the unit's
+    /// ([`matching::limit_answers`]), when a plan on offer lists its job under
+    /// the unit's digest, or when the filer said so. Units that differ in the
+    /// limit alone share their candidates,
+    /// so each first takes a run that the superseded plan holds for its own
+    /// limit, or one listed under its digest. A unit whose limit changed can
+    /// still take its twin's run after that. With other plans on offer, a unit
+    /// that drew a queued job no client is running takes one in its place.
     async fn answer<'u>(
         mut self,
         units: &'u [Unit],
         body_of: impl Fn(&'u Unit) -> Option<&'u Value>,
         inherited: &mut [Inherited],
+        todo: &dyn TodoStore,
         submissions: &dyn SubmissionStore,
     ) -> anyhow::Result<Answers> {
         let queued: HashSet<JobId> = if self.offers {
             let drawn = drawn_jobs(inherited.iter());
             let settled = submissions.find_outcomes(&drawn).await?;
-            drawn
+            let unsettled: Vec<JobId> = drawn
                 .into_iter()
                 .filter(|job_id| !settled.contains_key(job_id))
+                .collect();
+            let running = running_jobs(todo, &unsettled).await?;
+            unsettled
+                .into_iter()
+                .filter(|job_id| !running.contains(job_id))
                 .collect()
         } else {
             HashSet::new()
         };
-        let wanted: Vec<(usize, &Value, String, bool)> = units
+        let wanted: Vec<(usize, &Unit, &Value, String, bool)> = units
             .iter()
             .enumerate()
             .filter_map(|(index, unit)| {
@@ -893,17 +1031,18 @@ impl Unclaimed {
                     Inherited::Job(_)
                     | Inherited::Rerun(_)
                     | Inherited::Recalculate(_)
+                    | Inherited::Fail(..)
                     | Inherited::Answered(_)
                     | Inherited::Satisfied(_) => return None,
                 };
                 let body = body_of(unit)?;
-                let cell = crate::content_key::cell_digest(body);
+                let cell = crate::content_key::cell_digest_across_limit(body);
                 self.cells
                     .contains_key(&cell)
-                    .then_some((index, body, cell, drew_nothing))
+                    .then_some((index, unit, body, cell, drew_nothing))
             })
             .collect();
-        let cells: HashSet<&String> = wanted.iter().map(|(_, _, cell, _)| cell).collect();
+        let cells: HashSet<&String> = wanted.iter().map(|(_, _, _, cell, _)| cell).collect();
         let job_ids: Vec<JobId> = cells
             .into_iter()
             .filter_map(|cell| self.cells.get(cell))
@@ -911,41 +1050,80 @@ impl Unclaimed {
             .map(|candidate| candidate.job_id.clone())
             .collect();
         let runs = submissions.find_runs(&job_ids).await?;
-        let answers = wanted.into_iter().fold(
-            Answers::default(),
-            |mut answers, (index, body, cell, drew_nothing)| {
-                let Some(candidates) = self.cells.get_mut(&cell) else {
-                    return answers;
-                };
-                let answering = candidates.iter().position(|candidate| {
-                    matches!(
-                        runs.get(&candidate.job_id),
-                        Some(RecordedRun::Finished(flags))
-                            if matching::run_answers(&candidate.body, body, flags)
-                    )
+        let answering = |candidate: &Candidate, body: &Value| {
+            matches!(
+                runs.get(&candidate.job_id),
+                Some(RecordedRun::Finished(flags))
+                    if matching::run_answers(&candidate.body, body, flags)
+            )
+        };
+        let listed = |candidate: &Candidate, unit: &Unit| {
+            self.listed
+                .get(&candidate.job_id)
+                .is_some_and(|digests| digests.contains(&unit.digest))
+        };
+        let mut answers = Answers::default();
+        let mut hold = |index: usize, taken: Candidate| {
+            if let Some(plan_id) = taken.from {
+                answers.offered.insert(taken.job_id.clone(), plan_id);
+            }
+            if let Some(slot) = inherited.get_mut(index) {
+                *slot = Inherited::Answered(taken.job_id);
+            }
+        };
+        let open: Vec<(usize, &Value, String, bool)> = wanted
+            .into_iter()
+            .filter_map(|(index, unit, body, cell, drew_nothing)| {
+                let own = take_first(&mut self.cells, &cell, |candidate| {
+                    let held = candidate.held_for.as_ref().unwrap_or(&candidate.body);
+                    (matching::same_limit(held, body) || listed(candidate, unit))
+                        && answering(candidate, body)
                 });
-                let Some(at) = answering else {
-                    // The superseded plan's own run: another plan's is not it.
-                    let ran = candidates.iter().any(|candidate| {
-                        candidate.from.is_none() && runs.contains_key(&candidate.job_id)
-                    });
-                    if drew_nothing && ran {
-                        answers.requirements_rerun.insert(index);
+                match own {
+                    Some(taken) => {
+                        hold(index, taken);
+                        None
                     }
-                    return answers;
-                };
-                let taken = candidates.remove(at);
-                if let Some(plan_id) = taken.from {
-                    answers.offered.insert(taken.job_id.clone(), plan_id);
+                    None => {
+                        // The superseded plan's own run: another plan's is not it.
+                        let ran = self.cells.get(&cell).is_some_and(|candidates| {
+                            candidates.iter().any(|candidate| {
+                                candidate.from.is_none() && runs.contains_key(&candidate.job_id)
+                            })
+                        });
+                        Some((index, body, cell, drew_nothing && ran))
+                    }
                 }
-                if let Some(slot) = inherited.get_mut(index) {
-                    *slot = Inherited::Answered(taken.job_id);
+            })
+            .collect();
+        open.into_iter().for_each(|(index, body, cell, ran)| {
+            let taken = take_first(&mut self.cells, &cell, |candidate| {
+                (candidate
+                    .vouching()
+                    .any(|held| matching::limit_answers(held, body))
+                    || self.across_limit)
+                    && answering(candidate, body)
+            });
+            match taken {
+                Some(taken) => hold(index, taken),
+                None if ran => {
+                    answers.requirements_rerun.insert(index);
                 }
-                answers
-            },
-        );
+                None => {}
+            }
+        });
         Ok(answers)
     }
+}
+
+fn take_first(
+    cells: &mut HashMap<String, Vec<Candidate>>,
+    cell: &str,
+    fits: impl Fn(&Candidate) -> bool,
+) -> Option<Candidate> {
+    let candidates = cells.get_mut(cell)?;
+    let at = candidates.iter().position(fits)?;
+    Some(candidates.remove(at))
 }
 
 /// The jobs of the superseded plan that `slots` drew, which may still be
@@ -957,6 +1135,7 @@ fn drawn_jobs<'a>(slots: impl Iterator<Item = &'a Inherited>) -> Vec<JobId> {
             Inherited::Nothing
             | Inherited::Rerun(_)
             | Inherited::Recalculate(_)
+            | Inherited::Fail(..)
             | Inherited::Answered(_)
             | Inherited::Satisfied(_) => None,
         })
@@ -981,6 +1160,25 @@ async fn cell_scope(owner: &VaultOwner, orgs: &dyn OrgStore) -> anyhow::Result<C
     })
 }
 
+/// Those of `jobs` a client is running: [`running`] over their leases.
+async fn running_jobs(todo: &dyn TodoStore, jobs: &[JobId]) -> anyhow::Result<HashSet<JobId>> {
+    if jobs.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(running(todo.leases_for_jobs(jobs).await?, Utc::now()))
+}
+
+/// The jobs of `leases` a client is running at `now`: its lease has not
+/// lapsed, the queue's test, and the job's deadline has not passed, carry's
+/// test, so a job kept for its run can still be carried.
+fn running(leases: Vec<Lease>, now: DateTime<Utc>) -> HashSet<JobId> {
+    leases
+        .into_iter()
+        .filter(|lease| lease.lease_expiry > now && !lease.expires_at.is_expired(now))
+        .map(|lease| lease.job_id)
+        .collect()
+}
+
 /// A unit that [`satisfy_from_earlier_runs`] gave an earlier finished job.
 struct Satisfaction {
     /// The index of the unit.
@@ -1000,14 +1198,22 @@ struct Satisfaction {
 /// each unit that would carry a queued job of the superseded plan. It takes the
 /// newest such run. Each run answers at most one unit. A unit that opted out
 /// keeps what it drew. A carried job that has a record, finished or failed,
-/// also stays, because it is the run of the campaign.
+/// also stays, because it is the run of the campaign. So does a carried job
+/// that a client holds a live lease on: it finishes, and the plan takes its
+/// result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is distinct context the caller already holds"
+)]
 async fn satisfy_from_earlier_runs<'u>(
     units: &'u [Unit],
     body_of: impl Fn(&'u Unit) -> Option<&'u Value>,
     inherited: &mut [Inherited],
     plans: &dyn PlanStore,
+    todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     scope: &CellScope,
+    excluded_runs: &HashSet<JobId>,
 ) -> anyhow::Result<Vec<Satisfaction>> {
     let eligible: Vec<(usize, &Value, String)> = units
         .iter()
@@ -1032,8 +1238,10 @@ async fn satisfy_from_earlier_runs<'u>(
         .collect();
     let results = plans.find_cell_results(&cells, scope).await?;
     // Newest first within each cell, as the store returns them.
-    let by_cell: HashMap<&str, Vec<&CellResult>> =
-        results.iter().fold(HashMap::new(), |mut by_cell, result| {
+    let by_cell: HashMap<&str, Vec<&CellResult>> = results
+        .iter()
+        .filter(|result| !excluded_runs.contains(&result.job_id))
+        .fold(HashMap::new(), |mut by_cell, result| {
             by_cell
                 .entry(result.cell_digest.as_str())
                 .or_default()
@@ -1051,6 +1259,11 @@ async fn satisfy_from_earlier_runs<'u>(
     } else {
         submissions.find_outcomes(&drawn).await?
     };
+    let queued: Vec<JobId> = drawn
+        .into_iter()
+        .filter(|job_id| !recorded.contains_key(job_id))
+        .collect();
+    let running = running_jobs(todo, &queued).await?;
     // A job this plan already holds answers no other unit.
     let held: HashSet<JobId> = inherited
         .iter()
@@ -1058,6 +1271,7 @@ async fn satisfy_from_earlier_runs<'u>(
             Inherited::Job(job_id)
             | Inherited::Answered(job_id)
             | Inherited::Recalculate(job_id)
+            | Inherited::Fail(job_id, _)
             | Inherited::Satisfied(job_id) => Some(job_id.clone()),
             Inherited::Rerun(job_id) => job_id.clone(),
             Inherited::Nothing => None,
@@ -1067,7 +1281,9 @@ async fn satisfy_from_earlier_runs<'u>(
         (held, Vec::new()),
         |(mut held, mut satisfied), (index, body, cell)| {
             let carried = match inherited.get(index) {
-                Some(Inherited::Job(job_id)) if recorded.contains_key(job_id) => {
+                Some(Inherited::Job(job_id))
+                    if recorded.contains_key(job_id) || running.contains(job_id) =>
+                {
                     return (held, satisfied);
                 }
                 Some(Inherited::Job(job_id)) => Some(job_id.clone()),
@@ -1615,6 +1831,7 @@ pub async fn ingest_prepared(
     let Draw {
         mut inherited,
         rerun_of: carried_rerun_of,
+        excluded_runs,
         unclaimed,
     } = carry.draw(&grouped.units)?;
     unclaimed
@@ -1622,6 +1839,7 @@ pub async fn ingest_prepared(
             &grouped.units,
             |unit| inputs.get(unit.lead).map(|input| &input.body),
             &mut inherited,
+            context.todo,
             context.submissions,
         )
         .await?;
@@ -1630,8 +1848,10 @@ pub async fn ingest_prepared(
         |unit| inputs.get(unit.lead).map(|input| &input.body),
         &mut inherited,
         context.plans,
+        context.todo,
         context.submissions,
         &scope,
+        &excluded_runs,
     )
     .await?;
     satisfied.iter().for_each(|satisfaction| {
@@ -1681,6 +1901,9 @@ pub async fn ingest_prepared(
                     Some(Parent::Recalculates(source.clone()))
                 }
                 (Placed::Fresh, Some(Inherited::Rerun(of))) => of.clone().map(Parent::Reruns),
+                (Placed::Fresh, Some(Inherited::Fail(of, reason))) => {
+                    Some(Parent::Fails(of.clone(), reason.clone()))
+                }
                 _ => None,
             };
             anyhow::Ok(Placement::new(input, unit, placed, parent))
@@ -1712,13 +1935,13 @@ pub async fn ingest_prepared(
     } else {
         BTreeMap::new()
     };
-    // A job this plan re-runs names its parent, and a job it carries keeps the
-    // name the superseded plan gave it.
+    // A job this plan re-runs or marks failed names its parent, and a job it
+    // carries keeps the name the superseded plan gave it.
     let rerun_of: BTreeMap<JobId, JobId> = distinct
         .iter()
         .filter_map(|p| {
             let parent = match &p.parent {
-                Some(Parent::Reruns(of)) => Some(of.clone()),
+                Some(Parent::Reruns(of) | Parent::Fails(of, _)) => Some(of.clone()),
                 _ => carried_rerun_of.get(&p.job_id).cloned(),
             }?;
             Some((p.job_id.clone(), parent))
@@ -1772,7 +1995,7 @@ pub async fn ingest_prepared(
         job_ids: job_ids.clone(),
         content_keys,
         rerun_of,
-        campaign_id: Some(campaign_id),
+        campaign_id: Some(campaign_id.clone()),
         warnings: Vec::new(),
         // Only queue-maintenance records a lapse, so a fresh plan has none.
         expired_jobs: std::collections::BTreeMap::new(),
@@ -1810,10 +2033,10 @@ pub async fn ingest_prepared(
 
     // Per job: the source, then the link, then for a minted job its cell and
     // the marker. Jobs run concurrently. The promote into `avail/` waits for
-    // the recalculation copies, so no claimable job lacks its source or its
-    // minting plan's marker, and a failed copy leaves no job claimable. The
-    // minter writes a marker too, so an absent marker means released or
-    // lapsed, which `expired_jobs` tells apart.
+    // the recalculation copies and the marks' failures, so no claimable job
+    // lacks its source or its minting plan's marker, and a failed write leaves
+    // no job claimable. The minter writes a marker too, so an absent marker
+    // means released or lapsed, which `expired_jobs` tells apart.
     let staging: Vec<_> = distinct
         .iter()
         .map(|p| {
@@ -1844,10 +2067,9 @@ pub async fn ingest_prepared(
                         );
                     }
                 }
-                // A recalculated job is answered by its copy rather than
-                // queued, so it holds no marker, as a carried job with a
+                // Only a queued job holds a marker, as a carried job with a
                 // result holds none.
-                if !matches!(p.parent, Some(Parent::Recalculates(_))) && p.merged.is_none() {
+                if p.queues() {
                     plans
                         .write_job_plan_marker(&p.job_id, plan_id, p.expires_at)
                         .await
@@ -1918,22 +2140,72 @@ pub async fn ingest_prepared(
                 "recalculation copies staged"
             );
         }
+        let marks: Vec<_> = distinct
+            .iter()
+            .filter_map(|p| {
+                let Some(Parent::Fails(of, reason)) = &p.parent else {
+                    return None;
+                };
+                let plan_id = &plan_id;
+                Some(async move {
+                    let outcome = crate::submission::record_system_failure(
+                        submissions,
+                        catalog,
+                        &p.body,
+                        reason.as_str(),
+                        FailureCode::Unspecified,
+                        FailureSource::Marked,
+                        now,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("marking job {} failed for {of} in {plan_id}", p.job_id)
+                    })?;
+                    // The job id is fresh, so a record already under it is a bug.
+                    anyhow::ensure!(
+                        outcome == CreateOutcome::Created,
+                        "job {} minted for {plan_id} already has a record",
+                        p.job_id
+                    );
+                    anyhow::Ok(())
+                })
+            })
+            .collect();
+        let marked_jobs = marks.len();
+        futures::stream::iter(marks)
+            .buffer_unordered(PLAN_JOB_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+        if marked_jobs > 0 {
+            tracing::info!(plan_id = %plan_id, marked_jobs, "marks' failures staged");
+        }
     }
     // Collected first, as `staging` is: a stream over a borrowing filter is
     // not `Send` for every lifetime, and the HTTP handlers need it to be.
     let promotion_timings = PromotionTimings::default();
     let promotions: Vec<_> = distinct
         .iter()
-        .filter(|p| !matches!(p.parent, Some(Parent::Recalculates(_))) && p.merged.is_none())
+        .filter(|p| p.queues())
         .map(|p| {
-            let plan_id = &plan_id;
+            let (plan_id, campaign_id) = (&plan_id, &campaign_id);
             let promotion_timings = &promotion_timings;
             async move {
+                let family = size_family(&p.body, catalog, campaign_id).with_context(|| {
+                    format!("finding the family of job {} for {plan_id}", p.job_id)
+                })?;
                 todo.write_tmp(&p.job_id, &p.body)
                     .await
                     .with_context(|| format!("staging job {} for {plan_id}", p.job_id))?;
                 let started = std::time::Instant::now();
-                let promoted = todo.promote_avail(&p.job_id, p.expires_at).await;
+                let promoted = todo
+                    .promote_avail(
+                        &p.job_id,
+                        p.expires_at,
+                        family
+                            .as_ref()
+                            .map(|(key, sizes)| (key.as_str(), sizes.as_slice())),
+                    )
+                    .await;
                 promotion_timings.record(started.elapsed(), promoted.is_ok());
                 promoted.with_context(|| format!("promoting job {} for {plan_id}", p.job_id))
             }
@@ -2051,6 +2323,7 @@ pub async fn draw_carry(
     membership: CampaignMembership,
     bodies: &[Value],
     plans: &dyn PlanStore,
+    todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     orgs: &dyn OrgStore,
 ) -> Result<CarryDraw, IngestError> {
@@ -2060,6 +2333,7 @@ pub async fn draw_carry(
     let Draw {
         mut inherited,
         unclaimed,
+        excluded_runs,
         ..
     } = membership.carry.draw(&grouped.units)?;
     let Answers {
@@ -2070,6 +2344,7 @@ pub async fn draw_carry(
             &grouped.units,
             |unit| bodies.get(unit.lead),
             &mut inherited,
+            todo,
             submissions,
         )
         .await?;
@@ -2078,8 +2353,10 @@ pub async fn draw_carry(
         |unit| bodies.get(unit.lead),
         &mut inherited,
         plans,
+        todo,
         submissions,
         &scope,
+        &excluded_runs,
     )
     .await?
     .len();
@@ -2100,6 +2377,7 @@ pub async fn draw_carry(
             Inherited::Nothing
             | Inherited::Rerun(_)
             | Inherited::Recalculate(_)
+            | Inherited::Fail(..)
             | Inherited::Satisfied(_) => None,
         })
         .collect();
@@ -2110,7 +2388,10 @@ pub async fn draw_carry(
                 Inherited::Answered(job_id) if offered.contains_key(&job_id) => {}
                 Inherited::Job(job_id) | Inherited::Answered(job_id) => drawn.carried.push(job_id),
                 Inherited::Nothing => drawn.new_cells += 1,
-                Inherited::Rerun(_) | Inherited::Recalculate(_) | Inherited::Satisfied(_) => {}
+                Inherited::Rerun(_)
+                | Inherited::Recalculate(_)
+                | Inherited::Fail(..)
+                | Inherited::Satisfied(_) => {}
             }
             drawn
         });
@@ -2142,11 +2423,12 @@ pub async fn draw_carry(
 pub struct CarryDraw {
     /// The superseded plan's jobs the revision would hold.
     pub carried: Vec<JobId>,
-    /// Cells the superseded plan never ran, nor a re-run or a recalculation
-    /// names.
+    /// Cells the superseded plan never ran, nor a re-run, a mark or a
+    /// recalculation names.
     pub new_cells: usize,
     /// Cells the superseded plan ran that the revision runs again: the run
-    /// failed, or its device or build is not known to meet the cell's clauses.
+    /// failed, its device or build is not known to meet the cell's clauses, or
+    /// it is not known to have passed the cell's attempt limit.
     pub requirements_rerun: usize,
     /// Cells that an earlier finished run answers
     /// ([`satisfy_from_earlier_runs`]). The revision holds that run and queues
@@ -2276,7 +2558,7 @@ struct Placement {
     /// staging answers it.
     settled: bool,
     /// The superseded plan's job the job this input mints comes from, for a
-    /// recalculation or a re-run.
+    /// recalculation, a re-run or a mark.
     parent: Option<Parent>,
     /// The HuggingFace model that the import replaced, without its token,
     /// as [`GatedJob::hf_model`] holds it.
@@ -2290,6 +2572,15 @@ enum Parent {
     Recalculates(JobId),
     /// The minted job runs it again.
     Reruns(JobId),
+    /// A failure giving the reason answers the minted job in its place.
+    Fails(JobId, NonEmptyTrimmedString),
+}
+
+impl Parent {
+    /// Whether staging writes the minted job's record, so it is never queued.
+    fn answers_at_staging(&self) -> bool {
+        matches!(self, Self::Recalculates(_) | Self::Fails(..))
+    }
 }
 
 impl Placement {
@@ -2323,12 +2614,18 @@ impl Placement {
             horizon,
             merged,
             digest: unit.digest.clone(),
-            settled: settled || matches!(parent, Some(Parent::Recalculates(_))),
+            settled: settled || parent.as_ref().is_some_and(Parent::answers_at_staging),
             parent,
             hf_model,
         };
         placement.retime(expires_at);
         placement
+    }
+
+    /// Whether this input mints a job that is queued: one that staging does
+    /// not answer.
+    fn queues(&self) -> bool {
+        self.merged.is_none() && !self.parent.as_ref().is_some_and(Parent::answers_at_staging)
     }
 
     /// Move this placement onto its job's deadline, and stamp that back into the
@@ -2363,6 +2660,43 @@ fn minted_deadlines(placements: &[Placement]) -> HashMap<JobId, ExpiresAt> {
                 .or_insert(p.horizon);
             acc
         })
+}
+
+/// The family key and sizes of a job whose benchmark type has sizes, `None`
+/// for any other. The key is the `cell_digest` of the job with the sizes left
+/// out of its benchmark's params and its campaign added.
+pub(crate) fn size_family(
+    body: &Value,
+    catalog: &HashMap<BenchmarkId, Benchmark>,
+    campaign_id: &CampaignId,
+) -> anyhow::Result<Option<(String, Vec<i64>)>> {
+    let benchmark = body
+        .pointer("/spec/benchmark")
+        .and_then(Value::as_str)
+        .and_then(|id| catalog.get(&BenchmarkId::try_new(id).ok()?))
+        .context("a queued job's benchmark is not in the catalog")?;
+    let params = benchmark.params();
+    let sizes = params.sizes();
+    if sizes.is_empty() {
+        return Ok(None);
+    }
+    let mut others = serde_json::to_value(params)?;
+    if let Some(fields) = others.as_object_mut() {
+        sizes.iter().for_each(|(name, _)| {
+            fields.remove(*name);
+        });
+    }
+    let mut family = body.clone();
+    if let Some(slot) = family.pointer_mut("/spec/benchmark") {
+        *slot = others;
+    }
+    if let Some(fields) = family.as_object_mut() {
+        fields.insert("campaign_id".to_owned(), campaign_id.as_str().into());
+    }
+    Ok(Some((
+        crate::content_key::cell_digest(&family),
+        sizes.into_iter().map(|(_, size)| size).collect(),
+    )))
 }
 
 /// A job an input shares rather than mints: what a join reports, and what
@@ -2408,9 +2742,8 @@ enum JoinAttempt {
     /// The job is live and unlapsed, and the membership marker is written and
     /// confirmed.
     Joined(JoinTarget),
-    /// Not a job this input joins, and the record stands: the target is queued
-    /// under an unreadable deadline, or absent or lapsed with a record young
-    /// enough to be still staging. The caller mints either way.
+    /// The target is absent or lapsed, but its recent content-key record can
+    /// still belong to an ingest. Mint another job and keep the record.
     Declined,
     /// The record names a job that is provably gone, so the digest is available.
     Stale,
@@ -2421,8 +2754,6 @@ enum JoinAttempt {
 enum TargetState {
     /// Queued, under the official deadline it carries.
     Live(ExpiresAt),
-    /// Queued, and its deadline cannot be read.
-    LiveUnreadable,
     /// In neither `avail/` nor `leased/`.
     Absent,
 }
@@ -2458,7 +2789,7 @@ impl MergeContext<'_> {
             Inherited::Rerun(_) => return self.claim_unmerged(digest, candidate, "rerun").await,
             // Answered at staging and never queued, so no later plan can join
             // it, and the index is left alone.
-            Inherited::Recalculate(_) => return Ok(Placed::Fresh),
+            Inherited::Recalculate(_) | Inherited::Fail(..) => return Ok(Placed::Fresh),
             // Its run was read at the draw, and a recorded job is finished
             // whatever the queue still holds of it.
             Inherited::Answered(job_id) => return Ok(self.carried(digest, job_id, *horizon, true)),
@@ -2526,7 +2857,7 @@ impl MergeContext<'_> {
                 }
                 Ok(None)
             }
-            TargetState::Live(_) | TargetState::LiveUnreadable => Ok(None),
+            TargetState::Live(_) => Ok(None),
             // It may have finished since the first read: a submission records
             // before it leaves the queue.
             TargetState::Absent => Ok(if self.submissions.has_record(job_id).await? {
@@ -2643,7 +2974,8 @@ impl MergeContext<'_> {
     /// untouched. The job's deadline must still be in the future: a lapsed
     /// entry is dead, and a joiner would inherit its synthetic failure. This
     /// plan's horizon may fall either side of that deadline: the marker records
-    /// it, and the expiry pass re-dates.
+    /// it, and each `queue-maintenance` run stamps a waiting job with its
+    /// earliest live member horizon.
     ///
     /// The marker lands before a fresh liveness re-check in state-flow order
     /// (`avail/`, `leased/`, `avail/` again, the submission record). Forward
@@ -2659,17 +2991,6 @@ impl MergeContext<'_> {
         let target = &record.job_id;
         let official = match self.official_state(target).await? {
             TargetState::Live(official) => official,
-            // Minting is the only safe direction: reading it as absent would let
-            // [`Self::replace_stale`] take the digest over from a live job.
-            TargetState::LiveUnreadable => {
-                tracing::warn!(
-                    plan_id = %self.plan_id,
-                    job_id = %target,
-                    content_key = %digest,
-                    "declined to merge: the target is queued and its deadline is unreadable"
-                );
-                return Ok(JoinAttempt::Declined);
-            }
             TargetState::Absent => return Ok(self.classify_absent(record)),
         };
         // A fresh clock: a long ingest can outlive the target's deadline, and the
@@ -2679,10 +3000,32 @@ impl MergeContext<'_> {
             // to a synthetic failure, so it is dead already.
             return Ok(self.classify_absent(record));
         }
-        self.plans
-            .write_job_plan_marker(target, self.plan_id, plan_expiry)
-            .await?;
-        if !self.target_survives(target).await? {
+        let survives = match self
+            .plans
+            .join_job(target, self.plan_id, plan_expiry)
+            .await?
+        {
+            JobJoin::Joined => true,
+            JobJoin::Unchecked => self.target_survives(target).await?,
+            // Completed inside the window: the plan reads the same submission
+            // record, so the join stands on a fresh marker.
+            JobJoin::Gone if self.submissions.has_record(target).await? => {
+                self.plans
+                    .write_job_plan_marker(target, self.plan_id, plan_expiry)
+                    .await?;
+                true
+            }
+            JobJoin::Gone => {
+                tracing::info!(
+                    plan_id = %self.plan_id,
+                    job_id = %target,
+                    content_key = %digest,
+                    "merge target left the queue before the join; minting a fresh job"
+                );
+                return Ok(JoinAttempt::Stale);
+            }
+        };
+        if !survives {
             // Retired between the lookup and the marker. Dropping the marker is
             // best effort: the age-gated GC collects one left behind.
             if let Err(e) = self
@@ -2812,32 +3155,25 @@ impl MergeContext<'_> {
             .next())
     }
 
-    /// What an `avail/` entry says about the target; `None` is not absence, as
-    /// `leased/` is next. The deadline comes from the key, which scheduling reads:
-    /// the body's copy is never re-dated, so it would read a live job as lapsed
-    /// and let [`Self::replace_stale`] take its key. An unreadable name is
-    /// [`TargetState::LiveUnreadable`], never absence.
+    /// What the available entry says about the target. `None` is not absence,
+    /// as the lease is next. The deadline comes from the queue row, which
+    /// scheduling reads. The expiry pass never changes the body's deadline.
+    /// That old deadline could make [`Self::replace_stale`] replace a live
+    /// job's key.
     async fn avail_state(&self, job_id: &JobId) -> anyhow::Result<Option<TargetState>> {
-        let Some(name) = self.todo.avail_key_for_job(job_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some(match parse_avail_filename(&name) {
-            Ok((_, expires_at)) => TargetState::Live(expires_at),
-            Err(e) => {
-                tracing::warn!(
-                    plan_id = %self.plan_id,
-                    job_id = %job_id,
-                    key = %name,
-                    error = %e,
-                    "an avail/ key of a merge target does not parse; reading the job as queued"
-                );
-                TargetState::LiveUnreadable
-            }
-        }))
+        Ok(self
+            .todo
+            .avail_for_jobs(std::slice::from_ref(job_id))
+            .await?
+            .into_iter()
+            .next()
+            .map(|entry| TargetState::Live(entry.expires_at)))
     }
 
-    /// Whether the merge target still exists, read fresh in [`Self::try_join`]'s
-    /// order, after this plan's membership marker is written.
+    /// Check whether the merge target exists in the queue, for an object plan
+    /// store's [`JobJoin::Unchecked`]. Read in [`Self::try_join`]'s order after
+    /// the plan writes its membership marker. The database store checks the
+    /// queue inside [`PlanStore::join_job`].
     async fn target_survives(&self, job_id: &JobId) -> anyhow::Result<bool> {
         if self.avail_state(job_id).await?.is_some() {
             return Ok(true);
@@ -3018,6 +3354,49 @@ fn validate_job(
                 benchmark: benchmark_id.clone(),
                 reason,
             })?;
+        }
+        // Every device would fail these on every attempt, and clients report
+        // that as retriable.
+        if let Some((benchmark, decision)) = catalog.get(&benchmark_id).and_then(|benchmark| {
+            benchmark
+                .def
+                .as_decision_latency()
+                .or_else(|_| benchmark.def.as_decision_max_memory())
+                .ok()
+                .map(|decision| (benchmark, decision))
+        }) {
+            if decision.parameter_num_images.into_inner() > 0
+                && matches!(run_spec.model, Model::GgufText(_))
+            {
+                return Err(JobRejectionError::DecisionImagesOnTextModel {
+                    benchmark: benchmark_id,
+                });
+            }
+            // The conversion a client runs, on the flags it would build.
+            let flags = run_spec.runtime_flags.map_or_else(
+                || {
+                    RuntimeFlagRef::new(
+                        benchmark.benchmark_type(),
+                        RuntimeType::of(&run_spec.runtime),
+                        ModelType::of(&run_spec.model),
+                    )
+                },
+                RuntimeFlagRef::from,
+            );
+            if let Err(reason) = DecisionLlamacppCliStockTools::try_from(flags) {
+                return Err(
+                    if matches!(reason, RuntimeFlagsError::DecisionParallelUnset { .. }) {
+                        JobRejectionError::DecisionParallelUnset {
+                            benchmark: benchmark_id,
+                        }
+                    } else {
+                        JobRejectionError::DecisionCellUnrunnable {
+                            benchmark: benchmark_id,
+                            reason,
+                        }
+                    },
+                );
+            }
         }
     }
 
@@ -3356,7 +3735,7 @@ fn required_mark(marked: &str) -> Option<&str> {
         .filter(|plain| matching::is_routing_flag(plain))
 }
 
-fn lift_required_in(body: &mut Value) -> Result<(), JobRejectionError> {
+pub(crate) fn lift_required_in(body: &mut Value) -> Result<(), JobRejectionError> {
     // `validate_job` refuses a body that is not an object.
     let Some(fields) = body.as_object_mut() else {
         return Ok(());
@@ -3600,7 +3979,7 @@ mod tests {
     use pipette_core::config::{Config, StorageConfig};
     use pipette_core::denial::DenialRecord;
     use pipette_plan_types::{ClientId, DeviceProfile, UserId};
-    use pipette_store::{ClaimResult, Stores, drain_plans};
+    use pipette_store::{ClaimOutcome, ClaimResult, Stores, drain_plans};
     use pipette_store_fs::build_local_fs_stores;
     use pipette_store_testkit::{
         assert_each_job_has_its_source_and_link, finish_job, finish_job_with_failure,
@@ -4578,6 +4957,63 @@ mod tests {
         Ok(())
     }
 
+    // ── validation: a decision cell is one a client can run ─────────────────
+
+    /// A case's flags name only their knobs; the axes come from the entry and
+    /// the spec unless a case overrides one.
+    #[rstest]
+    #[case::parallel_set("decision_latency", 0, cli_spec(gguf_text(), Some(json!({"parallel": 1}))), None)]
+    #[case::parallel_unset("decision_latency", 0, cli_spec(gguf_text(), Some(json!({"threads": 4}))), Some((|k| matches!(k, JobRejectionError::DecisionParallelUnset { .. })) as Kind))]
+    #[case::no_flags("decision_latency", 0, cli_spec(gguf_text(), None), Some((|k| matches!(k, JobRejectionError::DecisionParallelUnset { .. })) as Kind))]
+    #[case::flags_for_another_benchmark("decision_latency", 0, cli_spec(gguf_text(), Some(json!({"benchmark_type": "eval", "parallel": 4}))), Some((|k| matches!(k, JobRejectionError::DecisionCellUnrunnable { .. })) as Kind))]
+    #[case::no_decision_cell("decision_latency", 0, json!({"model": {"type": "torch", "source": "huggingface", "org": "o", "repo_name": "r"}, "runtime": uv_vllm()}), Some((|k| matches!(k, JobRejectionError::DecisionCellUnrunnable { .. })) as Kind))]
+    #[case::images_on_vision("decision_latency", 1, cli_spec(json!({"type": "gguf_vision", "source": "huggingface", "org": "o", "repo_name": "r", "model": "m.gguf", "mmproj": "mmproj.gguf"}), Some(json!({"parallel": 1}))), None)]
+    #[case::images_on_text("decision_latency", 1, cli_spec(gguf_text(), Some(json!({"parallel": 1}))), Some((|k| matches!(k, JobRejectionError::DecisionImagesOnTextModel { .. })) as Kind))]
+    #[case::memory_images_on_text("decision_max_memory", 1, cli_spec(gguf_text(), Some(json!({"parallel": 1}))), Some((|k| matches!(k, JobRejectionError::DecisionImagesOnTextModel { .. })) as Kind))]
+    fn a_decision_cell_is_one_a_client_can_run(
+        #[case] benchmark_type: &str,
+        #[case] num_images: u32,
+        #[case] spec: Value,
+        #[case] expected: Option<Kind>,
+    ) -> anyhow::Result<()> {
+        let id = "decision-entry";
+        let size = if num_images > 0 {
+            "parameter_image_width = 384\nparameter_image_height = 384\n"
+        } else {
+            ""
+        };
+        let benchmark = Benchmark::from_toml(
+            id,
+            &format!(
+                "benchmark_type = \"{benchmark_type}\"\nparameter_text_tokens = 64\n\
+                 parameter_num_images = {num_images}\n{size}parameter_questions = 1\n"
+            ),
+        )?;
+        let catalog = HashMap::from([(BenchmarkId::try_new(id)?, benchmark)]);
+        let mut spec = spec;
+        let axes = [
+            ("benchmark_type", json!(benchmark_type)),
+            ("runtime_type", spec["runtime"]["type"].clone()),
+            ("model_type", spec["model"]["type"].clone()),
+        ];
+        if let Some(flags) = spec.get_mut("runtime_flags").and_then(Value::as_object_mut) {
+            axes.into_iter().for_each(|(key, value)| {
+                flags.entry(key).or_insert(value);
+            });
+        }
+        spec["benchmark"] = json!(id);
+        let job = json!({"requires": ["os:macos"], "spec": spec});
+        let checked = validate_job(&job, None, &catalog, ModelCheck::none(), Utc::now());
+        match expected {
+            None => anyhow::ensure!(checked.is_ok(), "{checked:?}"),
+            Some(kind) => anyhow::ensure!(
+                checked.as_ref().err().is_some_and(kind),
+                "wrong verdict: {checked:?}"
+            ),
+        }
+        Ok(())
+    }
+
     // ── validation: acceptances ─────────────────────────────────────────────
 
     #[rstest]
@@ -4792,13 +5228,17 @@ mod tests {
             .await
     }
 
-    fn stores_in(dir: &std::path::Path) -> anyhow::Result<Stores> {
+    async fn stores_in(dir: &std::path::Path) -> anyhow::Result<Stores> {
         let config = Config {
             storage: StorageConfig::local_fs(dir.to_path_buf()),
             auth_storage: StorageConfig::local_fs(dir.to_path_buf()),
             ..Config::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)
+    }
+
+    async fn sql_stores_in(dir: &std::path::Path) -> anyhow::Result<Stores> {
+        pipette_store_sql::scratch::stores(stores_in(dir).await?).await
     }
 
     fn client(id: &str, os: &str, status: ClientStatus) -> anyhow::Result<Client> {
@@ -4910,7 +5350,7 @@ mod tests {
         #[case] document: Option<&str>,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let source = document
             .map(|text| PlanSource::new(text.to_string()))
             .transpose()?;
@@ -4975,7 +5415,7 @@ mod tests {
         #[case] document: Option<&str>,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let catalog = catalog()?;
 
         let report = ingest_jobs(
@@ -5076,6 +5516,31 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PlanStore for FailsOneSourceStep {
+        async fn end_membership(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            self.inner.end_membership(job_id, plan_id).await
+        }
+        async fn join_job(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+            expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            self.inner.join_job(job_id, plan_id, expires_at).await
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            self.inner.read_gc_candidates().await
+        }
+        async fn write_gc_candidates(
+            &self,
+            candidates: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            self.inner.write_gc_candidates(candidates).await
+        }
+
         async fn put_job_cell(
             &self,
             job_id: &JobId,
@@ -5263,7 +5728,7 @@ mod tests {
         #[case] ingested: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let plans = FailsOneSourceStep::new(stores.plans.clone(), fail);
         let catalog = catalog()?;
 
@@ -5332,7 +5797,7 @@ mod tests {
         #[case] job_records: usize,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let plans = FailsOneSourceStep::new(stores.plans.clone(), fail);
         let catalog = catalog()?;
 
@@ -5366,7 +5831,10 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "{fail:?}: {result:?}");
-        assert!(stores.todo.list_avail().await?.is_empty(), "{fail:?}");
+        assert!(
+            stores.todo.list_avail_entries().await?.is_empty(),
+            "{fail:?}"
+        );
         assert_eq!(
             local_fs_job_record_count(dir.path()),
             job_records,
@@ -5414,7 +5882,7 @@ mod tests {
     #[tokio::test]
     async fn a_minted_job_indexes_its_cell_and_a_join_does_not() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         // A plan filed as job bodies writes no marker, so no step fails.
         let plans = FailsOneSourceStep::new(stores.plans.clone(), SourceStep::MarkerDelete);
         let twins = vec![
@@ -5455,7 +5923,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_cell_write_still_queues_the_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let plans = FailsOneSourceStep::new(stores.plans.clone(), SourceStep::JobCell);
 
         let report = ingest_through(
@@ -5466,7 +5934,7 @@ mod tests {
         .await?;
 
         assert_eq!(report.job_count, 1);
-        assert_eq!(stores.todo.list_avail().await?.len(), 1);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 1);
         Ok(())
     }
 
@@ -5475,7 +5943,7 @@ mod tests {
     #[tokio::test]
     async fn an_existing_plan_source_fails_the_ingest() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let squatter = PlanSource::new("benchmarks = [\"squatter\"]\n".to_string())?;
         let plans = FailsOneSourceStep {
             squatter: Some(squatter.clone()),
@@ -5542,7 +6010,7 @@ mod tests {
         #[case] expected: Option<&str>,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
 
         let jobs = vec![(
@@ -5573,7 +6041,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_stages_jobs_active_with_grouped_warning() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
 
         let jobs = vec![
@@ -5642,7 +6110,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_rejects_a_past_expires_at() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let live = json!({"requires":["os:macos"],"spec":spec_bench_1()});
         let mut lapsed = live.clone();
         lapsed["expires_at"] = json!("2020-01-01T00:00:00Z");
@@ -5666,7 +6134,7 @@ mod tests {
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert_eq!(local_fs_job_record_count(dir.path()), 0);
         Ok(())
     }
@@ -5676,7 +6144,7 @@ mod tests {
     #[tokio::test]
     async fn an_ingest_without_an_import_refuses_a_token() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let mut gated = json!({"requires":["os:macos"],"spec":spec_bench_1()});
         gated["spec"]["model"] = json!({
             "type": "gguf_text", "source": "huggingface", "org": "LiquidAI",
@@ -5693,7 +6161,7 @@ mod tests {
             matches!(kind, JobRejectionError::ImportUnavailable),
             "{kind:?}"
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         Ok(())
     }
 
@@ -5714,7 +6182,7 @@ mod tests {
         #[case] expected: &str,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let catalog = catalog()?;
         let ctx = IngestContext::from_stores(
             &stores,
@@ -5760,7 +6228,7 @@ mod tests {
     #[tokio::test]
     async fn staging_rejects_an_expires_at_that_passed_after_preparation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let catalog = catalog()?;
         let live = json!({"requires":["os:macos"],"spec":spec_bench_1()});
         let mut lapsed = live.clone();
@@ -5814,7 +6282,7 @@ mod tests {
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert_eq!(local_fs_job_record_count(dir.path()), 0);
         Ok(())
     }
@@ -5831,7 +6299,7 @@ mod tests {
         #[case] expires_at: Option<&str>,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let mut body = json!({"requires":["os:macos"],"spec":spec_bench_1()});
         if let Some(ts) = expires_at {
             body["expires_at"] = json!(ts);
@@ -5845,14 +6313,13 @@ mod tests {
         .await?;
         let job_id = report.job_ids[0].1.clone();
 
-        // The staged expiry, read off the avail/ key.
-        let staged_key = stores
+        let staged_expiry = stores
             .todo
-            .list_avail()
+            .list_avail_entries()
             .await?
             .pop()
-            .context("job in avail/")?;
-        let (_, staged_expiry) = pipette_core::todo_filename::parse_avail_filename(&staged_key)?;
+            .context("job in avail/")?
+            .expires_at;
         match expires_at {
             // The default is `now + 30 days`, which this test cannot name
             // exactly. Its observable property is that it is bounded.
@@ -5891,15 +6358,21 @@ mod tests {
             pipette_store::RecycleResult::Recycled
         );
 
-        // Back in avail/ under the identical key: the round trip preserves the
-        // expiry exactly.
-        let recycled_key = stores
+        // Back in avail/ under the identical entry: the round trip preserves
+        // the expiry exactly.
+        let recycled = stores
             .todo
-            .list_avail()
+            .list_avail_entries()
             .await?
             .pop()
             .context("job recycled to avail/")?;
-        assert_eq!(recycled_key, staged_key);
+        assert_eq!(
+            recycled,
+            pipette_store::AvailEntry {
+                job_id,
+                expires_at: staged_expiry
+            }
+        );
         Ok(())
     }
 
@@ -5921,7 +6394,7 @@ mod tests {
         });
         let first_expires_at = first_expires_at.as_deref();
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         // Distinct cells: `expires_at` is outside the content key, so inputs
         // that differ only there would share a job.
         let body = |cell: &str, expires_at: Option<&str>| {
@@ -5982,7 +6455,7 @@ mod tests {
         #[case] requires: &str,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let device = client("ev1_a", client_os, status)?;
         stores.clients.put_client(&device).await?;
         if granted {
@@ -6029,7 +6502,7 @@ mod tests {
         #[case] status: PlanStatus,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let device = client("ev1_a", "macOS", ClientStatus::Approved)?;
         stores.clients.put_client(&device).await?;
         grant_perform_work(&stores, &device).await?;
@@ -6069,7 +6542,7 @@ mod tests {
     #[tokio::test]
     async fn empty_job_set_is_rejected() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let err = ingest(&stores, &catalog()?, None, vec![])
             .await
             .err()
@@ -6099,7 +6572,7 @@ mod tests {
         #[case] staged: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let limit = std::num::NonZeroUsize::new(2).context("non-zero")?;
         let jobs = (0..count)
             .map(|i| {
@@ -6122,7 +6595,7 @@ mod tests {
         .await;
 
         let plans = drain_plans(stores.plans.as_ref(), None).await?.items;
-        let queued = stores.todo.list_avail().await?;
+        let queued = stores.todo.list_avail_entries().await?;
         if staged {
             let report = result?;
             assert_eq!(report.job_count, count);
@@ -6156,7 +6629,7 @@ mod tests {
     #[tokio::test]
     async fn rejection_names_the_offending_job_by_index_and_label() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let jobs = two_job_set(json!({"requires":["OS:macos"],"spec":spec_bench_1()}));
 
         let err = ingest(&stores, &catalog()?, None, jobs)
@@ -6182,7 +6655,7 @@ mod tests {
     async fn a_vault_reference_outside_the_filer_s_reach_is_refused_by_index() -> anyhow::Result<()>
     {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let owner = VaultOwner::Org {
             org_id: pipette_plan_types::OrgId::try_new("org_0195ab")?,
         };
@@ -6252,7 +6725,7 @@ mod tests {
     async fn a_vlm_eval_recipe_reads_no_vault_model_outside_the_filer_s_reach() -> anyhow::Result<()>
     {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let org = pipette_plan_types::OrgId::try_new("org_0195ab")?;
         let owner = VaultOwner::Org {
             org_id: org.clone(),
@@ -6318,7 +6791,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_set_writes_nothing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         // The second job violates reserved-namespace uniqueness — the whole set
         // must be rejected with nothing written.
         let jobs = two_job_set(json!({"requires":["os:ios","os:android"],"spec":spec_bench_1()}));
@@ -6330,7 +6803,7 @@ mod tests {
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert_eq!(local_fs_job_record_count(dir.path()), 0);
         Ok(())
     }
@@ -6381,7 +6854,7 @@ mod tests {
     #[tokio::test]
     async fn two_plans_wanting_one_cell_share_one_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let jobs = || vec![("cell.json".to_string(), cell_body("a", json!({})))];
 
         let first = ingest(&stores, &catalog()?, None, jobs()).await?;
@@ -6400,7 +6873,7 @@ mod tests {
         assert_eq!(second.job_ids.len(), 1, "one entry per input");
 
         // One queued job, listed by both manifests, held by both plans.
-        assert_eq!(stores.todo.list_avail().await?.len(), 1);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 1);
         for report in [&first, &second] {
             let manifest = stores
                 .plans
@@ -6422,7 +6895,7 @@ mod tests {
     #[tokio::test]
     async fn a_joining_plan_links_the_job_and_keeps_its_source() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
 
         let first = ingest(
             &stores,
@@ -6455,8 +6928,6 @@ mod tests {
         let mut expected = vec![first.plan_id, second.plan_id];
         expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(linked, expected);
-        // One job source and two links.
-        assert_eq!(local_fs_job_record_count(dir.path()), 3);
         Ok(())
     }
 
@@ -6465,7 +6936,7 @@ mod tests {
     #[tokio::test]
     async fn a_join_onto_a_job_with_no_source_stores_the_joiners_body() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let incumbent = JobId::from_uuid(uuid::Uuid::now_v7());
         let deadline = ExpiresAt::At(in_days(10));
         seed_content_key(
@@ -6570,7 +7041,7 @@ mod tests {
         #[case] merges: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
 
         let first = ingest(
             &stores,
@@ -6590,7 +7061,7 @@ mod tests {
         assert_eq!(first.job_ids[0].1 == second.job_ids[0].1, merges);
         assert_eq!(second.merged_job_count, usize::from(merges));
         assert_eq!(
-            stores.todo.list_avail().await?.len(),
+            stores.todo.list_avail_entries().await?.len(),
             if merges { 1 } else { 2 }
         );
         Ok(())
@@ -6683,11 +7154,23 @@ mod tests {
         recalculate: &BTreeSet<JobId>,
         jobs: Vec<(String, Value)>,
     ) -> anyhow::Result<IngestReport> {
+        revise_marking(stores, campaign, rerun, recalculate, &BTreeMap::new(), jobs).await
+    }
+
+    /// [`revise_naming`], marking the `fail` jobs failed too.
+    async fn revise_marking(
+        stores: &Stores,
+        campaign: &pipette_core::campaign::Campaign,
+        rerun: &BTreeSet<JobId>,
+        recalculate: &BTreeSet<JobId>,
+        fail: &BTreeMap<JobId, NonEmptyTrimmedString>,
+        jobs: Vec<(String, Value)>,
+    ) -> anyhow::Result<IngestReport> {
         let head = campaign.current_plan_id.as_ref().context("a head")?;
         let previous = stores.plans.get_plan(head).await?.context("the head")?;
         ingest_under(
             stores,
-            CampaignMembership::carrying(campaign, &previous, rerun, recalculate),
+            CampaignMembership::carrying(campaign, &previous, rerun, recalculate, fail),
             document()?,
             jobs,
         )
@@ -6706,7 +7189,7 @@ mod tests {
     #[tokio::test]
     async fn a_campaign_plan_records_the_content_key_of_each_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
 
         let (campaign, first) = campaign_of(&stores, cells(&["a", "b"], json!({}))).await?;
         let manifest = stores
@@ -6750,7 +7233,7 @@ mod tests {
     #[tokio::test]
     async fn a_revision_carries_the_cells_it_keeps_finished_or_not() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a", "b"], json!({}))).await?;
         let (done, live) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
         finish_job(&*stores.submissions, &*stores.todo, &done).await?;
@@ -6766,7 +7249,7 @@ mod tests {
 
         // The finished job stays out of the queue, and the revision writes no
         // marker on it: there is nothing left of it to lapse or tear down.
-        assert_eq!(stores.todo.list_avail().await?.len(), 2);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 2);
         assert_eq!(members(&stores, &done).await?, vec![first.plan_id.clone()]);
         let mut both = vec![first.plan_id.clone(), revision.plan_id.clone()];
         both.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -6793,7 +7276,7 @@ mod tests {
     #[tokio::test]
     async fn a_revision_of_finished_work_waits_on_no_client() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         finish_job(&*stores.submissions, &*stores.todo, &first.job_ids[0].1).await?;
 
@@ -6816,7 +7299,7 @@ mod tests {
     #[tokio::test]
     async fn a_revision_carries_an_opted_out_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let opted_out = || cells(&["a"], json!({"merge_duplicates": false}));
         let (campaign, first) = campaign_of(&stores, opted_out()).await?;
 
@@ -6824,7 +7307,7 @@ mod tests {
 
         assert_eq!(revision.job_ids[0].1, first.job_ids[0].1);
         assert_eq!(revision.merges[0].kind, MergeKind::Carried);
-        assert_eq!(stores.todo.list_avail().await?.len(), 1);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 1);
         Ok(())
     }
 
@@ -6857,6 +7340,7 @@ mod tests {
             carrying_sources(stores, campaign).await?,
             &bodies,
             &*stores.plans,
+            &*stores.todo,
             &*stores.submissions,
             &*stores.orgs,
         )
@@ -6877,8 +7361,13 @@ mod tests {
             })
             .try_collect()
             .await?;
-        let mut membership =
-            CampaignMembership::carrying(campaign, &previous, &BTreeSet::new(), &BTreeSet::new());
+        let mut membership = CampaignMembership::carrying(
+            campaign,
+            &previous,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
         membership.carry = membership.carry.with_sources(sources);
         Ok(membership)
     }
@@ -6888,7 +7377,7 @@ mod tests {
     #[tokio::test]
     async fn a_requirement_change_carries_a_run_that_still_answers() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let pinned = json!({"requires": ["os:macos", "client_version:2026.10.05-438185c"]});
         let (campaign, first) = campaign_of(&stores, cells(&["a", "b", "c"], pinned)).await?;
         let [(_, done), (_, failed), (_, queued)] = <[(String, JobId); 3]>::try_from(first.job_ids)
@@ -6978,7 +7467,7 @@ mod tests {
         #[case] carried: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], before)).await?;
         let (_, done) = first.job_ids.first().context("one job")?.clone();
         finish_job_with_success_on_build(
@@ -7050,6 +7539,457 @@ mod tests {
         Ok(())
     }
 
+    /// [`cell_body`] under an attempt limit of `limit` seconds. With none, the
+    /// flags are null, as the planner writes a cell that sets no flag.
+    fn limited_body(cell: &str, limit: Option<u64>) -> Value {
+        let mut body = cell_body(cell, json!({}));
+        body["spec"]["benchmark_flags"] = limit.map_or(Value::Null, |seconds| {
+            json!({
+                "runtime_type": "mlx_macos_pipette",
+                "model_type": "mlx",
+                "benchmark_type": "prefill_throughput",
+                "attempt_timeout_seconds": seconds,
+            })
+        });
+        body
+    }
+
+    /// [`cells`] over [`limited_body`].
+    fn limited(names: &[&str], limit: Option<u64>) -> Vec<(String, Value)> {
+        names
+            .iter()
+            .map(|name| (format!("{name}.json"), limited_body(name, limit)))
+            .collect()
+    }
+
+    /// The attempt limit of the job that `job_id` queues, `None` when it
+    /// queues none or sets no limit.
+    async fn queued_limit(stores: &Stores, job_id: &JobId) -> anyhow::Result<Option<Value>> {
+        let queued = stores.todo.get_avail_by_job(job_id).await?;
+        Ok(queued.and_then(|body| {
+            body.pointer("/spec/benchmark_flags/attempt_timeout_seconds")
+                .cloned()
+        }))
+    }
+
+    /// [`carrying_sources`], with `carry_across_limit` as the filer set it.
+    async fn carrying_across_limit(
+        stores: &Stores,
+        campaign: &pipette_core::campaign::Campaign,
+        across_limit: bool,
+    ) -> anyhow::Result<CampaignMembership> {
+        let mut membership = carrying_sources(stores, campaign).await?;
+        membership.carry = membership.carry.across_limit(across_limit);
+        Ok(membership)
+    }
+
+    /// What a revision does with one finished run when the attempt limit of
+    /// its cell alone goes from `before` to `after`. A run known to have passed
+    /// the new limit carries, and any other only with `carry_across_limit`.
+    /// The dry run and the filing agree on it.
+    #[rstest]
+    #[case::raised(Some(180), Some(300), false, true)]
+    #[case::lowered(Some(300), Some(180), false, false)]
+    #[case::set_on_a_run_with_none(None, Some(180), false, false)]
+    #[case::taken_off(Some(180), None, false, false)]
+    #[case::lowered_with_the_option(Some(300), Some(180), true, true)]
+    #[case::set_with_the_option(None, Some(180), true, true)]
+    #[case::taken_off_with_the_option(Some(180), None, true, true)]
+    #[tokio::test]
+    async fn a_limit_change_carries_a_run_known_to_have_passed_it(
+        #[case] before: Option<u64>,
+        #[case] after: Option<u64>,
+        #[case] across_limit: bool,
+        #[case] carried: bool,
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, limited(&["a"], before)).await?;
+        let (_, done) = first.job_ids.first().context("one job")?.clone();
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &done, "prefill").await?;
+
+        let draw = draw_carry(
+            carrying_across_limit(&stores, &campaign, across_limit).await?,
+            &[limited_body("a", after)],
+            &*stores.plans,
+            &*stores.todo,
+            &*stores.submissions,
+            &*stores.orgs,
+        )
+        .await?;
+        let revision = ingest_under(
+            &stores,
+            carrying_across_limit(&stores, &campaign, across_limit).await?,
+            document()?,
+            limited(&["a"], after),
+        )
+        .await?;
+
+        let expected = if carried {
+            CarryDraw {
+                carried: vec![done.clone()],
+                held: vec![HeldJob {
+                    body_index: 0,
+                    plan_id: first.plan_id.clone(),
+                    job_id: done.clone(),
+                }],
+                ..CarryDraw::default()
+            }
+        } else {
+            CarryDraw {
+                requirements_rerun: 1,
+                ..CarryDraw::default()
+            }
+        };
+        assert_eq!(draw, expected);
+        let (_, placed) = revision.job_ids.first().context("one job")?;
+        assert_eq!(*placed == done, carried);
+        // A kept run queues nothing, and a cell that runs again queues one job
+        // under the new limit.
+        assert_eq!(
+            stores.todo.list_avail_entries().await?.len(),
+            usize::from(!carried)
+        );
+        assert_eq!(
+            queued_limit(&stores, placed).await?,
+            after.filter(|_| !carried).map(Value::from)
+        );
+        Ok(())
+    }
+
+    /// `carry_across_limit` keeps a finished run only: a failed cell and a
+    /// queued one each get a new job under the new limit.
+    #[tokio::test]
+    async fn carrying_across_a_limit_keeps_only_a_finished_run() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, limited(&["a", "b", "c"], None)).await?;
+        let [(_, done), (_, failed), (_, queued)] = <[(String, JobId); 3]>::try_from(first.job_ids)
+            .map_err(|jobs| anyhow::anyhow!("three jobs, got {jobs:?}"))?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &done, "prefill").await?;
+        finish_job_with_failure(&*stores.submissions, &*stores.todo, &failed).await?;
+        let jobs = limited(&["a", "b", "c"], Some(180));
+        let bodies: Vec<Value> = jobs.iter().map(|(_, body)| body.clone()).collect();
+
+        let draw = draw_carry(
+            carrying_across_limit(&stores, &campaign, true).await?,
+            &bodies,
+            &*stores.plans,
+            &*stores.todo,
+            &*stores.submissions,
+            &*stores.orgs,
+        )
+        .await?;
+        assert_eq!(
+            draw,
+            CarryDraw {
+                carried: vec![done.clone()],
+                new_cells: 1,
+                requirements_rerun: 1,
+                held: vec![HeldJob {
+                    body_index: 0,
+                    plan_id: first.plan_id.clone(),
+                    job_id: done.clone(),
+                }],
+                ..CarryDraw::default()
+            }
+        );
+
+        let revision = ingest_under(
+            &stores,
+            carrying_across_limit(&stores, &campaign, true).await?,
+            document()?,
+            jobs,
+        )
+        .await?;
+
+        let [(_, kept), (_, rerun), (_, requeued)] =
+            <[(String, JobId); 3]>::try_from(revision.job_ids)
+                .map_err(|jobs| anyhow::anyhow!("three jobs, got {jobs:?}"))?;
+        assert_eq!(kept, done);
+        assert!(![&done, &failed, &queued].contains(&&rerun));
+        assert!(![&done, &failed, &queued].contains(&&requeued));
+        assert_eq!(queued_limit(&stores, &rerun).await?, Some(json!(180)));
+        assert_eq!(queued_limit(&stores, &requeued).await?, Some(json!(180)));
+        Ok(())
+    }
+
+    /// A revision that kept a run across a limit keys it under the body it now
+    /// answers, so the next revision carries it by digest with no option. The
+    /// job keeps the source it ran.
+    #[tokio::test]
+    async fn a_run_kept_across_a_limit_carries_by_digest_afterwards() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, limited(&["a"], None)).await?;
+        let (_, done) = first.job_ids.first().context("one job")?.clone();
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &done, "prefill").await?;
+
+        let second = ingest_under(
+            &stores,
+            carrying_across_limit(&stores, &campaign, true).await?,
+            document()?,
+            limited(&["a"], Some(180)),
+        )
+        .await?;
+
+        let manifest = stores
+            .plans
+            .get_plan(&second.plan_id)
+            .await?
+            .context("manifest")?;
+        assert_eq!(
+            manifest.content_keys.get(&done),
+            Some(&content_digest(&limited_body("a", Some(180))))
+        );
+        let source = stores
+            .plans
+            .get_job_source(&done)
+            .await?
+            .context("a job source")?;
+        assert_eq!(source.pointer("/spec/benchmark_flags"), Some(&Value::Null));
+
+        let campaign = pipette_core::campaign::Campaign {
+            current_plan_id: Some(second.plan_id),
+            ..campaign
+        };
+        let third =
+            revise_reading_sources(&stores, &campaign, limited(&["a", "b"], Some(180))).await?;
+
+        assert_eq!(third.job_ids.first().map(|(_, job_id)| job_id), Some(&done));
+        assert_eq!(merge_kinds(&third), vec![MergeKind::Carried]);
+        Ok(())
+    }
+
+    /// [`limited_body`] of the cell `a` under `limit` seconds, with `requires`
+    /// for its `requires`.
+    fn twin(limit: u64, requires: Value) -> (String, Value) {
+        let mut body = limited_body("a", Some(limit));
+        body["requires"] = requires;
+        (format!("a-{limit}.json"), body)
+    }
+
+    /// A campaign whose plan holds the cell `a` under each of `limits`, with
+    /// the two jobs in that order, both finished.
+    async fn twins(
+        stores: &Stores,
+        limits: [u64; 2],
+    ) -> anyhow::Result<(pipette_core::campaign::Campaign, [JobId; 2])> {
+        let filed = limits.map(|limit| twin(limit, json!(["os:macos"])));
+        let (campaign, first) = campaign_of(stores, filed.to_vec()).await?;
+        let [(_, one), (_, other)] = <[(String, JobId); 2]>::try_from(first.job_ids)
+            .map_err(|jobs| anyhow::anyhow!("two jobs, got {jobs:?}"))?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &one, "prefill").await?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &other, "prefill").await?;
+        Ok((campaign, [one, other]))
+    }
+
+    /// A plan may hold one cell under two attempt limits. A revision that
+    /// changes the requirements of both keeps each run for the limit it had,
+    /// though the run under the tighter limit would answer the looser cell
+    /// too, is the older candidate, and is asked for first.
+    #[tokio::test]
+    async fn a_cell_under_two_limits_keeps_each_run_for_its_own_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, [tight, loose]) = twins(&stores, [180, 300]).await?;
+        let routed = json!(["os:macos", "tag:lab-east"]);
+        let jobs = vec![twin(300, routed.clone()), twin(180, routed)];
+
+        let draw = preview_draw(&stores, &campaign, &jobs).await?;
+        let revision = revise_reading_sources(&stores, &campaign, jobs).await?;
+
+        assert_eq!(draw.carried, vec![loose.clone(), tight.clone()]);
+        assert_eq!(draw.requirements_rerun, 0);
+        let placed: Vec<JobId> = revision
+            .job_ids
+            .into_iter()
+            .map(|(_, job_id)| job_id)
+            .collect();
+        assert_eq!(placed, vec![loose, tight]);
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
+        Ok(())
+    }
+
+    /// A plan on offer lists a run under the body of one of two cells that
+    /// differ in the limit alone. That cell takes the run, though the run was
+    /// requested under the limit of the other cell, which then takes a run
+    /// that passed a tighter limit.
+    #[tokio::test]
+    async fn a_listed_run_goes_to_its_cell_before_a_twin_takes_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, [loose, tight]) = twins(&stores, [300, 240]).await?;
+        let routed = json!(["os:macos", "tag:lab-east"]);
+        let jobs = vec![twin(180, routed.clone()), twin(300, routed)];
+        let listed = HashMap::from([(loose.clone(), HashSet::from([content_digest(&jobs[0].1)]))]);
+        let mut membership = carrying_sources(&stores, &campaign).await?;
+        membership.carry = membership
+            .carry
+            .with_offered(Vec::new(), listed, HashSet::new());
+
+        let revision = ingest_under(&stores, membership, document()?, jobs).await?;
+
+        let placed: Vec<JobId> = revision
+            .job_ids
+            .into_iter()
+            .map(|(_, job_id)| job_id)
+            .collect();
+        assert_eq!(placed, vec![loose, tight]);
+        Ok(())
+    }
+
+    /// A plan may hold a run under another limit than the run was requested
+    /// with. Each of two cells that differ in the limit alone first takes the
+    /// run held under its own limit, though the run requested under the
+    /// tightest limit would answer both and is asked for first.
+    #[tokio::test]
+    async fn a_cell_takes_the_run_its_plan_holds_under_its_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, [first, second]) = twins(&stores, [100, 280]).await?;
+        let held = |limit| twin(limit, json!(["os:macos"])).1;
+        let mut membership = carrying_sources(&stores, &campaign).await?;
+        membership.carry = membership.carry.with_held_for(HashMap::from([
+            (first.clone(), held(250)),
+            (second.clone(), held(300)),
+        ]));
+        let routed = json!(["os:macos", "tag:lab-east"]);
+        let jobs = vec![twin(300, routed.clone()), twin(250, routed)];
+
+        let revision = ingest_under(&stores, membership, document()?, jobs).await?;
+
+        let placed: Vec<JobId> = revision
+            .job_ids
+            .into_iter()
+            .map(|(_, job_id)| job_id)
+            .collect();
+        assert_eq!(placed, vec![second, first]);
+        Ok(())
+    }
+
+    /// A run that its plan holds under a limit is not the own run of a cell
+    /// with none, though it was requested with none: that cell takes the run
+    /// of its own variant, and leaves the held run to the cell with the limit.
+    #[tokio::test]
+    async fn a_run_held_under_a_limit_stays_with_the_cell_that_sets_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let cell = |limit: Option<u64>, tags: &[&str]| {
+            let mut body = limited_body("a", limit);
+            body["requires"] = std::iter::once("os:macos")
+                .chain(tags.iter().copied())
+                .collect();
+            body
+        };
+        let filed = vec![
+            ("sf.json".to_string(), cell(None, &["tag:lab-sf"])),
+            ("east.json".to_string(), cell(None, &["tag:lab-east"])),
+        ];
+        let (campaign, first) = campaign_of(&stores, filed).await?;
+        let [(_, held), (_, plain)] = <[(String, JobId); 2]>::try_from(first.job_ids)
+            .map_err(|jobs| anyhow::anyhow!("two jobs, got {jobs:?}"))?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &held, "prefill").await?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &plain, "prefill").await?;
+        let mut membership = carrying_sources(&stores, &campaign).await?;
+        membership.carry = membership.carry.with_held_for(HashMap::from([(
+            held.clone(),
+            cell(Some(180), &["tag:lab-sf"]),
+        )]));
+        let jobs = vec![
+            (
+                "east.json".to_string(),
+                cell(None, &["tag:lab-east", "tag:rack-2"]),
+            ),
+            (
+                "sf.json".to_string(),
+                cell(Some(180), &["tag:lab-sf", "tag:rack-2"]),
+            ),
+        ];
+
+        let revision = ingest_under(&stores, membership, document()?, jobs).await?;
+
+        let placed: Vec<JobId> = revision
+            .job_ids
+            .into_iter()
+            .map(|(_, job_id)| job_id)
+            .collect();
+        assert_eq!(placed, vec![plain, held]);
+        Ok(())
+    }
+
+    /// Two cells that differ in their requirements alone share the superseded
+    /// plan's run. The one the run does not answer counts as run again, though
+    /// the cell after it takes the run.
+    #[tokio::test]
+    async fn a_cell_whose_run_goes_to_a_later_cell_counts_as_run_again() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, limited(&["a"], None)).await?;
+        let done = only_job(&first)?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &done, "prefill").await?;
+        let requiring = |name: &str, requires: Value| {
+            let mut body = limited_body("a", None);
+            body["requires"] = requires;
+            (name.to_string(), body)
+        };
+        // The recorded device is an Apple M5 MacBook Pro.
+        let jobs = vec![
+            requiring("m3.json", json!(["os:macos", "chip:applem3"])),
+            requiring("east.json", json!(["os:macos", "tag:lab-east"])),
+        ];
+
+        let draw = preview_draw(&stores, &campaign, &jobs).await?;
+
+        assert_eq!(draw.carried, vec![done]);
+        assert_eq!((draw.new_cells, draw.requirements_rerun), (0, 1));
+        Ok(())
+    }
+
+    /// `carry_across_limit` waives the limit alone. A run whose recorded
+    /// device lacks a chip that the cell now requires runs again, under the
+    /// new limit.
+    #[tokio::test]
+    async fn carrying_across_a_limit_still_checks_the_device() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, limited(&["a"], None)).await?;
+        let done = only_job(&first)?;
+        finish_job_with_success(&*stores.submissions, &*stores.todo, &done, "prefill").await?;
+        // The recorded device is an Apple M5 MacBook Pro.
+        let mut body = limited_body("a", Some(180));
+        body["requires"] = json!(["os:macos", "chip:applem3"]);
+
+        let draw = draw_carry(
+            carrying_across_limit(&stores, &campaign, true).await?,
+            std::slice::from_ref(&body),
+            &*stores.plans,
+            &*stores.todo,
+            &*stores.submissions,
+            &*stores.orgs,
+        )
+        .await?;
+        let revision = ingest_under(
+            &stores,
+            carrying_across_limit(&stores, &campaign, true).await?,
+            document()?,
+            vec![("a.json".to_string(), body)],
+        )
+        .await?;
+
+        assert_eq!(
+            draw,
+            CarryDraw {
+                requirements_rerun: 1,
+                ..CarryDraw::default()
+            }
+        );
+        let placed = only_job(&revision)?;
+        assert_ne!(placed, done);
+        assert_eq!(queued_limit(&stores, &placed).await?, Some(json!(180)));
+        Ok(())
+    }
+
     /// Ingestion takes `:required` off a tag or a build and lists the plain flag
     /// in `required_flags`; a body that marks neither stays as it was.
     #[rstest]
@@ -7089,7 +8029,7 @@ mod tests {
     #[tokio::test]
     async fn a_lapsed_job_is_placed_as_any_other_cell() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let job_id = first.job_ids[0].1.clone();
         let mut manifest = stores
@@ -7115,12 +8055,14 @@ mod tests {
 
     /// Claim `job_id` as a client does: it moves to `leased/`, and runs there.
     async fn lease(stores: &Stores, job_id: &JobId) -> anyhow::Result<()> {
-        let name = stores
+        let expires_at = stores
             .todo
-            .avail_key_for_job(job_id)
+            .avail_for_jobs(std::slice::from_ref(job_id))
             .await?
-            .context("the job is queued")?;
-        let (_, expires_at) = parse_avail_filename(&name)?;
+            .into_iter()
+            .next()
+            .context("the job is queued")?
+            .expires_at;
         let claimed = stores
             .todo
             .claim_job(
@@ -7143,7 +8085,7 @@ mod tests {
     #[tokio::test]
     async fn a_revision_carries_a_running_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let running = first.job_ids[0].1.clone();
         lease(&stores, &running).await?;
@@ -7164,7 +8106,7 @@ mod tests {
     #[tokio::test]
     async fn a_recorded_job_is_finished_while_its_lease_stands() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let job_id = first.job_ids[0].1.clone();
         lease(&stores, &job_id).await?;
@@ -7196,7 +8138,7 @@ mod tests {
     #[tokio::test]
     async fn a_revision_carries_a_finished_job_without_reading_its_record() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let done = first.job_ids[0].1.clone();
         finish_job(&*stores.submissions, &*stores.todo, &done).await?;
@@ -7206,7 +8148,7 @@ mod tests {
 
         assert_eq!(revision.job_ids[0].1, done);
         assert_eq!(revision.merges[0].kind, MergeKind::Carried);
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         Ok(())
     }
 
@@ -7226,18 +8168,20 @@ mod tests {
     #[tokio::test]
     async fn a_job_gone_without_a_result_is_not_carried(#[case] gone: Gone) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let job_id = first.job_ids[0].1.clone();
         match gone {
             Gone::Retired => stores.todo.delete_avail_by_job(&job_id).await?,
             Gone::PastDeadline => {
-                let name = stores
+                let expires_at = stores
                     .todo
-                    .avail_key_for_job(&job_id)
+                    .avail_for_jobs(std::slice::from_ref(&job_id))
                     .await?
-                    .context("the job is queued")?;
-                let (_, expires_at) = parse_avail_filename(&name)?;
+                    .into_iter()
+                    .next()
+                    .context("the job is queued")?
+                    .expires_at;
                 let redated = stores
                     .todo
                     .redate_avail(&job_id, expires_at, ExpiresAt::At(in_days(-1)))
@@ -7259,7 +8203,7 @@ mod tests {
     #[tokio::test]
     async fn each_opted_out_run_of_a_cell_carries_its_own_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let opted_out = |labels: &[&str]| -> Vec<(String, Value)> {
             labels
                 .iter()
@@ -7313,7 +8257,7 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_mints_the_cell_it_names_and_carries_the_rest() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a", "b"], json!({}))).await?;
         let (again, kept) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
         finish_job(&*stores.submissions, &*stores.todo, &again).await?;
@@ -7343,7 +8287,7 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_does_not_join_the_job_it_runs_again() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a"], json!({}))).await?;
         let job_id = first.job_ids[0].1.clone();
         lease(&stores, &job_id).await?;
@@ -7375,7 +8319,7 @@ mod tests {
         #[case] recalculates_kept: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (mut campaign, first) = campaign_of(&stores, cells(&["a", "b"], json!({}))).await?;
         let (again, kept) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
         finish_job(&*stores.submissions, &*stores.todo, &again).await?;
@@ -7442,7 +8386,7 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_of_opted_out_twins_names_each_run() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let twins = || cells(&["a", "a"], json!({"merge_duplicates": false}));
         let (campaign, first) = campaign_of(&stores, twins()).await?;
         let runs: BTreeSet<JobId> = first.job_ids.iter().map(|(_, id)| id.clone()).collect();
@@ -7470,8 +8414,18 @@ mod tests {
         Ok(())
     }
 
-    /// A re-run or recalculation whose document now places other cells than
-    /// the head's is refused before anything is written, dry run or not.
+    /// How [`a_drifted_revision_is_refused_by_the_check_and_the_ingest`] names
+    /// the head's first job.
+    #[derive(Clone, Copy, Debug)]
+    enum Named {
+        Rerun,
+        Recalculate,
+        Mark,
+    }
+
+    /// A re-run, a mark or a recalculation whose document now places other
+    /// cells than the head's is refused before anything is written, dry run or
+    /// not.
     #[rstest]
     #[case::unchanged(&["a", "b"], json!({}), &["a", "b"], json!({}), None)]
     #[case::a_cell_changed(&["a", "b"], json!({}), &["a", "c"], json!({}), Some(1))]
@@ -7497,16 +8451,22 @@ mod tests {
         #[case] now: &[&str],
         #[case] now_extra: Value,
         #[case] drift: Option<usize>,
-        #[values(false, true)] recalculated: bool,
+        #[values(Named::Rerun, Named::Recalculate, Named::Mark)] named: Named,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(head, head_extra)).await?;
         let job_id = first.job_ids[0].1.clone();
         finish_job_with_success(&*stores.submissions, &*stores.todo, &job_id, "eval").await?;
-        let (rerun, recalculate) = match recalculated {
-            false => (BTreeSet::from([job_id]), BTreeSet::new()),
-            true => (BTreeSet::new(), BTreeSet::from([job_id])),
+        let reason = NonEmptyTrimmedString::try_new("swap")?;
+        let (rerun, recalculate, fail) = match named {
+            Named::Rerun => (BTreeSet::from([job_id]), BTreeSet::new(), BTreeMap::new()),
+            Named::Recalculate => (BTreeSet::new(), BTreeSet::from([job_id]), BTreeMap::new()),
+            Named::Mark => (
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeMap::from([(job_id, reason)]),
+            ),
         };
         let previous = stores
             .plans
@@ -7517,14 +8477,15 @@ mod tests {
         let bodies: Vec<Value> = jobs.iter().map(|(_, body)| body.clone()).collect();
 
         let checked = draw_carry(
-            CampaignMembership::carrying(&campaign, &previous, &rerun, &recalculate),
+            CampaignMembership::carrying(&campaign, &previous, &rerun, &recalculate, &fail),
             &bodies,
             &*stores.plans,
+            &*stores.todo,
             &*stores.submissions,
             &*stores.orgs,
         )
         .await;
-        let filed = revise_naming(&stores, &campaign, &rerun, &recalculate, jobs).await;
+        let filed = revise_marking(&stores, &campaign, &rerun, &recalculate, &fail, jobs).await;
 
         match drift {
             None => {
@@ -7559,7 +8520,7 @@ mod tests {
     #[tokio::test]
     async fn recalculation_copy_failure_follows_staging() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a", "b", "c"], json!({}))).await?;
         let named = first
             .job_ids
@@ -7604,7 +8565,7 @@ mod tests {
     #[tokio::test]
     async fn a_recalculation_answers_a_shared_cell_once() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (campaign, first) = campaign_of(&stores, cells(&["a", "a"], json!({}))).await?;
         let named = first.job_ids[0].1.clone();
         assert_eq!(first.job_ids[1].1, named, "the twins share one job");
@@ -7630,12 +8591,125 @@ mod tests {
         Ok(())
     }
 
+    /// A mark answers its cell with a server failure giving the reason, under a
+    /// new job that never queues and that the manifest links to the replaced job.
+    #[tokio::test]
+    async fn a_mark_answers_its_cell_with_a_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, cells(&["a", "b"], json!({}))).await?;
+        let (marked, kept) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
+        finish_job(&*stores.submissions, &*stores.todo, &marked).await?;
+        let fail = BTreeMap::from([(
+            marked.clone(),
+            NonEmptyTrimmedString::try_new("swap after 5 runs")?,
+        )]);
+
+        let revision = revise_marking(
+            &stores,
+            &campaign,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &fail,
+            cells(&["a", "b"], json!({})),
+        )
+        .await?;
+
+        let minted = revision.job_ids[0].1.clone();
+        assert_ne!(minted, marked);
+        assert_eq!(revision.job_ids[1].1, kept);
+        assert!(stores.todo.get_avail_by_job(&minted).await?.is_none());
+        assert_eq!(members(&stores, &minted).await?, Vec::<PlanId>::new());
+        let manifest = stores
+            .plans
+            .get_plan(&revision.plan_id)
+            .await?
+            .context("the revision")?;
+        assert_eq!(
+            manifest.rerun_of,
+            BTreeMap::from([(minted.clone(), marked.clone())])
+        );
+        let digest = manifest.content_keys.get(&minted).context("its digest")?;
+        let indexed = stores.plans.get_content_key(digest).await?;
+        assert_eq!(indexed.map(|(record, _)| record.job_id), Some(marked));
+        let record = stores
+            .submissions
+            .find_job(&minted)
+            .await?
+            .context("the mark's record")?;
+        let crate::submission::Submission::Failure(failure) =
+            crate::submission::parse_stored_submission(&record.body)?
+        else {
+            anyhow::bail!("the mark's record is no failure: {}", record.body);
+        };
+        assert_eq!(
+            (
+                failure.client_id.as_str(),
+                failure.failure_source,
+                failure.wire.failure_code,
+                failure.wire.failure_reason.as_str()
+            ),
+            (
+                pipette_core::warehouse::SYSTEM_CLIENT_ID,
+                Some(FailureSource::Marked),
+                FailureCode::Unspecified,
+                "swap after 5 runs"
+            )
+        );
+        Ok(())
+    }
+
+    /// One revision runs a cell again and marks another failed: the re-run
+    /// queues, the mark's failure is staged, and each new job names the job it
+    /// replaces.
+    #[tokio::test]
+    async fn a_revision_reruns_one_cell_and_marks_another() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores_in(dir.path()).await?;
+        let (campaign, first) = campaign_of(&stores, cells(&["a", "b", "c"], json!({}))).await?;
+        let [(_, again), (_, marked), (_, kept)] = <[(String, JobId); 3]>::try_from(first.job_ids)
+            .map_err(|jobs| anyhow::anyhow!("three jobs, got {jobs:?}"))?;
+        finish_job(&*stores.submissions, &*stores.todo, &again).await?;
+        finish_job_with_failure(&*stores.submissions, &*stores.todo, &marked).await?;
+
+        let revision = revise_marking(
+            &stores,
+            &campaign,
+            &BTreeSet::from([again.clone()]),
+            &BTreeSet::new(),
+            &BTreeMap::from([(marked.clone(), NonEmptyTrimmedString::try_new("swap")?)]),
+            cells(&["a", "b", "c"], json!({})),
+        )
+        .await?;
+
+        let [(_, rerun_job), (_, mark_job), (_, carried)] =
+            <[(String, JobId); 3]>::try_from(revision.job_ids)
+                .map_err(|jobs| anyhow::anyhow!("three jobs, got {jobs:?}"))?;
+        assert_eq!(carried, kept);
+        assert!(stores.todo.get_avail_by_job(&rerun_job).await?.is_some());
+        assert!(stores.todo.get_avail_by_job(&mark_job).await?.is_none());
+        let manifest = stores
+            .plans
+            .get_plan(&revision.plan_id)
+            .await?
+            .context("the revision")?;
+        assert_eq!(
+            manifest.rerun_of,
+            BTreeMap::from([(rerun_job, again), (mark_job.clone(), marked)])
+        );
+        assert_eq!(
+            stores.submissions.list_incoming(NonZeroUsize::MAX).await?,
+            vec![mark_job]
+        );
+        Ok(())
+    }
+
     /// Opting out is a mint-time rule: it does not make the job private, so a
     /// later plan borrows it.
     #[tokio::test]
     async fn an_opted_out_job_mints_its_own_and_still_lends_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let opted_out = || {
             vec![(
                 "cell.json".to_string(),
@@ -7673,7 +8747,7 @@ mod tests {
         assert_eq!(third.merged_job_count, 1);
         assert_eq!(third.merges[0].kind, MergeKind::AcrossPlans);
         assert_eq!(
-            stores.todo.list_avail().await?.len(),
+            stores.todo.list_avail_entries().await?.len(),
             2,
             "two opted-out mints, and no job for the plan that borrowed one"
         );
@@ -7696,7 +8770,7 @@ mod tests {
     #[tokio::test]
     async fn opted_out_siblings_of_one_plan_do_not_share() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let body = cell_body("a", json!({"merge_duplicates": false}));
 
         let report = ingest(
@@ -7722,7 +8796,7 @@ mod tests {
     #[tokio::test]
     async fn declined_siblings_share_the_job_the_pass_mints() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
 
@@ -7748,7 +8822,7 @@ mod tests {
         assert_eq!(report.merged_job_count, 1);
         assert_eq!(report.merges[0].kind, MergeKind::WithinPlan);
         assert_eq!(
-            stores.todo.list_avail().await?.len(),
+            stores.todo.list_avail_entries().await?.len(),
             1,
             "the second input mints nothing of its own"
         );
@@ -7761,7 +8835,7 @@ mod tests {
     #[tokio::test]
     async fn a_sibling_of_a_cross_plan_join_is_labelled_across_plans() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let body = cell_body("a", json!({}));
 
         let first = ingest(
@@ -7807,7 +8881,7 @@ mod tests {
     #[tokio::test]
     async fn two_inputs_of_one_plan_share_one_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
 
         let report = ingest(
             &stores,
@@ -7838,7 +8912,7 @@ mod tests {
             .await?
             .context("manifest written")?;
         assert_eq!(manifest.job_ids.len(), 2);
-        assert_eq!(stores.todo.list_avail().await?.len(), 2);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 2);
         assert_eq!(
             members(&stores, &report.job_ids[0].1).await?,
             vec![report.plan_id.clone()],
@@ -7860,7 +8934,7 @@ mod tests {
         #[case] offset_days: Option<i64>,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
 
         let incumbent = in_days(90);
         let want_horizon = match offset_days {
@@ -7895,12 +8969,14 @@ mod tests {
 
         let job_id = &first.job_ids[0].1;
         assert_eq!(&second.job_ids[0].1, job_id, "both plans share one job");
-        // The joiner accepts the deadline the key carries rather than moving it,
-        // so the queue keeps exactly one entry for the shared job.
-        let keys = stores.todo.list_avail().await?;
+        // The joiner accepts the deadline that the queue row carries, so the
+        // queue keeps exactly one entry for the shared job.
         assert_eq!(
-            keys,
-            vec![format!("{job_id}/{}.json", ExpiresAt::At(incumbent))]
+            stores.todo.list_avail_entries().await?,
+            vec![pipette_store::AvailEntry {
+                job_id: job_id.clone(),
+                expires_at: ExpiresAt::At(incumbent)
+            }]
         );
 
         let mut markers = stores.plans.list_job_plan_markers(job_id).await?;
@@ -7920,7 +8996,7 @@ mod tests {
     #[tokio::test]
     async fn a_joined_job_carries_the_latest_horizon_of_its_inputs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
 
         let (sooner, incumbent, later) = (in_days(60), in_days(90), in_days(240));
         let first = ingest(
@@ -7975,7 +9051,7 @@ mod tests {
     #[tokio::test]
     async fn a_minted_job_carries_the_latest_horizon_of_its_inputs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let (sooner, later) = (in_days(60), in_days(240));
 
         let report = ingest(
@@ -7998,8 +9074,11 @@ mod tests {
         let job_id = &report.job_ids[0].1;
         assert_eq!(report.job_count, 1);
         assert_eq!(
-            stores.todo.list_avail().await?,
-            vec![format!("{job_id}/{}.json", ExpiresAt::At(later))]
+            stores.todo.list_avail_entries().await?,
+            vec![pipette_store::AvailEntry {
+                job_id: job_id.clone(),
+                expires_at: ExpiresAt::At(later)
+            }]
         );
         assert_eq!(
             stores.plans.list_job_plan_markers(job_id).await?,
@@ -8026,7 +9105,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_entry_is_never_joined(#[case] age_out_record: bool) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
 
         // A job whose deadline lapsed after it was staged, still sitting in
         // `avail/`. Ingestion refuses a lapsed `expires_at`, so the test seeds
@@ -8081,7 +9160,7 @@ mod tests {
     #[tokio::test]
     async fn a_target_that_lapsed_since_ingest_start_is_not_joined() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
@@ -8120,7 +9199,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_for_an_unqueued_job_is_left_alone() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let unborn = JobId::from_uuid(uuid::Uuid::now_v7());
         let owner = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
@@ -8239,14 +9318,17 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_completed_in_the_window_is_still_joined() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
         seed_content_key(&stores, &digest, &target, Utc::now()).await?;
         // The job is gone from the queue but its result is recorded, unreadable:
         // only its presence may be checked.
-        local_fs_spoil_record(dir.path(), &target)?;
+        stores
+            .submissions
+            .write_processed(&target, &Value::Null)
+            .await?;
 
         let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
         observed.script_leases(vec![race_lease(&target)?]);
@@ -8276,7 +9358,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_vanished_in_the_window_yields_a_fresh_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
@@ -8307,12 +9389,54 @@ mod tests {
         Ok(())
     }
 
+    /// On the database stores the join itself finds the job gone. A recorded
+    /// result keeps the join; otherwise the pass mints and writes no marker.
+    #[rstest]
+    #[case::completed(true)]
+    #[case::vanished(false)]
+    #[tokio::test]
+    async fn a_database_join_on_a_job_gone_from_the_queue(
+        #[case] recorded: bool,
+    ) -> anyhow::Result<()> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let stores = db.stores(stores_in(dir.path()).await?);
+        let target = JobId::from_uuid(uuid::Uuid::now_v7());
+        let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
+        let digest = content_digest(&cell_body("a", json!({})));
+        seed_content_key(&stores, &digest, &target, Utc::now()).await?;
+        if recorded {
+            stores
+                .submissions
+                .write_processed(&target, &json!({ "job_id": target.as_str() }))
+                .await?;
+        }
+
+        let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
+        observed.script_leases(vec![race_lease(&target)?]);
+        let mut stores = stores;
+        stores.todo = observed.clone();
+        let context = merge_context(&stores, &plan_id);
+        let (_, placed) = place_one(&context, &cell_body("a", json!({})), ExpiresAt::Never).await?;
+
+        if recorded {
+            assert!(matches!(&placed, Placed::Join(t) if t.job_id == target));
+            assert_eq!(members(&stores, &target).await?, vec![plan_id]);
+        } else {
+            assert!(matches!(placed, Placed::Fresh));
+            assert!(members(&stores, &target).await?.is_empty());
+        }
+        Ok(())
+    }
+
     /// A claimed job is live, so the pass joins it rather than taking over
     /// its aged record, which a claim never touches.
     #[tokio::test]
     async fn a_leased_candidate_is_still_joined() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
@@ -8321,7 +9445,10 @@ mod tests {
 
         // Queue the target, then claim it, so it sits in `leased/` alone.
         stores.todo.write_tmp(&target, &body).await?;
-        stores.todo.promote_avail(&target, ExpiresAt::Never).await?;
+        stores
+            .todo
+            .promote_avail(&target, ExpiresAt::Never, None)
+            .await?;
         let claimed = stores
             .todo
             .claim_job(
@@ -8353,51 +9480,6 @@ mod tests {
         Ok(())
     }
 
-    /// Queued under an unparseable deadline, so the pass mints alongside it:
-    /// reading it as absent would let [`MergeContext::replace_stale`] take the
-    /// digest over from a queued job.
-    #[tokio::test]
-    async fn a_candidate_whose_deadline_is_unreadable_is_not_taken_over() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
-        let target = JobId::from_uuid(uuid::Uuid::now_v7());
-        let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
-        let body = cell_body("a", json!({}));
-        let digest = content_digest(&body);
-        // Past the age gate, which is the state of every job an earlier plan
-        // queued.
-        seed_content_key(&stores, &digest, &target, Utc::now() - Duration::days(1)).await?;
-
-        // Queued under a name whose deadline does not parse. Written straight
-        // into `avail/`, because every name the store itself builds parses.
-        let mut queued = body.clone();
-        queued["job_id"] = json!(target.as_str());
-        let job_dir = dir.path().join("todo").join("avail").join(target.as_str());
-        std::fs::create_dir_all(&job_dir)?;
-        std::fs::write(
-            job_dir.join("not-a-deadline.json"),
-            serde_json::to_vec(&queued)?,
-        )?;
-
-        let context = merge_context(&stores, &plan_id);
-        let (_, placed) = place_one(&context, &body, ExpiresAt::Never).await?;
-
-        assert!(
-            matches!(placed, Placed::Fresh),
-            "an unreadable deadline declines the merge rather than joining blind"
-        );
-        let keys = stores.plans.list_content_keys().await?;
-        assert_eq!(
-            keys[0].1.job_id, target,
-            "the queued job keeps its content key"
-        );
-        assert!(
-            members(&stores, &target).await?.is_empty(),
-            "the pass declines before it writes a membership marker"
-        );
-        Ok(())
-    }
-
     /// A [`TodoStore`] that recycles one lease at the first `leased/` listing,
     /// between the pass's first `avail/` read and its `leased/` read. Any other
     /// method lands in `unexpected`, which the test asserts empty.
@@ -8413,9 +9495,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TodoStore for RecyclesAtFirstLeasedListing {
-        async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>> {
-            self.inner.avail_key_for_job(job_id).await
-        }
         async fn leases_for_jobs(
             &self,
             jobs: &[JobId],
@@ -8436,11 +9515,11 @@ mod tests {
             }
             self.inner.leases_for_jobs(jobs).await
         }
-        async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
-            Err(self.unexpected.record("list_leased"))
+        async fn list_leases(&self) -> anyhow::Result<Vec<pipette_core::todo_filename::Lease>> {
+            Err(self.unexpected.record("list_leases"))
         }
-        async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
-            Err(self.unexpected.record("list_avail"))
+        async fn list_avail_entries(&self) -> anyhow::Result<Vec<pipette_store::AvailEntry>> {
+            Err(self.unexpected.record("list_avail_entries"))
         }
         async fn get_avail(
             &self,
@@ -8470,11 +9549,8 @@ mod tests {
         ) -> anyhow::Result<pipette_store::RedateResult> {
             Err(self.unexpected.record("redate_avail"))
         }
-        async fn list_leased_for_client(
-            &self,
-            _client_id: &ClientId,
-        ) -> anyhow::Result<Vec<String>> {
-            Err(self.unexpected.record("list_leased_for_client"))
+        async fn restamp_avail_deadlines(&self, _now: DateTime<Utc>) -> anyhow::Result<u64> {
+            Err(self.unexpected.record("restamp_avail_deadlines"))
         }
         async fn get_leased(
             &self,
@@ -8582,10 +9658,13 @@ mod tests {
         async fn write_pending_reindex(&self, _client_id: &ClientId) -> anyhow::Result<()> {
             Err(self.unexpected.record("write_pending_reindex"))
         }
-        async fn list_pending_reindex(&self) -> anyhow::Result<Vec<(ClientId, String)>> {
+        async fn list_pending_reindex(&self) -> anyhow::Result<Vec<pipette_store::ReindexRequest>> {
             Err(self.unexpected.record("list_pending_reindex"))
         }
-        async fn delete_pending_reindex(&self, _key: &str) -> anyhow::Result<()> {
+        async fn delete_pending_reindex(
+            &self,
+            _request: &pipette_store::ReindexRequest,
+        ) -> anyhow::Result<()> {
             Err(self.unexpected.record("delete_pending_reindex"))
         }
         async fn has_pending_reindex(&self, _client_id: &ClientId) -> anyhow::Result<bool> {
@@ -8618,40 +9697,12 @@ mod tests {
             &self,
             _job_id: &JobId,
             _expires_at: ExpiresAt,
+            _family: Option<(&str, &[i64])>,
         ) -> anyhow::Result<()> {
             Err(self.unexpected.record("promote_avail"))
         }
-        async fn list_stale_tmp(&self, _age: std::time::Duration) -> anyhow::Result<Vec<String>> {
-            Err(self.unexpected.record("list_stale_tmp"))
-        }
-        async fn delete_tmp_object(&self, _key: &str) -> anyhow::Result<()> {
-            Err(self.unexpected.record("delete_tmp_object"))
-        }
-        async fn read_backlog(&self) -> anyhow::Result<Option<pipette_store::BacklogSnapshot>> {
-            Err(self.unexpected.record("read_backlog"))
-        }
-        async fn write_backlog(
-            &self,
-            _snapshot: &pipette_store::BacklogSnapshot,
-        ) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_backlog"))
-        }
-        async fn read_campaign_backlog(
-            &self,
-        ) -> anyhow::Result<Option<pipette_store::CampaignBacklogSnapshot>> {
-            Err(self.unexpected.record("read_campaign_backlog"))
-        }
-        async fn write_campaign_backlog(
-            &self,
-            _snapshot: &pipette_store::CampaignBacklogSnapshot,
-        ) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_campaign_backlog"))
-        }
-        async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
-            Err(self.unexpected.record("read_gc_candidates"))
-        }
-        async fn write_gc_candidates(&self, _candidates: &HashSet<String>) -> anyhow::Result<()> {
-            Err(self.unexpected.record("write_gc_candidates"))
+        async fn delete_stale_tmp(&self, _age: std::time::Duration) -> anyhow::Result<u64> {
+            Err(self.unexpected.record("delete_stale_tmp"))
         }
         async fn stamp_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
             Err(self.unexpected.record("stamp_liveness"))
@@ -8668,8 +9719,110 @@ mod tests {
         async fn delete_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
             Err(self.unexpected.record("delete_liveness"))
         }
-        async fn validate_backend(&self) -> anyhow::Result<()> {
-            Err(self.unexpected.record("validate_backend"))
+        async fn avail_for_jobs(
+            &self,
+            jobs: &[JobId],
+        ) -> anyhow::Result<Vec<pipette_store::AvailEntry>> {
+            self.inner.avail_for_jobs(jobs).await
+        }
+        async fn leases_for_client(
+            &self,
+            _client: &ClientId,
+        ) -> anyhow::Result<Vec<pipette_core::todo_filename::Lease>> {
+            Err(self.unexpected.record("leases_for_client"))
+        }
+        async fn denials_for_jobs(
+            &self,
+            _jobs: &[JobId],
+        ) -> anyhow::Result<Vec<(JobId, ClientId)>> {
+            Err(self.unexpected.record("denials_for_jobs"))
+        }
+        async fn claim_for_client(
+            &self,
+            _client_id: &ClientId,
+            _lease_expiry: DateTime<Utc>,
+            _lost_lease_limit: usize,
+            _passed_over: &[JobId],
+            _checked_lease: Option<&pipette_core::todo_filename::Lease>,
+            _cached: Option<&pipette_plan_types::CachedArtifacts>,
+            _now: DateTime<Utc>,
+        ) -> anyhow::Result<pipette_store::ClaimOutcome> {
+            Err(self.unexpected.record("claim_for_client"))
+        }
+        async fn reclaim_for_client(
+            &self,
+            _job_id: &JobId,
+            _client_id: &ClientId,
+            _lease_expiry: DateTime<Utc>,
+            _lost_lease_limit: usize,
+            _now: DateTime<Utc>,
+        ) -> anyhow::Result<pipette_store::ReclaimOutcome> {
+            Err(self.unexpected.record("reclaim_for_client"))
+        }
+        async fn forget_last_grant(
+            &self,
+            _job_id: &JobId,
+            _client_id: &ClientId,
+        ) -> anyhow::Result<()> {
+            Err(self.unexpected.record("forget_last_grant"))
+        }
+        async fn jobs_needing_reindex(
+            &self,
+            _jobs: &[JobId],
+        ) -> anyhow::Result<pipette_store::ReindexBatch> {
+            Err(self.unexpected.record("jobs_needing_reindex"))
+        }
+        async fn avail_clause_groups(
+            &self,
+            _jobs: &[JobId],
+        ) -> anyhow::Result<Vec<(serde_json::Value, Vec<JobId>)>> {
+            Err(self.unexpected.record("avail_clause_groups"))
+        }
+        async fn write_eligible_rows(
+            &self,
+            _client: &ClientId,
+            _jobs: &[JobId],
+        ) -> anyhow::Result<()> {
+            Err(self.unexpected.record("write_eligible_rows"))
+        }
+        async fn replace_eligibility(
+            &self,
+            _job_id: &JobId,
+            _revision: i64,
+            _clients: &[ClientId],
+        ) -> anyhow::Result<bool> {
+            Err(self.unexpected.record("replace_eligibility"))
+        }
+        async fn flag_for_reindex(&self, _jobs: &[JobId]) -> anyhow::Result<()> {
+            Err(self.unexpected.record("flag_for_reindex"))
+        }
+        async fn jobs_awaiting_index(
+            &self,
+            _jobs: &[JobId],
+        ) -> anyhow::Result<std::collections::HashSet<JobId>> {
+            Err(self.unexpected.record("jobs_awaiting_index"))
+        }
+        async fn read_workers(&self) -> anyhow::Result<std::collections::HashSet<ClientId>> {
+            Err(self.unexpected.record("read_workers"))
+        }
+        async fn write_workers(
+            &self,
+            _workers: &std::collections::HashSet<ClientId>,
+        ) -> anyhow::Result<()> {
+            Err(self.unexpected.record("write_workers"))
+        }
+        async fn delete_worker(&self, _client_id: &ClientId) -> anyhow::Result<()> {
+            Err(self.unexpected.record("delete_worker"))
+        }
+        async fn backlog(&self) -> anyhow::Result<std::collections::BTreeMap<ClientId, u64>> {
+            Err(self.unexpected.record("backlog"))
+        }
+        async fn campaign_backlog(
+            &self,
+            _client_id: &ClientId,
+            _creating_before: DateTime<Utc>,
+        ) -> anyhow::Result<pipette_store::CampaignBacklog> {
+            Err(self.unexpected.record("campaign_backlog"))
         }
     }
 
@@ -8678,7 +9831,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_recycled_between_the_queue_reads_is_still_joined() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let holder = ClientId::try_new("ev1_a")?;
@@ -8740,7 +9893,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_create_joins_the_winners_job() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
@@ -8778,7 +9931,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_swap_retries_the_join_against_the_new_incumbent() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = sql_stores_in(dir.path()).await?;
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
@@ -8853,7 +10006,7 @@ mod tests {
     #[tokio::test]
     async fn an_uncatalogued_model_warns_without_blocking_the_plan() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
 
@@ -8910,7 +10063,7 @@ mod tests {
         #[case] repo: &str,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
         let check = if strict {
@@ -8940,7 +10093,7 @@ mod tests {
     #[tokio::test]
     async fn warnings_group_by_model() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
 
@@ -8971,7 +10124,7 @@ mod tests {
     #[tokio::test]
     async fn strict_rejects_an_uncatalogued_model_before_writing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
 
@@ -9035,7 +10188,7 @@ mod tests {
         use pipette_hub_testkit::{MockFile, MockGate, MockHub, MockRepo};
 
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
         let hub = MockHub::start(HashMap::from([(
@@ -9116,7 +10269,7 @@ mod tests {
     #[tokio::test]
     async fn a_strict_refusal_omits_a_gated_models_token() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
         let models = model_table()?;
 
@@ -9148,7 +10301,7 @@ mod tests {
     #[tokio::test]
     async fn an_absent_catalog_checks_nothing(#[case] body: Option<&str>) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         enlist(&stores, &client("ev1_a", "macOS", ClientStatus::Approved)?).await?;
 
         let empty = body.map(ModelParamTable::from_toml).transpose()?;
@@ -9195,7 +10348,7 @@ mod tests {
             return Ok(None);
         };
         let dir = tempfile::tempdir()?;
-        let stores = db.stores(stores_in(dir.path())?);
+        let stores = db.stores(stores_in(dir.path()).await?);
         Ok(Some(SqlEnv {
             stores,
             catalog: catalog()?,
@@ -9251,7 +10404,7 @@ mod tests {
             }]
         );
         assert_eq!((second.job_count, second.merged_job_count), (1, 1));
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert!(!members(stores, &done).await?.contains(&second.plan_id));
         let manifest = stores
             .plans
@@ -9332,6 +10485,25 @@ mod tests {
     #[case::roster_run_on_the_os(roster_body("a"), Ended::Success, cell_body("a", json!({})), true)]
     #[case::roster_run_on_another_os(roster_body("a"), Ended::Success, cell_body("a", json!({"requires": ["os:ios"]})), false)]
     #[case::new_exclusion(cell_body("a", json!({})), Ended::Success, cell_body("a", json!({"excludes": ["chip:a15"]})), false)]
+    // The attempt limit is part of the cell here, raised or not.
+    #[case::same_limit(
+        limited_body("a", Some(180)),
+        Ended::Success,
+        limited_body("a", Some(180)),
+        true
+    )]
+    #[case::raised_limit(
+        limited_body("a", Some(180)),
+        Ended::Success,
+        limited_body("a", Some(300)),
+        false
+    )]
+    #[case::limit_set(
+        limited_body("a", None),
+        Ended::Success,
+        limited_body("a", Some(180)),
+        false
+    )]
     #[tokio::test]
     async fn an_earlier_run_satisfies_a_cell_it_answers(
         #[case] earlier: Value,
@@ -9362,7 +10534,7 @@ mod tests {
         } else {
             assert_ne!(only_job(&second)?, done);
             assert!(!kinds.contains(&MergeKind::Satisfied), "{kinds:?}");
-            assert_eq!(stores.todo.list_avail().await?.len(), 1);
+            assert_eq!(stores.todo.list_avail_entries().await?.len(), 1);
         }
         Ok(())
     }
@@ -9705,6 +10877,137 @@ mod tests {
         Ok(())
     }
 
+    /// A job runs while its lease has not lapsed and its deadline has not
+    /// passed, or it has none.
+    #[test]
+    fn a_job_runs_while_its_lease_and_its_deadline_hold() -> anyhow::Result<()> {
+        let now = Utc::now();
+        let ahead = now + Duration::minutes(5);
+        let behind = now - Duration::minutes(5);
+        let cases = [
+            ("job-live", ahead, ExpiresAt::At(ahead), true),
+            ("job-no-deadline", ahead, ExpiresAt::Never, true),
+            ("job-lapsed-lease", behind, ExpiresAt::At(ahead), false),
+            ("job-past-deadline", ahead, ExpiresAt::At(behind), false),
+        ];
+        let leases = cases
+            .iter()
+            .map(|(job, lease_expiry, expires_at, _)| {
+                Ok(Lease {
+                    job_id: JobId::new_unchecked(*job),
+                    expires_at: *expires_at,
+                    client_id: ClientId::try_new("ev1_a")?,
+                    lease_expiry: *lease_expiry,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let expected: HashSet<JobId> = cases
+            .iter()
+            .filter(|(.., runs)| *runs)
+            .map(|(job, ..)| JobId::new_unchecked(*job))
+            .collect();
+        assert_eq!(running(leases, now), expected);
+        Ok(())
+    }
+
+    /// A revision cell whose carried job a client is running keeps that job,
+    /// though an earlier finished run answers the cell: the run finishes, and
+    /// the revision takes its result. The dry run carries the job too.
+    #[tokio::test]
+    async fn a_running_carry_does_not_give_way_to_an_earlier_run() -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let (campaign, first) = campaign_of(stores, cells(&["a"], json!({}))).await?;
+        let running = only_job(&first)?;
+        lease(stores, &running).await?;
+        // Another campaign of the same owner, so the run is in scope.
+        let elsewhere = ingest_owned(
+            &env,
+            owner(USER_ADA)?,
+            cells(&["a"], json!({"merge_duplicates": false})),
+        )
+        .await?;
+        env.finish(&only_job(&elsewhere)?).await?;
+
+        let jobs = cells(&["a"], json!({}));
+        let draw = preview_draw(stores, &campaign, &jobs).await?;
+        let revision = revise(stores, &campaign, jobs).await?;
+
+        assert_eq!(
+            draw,
+            CarryDraw {
+                carried: vec![running.clone()],
+                held: vec![HeldJob {
+                    body_index: 0,
+                    plan_id: first.plan_id.clone(),
+                    job_id: running.clone(),
+                }],
+                ..CarryDraw::default()
+            }
+        );
+        assert_eq!(only_job(&revision)?, running);
+        assert_eq!(merge_kinds(&revision), vec![MergeKind::Carried]);
+        let mut both = vec![first.plan_id.clone(), revision.plan_id.clone()];
+        both.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(members(stores, &running).await?, both);
+        Ok(())
+    }
+
+    /// `carry_across_limit` reaches the runs of the superseded plan and of the
+    /// plans on offer only. Where that plan's run failed, a finished run of the
+    /// cell under another limit, from another campaign in the same scope that
+    /// no plan offers, answers nothing: the cell runs again. The same run does
+    /// answer a plan that asks for its own body.
+    #[tokio::test]
+    async fn an_earlier_run_never_answers_across_a_limit() -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let (campaign, first) = campaign_of(stores, limited(&["a"], None)).await?;
+        let failed = only_job(&first)?;
+        finish_job_with_failure(&*stores.submissions, &*stores.todo, &failed).await?;
+        let mut twin = limited_body("a", None);
+        twin["merge_duplicates"] = json!(false);
+        let elsewhere = ingest_owned(&env, owner(USER_ADA)?, vec![("a.json".into(), twin)]).await?;
+        let done = only_job(&elsewhere)?;
+        env.finish(&done).await?;
+
+        let draw = draw_carry(
+            carrying_across_limit(stores, &campaign, true).await?,
+            &[limited_body("a", Some(180))],
+            &*stores.plans,
+            &*stores.todo,
+            &*stores.submissions,
+            &*stores.orgs,
+        )
+        .await?;
+        let revision = ingest_under(
+            stores,
+            carrying_across_limit(stores, &campaign, true).await?,
+            document()?,
+            limited(&["a"], Some(180)),
+        )
+        .await?;
+
+        assert_eq!(
+            draw,
+            CarryDraw {
+                requirements_rerun: 1,
+                ..CarryDraw::default()
+            }
+        );
+        let placed = only_job(&revision)?;
+        assert!(placed != done && placed != failed, "{placed}");
+        assert!(revision.merges.is_empty(), "{:?}", revision.merges);
+
+        let unlimited = ingest_owned(&env, owner(USER_ADA)?, limited(&["a"], None)).await?;
+        assert_eq!(only_job(&unlimited)?, done);
+        Ok(())
+    }
+
     /// A revision keeps each finished run of the plan it supersedes, though a
     /// newer run of the same cell answers it too. Removing or adding a cell
     /// leaves the data of the other cells as it was.
@@ -9749,6 +11052,205 @@ mod tests {
         };
         assert_eq!(ids(&revision), ids(&first));
         assert_eq!(merge_kinds(&revision), vec![MergeKind::Carried; kept]);
+        Ok(())
+    }
+
+    // ── smaller runs first ──────────────────────────────────────────────────
+
+    const CAMPAIGN_A: &str = "campaign_00000000-0000-0000-0000-000000000001";
+    const CAMPAIGN_B: &str = "campaign_00000000-0000-0000-0000-000000000002";
+
+    /// Decode cells at two prompt sizes and at another decode count, an
+    /// end-to-end cell, VL cells at two image sizes, ASR cells at two audio
+    /// lengths and another sample rate, and an eval, which has no sizes.
+    fn family_catalog() -> anyhow::Result<HashMap<BenchmarkId, Benchmark>> {
+        [
+            (
+                "decode-256",
+                "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 256\n\
+                 parameter_decode_tokens = 100",
+            ),
+            (
+                "decode-512",
+                "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 512\n\
+                 parameter_decode_tokens = 100",
+            ),
+            (
+                "decode-256-200",
+                "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 256\n\
+                 parameter_decode_tokens = 200",
+            ),
+            (
+                "e2e-256",
+                "benchmark_type = \"end_to_end_latency\"\nparameter_prefill_tokens = 256\n\
+                 parameter_decode_tokens = 100",
+            ),
+            (
+                "vl-224",
+                "benchmark_type = \"vl_max_memory\"\nparameter_image_width = 224\n\
+                 parameter_image_height = 224",
+            ),
+            (
+                "vl-448",
+                "benchmark_type = \"vl_max_memory\"\nparameter_image_width = 448\n\
+                 parameter_image_height = 448",
+            ),
+            (
+                "asr-5s",
+                "benchmark_type = \"asr_throughput\"\nparameter_audio_duration_ms = 5000\n\
+                 parameter_audio_sample_rate_hz = 16000\nparameter_audio_channels = 1\n\
+                 parameter_decode_tokens = 128",
+            ),
+            (
+                "asr-10s",
+                "benchmark_type = \"asr_throughput\"\nparameter_audio_duration_ms = 10000\n\
+                 parameter_audio_sample_rate_hz = 16000\nparameter_audio_channels = 1\n\
+                 parameter_decode_tokens = 128",
+            ),
+            (
+                "asr-5s-48k",
+                "benchmark_type = \"asr_throughput\"\nparameter_audio_duration_ms = 5000\n\
+                 parameter_audio_sample_rate_hz = 48000\nparameter_audio_channels = 1\n\
+                 parameter_decode_tokens = 128",
+            ),
+            (
+                "eval",
+                "benchmark_type = \"eval\"\nparameter_eval_id = \"mmlu_pro\"\n\
+                 parameter_dataset_name = \"edge_2026.03.1\"\nparameter_max_tokens = 256",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, def)| Ok((BenchmarkId::try_new(id)?, Benchmark::from_toml(id, def)?)))
+        .collect()
+    }
+
+    /// A cell of `benchmark` on one model and runtime, under one set of flags.
+    fn family_body(benchmark: &str) -> Value {
+        json!({
+            "requires": ["os:android"],
+            "spec": {
+                "benchmark": benchmark,
+                "model": {"name": "m"},
+                "runtime": {"name": "r"},
+                "runtime_flags": {"threads": 4},
+                "benchmark_flags": {"attempt_timeout_seconds": 180},
+            },
+        })
+    }
+
+    type Change = fn(&mut Value);
+
+    /// A family is the cells of one campaign that differ only in their sizes.
+    /// The clauses that pick a device are outside it.
+    #[rstest]
+    #[case::another_prompt_size((|b| b["spec"]["benchmark"] = json!("decode-512")) as Change, CAMPAIGN_A, true)]
+    #[case::other_decode_tokens((|b| b["spec"]["benchmark"] = json!("decode-256-200")) as Change, CAMPAIGN_A, true)]
+    #[case::other_clauses((|b| b["requires"] = json!(["os:android", "tag:lab"])) as Change, CAMPAIGN_A, true)]
+    #[case::another_model((|b| b["spec"]["model"]["name"] = json!("other")) as Change, CAMPAIGN_A, false)]
+    #[case::another_runtime((|b| b["spec"]["runtime"]["name"] = json!("other")) as Change, CAMPAIGN_A, false)]
+    #[case::other_runtime_flags((|b| b["spec"]["runtime_flags"]["threads"] = json!(8)) as Change, CAMPAIGN_A, false)]
+    #[case::another_attempt_limit((|b| b["spec"]["benchmark_flags"]["attempt_timeout_seconds"] = json!(300)) as Change, CAMPAIGN_A, false)]
+    #[case::another_benchmark_type((|b| b["spec"]["benchmark"] = json!("e2e-256")) as Change, CAMPAIGN_A, false)]
+    #[case::another_campaign((|_| ()) as Change, CAMPAIGN_B, false)]
+    fn a_familys_cells_differ_only_in_their_sizes(
+        #[case] change: Change,
+        #[case] campaign: &str,
+        #[case] same_family: bool,
+    ) -> anyhow::Result<()> {
+        let catalog = family_catalog()?;
+        let key = |body: &Value, campaign: &str| -> anyhow::Result<String> {
+            let family = size_family(body, &catalog, &CampaignId::try_new(campaign)?)?;
+            Ok(family.context("a cell with sizes has a family")?.0)
+        };
+        let base = family_body("decode-256");
+        let mut other = base.clone();
+        change(&mut other);
+        assert_eq!(
+            key(&base, CAMPAIGN_A)? == key(&other, campaign)?,
+            same_family
+        );
+        Ok(())
+    }
+
+    /// Image sides and audio length are sizes too, so VL and ASR cells that
+    /// differ only in them share a family. A sample rate is not a size.
+    #[rstest]
+    #[case::image_sides("vl-224", "vl-448", true)]
+    #[case::audio_length("asr-5s", "asr-10s", true)]
+    #[case::sample_rate("asr-5s", "asr-5s-48k", false)]
+    fn vl_and_asr_cells_share_a_family_across_their_sizes(
+        #[case] one: &str,
+        #[case] other: &str,
+        #[case] same_family: bool,
+    ) -> anyhow::Result<()> {
+        let (catalog, campaign) = (family_catalog()?, CampaignId::try_new(CAMPAIGN_A)?);
+        let key = |benchmark: &str| -> anyhow::Result<String> {
+            let family = size_family(&family_body(benchmark), &catalog, &campaign)?;
+            Ok(family.context("a cell with sizes has a family")?.0)
+        };
+        assert_eq!(key(one)? == key(other)?, same_family);
+        Ok(())
+    }
+
+    /// A job's place in its family is its benchmark's sizes, in its type's
+    /// order. A benchmark type without sizes puts its job in no family.
+    #[test]
+    fn a_jobs_sizes_are_its_benchmarks() -> anyhow::Result<()> {
+        let (catalog, campaign) = (family_catalog()?, CampaignId::try_new(CAMPAIGN_A)?);
+        let sizes = |benchmark: &str| -> anyhow::Result<Option<Vec<i64>>> {
+            let family = size_family(&family_body(benchmark), &catalog, &campaign)?;
+            Ok(family.map(|(_, sizes)| sizes))
+        };
+        // Prompt tokens, decode tokens, batch size.
+        assert_eq!(sizes("decode-512")?, Some(vec![512, 100, 1]));
+        // Image sides, images, text tokens, decode tokens.
+        assert_eq!(sizes("vl-448")?, Some(vec![448, 448, 1, 0, 1]));
+        // Audio milliseconds, text tokens, decode tokens.
+        assert_eq!(sizes("asr-10s")?, Some(vec![10000, 0, 128]));
+        assert_eq!(sizes("eval")?, None);
+        Ok(())
+    }
+
+    /// Ingestion queues each job with its family, so the claim hands out the
+    /// smaller run first.
+    #[tokio::test]
+    async fn an_ingested_family_hands_out_its_smaller_run_first() -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let cell = |benchmark: &str| {
+            let mut body = cell_body("a", json!({}));
+            body["spec"]["benchmark"] = json!(benchmark);
+            (format!("{benchmark}.json"), body)
+        };
+        let cells = vec![cell("decode-512"), cell("decode-256")];
+        let report = ingest(stores, &family_catalog()?, None, cells).await?;
+        let job = |label: &str| {
+            report
+                .job_ids
+                .iter()
+                .find(|(queued, _)| queued == label)
+                .map(|(_, job_id)| job_id.clone())
+                .context("a job for each cell")
+        };
+        let (small, large) = (job("decode-256.json")?, job("decode-512.json")?);
+        let client = ClientId::try_new("ev1_test")?;
+        stores
+            .todo
+            .write_eligible_rows(&client, &[small.clone(), large])
+            .await?;
+        let at = Utc::now();
+        let until = at + Duration::hours(1);
+
+        let granted = stores
+            .todo
+            .claim_for_client(&client, until, 0, &[], None, None, at)
+            .await?;
+        let ClaimOutcome::Granted { lease, .. } = granted else {
+            anyhow::bail!("expected a grant, got {granted:?}");
+        };
+        assert_eq!(lease.job_id, small);
         Ok(())
     }
 }

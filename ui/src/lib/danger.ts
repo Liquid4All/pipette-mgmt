@@ -6,7 +6,7 @@ export const PHRASES = { evals: "recalculate all", all: "re-run all", cancel: "c
 /** Each record's delete. */
 export const DELETES = {
   resource: "delete resource", device: "delete device",
-  benchmark: "delete benchmark",
+  benchmark: "delete benchmark", group: "delete group",
 } as const;
 
 /** An account's disable, and a pending device's reject, which deletes its registration. */

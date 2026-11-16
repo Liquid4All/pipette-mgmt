@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
-  ACTOR_KINDS, DEFAULT_ACTORS, OUTCOMES, actionShown, actorShown, auditAction, auditFilters, auditLink, auditQuery,
-  effectiveActors, offered, targetHref, targetId, targetShown, toggled,
+  ACTOR_KINDS, DEFAULT_ACTORS, OUTCOMES, actionShown, actorShown, auditAction, auditFilters, auditLink, auditLog,
+  auditQuery, effectiveActors, offered, targetHref, targetId, targetShown, toggled,
 } from "../src/lib/audit";
 import type { AuditTarget, UserPermission, OwnUserView } from "../src/lib/api-types";
 import { abilitiesOf } from "./abilities";
@@ -130,12 +130,21 @@ describe("a row", () => {
       .toBe("First Clerk sign-in, to an account holding 1 key");
   });
 
+  test("a group policy filing reads as its policies and counts, its group on hover", () => {
+    expect(actionShown({ action: { type: "group_policy", group_id: "group_a", kinds: ["swap", "spread"],
+                                   rerun_job_count: 3, marked_job_count: 1 },
+                         outcome: "failed" }))
+      .toEqual({ text: "Campaign group policies swap, spread: re-run 3, marked 1 failed", title: "group_a",
+                 status: null });
+  });
+
   test("a target's id sits under its kind's key, a vault resource's as every vault body names it", () => {
     const targets: [AuditTarget, string][] = [
       [{ type: "org", org_id: "org_1" }, "org_1"],
       [{ type: "user", user_id: "user_1" }, "user_1"],
       [{ type: "client", client_id: "ev1_a" }, "ev1_a"],
       [{ type: "campaign", campaign_id: "campaign_1" }, "campaign_1"],
+      [{ type: "campaign_group", group_id: "group_1" }, "group_1"],
       [{ type: "plan", plan_id: "plan-1" }, "plan-1"],
       [{ type: "job", job_id: "job-1" }, "job-1"],
       [{ type: "vault_resource", resource_id: "vault_1" }, "vault_1"],
@@ -155,7 +164,7 @@ describe("a row", () => {
     expect(targetHref({ type: "client", client_id: "ev1_a" }, named)).toBe("/app/clients/ev1_a");
   });
 
-  test("an unnamed target is out of reach or gone, so links nowhere; a plan, which names never cover, still links", () => {
+  test("an unnamed target is out of reach or gone, so links nowhere; a plan or a group, which names never cover, still links", () => {
     expect(targetShown({ type: "org", org_id: "org_2" }, names))
       .toEqual({ text: "org_2", href: null, title: undefined, id: true });
     const unnamed: AuditTarget[] = [
@@ -165,6 +174,8 @@ describe("a row", () => {
     for (const target of unnamed) expect(targetHref(target, names)).toBeNull();
     expect(targetShown({ type: "plan", plan_id: "plan-1" }, names))
       .toEqual({ text: "plan-1", href: "/app/plans/plan-1", title: undefined, id: true });
+    expect(targetShown({ type: "campaign_group", group_id: "group_1" }, names))
+      .toEqual({ text: "group_1", href: "/app/campaign-groups/group_1", title: undefined, id: true });
   });
 });
 
@@ -174,18 +185,24 @@ describe("a record page's audit link", () => {
   });
 
   test("a server admin's opens the whole log on the record, every actor kind", () => {
+    expect(auditLog(reader(["manage_any_orgs"]))).toBe("/app/server/audit");
     expect(auditAction(reader(["manage_any_orgs"]), "ev1_a"))
       .toEqual({ href: "/app/server/audit?target=ev1_a&actor=", label: "Audit" });
   });
 
   test("an organization's administrator's opens that organization's log", () => {
+    expect(auditLog(reader(["manage_orgs"], "org_acme"))).toBe("/app/orgs/acme/audit");
     expect(auditAction(reader(["manage_orgs"], "org_acme"), "campaign_1"))
       .toEqual({ href: "/app/orgs/acme/audit?target=campaign_1&actor=", label: "Audit" });
+    expect(auditAction(reader(["manage_orgs"], "org_acme"), "group_1")?.href)
+      .toBe("/app/orgs/acme/audit?target=group_1&actor=");
   });
 
   test("a reader administering no roster has none", () => {
+    expect(auditLog(reader(["read_orgs", "read_plans"], "org_acme"))).toBeNull();
     expect(auditAction(reader(["read_orgs", "read_plans"], "org_acme"), "user_1")).toBeNull();
     // Nor an administrator whose organization the session cannot name.
+    expect(auditLog({ may: abilitiesOf(["manage_orgs"], "org_acme") })).toBeNull();
     expect(auditAction({ may: abilitiesOf(["manage_orgs"], "org_acme") }, "user_1")).toBeNull();
   });
 

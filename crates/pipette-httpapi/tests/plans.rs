@@ -23,14 +23,15 @@ use pipette_plan_types::{
 };
 use pipette_store::drain_vault_resources;
 use pipette_web_testkit::{
-    GATED_GGUF_FILE, GatedModel, ONE_CELL_PLAN, QueueBackend, UserSigner, VISION_MMPROJ_FILE,
-    VISION_MODEL_BYTES, VISION_MODEL_FILE, approved_client, assert_nothing_staged, authed_post,
-    authed_user_get, body_json, file_job_bodies, filing_uri, gated_hub, gated_macos_document, job,
-    json_str, make_state_with_hf_endpoint, make_state_with_plan_max_jobs, own_campaign_plans_uri,
+    GATED_GGUF_FILE, GatedModel, ONE_CELL_PLAN, UserSigner, VISION_MMPROJ_FILE, VISION_MODEL_BYTES,
+    VISION_MODEL_FILE, approved_client, assert_nothing_staged, authed_post, authed_user_get,
+    body_json, file_job_bodies, filing_uri, gated_hub, gated_macos_document, job, json_str,
+    make_state_with_hf_endpoint, make_state_with_plan_max_jobs, own_campaign_plans_uri,
     post_plan_document, put_idle_campaign, put_idle_campaign_of, raw_request, register_and_approve,
-    registered_user, registered_user_with_detail, run_qm, seed_org, seeded_queue_state,
-    seeded_state, set_matching_input, set_user_org, setup_benchmarks, setup_scheduler_benchmarks,
-    signed_json, stream_lines, stream_plan_document, user_auth_headers,
+    registered_user, registered_user_with_detail, run_qm, seed_org, seeded_object_state,
+    seeded_queue_state, seeded_state, set_matching_input, set_user_org, setup_benchmarks,
+    setup_scheduler_benchmarks, signed_json, stream_lines, stream_plan_document, test_config,
+    user_auth_headers,
 };
 
 use crate::campaign_listings::as_a_row;
@@ -156,7 +157,7 @@ async fn test_a_filing_reports_a_merge_count_but_not_which_inputs_merged() -> an
         "both plans hold the jobs that run the cells"
     );
     assert_eq!(
-        state.todo_store.list_avail().await?.len(),
+        state.todo_store.list_avail_entries().await?.len(),
         3,
         "three cells, three queued jobs"
     );
@@ -226,7 +227,12 @@ async fn test_an_excluded_client_warns_and_still_stages(
 async fn test_an_uncatalogued_model_warns_at_both_tiers_and_still_stages() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_scheduler_benchmarks(dir.path())?;
-    let state = seeded_state(dir.path()).await?;
+    let mut state = seeded_state(dir.path()).await?;
+    state.model_params_store = pipette_store_fs::build_local_fs_stores(
+        &test_config(dir.path()),
+        pipette_store_testkit::no_queue(),
+    )?
+    .model_params;
     // A table that knows another model only, so the warning is a miss in a
     // table that has rows rather than an empty one.
     state
@@ -283,7 +289,7 @@ async fn test_an_uncatalogued_model_warns_at_both_tiers_and_still_stages() -> an
 #[tokio::test]
 async fn test_an_unreadable_model_table_files_the_plan_without_a_warning() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (mut state, signer) = document_state(dir.path()).await?;
+    let (mut state, signer) = object_document_state(dir.path()).await?;
 
     // A readable table that lacks the model warns, so the store is the one read.
     state
@@ -442,6 +448,17 @@ async fn document_state(
     Ok((state, signer))
 }
 
+/// A [`document_state`] whose records stay on the local_fs stores, for a test
+/// that tampers with a stored record file.
+async fn object_document_state(
+    dir: &std::path::Path,
+) -> anyhow::Result<(AppState, pipette_web_testkit::UserSigner)> {
+    setup_scheduler_benchmarks(dir)?;
+    let state = seeded_object_state(dir).await?;
+    let signer = filer(&state).await?;
+    Ok((state, signer))
+}
+
 /// `query` is empty or starts with `?`.
 async fn post_into_own_campaign(
     state: &AppState,
@@ -488,7 +505,7 @@ async fn test_a_plan_document_stages_its_cells() -> anyhow::Result<()> {
     let report = body_json(resp).await?;
     assert_eq!(report["job_count"], 3);
     assert_eq!(report["note"], "e2e");
-    assert_eq!(state.todo_store.list_avail().await?.len(), 3);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 3);
 
     let plan_id = pipette_plan_types::PlanId::try_new(json_str(&report, "plan_id")?)?;
     let manifest = state
@@ -779,7 +796,7 @@ async fn mac_reporting(
 async fn test_a_pinned_document_is_claimed_at_a_listed_build() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_scheduler_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1235,6 +1252,34 @@ async fn post_afm_mlx(
     body_json(resp).await
 }
 
+/// Seed another readable manifest and its links for tests of object-record reads.
+async fn link_another_manifest(
+    state: &AppState,
+    report: &Value,
+) -> anyhow::Result<pipette_plan_types::PlanId> {
+    let original = pipette_plan_types::PlanId::try_new(json_str(report, "plan_id")?)?;
+    let mut manifest = state
+        .plan_store
+        .get_plan(&original)
+        .await?
+        .context("the original plan")?;
+    manifest.plan_id = pipette_plan_types::PlanId::from_uuid(uuid::Uuid::now_v7());
+    state.plan_store.put_plan(&manifest).await?;
+    futures::stream::iter(manifest.job_ids.iter().map(anyhow::Ok))
+        .try_for_each(|job_id| {
+            let plan_id = &manifest.plan_id;
+            async move {
+                state
+                    .plan_store
+                    .put_job_plan_link(job_id, plan_id)
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await?;
+    Ok(manifest.plan_id)
+}
+
 fn listed_plan_ids(view: &Value) -> anyhow::Result<Vec<String>> {
     view["plans"]
         .as_array()
@@ -1290,7 +1335,7 @@ async fn test_a_shared_job_lists_its_plans_oldest_first() -> anyhow::Result<()> 
         .await
 }
 
-/// The body still answers after the job finishes and leaves `todo/`.
+/// The body still answers after the job finishes and leaves the queue.
 #[tokio::test]
 async fn test_a_job_body_outlives_the_queue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1381,14 +1426,14 @@ async fn test_a_read_any_plans_holder_lists_every_tenants_plan() -> anyhow::Resu
 #[tokio::test]
 async fn test_a_foreign_job_and_an_unlinked_job_answer_the_same_404() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, owner) = document_state(dir.path()).await?;
+    let (state, owner) = object_document_state(dir.path()).await?;
     let stranger = registered_user(&state, &[UserPermission::ReadPlans]).await?;
     let report = post_afm_mlx(&state, &owner, "owner").await?;
     let plan_id = pipette_plan_types::PlanId::try_new(json_str(&report, "plan_id")?)?;
     let job_ids = report_job_ids(&report)?;
 
     // The state of a job minted before job-plan links existed: a body in
-    // `todo/`, and no link or job source.
+    // the queue, and no link or job source.
     let unlinked = job(&job_ids[1])?;
     pipette_store_testkit::local_fs_remove_job_plan_link(dir.path(), &unlinked, &plan_id)?;
     pipette_store_testkit::local_fs_remove_job_source(dir.path(), &unlinked)?;
@@ -1415,9 +1460,9 @@ async fn test_a_foreign_job_and_an_unlinked_job_answer_the_same_404() -> anyhow:
 #[tokio::test]
 async fn test_a_link_whose_manifest_is_gone_is_skipped() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, signer) = document_state(dir.path()).await?;
+    let (state, signer) = object_document_state(dir.path()).await?;
     let gone = post_afm_mlx(&state, &signer, "gone").await?;
-    let kept = post_afm_mlx(&state, &signer, "kept").await?;
+    let kept = link_another_manifest(&state, &gone).await?;
     pipette_store_testkit::local_fs_remove_plan(
         dir.path(),
         &pipette_plan_types::PlanId::try_new(json_str(&gone, "plan_id")?)?,
@@ -1425,10 +1470,7 @@ async fn test_a_link_whose_manifest_is_gone_is_skipped() -> anyhow::Result<()> {
 
     let (status, view) = plans_by_job(&state, &signer, json_str(&gone["job_ids"], "0")?).await?;
     assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(
-        listed_plan_ids(&view)?,
-        vec![json_str(&kept, "plan_id")?.to_string()]
-    );
+    assert_eq!(listed_plan_ids(&view)?, vec![kept.to_string()]);
     Ok(())
 }
 
@@ -1451,7 +1493,7 @@ async fn test_a_stored_object_that_is_not_json_uses_scope_aware_status(
     #[case] expected: StatusCode,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, signer) = document_state(dir.path()).await?;
+    let (state, signer) = object_document_state(dir.path()).await?;
     let report = post_afm_mlx(&state, &signer, "e2e").await?;
     let job_id = json_str(&report["job_ids"], "0")?;
     let path = match garbled {
@@ -1500,10 +1542,9 @@ async fn test_an_unreadable_foreign_manifest_answers_the_same_404_as_a_miss() ->
 #[tokio::test]
 async fn test_an_unreadable_link_with_a_readable_plan_answers_500() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, signer) = document_state(dir.path()).await?;
+    let (state, signer) = object_document_state(dir.path()).await?;
     let broken = post_afm_mlx(&state, &signer, "broken").await?;
-    let kept = post_afm_mlx(&state, &signer, "kept").await?;
-    assert_eq!(kept["merged_job_count"], 3);
+    link_another_manifest(&state, &broken).await?;
     let manifest_path = dir
         .path()
         .join("plans")
@@ -1593,7 +1634,7 @@ async fn test_a_legacy_job_source_excludes_unkeyed_fields() -> anyhow::Result<()
 #[tokio::test]
 async fn test_a_missing_job_source_answers_a_null_body() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, signer) = document_state(dir.path()).await?;
+    let (state, signer) = object_document_state(dir.path()).await?;
     let report = post_afm_mlx(&state, &signer, "e2e").await?;
     let job_id = job(json_str(&report["job_ids"], "0")?)?;
     pipette_store_testkit::local_fs_remove_job_source(dir.path(), &job_id)?;

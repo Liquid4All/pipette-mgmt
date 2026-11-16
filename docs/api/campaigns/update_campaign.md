@@ -28,6 +28,11 @@ the state the record is already in, writes nothing. Answers `200` with the
 [record](get_campaign.md) and `changed`, whether the
 write changed it; `changed: false` is a success, so the write is safe to retry.
 
+The edit lands only on the record as read, so it never undoes a write that
+landed meanwhile, such as a revision moving the campaign's plan. If the record
+changed since it was read, the answer is `409` and nothing was written: send it
+again.
+
 ## Statuses
 
 | Status | When |
@@ -36,3 +41,4 @@ write changed it; `changed: false` is a success, so the write is safe to retry.
 | 400 | `campaign_id` is not a campaign id; the body is not JSON, names another field, or carries an empty or overlong `name` or an unknown `state`; or `labels` breaks a tag rule (the message names the key where there is one) |
 | 403 | The caller may not administer the record ([who may do what](../campaigns.md#who-may-do-what)) |
 | 404 | No such campaign |
+| 409 | Another write changed the campaign while this edit was made: nothing was written; send it again |

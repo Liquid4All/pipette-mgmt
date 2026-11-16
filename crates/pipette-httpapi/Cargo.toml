@@ -123,8 +123,10 @@ pipette-hub-testkit.workspace = true
 pipette-plan-types.workspace = true
 pipette-pipeline.workspace = true
 pipette-store.workspace = true
-# Tests here that build a fleet or a queue drive the filesystem stores directly.
+# Tests here that build a fleet drive the filesystem stores directly.
 pipette-store-fs.workspace = true
+# `scratch::TestDb`, the database that the queue tests here run on.
+pipette-store-sql = { workspace = true, features = ["testkit"] }
 # `TEST_LIST_LIMIT`, which several tests here page a listing with.
 pipette-store-testkit.workspace = true
 pipette-web-testkit.workspace = true

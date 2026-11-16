@@ -143,7 +143,8 @@ audit log does not record these requests:
   - a check;
   - a claim that found no job;
   - a write that answers `changed: false`
-    ([write answers](../httpapi.md#16-write-answers));
+    ([write answers](../httpapi.md#16-write-answers)), unless a campaign
+    hand-off took the campaign out of its [campaign group](campaign-groups.md);
   - a cancel of a plan that is already cancelled or has a cancel in progress.
 - A request that gets a `405`.
 - `PUT /plans/{job_id}/heartbeat`. A device renews its lease at each half of
@@ -163,6 +164,11 @@ name, the new name, and the scope. A rename that merges two entries adds a
 `catalog_merge` event in its place. This event records the stored old name,
 the name of the target entry, the scope, and the keys of the moved and the
 skipped members.
+
+Each revision that `queue-maintenance` files for the policies of a
+[campaign group](campaign-groups.md) adds a `group_policy` event. This event
+records the group, the policies, and the counts of re-run and marked jobs. Its
+outcome is `failed` unless the campaign moved onto the revision.
 
 Beside the request event, the log also records an account's first Clerk
 sign-in when the account already held keys. The `first_clerk_sign_in` action

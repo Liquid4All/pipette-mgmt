@@ -14,9 +14,9 @@ use pipette_plan_types::{
 use crate::parquet_utils::WriterOpts;
 
 /// One object-store section (`[storage]`, `[auth_storage]`,
-/// `[eval_packages_storage]`, or a `[todo_storage]` that uses an object store),
-/// chosen by `backend`. S3 credentials come from the environment (`AWS_*`, or
-/// an instance or task role), never from this file.
+/// `[eval_packages_storage]` or `[vault_storage]`), chosen by `backend`.
+/// S3 credentials come from the environment (`AWS_*`, or an instance or task
+/// role), never from this file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum StorageConfig {
@@ -46,60 +46,6 @@ pub enum StorageConfig {
         #[serde(skip)]
         read_timeout_secs: Option<NonZeroU64>,
     },
-}
-
-impl StorageConfig {
-    /// The keys that each variant reads from the config file, with `backend`.
-    /// Keep them in step with the fields above: `Config::unknown_keys` reports
-    /// any other key in `[todo_storage]`.
-    pub(crate) const LOCAL_FS_KEYS: &[&str] = &["backend", "data_dir"];
-    pub(crate) const S3_KEYS: &[&str] = &[
-        "backend",
-        "bucket",
-        "prefix",
-        "region",
-        "endpoint",
-        "max_concurrent_requests",
-    ];
-}
-
-/// The queue can use an object store or the configured PostgreSQL database.
-#[derive(Debug, Clone)]
-pub enum TodoStorageConfig {
-    ObjectStore(StorageConfig),
-    Database,
-}
-
-/// A `[todo_storage]` with `backend = "database"` in a config that has no
-/// `[database]` section.
-#[derive(Debug, thiserror::Error)]
-#[error("[todo_storage] backend = \"database\" requires [database]")]
-pub struct MissingDatabaseError;
-
-#[derive(Debug, Clone, Copy)]
-pub enum TodoStorageRef<'a> {
-    ObjectStore(&'a StorageConfig),
-    Database,
-}
-
-/// Reads `backend` first, so the `StorageConfig` error for an object-store
-/// section reaches the operator with its field name.
-impl<'de> Deserialize<'de> for TodoStorageConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-
-        let value = toml::Value::deserialize(deserializer)?;
-        match value.get("backend").and_then(toml::Value::as_str) {
-            Some("database") => Ok(Self::Database),
-            Some("local_fs" | "s3") | None => StorageConfig::deserialize(value)
-                .map(Self::ObjectStore)
-                .map_err(D::Error::custom),
-            Some(other) => Err(D::Error::unknown_variant(
-                other,
-                &["local_fs", "s3", "database"],
-            )),
-        }
-    }
 }
 
 fn default_max_concurrent_requests() -> usize {
@@ -212,7 +158,8 @@ pub struct Config {
     #[serde(default = "default_dataset_probe_max_age_secs")]
     pub dataset_probe_max_age_secs: NonZeroU64,
     /// Deadline for the probe of one upstream, all attempts and `git` steps
-    /// together. Past it the upstream is recorded `unavailable`.
+    /// together. After this deadline, the probe records the upstream as
+    /// `unavailable`.
     /// Retry once if the upstream was `ok` and the first attempt finds it
     /// unavailable. The first attempt gets half the deadline. The second
     /// attempt gets the rest. At most 315360000 (10 years). Defaults to 30.
@@ -223,10 +170,8 @@ pub struct Config {
     /// The same deadline bounds `dataset-cache pins`. Defaults to 900.
     #[serde(default = "default_dataset_build_timeout_secs")]
     pub dataset_build_timeout_secs: NonZeroU64,
-    /// The object store for the catalog, submissions, the warehouse, blobs,
-    /// the dataset cache and, without `[todo_storage]`, the queue. Without
-    /// `[database]` it also holds the records, the relations that decide access
-    /// among them. Defaults to `local_fs` at `./data`.
+    /// The object store for the catalog, submissions, the warehouse, blobs
+    /// and the dataset cache. Defaults to `local_fs` at `./data`.
     #[serde(default)]
     pub storage: StorageConfig,
     /// Required. The object store for identities, keys and their claims, kept
@@ -239,6 +184,11 @@ pub struct Config {
     /// it. Defaults to `[storage]`.
     #[serde(default)]
     pub eval_packages_storage: Option<StorageConfig>,
+    /// The object store for the vault's blobs (`vault-resources/`) and staged
+    /// writes (`vault-staging/`). The records stay in `[database]`.
+    /// Defaults to `[storage]`.
+    #[serde(default)]
+    pub vault_storage: Option<StorageConfig>,
     /// Unverified-submission archive settings. Off by default. When disabled, a
     /// result submission from an unapproved client is refused with `403`.
     #[serde(default)]
@@ -294,15 +244,9 @@ pub struct Config {
     /// and an endpoint that ignores the precondition fails silently. Set `false`
     /// only where the backend is known to honor it (AWS S3 does), to skip the
     /// probe's writes and, on a versioned bucket, the noncurrent versions it
-    /// leaves under `probe/`; the `todo/` probe is unaffected. Defaults to `true`.
+    /// leaves under `probe/`. Defaults to `true`.
     #[serde(default = "default_probe_backend_capabilities")]
     pub probe_backend_capabilities: bool,
-    /// Storage for the job queue. Set `backend = "database"` to use
-    /// `[database]`. Set `backend = "local_fs"` or `"s3"` to use an object
-    /// store. If this section is absent, the queue uses `[storage]`. An S3
-    /// queue needs Express One Zone for atomic `RenameObject`.
-    #[serde(default)]
-    pub todo_storage: Option<TodoStorageConfig>,
     /// Lease duration, in seconds, granted on a successful claim and
     /// extended by each heartbeat. Clients see it as the claim's `time_window`
     /// and heartbeat at half of it. Must be non-zero. Defaults to 300
@@ -319,22 +263,10 @@ pub struct Config {
     /// after this many seconds with no response bytes. The timer starts with the
     /// request, so it covers uploading the body too, and restarts at each
     /// response body byte. Without it a request waits the client's 30 s
-    /// timeout. Other commands do not use it, nor do the `aws-sdk-s3` clients
-    /// of the `todo/` queue and of vault part copies.
+    /// timeout. Other commands do not use it, nor does the `aws-sdk-s3` client
+    /// of vault part copies.
     #[serde(default)]
     pub queue_maintenance_read_timeout_secs: Option<NonZeroU64>,
-    /// Fail one attempt of a request to the `todo/` queue after this many
-    /// seconds, and retry it. S3 Express answers in milliseconds, so this ends
-    /// a stalled attempt, not a slow one. The attempt includes its connect,
-    /// which times out at 3.1 s, so keep this above that. Every command's queue
-    /// client reads it. Defaults to 5.
-    #[serde(default = "default_todo_attempt_timeout_secs")]
-    pub todo_attempt_timeout_secs: NonZeroU64,
-    /// Fail a request to the `todo/` queue after this many seconds, its
-    /// retries included. Defaults to 20, which holds the client's three
-    /// attempts at the default attempt timeout and the backoff between them.
-    #[serde(default = "default_todo_operation_timeout_secs")]
-    pub todo_operation_timeout_secs: NonZeroU64,
     /// Ceiling, in bytes, on a request body for every route that does not set
     /// its own. Bodies are buffered whole and `POST /clients/register` is
     /// unauthenticated, so it is at most 1048576 (1 MB). Must be non-zero.
@@ -402,11 +334,10 @@ pub struct Config {
     /// objects one request may read. Must be non-zero. Defaults to 200.
     #[serde(default = "default_list_max_limit")]
     pub list_max_limit: NonZeroUsize,
-    /// Age, in seconds, past which `queue-maintenance` deletes a partial job
-    /// file under `todo/tmp/` (left behind by a crashed planner). Set it
-    /// comfortably above the planner's longest write-then-rename window. On S3,
-    /// a lifecycle rule on the `todo/tmp/` prefix can substitute for this pass.
-    /// Must be non-zero. Defaults to 86400 (24 hours).
+    /// Age limit, in seconds, for staged job bodies. A planner crash between
+    /// `write_tmp` and `promote_avail` can leave such a body. Set it well above the
+    /// planner's longest stage-then-promote window. Must be non-zero. Defaults
+    /// to 86400 (24 hours).
     #[serde(default = "default_todo_tmp_max_age_secs")]
     pub todo_tmp_max_age_secs: NonZeroU64,
     /// Age, in seconds, past which `queue-maintenance` tears down a plan still
@@ -435,11 +366,10 @@ pub struct Config {
     /// console signs in with keys alone.
     #[serde(default)]
     pub clerk: Option<ClerkConfig>,
-    /// The PostgreSQL database the records live in
-    /// (`docs/design/sql-record-store.md`). Absent, the records stay on
-    /// `[storage]` and `[auth_storage]`, which is for tests only.
-    #[serde(default)]
-    pub database: Option<DatabaseConfig>,
+    /// Required. The PostgreSQL database that holds the records
+    /// (`docs/design/sql-record-store.md`) and the job queue
+    /// (`docs/design/sql-job-queue.md`).
+    pub database: DatabaseConfig,
 }
 
 /// Offer rules for known runtime flavors, and the flavor order that importers
@@ -719,6 +649,21 @@ pub struct DatabaseConfig {
     /// The connection pool's size. Defaults to 8.
     #[serde(default = "default_database_max_connections")]
     pub max_connections: NonZeroU32,
+}
+
+/// A bare `[database]` section: libpq reads every connection setting from the
+/// environment.
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: None,
+            user: None,
+            database: None,
+            ssl_mode: None,
+            max_connections: default_database_max_connections(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1025,14 +970,6 @@ fn default_read_timeout_secs() -> NonZeroU64 {
     nonzero_u64(75)
 }
 
-fn default_todo_attempt_timeout_secs() -> NonZeroU64 {
-    nonzero_u64(5)
-}
-
-fn default_todo_operation_timeout_secs() -> NonZeroU64 {
-    nonzero_u64(20)
-}
-
 fn default_max_connections() -> NonZeroUsize {
     nonzero_usize(512)
 }
@@ -1065,6 +1002,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             auth_storage: StorageConfig::default(),
             eval_packages_storage: None,
+            vault_storage: None,
             unverified_submissions: UnverifiedSubmissionsConfig::default(),
             auto_approve: AutoApproveConfig::default(),
             require_client_preauth_key: false,
@@ -1074,12 +1012,9 @@ impl Default for Config {
             authorities: Vec::new(),
             trusted_proxy_hops: default_trusted_proxy_hops(),
             probe_backend_capabilities: default_probe_backend_capabilities(),
-            todo_storage: None,
             plan_lease_duration_secs: default_plan_lease_duration_secs(),
             plan_lost_lease_limit: default_plan_lost_lease_limit(),
             queue_maintenance_read_timeout_secs: None,
-            todo_attempt_timeout_secs: default_todo_attempt_timeout_secs(),
-            todo_operation_timeout_secs: default_todo_operation_timeout_secs(),
             default_body_limit_bytes: default_body_limit_bytes(),
             plan_body_limit_bytes: default_plan_body_limit_bytes(),
             submission_body_limit_bytes: default_submission_body_limit_bytes(),
@@ -1095,7 +1030,7 @@ impl Default for Config {
             warehouse_lock_age_secs: default_warehouse_lock_age_secs(),
             duckdb: None,
             clerk: None,
-            database: None,
+            database: DatabaseConfig::default(),
         }
     }
 }
@@ -1127,6 +1062,29 @@ fn reject_renamed_keys(table: &toml::Table) -> anyhow::Result<()> {
     }
 }
 
+/// Top-level config keys that the database queue retired (PIP-839). `load`
+/// rejects each one.
+const RETIRED_KEYS: &[&str] = &[
+    "todo_storage",
+    "todo_attempt_timeout_secs",
+    "todo_operation_timeout_secs",
+];
+
+/// Refuse a config file that keeps a retired queue key, or that has no
+/// `[database]` section.
+fn check_queue_keys(table: &toml::Table) -> anyhow::Result<()> {
+    if let Some(key) = RETIRED_KEYS.iter().find(|key| table.contains_key(**key)) {
+        anyhow::bail!(
+            "config key `{key}` is retired: the job queue is in [database] (PIP-839). Delete it from the config"
+        );
+    }
+    anyhow::ensure!(
+        table.contains_key("database"),
+        "the config has no [database] section: the records and the job queue are in PostgreSQL (PIP-839)"
+    );
+    Ok(())
+}
+
 fn read_config(path: &std::path::Path) -> anyhow::Result<String> {
     std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config file {}: {e}", path.display()))
@@ -1137,22 +1095,15 @@ fn parse_error(path: &std::path::Path, e: toml::de::Error) -> anyhow::Error {
 }
 
 impl Config {
-    /// Returns the queue storage, or `[storage]` if `[todo_storage]` is absent.
-    /// Commands that use an object store check for atomic rename at startup
-    /// with `TodoStore::validate_backend`. The SQL store checks its database
-    /// and schema at startup.
-    pub fn todo_storage(&self) -> TodoStorageRef<'_> {
-        match &self.todo_storage {
-            Some(TodoStorageConfig::ObjectStore(storage)) => TodoStorageRef::ObjectStore(storage),
-            Some(TodoStorageConfig::Database) => TodoStorageRef::Database,
-            None => TodoStorageRef::ObjectStore(&self.storage),
-        }
-    }
-
     /// The eval package store, or `[storage]` if `[eval_packages_storage]` is
     /// absent.
     pub fn eval_packages_storage(&self) -> &StorageConfig {
         self.eval_packages_storage.as_ref().unwrap_or(&self.storage)
+    }
+
+    /// The vault store, or `[storage]` if `[vault_storage]` is absent.
+    pub fn vault_storage(&self) -> &StorageConfig {
+        self.vault_storage.as_ref().unwrap_or(&self.storage)
     }
 
     /// This config, with `queue_maintenance_read_timeout_secs` applied to the
@@ -1180,6 +1131,7 @@ impl Config {
         let invalid =
             |e: anyhow::Error| anyhow::anyhow!("invalid config file {}: {e:#}", path.display());
         reject_renamed_keys(&table).map_err(invalid)?;
+        check_queue_keys(&table).map_err(invalid)?;
         let config: Config = toml::from_str(&content).map_err(|e| parse_error(path, e))?;
         config.validate().map_err(invalid)?;
         Ok(config)
@@ -1187,33 +1139,15 @@ impl Config {
 
     /// The dotted path of each key in the config file at `path` that no
     /// `Config` field reads. `load` ignores such a key, so its default applies.
-    /// A key inside `[storage]`, `[auth_storage]` or `[eval_packages_storage]`
-    /// is not seen: the section deserializes as a tagged enum, which takes its
-    /// keys as one unit. A key inside `[todo_storage]` is compared with the
-    /// keys that its `backend` reads.
+    /// A key inside `[storage]`, `[auth_storage]`, `[eval_packages_storage]` or
+    /// `[vault_storage]` is not seen: the section deserializes as a tagged
+    /// enum, which takes its keys as one unit.
     pub fn unknown_keys(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
         let content = read_config(path)?;
         let value: toml::Value = toml::from_str(&content).map_err(|e| parse_error(path, e))?;
         let mut unknown = Vec::new();
-        serde_ignored::deserialize::<_, _, Config>(value.clone(), |key| {
-            unknown.push(key.to_string())
-        })
-        .map_err(|e| parse_error(path, e))?;
-        // serde_ignored cannot see the keys inside `TodoStorageConfig`, so
-        // compare the `[todo_storage]` keys with the keys its backend reads.
-        if let Some(section) = value.get("todo_storage").and_then(toml::Value::as_table) {
-            let allowed: &[&str] = match section.get("backend").and_then(toml::Value::as_str) {
-                Some("local_fs") => StorageConfig::LOCAL_FS_KEYS,
-                Some("s3") => StorageConfig::S3_KEYS,
-                _ => &["backend"],
-            };
-            unknown.extend(
-                section
-                    .keys()
-                    .filter(|key| !allowed.contains(&key.as_str()))
-                    .map(|key| format!("todo_storage.{key}")),
-            );
-        }
+        serde_ignored::deserialize::<_, _, Config>(value, |key| unknown.push(key.to_string()))
+            .map_err(|e| parse_error(path, e))?;
         Ok(unknown)
     }
 
@@ -1227,10 +1161,6 @@ impl Config {
         const MAX_HF_IMPORTS: usize = 1024;
         const MAX_DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
         self.descriptor_catalog.validate()?;
-        if matches!(self.todo_storage, Some(TodoStorageConfig::Database)) && self.database.is_none()
-        {
-            return Err(MissingDatabaseError.into());
-        }
         if self.plan_lease_duration_secs.get() > MAX_DURATION_SECS {
             anyhow::bail!(
                 "plan_lease_duration_secs = {} exceeds the maximum of {MAX_DURATION_SECS} (10 years)",
@@ -1334,6 +1264,8 @@ evals_server_url = "http://evals:8000"
 
 [auth_storage]
 backend = "local_fs"
+
+[database]
 "#
         )
     }
@@ -1709,25 +1641,20 @@ password = "hunter2"
         assert!(toml::from_str::<Config>(&toml).is_err());
     }
 
-    /// The smallest config with a bare `[database]` section.
-    fn database_config() -> String {
-        minimal_toml("") + "\n[database]\n"
-    }
-
     /// The RDS (Amazon Relational Database Service) stack sets the libpq
     /// variables in the mgmt container. The container needs only the bare
     /// `[database]` section.
     #[test]
     fn a_bare_database_section_leaves_the_connection_to_libpq() -> anyhow::Result<()> {
-        let config: Config = toml::from_str(&database_config())?;
-        let Some(DatabaseConfig {
+        let config: Config = toml::from_str(&minimal_toml(""))?;
+        let DatabaseConfig {
             host: None,
             port: None,
             user: None,
             database: None,
             ssl_mode: None,
             max_connections,
-        }) = config.database
+        } = config.database
         else {
             anyhow::bail!("expected a bare section, got {:?}", config.database);
         };
@@ -1737,7 +1664,7 @@ password = "hunter2"
 
     #[test]
     fn the_database_section_refuses_an_unknown_key() {
-        let toml = format!("{}password = \"hunter2\"\n", database_config());
+        let toml = format!("{}password = \"hunter2\"\n", minimal_toml(""));
         assert!(toml::from_str::<Config>(&toml).is_err());
     }
 
@@ -1812,6 +1739,8 @@ data_dir = "/var/lib/pipette-mgmt"
 [auth_storage]
 backend = "local_fs"
 data_dir = "/var/lib/pipette-mgmt/auth"
+
+[database]
 "#;
         let config: Config = toml::from_str(toml)?;
         assert_eq!(config.evals_server_url, "http://evals:8000");
@@ -1825,7 +1754,7 @@ data_dir = "/var/lib/pipette-mgmt/auth"
 
     #[test]
     fn test_parse_minimal_config_fails_without_auth_storage() {
-        let toml = r#"evals_server_url = "http://evals:8000""#;
+        let toml = "evals_server_url = \"http://evals:8000\"\n\n[database]\n";
         let result: Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
@@ -1942,6 +1871,8 @@ endpoint = "https://s3.custom.example.com"
 [auth_storage]
 backend = "s3"
 bucket = "my-auth-bucket"
+
+[database]
 "#;
         let config: Config = toml::from_str(toml)?;
         let StorageConfig::S3 {
@@ -1978,7 +1909,8 @@ bucket = "my-auth-bucket"
         let toml = format!(
             "evals_server_url = \"http://evals:8000\"\n{line}\n\n\
              [storage]\nbackend = \"s3\"\nbucket = \"data\"\n\n\
-             [auth_storage]\nbackend = \"s3\"\nbucket = \"auth\"\n"
+             [auth_storage]\nbackend = \"s3\"\nbucket = \"auth\"\n\n\
+             [database]\n"
         );
         let Some(expected) = expected else {
             assert!(toml::from_str::<Config>(&toml).is_err());
@@ -1995,36 +1927,6 @@ bucket = "my-auth-bucket"
         };
         assert_eq!(timeouts(&config), [None, None], "only maintenance sets it");
         assert_eq!(timeouts(&config.for_queue_maintenance()), [expected; 2]);
-        Ok(())
-    }
-
-    /// The `todo/` queue's timeouts default to 5 s and 20 s and take any
-    /// positive number of seconds. Each rejects 0, because 0 fails every request.
-    #[rstest]
-    #[case::defaults("", Some((5, 20)))]
-    #[case::set(
-        "todo_attempt_timeout_secs = 2\ntodo_operation_timeout_secs = 9",
-        Some((2, 9))
-    )]
-    #[case::zero_attempt("todo_attempt_timeout_secs = 0", None)]
-    #[case::zero_operation("todo_operation_timeout_secs = 0", None)]
-    fn todo_timeouts_default_and_refuse_zero(
-        #[case] lines: &str,
-        #[case] expected: Option<(u64, u64)>,
-    ) -> anyhow::Result<()> {
-        let parsed = toml::from_str::<Config>(&minimal_toml(lines));
-        let Some(expected) = expected else {
-            assert!(parsed.is_err());
-            return Ok(());
-        };
-        let config = parsed?;
-        assert_eq!(
-            (
-                config.todo_attempt_timeout_secs.get(),
-                config.todo_operation_timeout_secs.get()
-            ),
-            expected
-        );
         Ok(())
     }
 
@@ -2074,6 +1976,8 @@ bucket = "data-bucket"
 [auth_storage]
 backend = "s3"
 bucket = "auth-bucket"
+
+[database]
 "#;
         let config: Config = toml::from_str(toml)?;
         let StorageConfig::S3 { bucket, .. } = &config.auth_storage else {
@@ -2091,6 +1995,8 @@ evals_server_url = "http://evals:8000"
 [storage]
 backend = "s3"
 bucket = "data-bucket"
+
+[database]
 "#;
         let result: Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());
@@ -2135,29 +2041,6 @@ bucket = "data-bucket"
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_todo_storage_defaults_to_none_and_falls_back_to_storage() -> anyhow::Result<()> {
-        let toml = r#"
-evals_server_url = "http://evals:8000"
-
-[storage]
-backend = "s3"
-bucket = "data-bucket"
-
-[auth_storage]
-backend = "local_fs"
-"#;
-        let config: Config = toml::from_str(toml)?;
-        assert!(config.todo_storage.is_none());
-        // todo_storage() must return the [storage] config when unset
-        let TodoStorageRef::ObjectStore(StorageConfig::S3 { bucket, .. }) = config.todo_storage()
-        else {
-            anyhow::bail!("expected S3 config from fallback");
-        };
-        assert_eq!(bucket, "data-bucket");
-        Ok(())
-    }
-
     #[rstest]
     #[case::absent("", "data-bucket")]
     #[case::own_section(
@@ -2178,67 +2061,75 @@ backend = "local_fs"
     }
 
     #[rstest]
-    #[case::s3(
-        "backend = \"s3\"\nbucket = \"todo-bucket--use1-az4--x-s3\"\nregion = \"us-east-1\"\n",
-        "todo-bucket--use1-az4--x-s3"
+    #[case::absent("", "data-bucket")]
+    #[case::own_section(
+        "\n[vault_storage]\nbackend = \"s3\"\nbucket = \"vault-bucket\"\n",
+        "vault-bucket"
     )]
-    #[case::local_fs("backend = \"local_fs\"\ndata_dir = \"./queue\"\n", "./queue")]
-    fn test_todo_storage_explicit(
-        #[case] section: &str,
-        #[case] location: &str,
-    ) -> anyhow::Result<()> {
-        let config: Config = toml::from_str(&(minimal_toml("") + "\n[todo_storage]\n" + section))?;
-        let found = match config.todo_storage() {
-            TodoStorageRef::ObjectStore(StorageConfig::S3 { bucket, .. }) => bucket.clone(),
-            TodoStorageRef::ObjectStore(StorageConfig::LocalFs { data_dir }) => {
-                data_dir.display().to_string()
-            }
-            TodoStorageRef::Database => anyhow::bail!("expected an object-store queue"),
-        };
-        assert_eq!(found, location);
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::s3_without_bucket("backend = \"s3\"\n", "bucket")]
-    #[case::unknown_backend("backend = \"databse\"\n", "databse")]
-    fn test_todo_storage_parse_error_names_the_key(
+    fn test_vault_storage_falls_back_to_storage(
         #[case] section: &str,
         #[case] expected: &str,
     ) -> anyhow::Result<()> {
-        let result: Result<Config, _> =
-            toml::from_str(&(minimal_toml("") + "\n[todo_storage]\n" + section));
-        let Err(error) = result else {
-            anyhow::bail!("a malformed [todo_storage] parsed");
+        let storage = "\n[storage]\nbackend = \"s3\"\nbucket = \"data-bucket\"\n";
+        let config: Config = toml::from_str(&(minimal_toml("") + storage + section))?;
+        let StorageConfig::S3 { bucket, .. } = config.vault_storage() else {
+            anyhow::bail!("expected an s3 vault store");
         };
-        let message = error.to_string();
-        assert!(message.contains(expected), "{message}");
+        assert_eq!(bucket, expected);
         Ok(())
     }
 
-    #[test]
-    fn test_todo_storage_database_requires_database_section() -> anyhow::Result<()> {
+    /// The database queue retired `[todo_storage]` and the two queue
+    /// timeouts. A config that keeps one of them, whatever its value, or a
+    /// config without `[database]`, fails to load with a message that names
+    /// PIP-839.
+    #[rstest]
+    #[case::absent(minimal_toml(""), None)]
+    #[case::database(
+        minimal_toml("") + "\n[todo_storage]\nbackend = \"database\"\n",
+        Some("`todo_storage` is retired")
+    )]
+    #[case::s3(
+        minimal_toml("") + "\n[todo_storage]\nbackend = \"s3\"\nbucket = \"queue--x-s3\"\n",
+        Some("`todo_storage` is retired")
+    )]
+    #[case::no_backend(
+        minimal_toml("") + "\n[todo_storage]\nbucket = \"queue--x-s3\"\n",
+        Some("`todo_storage` is retired")
+    )]
+    #[case::attempt_timeout(
+        minimal_toml("todo_attempt_timeout_secs = 5"),
+        Some("`todo_attempt_timeout_secs` is retired")
+    )]
+    #[case::operation_timeout(
+        minimal_toml("todo_operation_timeout_secs = 20"),
+        Some("`todo_operation_timeout_secs` is retired")
+    )]
+    #[case::no_database(
+        minimal_toml("").replace("[database]", ""),
+        Some("no [database] section")
+    )]
+    fn retired_queue_keys(
+        #[case] content: String,
+        #[case] error: Option<&str>,
+    ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            minimal_toml("") + "\n[todo_storage]\nbackend = \"database\"\n",
-        )?;
-        let Err(error) = Config::load(&path) else {
-            anyhow::bail!("a database queue without [database] loaded");
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("[todo_storage]") && message.contains("[database]"),
-            "{message}"
-        );
-
-        std::fs::write(
-            &path,
-            minimal_toml("") + "\n[todo_storage]\nbackend = \"database\"\n\n[database]\n",
-        )?;
-        let config = Config::load(&path)?;
-        assert!(matches!(config.todo_storage(), TodoStorageRef::Database));
+        std::fs::write(&path, content)?;
+        match (Config::load(&path), error) {
+            (Ok(_), None) => {
+                assert_eq!(Config::unknown_keys(&path)?, Vec::<String>::new());
+            }
+            (Err(e), Some(expected)) => {
+                let message = format!("{e:#}");
+                assert!(
+                    message.contains(expected) && message.contains("PIP-839"),
+                    "{message}"
+                );
+            }
+            (Ok(_), Some(expected)) => anyhow::bail!("loaded; expected {expected:?}"),
+            (Err(e), None) => return Err(e),
+        }
         Ok(())
     }
 

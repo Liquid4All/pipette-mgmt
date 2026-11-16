@@ -69,10 +69,11 @@ export function catalogNameError(text: string): string | null {
   return null;
 }
 
-/** Why `text` is not a quantization label, or null for a valid label. The server takes `[a-z0-9_]+`. */
+/** Why `text` is not a quantization label, or null for a valid label. The server takes `[a-z0-9_]+(@[a-z0-9_]+)?`. */
 export function quantizationError(text: string): string | null {
   if (!text) return "Type a quantization label, such as q4_0.";
-  if (!/^[a-z0-9_]+$/.test(text)) return "Use only lowercase letters, digits and '_' in the quantization label.";
+  if (!/^[a-z0-9_]+(@[a-z0-9_]+)?$/.test(text))
+    return "Use only lowercase letters, digits, '_' and one '@' between them in the quantization label, such as q4_k_m@unsloth.";
   return null;
 }
 

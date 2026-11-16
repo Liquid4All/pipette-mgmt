@@ -93,7 +93,8 @@ async fn shared(admin: &PgConnectOptions) -> sqlx::Result<PgConnectOptions> {
 
 /// An empty schema in the [`SHARED`] database, dropped with this value. Its
 /// connections use its name as `application_name`, so the drop can end them.
-struct Schema {
+#[derive(Debug)]
+pub(crate) struct Schema {
     shared: PgConnectOptions,
     name: String,
 }
@@ -110,13 +111,15 @@ impl Schema {
         Ok(Self { shared, name })
     }
 
-    fn connect(&self, max_connections: u32) -> SqlDatabase {
+    /// A database on this schema, which keeps the schema until the last clone
+    /// of the database drops.
+    fn connect(self, max_connections: u32) -> SqlDatabase {
         let options = self
             .shared
             .clone()
             .application_name(&self.name)
             .options([("search_path", &self.name)]);
-        SqlDatabase::from_options(options, max_connections)
+        SqlDatabase::from_options(options, max_connections).owning(self)
     }
 }
 
@@ -136,10 +139,10 @@ impl Drop for Schema {
     }
 }
 
-/// A new, migrated schema, dropped with this value.
+/// A new, migrated schema. The schema drops with the last clone of
+/// [`TestDb::db`], so a store built on it keeps it.
 pub struct TestDb {
     db: SqlDatabase,
-    _schema: Schema,
 }
 
 impl TestDb {
@@ -153,10 +156,8 @@ impl TestDb {
         let Some(admin) = server()? else {
             return Ok(None);
         };
-        let schema = Schema::create(&admin).await?;
         Ok(Some(Self {
-            db: schema.connect(POOL_SIZE),
-            _schema: schema,
+            db: Schema::create(&admin).await?.connect(POOL_SIZE),
         }))
     }
 
@@ -165,13 +166,9 @@ impl TestDb {
         let Some(admin) = server()? else {
             return Ok(None);
         };
-        let schema = Schema::create(&admin).await?;
-        let db = schema.connect(max_connections);
-        crate::migrate::migrate(&db, None, false).await?;
-        Ok(Some(Self {
-            db,
-            _schema: schema,
-        }))
+        let db = Schema::create(&admin).await?.connect(max_connections);
+        crate::migrate::migrate_scratch(&db).await?;
+        Ok(Some(Self { db }))
     }
 
     pub fn db(&self) -> &SqlDatabase {
@@ -188,8 +185,31 @@ impl TestDb {
     /// `stores` with the record stores and the queue in this schema, as a
     /// `[database]` deployment builds them.
     pub fn stores(&self, stores: pipette_store::Stores) -> pipette_store::Stores {
-        let mut stores = crate::overlay(&self.db, stores);
-        stores.todo = std::sync::Arc::new(crate::SqlTodoStore::new(self.db.clone()));
-        stores
+        crate::overlay(&self.db, stores)
     }
+}
+
+/// `stores` with the record stores and the queue in a new, migrated schema, as
+/// a `[database]` deployment builds them. The schema drops with the last of
+/// these stores. A test that files a plan needs the queue, so this fails if
+/// no server exists to test against.
+pub async fn stores(stores: pipette_store::Stores) -> anyhow::Result<pipette_store::Stores> {
+    Ok(required().await?.stores(stores))
+}
+
+/// A queue in a new, migrated schema, for a test that keeps its records on the
+/// object stores. The schema drops with the last clone of the queue. This
+/// fails if no server exists to test against.
+pub async fn queue() -> anyhow::Result<std::sync::Arc<dyn pipette_store::TodoStore>> {
+    Ok(std::sync::Arc::new(crate::SqlTodoStore::new(
+        required().await?.db().clone(),
+    )))
+}
+
+async fn required() -> anyhow::Result<TestDb> {
+    TestDb::new().await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this test needs PostgreSQL: set {URL_VAR}, for example with scripts/dev-postgres.sh"
+        )
+    })
 }

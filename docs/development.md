@@ -17,7 +17,6 @@ cargo clippy -p pipette-plan-types --all-targets --locked
 cargo doc --workspace --no-deps --locked
 cargo nextest run --workspace --locked  # or: cargo test --workspace --locked
 cargo nextest run -p pipette-plan-types --locked
-cargo test --workspace --doc --locked
 (cd ui && npm ci && npm run check && npm test && npm run build)
 cargo run -p pipette-mgmt --locked -- openapi --site target/api-docs  # the API reference page
 ```
@@ -32,13 +31,19 @@ command can pass while CI fails.
 
 Two test sets need more than the command:
 
-- The tests that run on PostgreSQL need a server at `TEST_DATABASE_URL`. These
-  are `pipette-store-sql`'s tests, the tests built on `seeded_sql_state` or
-  `seeded_queue_state` in `pipette-web-testkit`, and every test that runs
-  `queue-maintenance`. An example address is
-  `postgres://postgres@127.0.0.1:5432/postgres`. Unset, they skip
-  locally and fail in CI. Each test makes and drops a schema of its own in a
-  `pipette_test` database, which the first test creates and later runs reuse.
+- The job queue is on PostgreSQL only, so most tests need a server at
+  `TEST_DATABASE_URL`. An example address is
+  `postgres://postgres@127.0.0.1:5432/postgres`. Each test makes and drops a
+  schema of its own in a `pipette_test` database, which the first test creates
+  and later runs reuse. Without `TEST_DATABASE_URL`, the tests behave in two
+  ways:
+
+  - The shared fixtures of `pipette-web-testkit` (`make_state` and the other
+    `make_state_*` functions) put the records and the job queue in a new
+    schema. A test built on them fails. Most `pipette-httpapi` and
+    `pipette-pipeline` tests use these fixtures.
+  - `pipette-store-sql`'s tests, the tests built on `TestDb::new`,
+    `seeded_sql_state` or `seeded_queue_state` skip locally and fail in CI.
 
   `scripts/dev-postgres.sh` starts the server that CI uses, in a Docker
   container, and prints the line that sets `TEST_DATABASE_URL`. Run

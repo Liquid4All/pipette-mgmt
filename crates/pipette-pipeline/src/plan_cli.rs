@@ -16,15 +16,14 @@ use pipette_core::matching::{NarrowingClauses, describe_clauses};
 use pipette_core::plan::{
     PlanExplanation, PlanLeases, PlanManifest, PlanNotes, StarvedExplanation, StarvedGroup,
 };
-use pipette_core::todo_filename::avail_filename;
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
     CampaignId, ClientId, FleetStanding, JobCensus, JobId, NonEmptyTrimmedString, PlanId,
     PlanStatus, SchedulingState, UserId,
 };
 use pipette_store::{
-    ClientStore, PlanStore, Stores, TagStore, TodoStore, UnreadableObjectError, drain_clients,
-    drain_plans, warn_unreadable_clients,
+    AvailEntry, ClientStore, PlanStore, Stores, TagStore, TodoStore, UnreadableObjectError,
+    drain_clients, drain_plans, warn_unreadable_clients,
 };
 
 use crate::plan_document;
@@ -32,9 +31,7 @@ use crate::plan_document::{DocumentDryRun, ExpandedDocument, index_labels};
 use crate::plan_ingestion::{
     CampaignMembership, IngestContext, IngestReport, PlanSubmission, ingest_jobs,
 };
-#[cfg(test)]
-use crate::queue_maintenance::collect_all_avail;
-use crate::queue_maintenance::{AvailKey, cached_body};
+use crate::queue_maintenance::cached_body;
 
 /// A plan failed to read, or there is none by that id.
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +52,8 @@ pub enum PlanInput<'a> {
 
 /// Read a plan and file it through the ingestion pipeline into `membership`.
 ///
-/// Validates the `todo/` backend up front: staging needs atomic renames, and
-/// failing midway would leave a half-staged plan. Takes no mutate lock, as
-/// `plans/` and `todo/` are disjoint from the warehouse paths it serializes.
+/// Takes no mutate lock, as `plans/` and the job queue are disjoint from the
+/// warehouse paths it serializes.
 pub async fn ingest(
     ctx: &IngestContext<'_>,
     input: PlanInput<'_>,
@@ -75,7 +71,6 @@ pub async fn ingest(
             expand_plan_text(ctx, &membership.owner, text.to_string(), note.as_ref()).await?
         }
     };
-    ctx.todo.validate_backend().await?;
 
     Ok(ingest_jobs(
         ctx,
@@ -316,23 +311,14 @@ pub async fn explain_plan_with(
     let cancel_requested = record.cancel_requested;
     let plan_id = manifest.plan_id.clone();
 
-    // Rebuild each avail/ key: the indexed-state and body-cache lookups below key on it.
-    let entries = todo
+    let keys = todo
         .avail_for_jobs(&manifest.job_ids)
         .await
         .context("reading the plan's available jobs")?;
-    let keys: Vec<AvailKey> = entries
-        .into_iter()
-        .map(|entry| AvailKey {
-            key: avail_filename(&entry.job_id, entry.expires_at),
-            job_id: entry.job_id,
-            expires_at: entry.expires_at,
-        })
-        .collect();
-    let avail: Vec<&AvailKey> = keys.iter().collect();
+    let avail: Vec<&AvailEntry> = keys.iter().collect();
     // The claim path refuses an expired job even before `queue-maintenance`
     // sweeps it, so an expired entry is available but not claimable.
-    let claimable: Vec<&AvailKey> = avail
+    let claimable: Vec<&AvailEntry> = avail
         .iter()
         .copied()
         .filter(|key| !key.expires_at.is_expired(now))
@@ -377,7 +363,7 @@ pub async fn explain_plan_with(
         .await
         .context("listing pending-reindex flags")?
         .into_iter()
-        .map(|(client_id, _)| client_id)
+        .map(|request| request.client_id)
         .collect();
 
     // Every count below `approved` is measured against the claim permission.
@@ -418,10 +404,10 @@ pub async fn explain_plan_with(
         .progress_snapshot
         .as_ref()
         .map_or(&[], |snapshot| &snapshot.starved);
-    let available: HashMap<&JobId, &AvailKey> =
+    let available: HashMap<&JobId, &AvailEntry> =
         avail.iter().map(|key| (&key.job_id, *key)).collect();
     // Shared with the verdict scan, which may reach a group's representative job.
-    let mut bodies: HashMap<String, Value> = HashMap::new();
+    let mut bodies: HashMap<AvailEntry, Value> = HashMap::new();
     let mut groups = Vec::with_capacity(starved.len());
     for group in starved {
         groups.push(
@@ -622,10 +608,10 @@ struct ScanFleet<'a> {
 /// failure propagates rather than invent "no client can take these".
 async fn scan_takeability(
     todo: &dyn TodoStore,
-    claimable: &[&AvailKey],
+    claimable: &[&AvailEntry],
     starved_ids: &HashSet<&JobId>,
     fleet: ScanFleet<'_>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Takeability> {
     let ScanFleet {
@@ -639,7 +625,7 @@ async fn scan_takeability(
     if working.is_empty() {
         return Ok(Takeability::Blocked);
     }
-    let (fresh, stale): (Vec<&&AvailKey>, Vec<&&AvailKey>) = claimable
+    let (fresh, stale): (Vec<&&AvailEntry>, Vec<&&AvailEntry>) = claimable
         .iter()
         .partition(|key| !starved_ids.contains(&key.job_id));
     let mut working_match = false;
@@ -700,9 +686,9 @@ struct GroupFleet<'a> {
 async fn explain_group(
     todo: &dyn TodoStore,
     group: &StarvedGroup,
-    available: &HashMap<&JobId, &AvailKey>,
+    available: &HashMap<&JobId, &AvailEntry>,
     fleet: GroupFleet<'_>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
 ) -> anyhow::Result<StarvedExplanation> {
     let GroupFleet {
         registered,
@@ -751,8 +737,8 @@ async fn explain_group(
 async fn read_group_body(
     todo: &dyn TodoStore,
     group: &StarvedGroup,
-    available: &HashMap<&JobId, &AvailKey>,
-    bodies: &mut HashMap<String, Value>,
+    available: &HashMap<&JobId, &AvailEntry>,
+    bodies: &mut HashMap<AvailEntry, Value>,
 ) -> anyhow::Result<Option<(Value, Option<String>)>> {
     let Some(key) = group
         .job_ids
@@ -857,13 +843,13 @@ mod tests {
     use super::*;
     use crate::plan_ingestion::ModelCheck;
 
-    fn stores_in(dir: &std::path::Path) -> anyhow::Result<Stores> {
+    async fn stores_in(dir: &std::path::Path) -> anyhow::Result<Stores> {
         let config = Config {
             storage: StorageConfig::local_fs(dir.to_path_buf()),
             auth_storage: StorageConfig::local_fs(dir.to_path_buf()),
             ..Config::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)
     }
 
     /// [`stores_in`] with the record stores and the queue on a new database,
@@ -875,7 +861,7 @@ mod tests {
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(None);
         };
-        Ok(Some((db.stores(stores_in(dir)?), db)))
+        Ok(Some((db.stores(stores_in(dir).await?), db)))
     }
 
     fn manifest(id: u128, status: PlanStatus) -> anyhow::Result<PlanManifest> {
@@ -993,7 +979,7 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert!(stores.plans.list_pending_source_markers().await?.is_empty());
         let sources = std::fs::read_dir(store_dir.join("plan-sources"))
             .map(Iterator::count)
@@ -1012,7 +998,7 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
     #[tokio::test]
     async fn ingest_document_stages_its_cells_and_stores_the_source() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let path = plan_file(plans_dir.path(), AFM_MLX)?;
 
@@ -1036,7 +1022,7 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
             "{:?}",
             report.plan_warnings
         );
-        assert_eq!(stores.todo.list_avail().await?.len(), 3);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 3);
 
         let manifest = stores
             .plans
@@ -1057,7 +1043,9 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
     #[tokio::test]
     async fn ingest_document_twice_shares_the_jobs_of_the_first_plan() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let (stores, _db) = sql_stores_in(store_dir.path())
+            .await?
+            .context("PostgreSQL required")?;
         let plans_dir = tempfile::tempdir()?;
         let path = plan_file(plans_dir.path(), AFM_MLX)?;
 
@@ -1066,14 +1054,14 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
         assert_ne!(first.plan_id, second.plan_id);
         assert_eq!(second.merged_job_count, 3);
         assert_eq!(second.job_ids, first.job_ids);
-        assert_eq!(stores.todo.list_avail().await?.len(), 3);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 3);
         Ok(())
     }
 
     #[tokio::test]
     async fn ingest_document_stores_the_planner_warnings() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         // A dead capability path with a live roster: a warning, not a refusal.
         let document = mlx_document(
@@ -1114,7 +1102,7 @@ runtime_flags = [{ benchmark_type = "prefill_throughput", runtime_type = "llamac
         #[case] needle: &str,
     ) -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let path = plan_file(plans_dir.path(), &document)?;
 
@@ -1140,7 +1128,7 @@ runtime_flags = [{ benchmark_type = "prefill_throughput", runtime_type = "llamac
         #[case] needle: &str,
     ) -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let path = plan_file(plans_dir.path(), AFM_MLX)?;
 
@@ -1157,7 +1145,7 @@ runtime_flags = [{ benchmark_type = "prefill_throughput", runtime_type = "llamac
     #[tokio::test]
     async fn a_vault_reference_nothing_backs_writes_nothing() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let document = r#"benchmarks = ["decode_throughput_512_100"]
 
@@ -1183,7 +1171,7 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
     #[tokio::test]
     async fn a_model_token_without_an_import_writes_nothing() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let document = mlx_document("requires = [\"os:macos\"]").replace(
             "repo_name = \"LFM2.5-350M-MLX-4bit\"",
@@ -1206,7 +1194,7 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
     #[tokio::test]
     async fn dry_run_document_writes_nothing() -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let plans_dir = tempfile::tempdir()?;
         let path = plan_file(plans_dir.path(), AFM_MLX)?;
         let catalog = scheduler_catalog()?;
@@ -1247,7 +1235,7 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
         #[case] refusal: Option<&str>,
     ) -> anyhow::Result<()> {
         let store_dir = tempfile::tempdir()?;
-        let stores = stores_in(store_dir.path())?;
+        let stores = stores_in(store_dir.path()).await?;
         let id = "eval_math_500_2026.10.1_ctx32768";
         let entry = "benchmark_type = \"eval\"\nparameter_eval_id = \"math_500\"\n\
                      parameter_dataset_name = \"2026.10.1\"\nparameter_max_tokens = 32768\n\
@@ -1297,7 +1285,7 @@ runtime_flags = [
     #[tokio::test]
     async fn list_plans_sorts_newest_first_and_filters() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let old = manifest(1, PlanStatus::Active)?;
         let new = manifest(3, PlanStatus::Complete)?;
         let mid = manifest(2, PlanStatus::Active)?;
@@ -1328,7 +1316,7 @@ runtime_flags = [
     #[tokio::test]
     async fn list_plans_filters_by_submitter() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let by_user = PlanManifest {
             submitted_by: Some(UserId::try_new(USER_ADA)?),
             ..manifest(1, PlanStatus::Active)?
@@ -1379,7 +1367,7 @@ runtime_flags = [
     async fn a_dated_submitter_lists_and_reads_rather_than_being_unreadable() -> anyhow::Result<()>
     {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(7));
         std::fs::create_dir_all(dir.path().join("plans"))?;
         std::fs::write(
@@ -1422,7 +1410,7 @@ runtime_flags = [
     #[tokio::test]
     async fn plan_status_absent_plan_errors() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let absent = PlanId::from_uuid(uuid::Uuid::from_u128(9));
         let err = plan_status(stores.plans.as_ref(), &absent)
             .await
@@ -1445,7 +1433,7 @@ runtime_flags = [
         #[case] status: PlanStatus,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let m = manifest(1, PlanStatus::Active)?;
         let m = PlanManifest { status, ..m };
         stores.plans.put_plan(&m).await?;
@@ -1477,7 +1465,7 @@ runtime_flags = [
         #[case] expected: CancelOutcome,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let m = manifest(1, status)?;
         stores.plans.put_plan(&m).await?;
 
@@ -1493,7 +1481,7 @@ runtime_flags = [
     #[tokio::test]
     async fn cancel_twice_before_teardown_is_idempotent() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let m = manifest(1, PlanStatus::Active)?;
         stores.plans.put_plan(&m).await?;
 
@@ -1511,7 +1499,7 @@ runtime_flags = [
     #[tokio::test]
     async fn cancel_refuses_a_plan_with_no_manifest() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let m = manifest(1, PlanStatus::Active)?;
 
         let err = cancel_plan(stores.plans.as_ref(), &m.plan_id)
@@ -1527,7 +1515,7 @@ runtime_flags = [
     #[tokio::test]
     async fn cancel_refuses_a_complete_plan_and_writes_no_marker() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let m = manifest(1, PlanStatus::Complete)?;
         stores.plans.put_plan(&m).await?;
 
@@ -1702,7 +1690,7 @@ runtime_flags = [
         let expires_at = manifest.job_expiry.context("frozen expiry")?.earliest;
         stores.todo.write_tmp(job_id, body).await?;
         stores.todo.delete_avail(job_id, expires_at).await?;
-        stores.todo.promote_avail(job_id, expires_at).await?;
+        stores.todo.promote_avail(job_id, expires_at, None).await?;
         Ok(job_id.clone())
     }
 
@@ -1892,7 +1880,7 @@ runtime_flags = [
 
         let hour = chrono::Duration::hours(1);
         let holder = ClientId::try_new("ev1_alpha")?;
-        let mut keys = collect_all_avail(stores.todo.as_ref()).await?.keys;
+        let mut keys = stores.todo.list_avail_entries().await?;
         let stranded = keys.pop().context("two jobs minted")?;
         let held = keys.pop().context("two jobs minted")?;
         stores
@@ -2040,13 +2028,13 @@ runtime_flags = [
         #[case] expected: Takeability,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = stores_in(dir.path())?;
+        let stores = stores_in(dir.path()).await?;
         let bystander = client("ev1_beta", "Android")?;
         enlist(&stores, &bystander).await?;
         ingest(&stores, vec![job("a.json", "os:ios")]).await?;
 
-        let listing = collect_all_avail(stores.todo.as_ref()).await?;
-        let key = listing.keys.first().context("one job staged")?;
+        let listing = stores.todo.list_avail_entries().await?;
+        let key = listing.first().context("one job staged")?;
 
         match vanish {
             Vanish::Claimed | Vanish::ClaimedThenLapsed => {
@@ -2685,9 +2673,10 @@ runtime_flags = [
             .await?
             .context("manifest written")?;
         let members: HashSet<JobId> = manifest.job_ids.iter().cloned().collect();
-        for key in collect_all_avail(stores.todo.as_ref())
+        for key in stores
+            .todo
+            .list_avail_entries()
             .await?
-            .keys
             .into_iter()
             .filter(|key| members.contains(&key.job_id))
         {

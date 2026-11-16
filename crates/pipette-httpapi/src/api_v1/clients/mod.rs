@@ -288,6 +288,7 @@ async fn delete(
         &*state.org_store,
         &*state.tag_store,
         &*state.todo_store,
+        &*state.submission_store,
         client_id,
     )
     .await?;

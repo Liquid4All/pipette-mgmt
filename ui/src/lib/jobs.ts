@@ -8,7 +8,7 @@ import {
 import {
   BEYOND_LIMIT, beyondAudioLimit, canonical, descriptorText, deviceNames, deviceType, knobsText, lowerIsBetter, ttftOver,
 } from "./report";
-import { offeredChoices } from "./table";
+import { csvOf, offeredChoices } from "./table";
 import { tabLink, type TabBase } from "./tabs";
 import { nameOf, nameTexts, type DescriptorNames } from "./descriptor-names";
 import { namedLabel, namedAs } from "./vault";
@@ -37,6 +37,33 @@ export function earlierRows({ job, row }: Line): { run: ParentJob; row: ResultRo
     run, row: rows.find((r) => r.metric === row.metric && canonical(r.parameters) === parameters) ?? null,
   }));
 }
+
+/** Whether a run's rows are a mark's: a failure filed in place of a run, which no device ran. */
+export const isMark = (rows: readonly ResultRow[]): boolean => rows.some((row) => row.failure_source === "marked");
+
+/**
+ * How many re-runs led to a job, one per job before it in its re-run chain, less the marks: a mark replaced a job
+ * without running it. Null where the read gave no plan detail, or stopped short of the chain's first job: a job whose
+ * plan it could not read ends the chain with no plan named.
+ */
+// shortcut: rerun_history stops at HISTORY_LIMIT (16, api_v1/plans/reads.rs), so a longer chain reads 17; show 17 as
+// "17 or more" if chains grow that long.
+// shortcut: only scored rows say a job is a mark, so a mark counts as a re-run until the job's own rows are read;
+// a count served with the chain would close that.
+export function rerunsOf({ plan, result }: Listed): number | null {
+  if (!plan) return null;
+  if (!plan.rerun_of) return 0;
+  const oldest = plan.rerun_history.at(-1) ?? plan.rerun_of;
+  if (oldest.plan_id === null) return null;
+  const marks = result.status === "scored"
+    ? [result.rows, ...result.earlier_runs.map(({ rows }) => rows)].filter(isMark).length
+    : 0;
+  return 1 + plan.rerun_history.length - marks;
+}
+
+/** What the Jobs table calls the job a job replaced: only the job's scored rows say it is a mark, as in `rerunsOf`. */
+export const rerunOfText = ({ result }: Pick<Listed, "result">): string =>
+  (result.status === "scored" && isMark(result.rows) ? "marked failed in place of" : "re-run of");
 
 /** How a line's value moved from its newest earlier run's: in percent, or in points on a ratio. */
 export interface Change {
@@ -248,6 +275,7 @@ const stored = (key: Stored, label: string, shown = false): Column => ({
 export const COLUMNS: Column[] = [
   { key: "job", label: "job", job: true, shown: true, raw: ({ job }) => job.job_id },
   { key: "state", label: "state", job: true, shown: true, raw: ({ job }) => job.state },
+  { key: "reruns", label: "re-runs", job: true, shown: false, num: true, raw: ({ job }) => rerunsOf(job) },
   { key: "model_descriptor", label: "model", job: false, shown: true, json: true, raw: (line) => modelOf(line) || null },
   { key: "model_catalog_name", label: "model catalog name", job: false, shown: false,
     raw: (line, ctx) => modelNameOf(line, ctx)?.display ?? null },
@@ -282,6 +310,7 @@ export const COLUMNS: Column[] = [
     raw: ({ row }) => (row?.failed ? failedText(row.failure_source) : null) },
   { key: "failed_reason", label: "failure reason", job: false, shown: true, raw: ({ row }) => row?.failed_reason ?? null },
   { key: "failure_source", label: "failure source", job: false, shown: true, raw: ({ row }) => row?.failure_source ?? null },
+  { key: "failure_code", label: "failure code", job: false, shown: true, raw: ({ row }) => row?.failure_code ?? null },
   { key: "device", label: "device", job: true, shown: true,
     raw: (line, ctx) => {
       const id = clientOf(line);
@@ -405,25 +434,13 @@ export const cellText = (column: Column, line: Line, ctx: Context): string => {
   return raw === null ? "" : String(raw);
 };
 
-/**
- * A CSV field, quoted where it holds a comma, a quote or a line break; text led by
- * `=`, `+`, `-`, `@`, a tab or a carriage return gets a `'`, so a spreadsheet reads no formula.
- */
-const field = (value: Raw | undefined): string => {
-  let text = value === null || value === undefined ? "" : String(value);
-  if (typeof value === "string" && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-};
-
 /** `lines` as one CSV file in `columns`, with each column's raw value and label. */
 export const linesCsv = (lines: readonly Line[], columns: readonly Column[], ctx: Context): string =>
-  [columns.map((column) => field(column.label)),
-   ...lines.map((line) => columns.map((column) => field(column.raw(line, ctx))))]
-    .map((cells) => cells.join(",")).join("\r\n") + "\r\n";
+  csvOf([columns.map((column) => column.label), ...lines.map((line) => columns.map((column) => column.raw(line, ctx)))]);
 
 export const TEXT_KEYS = ["q"] as const;
 export const CHOICE_KEYS = [
-  "state", "result", "benchmark", "benchmark_type", "device", "model_descriptor", "runtime_descriptor", "model_flags", "runtime_flags",
+  "state", "reruns", "result", "benchmark", "benchmark_type", "device", "model_descriptor", "runtime_descriptor", "model_flags", "runtime_flags",
   "benchmark_flags", "metric", "spread", "issue",
 ] as const;
 export type TextKey = (typeof TEXT_KEYS)[number];
@@ -562,6 +579,7 @@ const TEXTS: Record<TextKey, (job: Listed, ctx: Context) => (string | null | und
 /** Each select's values on a line, `""` where it has none. */
 const CHOSEN: Record<ChoiceKey, (line: Line, ctx: Context) => string[]> = {
   state: ({ job }) => [job.state],
+  reruns: ({ job }) => [String(rerunsOf(job) ?? "")],
   result: (line) => [outcomeOf(line)],
   benchmark: (line) => [benchmarkOf(line)],
   benchmark_type: ({ job, row }) => [row?.benchmark_type ?? job.planned?.benchmark_type ?? ""],
@@ -640,6 +658,7 @@ export function jobChoices(lines: readonly Line[], ctx: Context, chosen: Partial
   const labelled = (labels: Record<string, string>) => (v: string) => labels[v] ?? v;
   return {
     state: count("state", true, labelled(STATE_LABELS), Object.keys(STATE_LABELS)),
+    reruns: stored("reruns"),
     result: count("result", false, labelled(OUTCOME_LABELS), Object.keys(OUTCOME_LABELS)),
     benchmark: stored("benchmark"),
     benchmark_type: stored("benchmark_type"),

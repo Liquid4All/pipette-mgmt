@@ -2,7 +2,7 @@
 //! marker's expiry is the `ExpiresAt` display string, truncated to the second
 //! as the object key is.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
@@ -16,13 +16,14 @@ use sqlx::postgres::PgRow;
 
 use pipette_core::plan::{PlanHeader, PlanManifest, PlanNotes, PlanSource, PlanSummary};
 use pipette_plan_types::{
-    Answered, CampaignId, ExpiresAt, JobId, PlanId, RestoredVariant, RevisionChange,
+    Answered, CampaignGroupId, CampaignId, ExpiresAt, JobId, PlanId, PolicyKind, RestoredVariant,
+    RevisionChange,
 };
 use pipette_store::{
     CellResult, CellScope, ContentKeyCas, ContentKeyClaim, ContentKeyRecord, ContentKeyVersion,
-    CreateOutcome, JobHolder, JobHolderListing, JobPlanMarker, Listing, PLANS_PREFIX,
-    PendingSourceMarker, PlanFilter, PlanHeaderPage, PlanListing, PlanPage, PlanStore,
-    PlanSummaryListing, UnreadableObjectError, is_content_digest,
+    CreateOutcome, JobHolder, JobHolderListing, JobJoin, JobPlanMarker, Listing, MembershipEnd,
+    PLANS_PREFIX, PendingSourceMarker, PlanFilter, PlanHeaderPage, PlanListing, PlanPage,
+    PlanStore, PlanSummaryListing, UnreadableObjectError, is_content_digest,
 };
 
 use crate::ClaimVanishedError;
@@ -409,6 +410,8 @@ enum StoredChange {
         added: usize,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        carry_across_limit: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -417,6 +420,8 @@ enum StoredChange {
     Document {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        carry_across_limit: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
     },
@@ -424,6 +429,12 @@ enum StoredChange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered: Option<Answered>,
         jobs: usize,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        marked: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<CampaignGroupId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        policies: Vec<PolicyKind>,
     },
     Recalculate {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -441,6 +452,10 @@ struct StoredRestored {
     index: usize,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 impl From<RevisionChange> for StoredChange {
     fn from(change: RevisionChange) -> Self {
         match change {
@@ -448,12 +463,14 @@ impl From<RevisionChange> for StoredChange {
                 removed_variant_count,
                 added_variant_count,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
                 restored,
             } => Self::Variants {
                 removed: removed_variant_count,
                 added: added_variant_count,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
                 restored: restored
                     .into_iter()
@@ -465,17 +482,25 @@ impl From<RevisionChange> for StoredChange {
             },
             RevisionChange::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
             } => Self::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
             },
             RevisionChange::Rerun {
                 answered,
                 job_count,
+                marked_job_count,
+                group_id,
+                policies,
             } => Self::Rerun {
                 answered,
                 jobs: job_count,
+                marked: marked_job_count,
+                group_id,
+                policies,
             },
             RevisionChange::Recalculate {
                 all_evals,
@@ -496,12 +521,14 @@ impl From<StoredChange> for RevisionChange {
                 removed,
                 added,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
                 restored,
             } => Self::Variants {
                 removed_variant_count: removed,
                 added_variant_count: added,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
                 restored: restored
                     .into_iter()
@@ -513,14 +540,25 @@ impl From<StoredChange> for RevisionChange {
             },
             StoredChange::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
             } => Self::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
             },
-            StoredChange::Rerun { answered, jobs } => Self::Rerun {
+            StoredChange::Rerun {
+                answered,
+                jobs,
+                marked,
+                group_id,
+                policies,
+            } => Self::Rerun {
                 answered,
                 job_count: jobs,
+                marked_job_count: marked,
+                group_id,
+                policies,
             },
             StoredChange::Recalculate { all_evals, jobs } => Self::Recalculate {
                 all_evals,
@@ -1259,6 +1297,122 @@ impl PlanStore for SqlPlanStore {
         Ok(())
     }
 
+    async fn end_membership(
+        &self,
+        job_id: &JobId,
+        plan_id: &PlanId,
+    ) -> anyhow::Result<MembershipEnd> {
+        retry("end_membership", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                sqlx::query("DELETE FROM job_plans WHERE job_id = $1 AND plan_id = $2")
+                    .bind(job_id.as_str())
+                    .bind(plan_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                let (surviving,): (i64,) =
+                    sqlx::query_as("SELECT count(*) FROM job_plans WHERE job_id = $1")
+                        .bind(job_id.as_str())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let end = if surviving > 0 {
+                    MembershipEnd::Released {
+                        surviving_plans: usize::try_from(surviving).unwrap_or(usize::MAX),
+                    }
+                } else {
+                    // A joiner writes this row too, so a join that this
+                    // transaction did not see makes one of the two retry.
+                    let deleted = sqlx::query("DELETE FROM queue_jobs WHERE job_id = $1")
+                        .bind(job_id.as_str())
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                    if deleted > 0 {
+                        MembershipEnd::Retired
+                    } else {
+                        MembershipEnd::Absent
+                    }
+                };
+                tx.commit().await?;
+                Ok(end)
+            })
+        })
+        .await
+    }
+
+    async fn join_job(
+        &self,
+        job_id: &JobId,
+        plan_id: &PlanId,
+        expires_at: ExpiresAt,
+    ) -> anyhow::Result<JobJoin> {
+        let expires_at = expires_at.to_string();
+        retry("join_job", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                sqlx::query(
+                    "INSERT INTO job_plans (job_id, plan_id, expires_at, written_at)
+                     VALUES ($1, $2, $3, now())
+                     ON CONFLICT (job_id, plan_id, expires_at)
+                     DO UPDATE SET written_at = EXCLUDED.written_at",
+                )
+                .bind(job_id.as_str())
+                .bind(plan_id.as_str())
+                .bind(expires_at.as_str())
+                .execute(&mut *tx)
+                .await?;
+                // The write to the job's row conflicts with a concurrent
+                // end_membership, which deletes the row.
+                let held =
+                    sqlx::query("UPDATE queue_jobs SET revision = revision + 1 WHERE job_id = $1")
+                        .bind(job_id.as_str())
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                if held == 0 {
+                    tx.rollback().await?;
+                    return Ok(JobJoin::Gone);
+                }
+                tx.commit().await?;
+                Ok(JobJoin::Joined)
+            })
+        })
+        .await
+    }
+
+    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
+        let rows: Vec<(String,)> = self
+            .db
+            .fetch_all("read_gc_candidates", || {
+                sqlx::query_as("SELECT key FROM plan_index_gc_candidates")
+            })
+            .await?;
+        Ok(rows.into_iter().map(|(key,)| key).collect())
+    }
+
+    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
+        let keys: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        retry("write_gc_candidates", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                sqlx::query("DELETE FROM plan_index_gc_candidates WHERE NOT (key = ANY($1))")
+                    .bind(&keys)
+                    .execute(&mut *tx)
+                    .await?;
+                // A key staged earlier keeps its first_seen_at.
+                sqlx::query(
+                    "INSERT INTO plan_index_gc_candidates (key) SELECT unnest($1::text[])
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&keys)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await
+            })
+        })
+        .await
+    }
+
     async fn put_plan_source(
         &self,
         plan_id: &PlanId,
@@ -1640,12 +1794,12 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Context;
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
 
-    use pipette_core::config::StorageConfig;
     use pipette_core::plan::{ExpiredJob, sample_manifest};
     use pipette_core::types::Mint;
     use pipette_plan_types::{CampaignId, PlanStatus};
+    use pipette_store::TodoStore as _;
     use pipette_store::drain_plans;
 
     use super::*;
@@ -1665,6 +1819,215 @@ mod tests {
 
     fn store(test_db: &TestDb) -> SqlPlanStore {
         SqlPlanStore::new(test_db.db().clone())
+    }
+
+    /// Queue `job` on the database queue, with a membership marker for each
+    /// of `members`.
+    async fn queue_job(test_db: &TestDb, job: &JobId, members: &[&PlanId]) -> anyhow::Result<()> {
+        use pipette_store::TodoStore;
+        let todo = crate::SqlTodoStore::new(test_db.db().clone());
+        todo.write_tmp(job, &serde_json::json!({"job_id": job.as_str()}))
+            .await?;
+        todo.promote_avail(job, ExpiresAt::Never, None).await?;
+        futures::stream::iter(members.iter())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|plan| async move {
+                store(test_db)
+                    .write_job_plan_marker(job, plan, ExpiresAt::Never)
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn job_queued(test_db: &TestDb, job: &JobId) -> anyhow::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM queue_jobs WHERE job_id = $1)")
+                .bind(job.as_str())
+                .fetch_one(test_db.db().pool())
+                .await?,
+        )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Members {
+        Alone,
+        Shared,
+        NotQueued,
+    }
+
+    #[rstest::rstest]
+    #[case::alone(Members::Alone, MembershipEnd::Retired)]
+    #[case::shared(Members::Shared, MembershipEnd::Released { surviving_plans: 1 })]
+    #[case::not_queued(Members::NotQueued, MembershipEnd::Absent)]
+    #[tokio::test]
+    async fn end_membership_retires_the_job_with_its_last_member(
+        #[case] members: Members,
+        #[case] expected: MembershipEnd,
+    ) -> anyhow::Result<()> {
+        let Some(test_db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let job = JobId::try_new("job-ending")?;
+        let ending = PlanId::from_uuid(uuid::Uuid::from_u128(1));
+        let other = PlanId::from_uuid(uuid::Uuid::from_u128(2));
+        match members {
+            Members::Alone => queue_job(&test_db, &job, &[&ending]).await?,
+            Members::Shared => queue_job(&test_db, &job, &[&ending, &other]).await?,
+            Members::NotQueued => {
+                store(&test_db)
+                    .write_job_plan_marker(&job, &ending, ExpiresAt::Never)
+                    .await?;
+            }
+        }
+        let plans = store(&test_db);
+        assert_eq!(plans.end_membership(&job, &ending).await?, expected);
+        let remaining: Vec<PlanId> = plans
+            .list_job_plan_markers(&job)
+            .await?
+            .into_iter()
+            .map(|(plan, _)| plan)
+            .collect();
+        let shared = matches!(members, Members::Shared);
+        assert_eq!(remaining, if shared { vec![other] } else { Vec::new() });
+        assert_eq!(job_queued(&test_db, &job).await?, shared);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_join_on_a_job_not_in_the_queue_writes_no_marker() -> anyhow::Result<()> {
+        let Some(test_db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let plans = store(&test_db);
+        let job = JobId::try_new("job-joined")?;
+        let joiner = PlanId::from_uuid(uuid::Uuid::from_u128(3));
+        assert_eq!(
+            plans.join_job(&job, &joiner, ExpiresAt::Never).await?,
+            JobJoin::Gone
+        );
+        assert!(plans.list_job_plan_markers(&job).await?.is_empty());
+        queue_job(&test_db, &job, &[]).await?;
+        assert_eq!(
+            plans.join_job(&job, &joiner, ExpiresAt::Never).await?,
+            JobJoin::Joined
+        );
+        assert_eq!(
+            plans.list_job_plan_markers(&job).await?,
+            vec![(joiner, ExpiresAt::Never)]
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    enum Raced {
+        Teardown(MembershipEnd),
+        Join(JobJoin),
+    }
+
+    /// A join and a teardown race on each job. Either the joiner holds a
+    /// marker on a queued job, or the joiner wrote no marker and the job left
+    /// the queue.
+    #[tokio::test]
+    async fn a_racing_join_and_teardown_never_strand_a_marker() -> anyhow::Result<()> {
+        let Some(test_db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let ending = PlanId::from_uuid(uuid::Uuid::from_u128(1));
+        let joiner = PlanId::from_uuid(uuid::Uuid::from_u128(2));
+        let job = |pair: usize| JobId::try_new(format!("job-raced-{pair}"));
+        let pairs = crate::testing::RACERS / 2;
+        futures::stream::iter(0..pairs)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|pair| {
+                let test_db = &test_db;
+                let ending = &ending;
+                async move {
+                    queue_job(test_db, &job(pair)?, &[ending]).await?;
+                    anyhow::Ok(())
+                }
+            })
+            .await?;
+
+        let outcomes = race(|n| {
+            let plans = store(&test_db);
+            let (ending, joiner) = (ending.clone(), joiner.clone());
+            async move {
+                let job = job(n / 2)?;
+                Ok(if n % 2 == 0 {
+                    Raced::Teardown(plans.end_membership(&job, &ending).await?)
+                } else {
+                    Raced::Join(plans.join_job(&job, &joiner, ExpiresAt::Never).await?)
+                })
+            }
+        })
+        .await?;
+
+        futures::stream::iter(outcomes.chunks(2).enumerate())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(pair, racers)| {
+                let test_db = &test_db;
+                let joiner = &joiner;
+                async move {
+                    let job = job(pair)?;
+                    let markers = store(test_db).list_job_plan_markers(&job).await?;
+                    let queued = job_queued(test_db, &job).await?;
+                    match racers {
+                        [
+                            Raced::Teardown(MembershipEnd::Released { surviving_plans: 1 }),
+                            Raced::Join(JobJoin::Joined),
+                        ] => {
+                            assert_eq!(markers, vec![(joiner.clone(), ExpiresAt::Never)]);
+                            assert!(queued, "{job}: the joined job stays queued");
+                        }
+                        [
+                            Raced::Teardown(MembershipEnd::Retired),
+                            Raced::Join(JobJoin::Gone),
+                        ] => {
+                            assert!(markers.is_empty(), "{job}: {markers:?}");
+                            assert!(!queued, "{job}: the retired job left the queue");
+                        }
+                        other => anyhow::bail!("{job}: unexpected outcome {other:?}"),
+                    }
+                    anyhow::Ok(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_candidates_are_replaced_and_keep_their_first_sighting() -> anyhow::Result<()> {
+        let Some(test_db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let plans = store(&test_db);
+        let keys = |names: &[&str]| -> HashSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert!(plans.read_gc_candidates().await?.is_empty());
+        plans
+            .write_gc_candidates(&keys(&["plans:a", "plans:b"]))
+            .await?;
+        let first_seen = || {
+            sqlx::query_scalar::<_, DateTime<Utc>>(
+                "SELECT first_seen_at FROM plan_index_gc_candidates WHERE key = 'plans:b'",
+            )
+            .fetch_one(test_db.db().pool())
+        };
+        let staged = first_seen().await?;
+        plans
+            .write_gc_candidates(&keys(&["plans:b", "plans:c"]))
+            .await?;
+        assert_eq!(
+            plans.read_gc_candidates().await?,
+            keys(&["plans:b", "plans:c"])
+        );
+        assert_eq!(first_seen().await?, staged);
+        plans.write_gc_candidates(&HashSet::new()).await?;
+        assert!(plans.read_gc_candidates().await?.is_empty());
+        Ok(())
     }
 
     fn plan(n: u128) -> PlanId {
@@ -1780,6 +2143,9 @@ mod tests {
             change: Some(pipette_plan_types::RevisionChange::Rerun {
                 answered: Some(pipette_plan_types::Answered::Failed),
                 job_count: 2,
+                marked_job_count: 0,
+                group_id: None,
+                policies: Vec::new(),
             }),
         };
         assert!(!store.put_plan_notes(&plan_id, &filed).await?);
@@ -1911,13 +2277,17 @@ mod tests {
 
     /// Each kind of change as every build writes the column: what a rollback reads.
     fn stored_changes() -> anyhow::Result<Vec<(&'static str, RevisionChange)>> {
-        let document = |carry_earlier| RevisionChange::Document {
+        let document = |carry_earlier, carry_across_limit| RevisionChange::Document {
             carry_earlier,
+            carry_across_limit,
             inherit_from: Vec::new(),
         };
-        let rerun = |answered, job_count| RevisionChange::Rerun {
+        let rerun = |answered, job_count, marked_job_count| RevisionChange::Rerun {
             answered,
             job_count,
+            marked_job_count,
+            group_id: None,
+            policies: Vec::new(),
         };
         let recalculate = |all_evals, job_count| RevisionChange::Recalculate {
             all_evals,
@@ -1930,6 +2300,7 @@ mod tests {
                     removed_variant_count: 0,
                     added_variant_count: 1,
                     carry_earlier: false,
+                    carry_across_limit: false,
                     inherit_from: Vec::new(),
                     restored: Vec::new(),
                 },
@@ -1940,7 +2311,19 @@ mod tests {
                     removed_variant_count: 2,
                     added_variant_count: 3,
                     carry_earlier: true,
+                    carry_across_limit: false,
                     inherit_from: vec![PlanId::try_new("plan-a")?, PlanId::try_new("plan-b")?],
+                    restored: Vec::new(),
+                },
+            ),
+            (
+                r#"{"kind":"variants","removed":0,"added":1,"carry_earlier":true,"carry_across_limit":true}"#,
+                RevisionChange::Variants {
+                    removed_variant_count: 0,
+                    added_variant_count: 1,
+                    carry_earlier: true,
+                    carry_across_limit: true,
+                    inherit_from: Vec::new(),
                     restored: Vec::new(),
                 },
             ),
@@ -1950,6 +2333,7 @@ mod tests {
                     removed_variant_count: 1,
                     added_variant_count: 2,
                     carry_earlier: false,
+                    carry_across_limit: false,
                     inherit_from: vec![PlanId::try_new("plan-a")?],
                     restored: vec![
                         RestoredVariant {
@@ -1963,19 +2347,34 @@ mod tests {
                     ],
                 },
             ),
-            (r#"{"kind":"document"}"#, document(false)),
+            (r#"{"kind":"document"}"#, document(false, false)),
             (
                 r#"{"kind":"document","carry_earlier":true}"#,
-                document(true),
+                document(true, false),
             ),
-            (r#"{"kind":"rerun","jobs":1}"#, rerun(None, 1)),
+            (
+                r#"{"kind":"document","carry_across_limit":true}"#,
+                document(false, true),
+            ),
+            (r#"{"kind":"rerun","jobs":1}"#, rerun(None, 1, 0)),
             (
                 r#"{"kind":"rerun","answered":"failed","jobs":12}"#,
-                rerun(Some(Answered::Failed), 12),
+                rerun(Some(Answered::Failed), 12, 0),
             ),
             (
                 r#"{"kind":"rerun","answered":"all","jobs":3}"#,
-                rerun(Some(Answered::All), 3),
+                rerun(Some(Answered::All), 3, 0),
+            ),
+            (r#"{"kind":"rerun","jobs":3,"marked":2}"#, rerun(None, 3, 2)),
+            (
+                r#"{"kind":"rerun","jobs":3,"marked":2,"group_id":"group_a","policies":["swap","spread"]}"#,
+                RevisionChange::Rerun {
+                    answered: None,
+                    job_count: 3,
+                    marked_job_count: 2,
+                    group_id: Some(CampaignGroupId::try_new("group_a")?),
+                    policies: vec![PolicyKind::Swap, PolicyKind::Spread],
+                },
             ),
             (r#"{"kind":"recalculate","jobs":2}"#, recalculate(false, 2)),
             (
@@ -2071,6 +2470,7 @@ mod tests {
             note: Some("as filed".into()),
             change: Some(RevisionChange::Document {
                 carry_earlier: true,
+                carry_across_limit: false,
                 inherit_from: Vec::new(),
             }),
         };
@@ -2193,15 +2593,11 @@ mod tests {
         Ok(())
     }
 
-    /// Against a queue on the object store, the split the SQL backend runs in.
     #[tokio::test]
     async fn each_job_has_its_source_and_link() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = store(&test_db);
-        let dir = tempfile::tempdir()?;
-        let todo = pipette_store_fs::build_local_fs_todo_store(&StorageConfig::local_fs(
-            dir.path().to_path_buf(),
-        ))?;
+        let todo = crate::SqlTodoStore::new(test_db.db().clone());
         let plan_id = plan(1);
         let job_ids = vec![job(10), job(11)];
         for job_id in &job_ids {
@@ -2210,15 +2606,12 @@ mod tests {
                 "spec": { "benchmark": "decode_throughput_512_100" },
             });
             todo.write_tmp(job_id, &body).await?;
-            todo.promote_avail(job_id, ExpiresAt::Never).await?;
+            todo.promote_avail(job_id, ExpiresAt::Never, None).await?;
             store.put_job_source(job_id, &body).await?;
             store.put_job_plan_link(job_id, &plan_id).await?;
         }
         pipette_store_testkit::assert_each_job_has_its_source_and_link(
-            &store,
-            todo.as_ref(),
-            &plan_id,
-            &job_ids,
+            &store, &todo, &plan_id, &job_ids,
         )
         .await
     }

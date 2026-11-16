@@ -218,6 +218,9 @@ fn runs<'a>(rows: &'a [ResultRow], names: &'a CatalogNames) -> Vec<CsvRun<'a>> {
                 |row| row.model_descriptor_sha256.as_ref(),
                 names,
             ),
+            CsvRun::One("failure_code", |row| {
+                optional_text(row.failure_code.as_ref().map(AsRef::as_ref))
+            }),
             CsvRun::named(rows, "observation_", |row| &row.observations),
             CsvRun::Named(
                 "device_",
@@ -265,7 +268,7 @@ fn named_value(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use pipette_plan_types::FailureSource;
+    use pipette_plan_types::{FailureCode, FailureSource};
 
     use super::*;
 
@@ -309,6 +312,7 @@ mod tests {
             scored_at: Some("2026-09-29T10:05:00Z".parse()?),
             device_time_ms: value.map(|_| 184_250),
             failure_source: value.is_none().then_some(FailureSource::Client),
+            failure_code: value.is_none().then_some(FailureCode::OutOfMemory),
             rescored_from: None,
             run_submitted_at: None,
             score_runtime_version: None,
@@ -336,10 +340,10 @@ mod tests {
             format!(
                 "{CSV_HEADER},parameter_eval_id,parameter_prefill_tokens,{tail}\n\
                  job-1,prefill_throughput_256,prefill_throughput,ttft,41,0.5,ms,false,,,,,,,,,,,,,\
-                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,,256,,,,,,,,,{empty}\n\
+                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,,256,,,,,,,,,,{empty}\n\
                  job-2,prefill_throughput_256,prefill_throughput,ttft,,,ms,true,\
                  out of memory on ev1_a,,,,,,,,,,,,ev1_a,Pixel 9,,2026-09-29T10:05:00Z,,client,\
-                 mmlu,,,,,,,,,,{empty}\n",
+                 mmlu,,,,,,,,,,out_of_memory,{empty}\n",
                 tail = csv_tail(),
                 empty = device_cells(&[]),
             )
@@ -385,7 +389,7 @@ mod tests {
         format!(
             "client_version,rescored_from,run_submitted_at,score_runtime_version,\
              model_params_total_millions,model_params_active_millions,runtime_catalog_name,\
-             model_catalog_name,{}",
+             model_catalog_name,failure_code,{}",
             DEVICE_COLUMNS.join(",")
         )
     }
@@ -405,11 +409,11 @@ mod tests {
                 "{CSV_HEADER},parameter_prefill_tokens,client_version,rescored_from,\
                  run_submitted_at,score_runtime_version,model_params_total_millions,\
                  model_params_active_millions,runtime_catalog_name,model_catalog_name,\
-                 observation_max_swap_bytes,{devices}\n\
+                 failure_code,observation_max_swap_bytes,{devices}\n\
                  job-1,prefill_throughput_256,prefill_throughput,ttft,41,0.5,ms,false,,,,,,,,,,,,,\
-                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,,1.4.0,job-0,2026-09-01T08:00:00Z,1.2.3,8340,1500,,,1048576,{first}\n\
+                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,,1.4.0,job-0,2026-09-01T08:00:00Z,1.2.3,8340,1500,,,,1048576,{first}\n\
                  job-2,prefill_throughput_256,prefill_throughput,ttft,40,0.5,ms,false,,,,,,,,,,,,,\
-                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,256,,,,,,,,,,{second}\n",
+                 ev1_a,Pixel 9,,2026-09-29T10:05:00Z,184250,,256,,,,,,,,,,,{second}\n",
                 devices = DEVICE_COLUMNS.join(",")
             )
         );

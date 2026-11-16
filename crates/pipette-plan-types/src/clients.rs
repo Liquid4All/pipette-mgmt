@@ -504,21 +504,19 @@ pub struct ClientListRow {
     /// the server's stamp interval. `null` when the server holds no stamp for
     /// the device.
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// The queued jobs the device could claim, as the last `queue-maintenance`
-    /// run counted them. `null` before the first run counts them.
+    /// The queued jobs the device could claim, counted for this response.
+    /// `null` when the server cannot count them.
     pub backlog: Option<Backlog>,
 }
 
-/// The queued jobs a device could claim, as one `queue-maintenance` run
-/// counted them.
+/// The queued jobs a device could claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Backlog {
     /// The jobs the device is indexed for and could claim: queued, not leased,
     /// not past their deadline, and not denied by the device.
     pub job_count: u64,
-    /// The start of the run that counted the jobs. The count is at most one
-    /// `queue-maintenance` interval old.
+    /// The time of the count: the time of the request.
     pub counted_at: DateTime<Utc>,
 }
 
@@ -536,15 +534,14 @@ pub struct ClientDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub owning_org_id: Option<OrgId>,
-    /// The device's backlog by campaign, as the last `queue-maintenance` run
-    /// counted it. The value is `null` before the first run counts the
-    /// backlog, or if the server cannot read the count.
+    /// The device's backlog by campaign, counted for this response. The value
+    /// is `null` if the server cannot count it.
     pub backlog_by_campaign: Option<BacklogByCampaign>,
 }
 
-/// The queued jobs a device could claim, by campaign, as one
-/// `queue-maintenance` run counted them. A job counts once in each campaign
-/// that holds it, so the counts can add up to more than the device's backlog.
+/// The queued jobs a device could claim, by campaign. A job counts once in
+/// each campaign that holds it, so the counts can add up to more than the
+/// device's backlog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct BacklogByCampaign {
@@ -556,7 +553,8 @@ pub struct BacklogByCampaign {
     /// The jobs in the campaigns that the reader may not read, summed over
     /// those campaigns.
     pub unreadable_job_count: u64,
-    /// The start of the run that counted the jobs.
+    /// The time of the count: the time of the request, the same as the
+    /// `counted_at` of the device's backlog.
     pub counted_at: DateTime<Utc>,
 }
 

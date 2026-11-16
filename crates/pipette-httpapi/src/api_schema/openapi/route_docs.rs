@@ -223,6 +223,50 @@ const OPERATIONS: &[Doc] = &[
         "change_org_descriptor_entry_state",
         "descriptor-catalog/change_org_descriptor_entry_state.md"
     ),
+    doc!(
+        "add_campaign_group_members",
+        "campaign-groups/add_campaign_group_members.md"
+    ),
+    doc!(
+        "create_campaign_group",
+        "campaign-groups/create_campaign_group.md"
+    ),
+    doc!(
+        "delete_campaign_group",
+        "campaign-groups/delete_campaign_group.md"
+    ),
+    doc!(
+        "get_campaign_group",
+        "campaign-groups/get_campaign_group.md"
+    ),
+    doc!(
+        "list_campaign_group_policies",
+        "campaign-groups/list_campaign_group_policies.md"
+    ),
+    doc!(
+        "list_campaign_group_rerun_results",
+        "campaign-groups/list_campaign_group_rerun_results.md"
+    ),
+    doc!(
+        "list_campaign_groups",
+        "campaign-groups/list_campaign_groups.md"
+    ),
+    doc!(
+        "preview_campaign_group_policies",
+        "campaign-groups/preview_campaign_group_policies.md"
+    ),
+    doc!(
+        "remove_campaign_group_member",
+        "campaign-groups/remove_campaign_group_member.md"
+    ),
+    doc!(
+        "set_campaign_group_policy",
+        "campaign-groups/set_campaign_group_policy.md"
+    ),
+    doc!(
+        "update_campaign_group",
+        "campaign-groups/update_campaign_group.md"
+    ),
     doc!("create_campaign", "campaigns/create_campaign.md"),
     doc!("delete_campaign", "campaigns/delete_campaign.md"),
     doc!("edit_variants", "campaigns/edit_variants.md"),
@@ -335,6 +379,7 @@ const OPERATIONS: &[Doc] = &[
 /// Each tag's intro, by its slug.
 const TAGS: &[Doc] = &[
     doc!("descriptor-catalog", "descriptor-catalog.md"),
+    doc!("campaign-groups", "campaign-groups.md"),
     doc!("campaigns", "campaigns.md"),
     doc!("devices", "devices.md"),
     doc!("model-params", "model-params.md"),
@@ -991,6 +1036,7 @@ mod tests {
             scored_at: Some(at("2026-09-29T10:05:00Z")?),
             device_time_ms: Some(9500),
             failure_source: Some(source),
+            failure_code: Some(pipette_plan_types::FailureCode::OutOfMemory),
             rescored_from: Some(pipette_plan_types::JobId::try_new("job-0")?),
             run_submitted_at: Some(at("2026-09-29T09:00:00Z")?),
             score_runtime_version: text("1.2.3"),

@@ -60,8 +60,8 @@ pub enum BenchmarkFlagsError {
 /// on its own. The warm-up is an uncounted attempt with the same limit, and
 /// model load and server start count against it. Calibration and
 /// readiness-gate waits do not count; each gate has its own
-/// `readiness.max_wait_secs`. An attempt past the limit is stopped and the run
-/// fails. Unset, the client's default applies.
+/// `readiness.max_wait_secs`. The client stops an attempt that exceeds the limit.
+/// The run fails. Unset, the client's default applies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, strum::EnumCount)]
 #[cfg_attr(test, derive(strum::IntoStaticStr))]
 // As on `RuntimeFlags`: the variants, their name tags turned into axis keys.
@@ -102,6 +102,26 @@ pub enum BenchmarkFlags {
         http_timeout_seconds: Option<PositiveSeconds>,
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
+    },
+    DecisionLatencyLlamacppCliStockToolsGgufText {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    DecisionLatencyLlamacppCliStockToolsGgufVision {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    /// Both decision peak-memory cells: the two timeouts and no `readiness`, as the
+    /// peak-memory VL cell.
+    DecisionMaxMemoryLlamacppCliStockToolsGgufText {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    DecisionMaxMemoryLlamacppCliStockToolsGgufVision {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     /// Peak-memory VL cell: `http_timeout_seconds` bounds one request,
     /// `attempt_timeout_seconds` the whole attempt. No `readiness`: one
@@ -509,6 +529,20 @@ impl BenchmarkFlags {
             BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision { .. } => {
                 (B::AsrThroughput, R::LlamacppCliStockTools, M::GgufVision)
             }
+            BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufText { .. } => {
+                (B::DecisionLatency, R::LlamacppCliStockTools, M::GgufText)
+            }
+            BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufVision { .. } => {
+                (B::DecisionLatency, R::LlamacppCliStockTools, M::GgufVision)
+            }
+            BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. } => {
+                (B::DecisionMaxMemory, R::LlamacppCliStockTools, M::GgufText)
+            }
+            BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. } => (
+                B::DecisionMaxMemory,
+                R::LlamacppCliStockTools,
+                M::GgufVision,
+            ),
             BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. } => {
                 (B::VlMaxMemory, R::LlamacppCliStockTools, M::GgufVision)
             }
@@ -787,6 +821,22 @@ impl BenchmarkFlags {
                 http_timeout_seconds,
                 ..
             }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufText {
+                http_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufVision {
+                http_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText {
+                http_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision {
+                http_timeout_seconds,
+                ..
+            }
             | BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision {
                 http_timeout_seconds,
                 ..
@@ -1026,6 +1076,22 @@ impl BenchmarkFlags {
                 ..
             }
             | BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufVision {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision {
                 attempt_timeout_seconds,
                 ..
             }
@@ -1326,6 +1392,10 @@ impl BenchmarkFlags {
             | BenchmarkFlags::EndToEndLatencyLlamacppCliStockToolsGgufText { readiness, .. }
             | BenchmarkFlags::VlThroughputLlamacppCliStockToolsGgufVision { readiness, .. }
             | BenchmarkFlags::AsrThroughputLlamacppCliStockToolsGgufVision { readiness, .. }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufText { readiness, .. }
+            | BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufVision {
+                readiness, ..
+            }
             | BenchmarkFlags::VlmEvalLlamacppCliStockToolsGgufVision { readiness, .. }
             | BenchmarkFlags::AsrEvalLlamacppCliStockToolsGgufVision { readiness, .. }
             | BenchmarkFlags::VlSpecDecodeLlamacppCliStockToolsGgufVision { readiness, .. }
@@ -1406,6 +1476,8 @@ impl BenchmarkFlags {
             BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision { .. }
             | BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision { .. }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. }
+            | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::EvalLlamacppCliStockToolsGgufText { .. }
             | BenchmarkFlags::EvalMlxMacosPipetteMlx { .. }
             | BenchmarkFlags::EvalDockerVllmTorch { .. }
@@ -1467,9 +1539,10 @@ impl BenchmarkFlags {
     /// What the cell ran under, as the result records it: this value minus the
     /// axis keys, which the result already carries.
     ///
-    /// Report the value the run **resolved to**, not the one the plan authored:
-    /// a `readiness` block with `None` fields describes a request, not what
-    /// happened.
+    /// Report the `readiness` block the run **resolved to**, not the one the
+    /// plan authored: one with `None` fields describes a request, not what
+    /// happened. Report the timeouts as the plan set them, `None` when it set
+    /// none, so a run on the client's default keeps grouping with older rows.
     pub fn submission_value(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self)
             // Unreachable: `BenchmarkFlags` serializes infallibly. Fall closed
@@ -1481,6 +1554,19 @@ impl BenchmarkFlags {
             });
         }
         value
+    }
+
+    /// Take `attempt_timeout_seconds` out of `flags`, a job body's
+    /// `spec.benchmark_flags`. A value left with the axis keys alone becomes
+    /// null, which a cell that sets no flag holds.
+    pub fn drop_attempt_timeout(flags: &mut serde_json::Value) {
+        let Some(fields) = flags.as_object_mut() else {
+            return;
+        };
+        fields.remove("attempt_timeout_seconds");
+        if fields.keys().all(|key| AXIS_KEYS.contains(&key.as_str())) {
+            *flags = serde_json::Value::Null;
+        }
     }
 }
 
@@ -1957,6 +2043,21 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                     readiness: r.readiness,
                 }
             }
+            // decision-latency: HTTP timeout + readiness, like vl-throughput.
+            (B::DecisionLatency, R::LlamacppCliStockTools, M::GgufText) => {
+                BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufText {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::DecisionLatency, R::LlamacppCliStockTools, M::GgufVision) => {
+                BenchmarkFlags::DecisionLatencyLlamacppCliStockToolsGgufVision {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
             // vl-max-memory: both timeouts (a single ungated run).
             (B::VlMaxMemory, R::LlamacppCliStockTools, M::GgufVision) => {
                 r.deny_readiness()?;
@@ -1969,6 +2070,20 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             (B::AsrMaxMemory, R::LlamacppCliStockTools, M::GgufVision) => {
                 r.deny_readiness()?;
                 BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::DecisionMaxMemory, R::LlamacppCliStockTools, M::GgufText) => {
+                r.deny_readiness()?;
+                BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::DecisionMaxMemory, R::LlamacppCliStockTools, M::GgufVision) => {
+                r.deny_readiness()?;
+                BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision {
                     http_timeout_seconds: r.http_timeout_seconds,
                     attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
@@ -2246,6 +2361,32 @@ mod submission_tests {
         AXIS_KEYS.iter().for_each(|key| {
             assert_eq!(value.get(*key), None, "{key} should not be reported");
         });
+    }
+
+    /// A body whose only flag is the limit holds the axis keys beside it, and
+    /// reads as a body with no flags once the limit is out.
+    #[rstest::rstest]
+    #[case::only_the_limit(None)]
+    #[case::beside_readiness(Some(ReadinessOverrides {
+        max_wait_secs: Some(300),
+        ..ReadinessOverrides::default()
+    }))]
+    fn a_flags_value_drops_its_attempt_limit_alone(
+        #[case] readiness: Option<ReadinessOverrides>,
+    ) -> anyhow::Result<()> {
+        let limited = BenchmarkFlags::PrefillThroughputLlamacppCliStockToolsGgufText {
+            attempt_timeout_seconds: Some(PositiveSeconds::try_new(180)?),
+            readiness: readiness.clone(),
+        };
+        let mut flags = serde_json::to_value(limited)?;
+        BenchmarkFlags::drop_attempt_timeout(&mut flags);
+
+        let expected = match readiness {
+            Some(_) => serde_json::to_value(prefill_flags(readiness))?,
+            None => serde_json::Value::Null,
+        };
+        assert_eq!(flags, expected);
+        Ok(())
     }
 
     #[test]
@@ -2811,6 +2952,14 @@ mod tests {
         ("asr_eval", "llamacpp_cli_stock_tools", "gguf_vision",
          &["http_timeout_seconds", "readiness"]),
         ("vl_throughput", "mlx_macos_pipette", "mlx", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decision_latency", "llamacpp_cli_stock_tools", "gguf_text",
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decision_latency", "llamacpp_cli_stock_tools", "gguf_vision",
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("decision_max_memory", "llamacpp_cli_stock_tools", "gguf_text",
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
+        ("decision_max_memory", "llamacpp_cli_stock_tools", "gguf_vision",
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("vl_max_memory", "llamacpp_cli_stock_tools", "gguf_vision",
          &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("vl_throughput", "trt_edgellm", "gguf_vision", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),

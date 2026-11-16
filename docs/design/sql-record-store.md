@@ -41,11 +41,11 @@ None of that is true of the results. The warehouse is append-only Parquet that
 DuckDB scans in place. That is an object-store workload, and it stays in the
 object store.
 
-The job queue has every cost above. The claim of a job is an atomic rename, and
-S3 Express does a rename well. But each claim and each `queue-maintenance` run
-lists whole keyspaces. Nothing in `todo/` names a plan. Each transition that
-touches more than one key needs a manual crash-safe order. So the queue moves
-too, and [sql-job-queue.md](sql-job-queue.md) is that design.
+The object-store job queue had every cost above. Its claim of a job was an
+atomic rename, and S3 Express did a rename well. But each claim and each
+`queue-maintenance` run listed whole keyspaces. No queue key named a plan. Each
+transition that touched more than one key needed a manual crash-safe order. So
+the queue moved too, and [sql-job-queue.md](sql-job-queue.md) is that design.
 
 ## The split
 
@@ -59,7 +59,7 @@ too, and [sql-job-queue.md](sql-job-queue.md) is that design.
 | `locks/` (the mutate and score-eval leases) | plans, cancel markers, plan sources, content keys, job-plan markers, job sources, job-plan links |
 | | campaigns, vault records, vault imports |
 | | an index of the outcome of each submission |
-| | `todo/`, the job queue (`[todo_storage]`), at the cutover in [sql-job-queue.md](sql-job-queue.md) |
+| | the job queue ([sql-job-queue.md](sql-job-queue.md)) |
 
 Submissions stay because they are bodies and not records. The completions of an
 eval submission reach megabytes in size. The state of a submission is the queue
@@ -85,7 +85,7 @@ contract can still report a corrupt record rather than refuse to store it.
 
 The note and the revision change of a plan are columns next to its body. A
 rewrite of the manifest does not change them. Only the SQL store keeps them.
-Without `[database]`, a plan has neither.
+The object-store plan record has neither.
 
 The two `-index` keyspaces are tables whose primary key is the claimed value,
 so a constraint enforces the uniqueness. Listings that page keep the object
@@ -142,14 +142,14 @@ of each store requires the outcome that the object store gives.
 
 Flows that span both sides keep their order and their convergence. Plan
 ingestion writes the source, the link and the membership marker before the job
-reaches `todo/`. `clients delete` deletes the identity before it purges the
+reaches the job queue. `clients delete` deletes the identity before it purges the
 queue. A record write is one transaction (a client and its permission set go in
 one transaction). No transaction spans the database and the bucket.
 
 ## Readers outside mgmt
 
-pipette-duckdb joins the records to the results. With `[database]` set, the
-record keyspaces stop changing in the bucket, so a mirror of them goes stale.
+pipette-duckdb joins the records to the results. The record keyspaces in the
+bucket do not change, so a mirror of them goes stale.
 The decision is that duckdb attaches the database read-only
 (`PIPETTE_RECORDS_SOURCE=database`, its `docs/configuration.md`), as a role that
 reads only the record tables, rather than mgmt exporting a copy: no mirror, so
@@ -163,7 +163,7 @@ columns without a JSON parse.
   rewrites the `progress_snapshot` in the body. A store method that writes only
   the status and the snapshot would remove that work.
 - **`[auth_storage]` is required.** `serve` probes it for conditional PUT,
-  although no record lives there if `[database]` is set.
+  although no record that `serve` reads lives there.
 - **Listings sort on an expression** (`{id}.json`, the object-store order that
   the shared contract requires), so each page sorts the keyspace again. This
   cost is acceptable at thousands of rows. For more rows, a stored sort-key

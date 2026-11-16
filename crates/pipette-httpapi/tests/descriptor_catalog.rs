@@ -2106,7 +2106,7 @@ async fn rejects_bad_query(#[case] uri: String) -> anyhow::Result<()> {
 async fn no_database_returns_404(#[case] uri: String) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let signer = registered_user(&state, &[UserPermission::ReadClients]).await?;
     let (status, body) = read(&state, &signer, &uri).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -2117,7 +2117,7 @@ async fn no_database_returns_404(#[case] uri: String) -> anyhow::Result<()> {
 async fn org_write_routes_gate_before_the_missing_catalog() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let org = seed_org(&state, "acme").await?.org_id;
     let member = registered_user(&state, &[UserPermission::EditCatalog]).await?;
     set_user_org(&state, &member.1, Some(org.clone())).await?;
@@ -3067,7 +3067,8 @@ async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow
             pipette_plan_types::AuditAction::Http { .. }
             | pipette_plan_types::AuditAction::Cli { .. }
             | pipette_plan_types::AuditAction::CatalogMerge { .. }
-            | pipette_plan_types::AuditAction::FirstClerkSignIn { .. } => None,
+            | pipette_plan_types::AuditAction::FirstClerkSignIn { .. }
+            | pipette_plan_types::AuditAction::GroupPolicy { .. } => None,
         })
         .collect();
     assert_eq!(renames.len(), 1, "{renames:?}");

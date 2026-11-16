@@ -21,6 +21,11 @@ caller may not read stays a row, its id alone, so a running campaign does not
 read as idle; `current_plan_id` is present exactly when the campaign runs a
 plan, read or not.
 
+`group` is the record of the [campaign group](../campaign-groups.md) the
+campaign is in, or `null` when it is in none, on a server without a
+`[database]`, and for a caller that may not read the group, such as a campaign
+reader.
+
 ## Statuses
 
 | Status | When |

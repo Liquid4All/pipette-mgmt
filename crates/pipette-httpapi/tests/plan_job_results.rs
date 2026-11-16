@@ -24,9 +24,10 @@ use pipette_plan_types::{
 };
 use pipette_store_testkit::{TodoStoreUnimplemented, a_descriptor_entry, a_member, a_model_member};
 use pipette_web_testkit::{
-    DUCKDB_TIMEOUT, ONE_CELL_PLAN, approved_client, authed_user_get, body_json, created_campaign,
-    created_campaign_from, grant_user, register_and_approve, registered_user,
-    registered_user_with_detail, run_mocked, seed_org, seeded_sql_state, set_user_org, with_duckdb,
+    DUCKDB_TIMEOUT, ONE_CELL_PLAN, approved_client, approved_object_client, authed_user_get,
+    body_json, created_campaign, created_campaign_from, grant_user, register_and_approve,
+    registered_user, registered_user_with_detail, run_mocked, seed_org, seeded_sql_state,
+    set_user_org, with_duckdb,
 };
 
 /// [`ONE_CELL_PLAN`] over three models: a first plan of three jobs, to page.
@@ -45,7 +46,8 @@ runtimes = [{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-ar
 
 /// A campaign's first plan, filed by an account that reads its plans, and the
 /// fleet when `detail`, on a server reading pipette-duckdb from `duckdb` when one
-/// is given.
+/// is given. The records stay on the local_fs stores, so a test can tamper with
+/// a stored file.
 struct Filed {
     _dir: TempDir,
     state: AppState,
@@ -64,7 +66,7 @@ async fn filed_from(
     document: &str,
 ) -> anyhow::Result<Filed> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, _client_id) = approved_client(dir.path()).await?;
+    let (state, _key, _client_id) = approved_object_client(dir.path()).await?;
     let state = match duckdb {
         Some(server) => with_duckdb(state, &server.base_url())?,
         None => state,
@@ -170,9 +172,9 @@ fn rows_body(job_id: &str, failed_reason: Option<&str>) -> Value {
 /// One result row of `job_id`, in the columns [`query_body`] names. A failure
 /// is one its client reported.
 fn result_row(job_id: &str, failed_reason: Option<&str>) -> Value {
-    let (value, failed, source) = match failed_reason {
-        None => (json!(42.5), false, Value::Null),
-        Some(_) => (Value::Null, true, json!("client")),
+    let (value, failed, source, code) = match failed_reason {
+        None => (json!(42.5), false, Value::Null, Value::Null),
+        Some(_) => (Value::Null, true, json!("client"), json!("out_of_memory")),
     };
     json!([
         job_id,
@@ -191,7 +193,8 @@ fn result_row(job_id: &str, failed_reason: Option<&str>) -> Value {
         "2026-09-29T10:00:00.000000Z",
         "2026-09-29T10:05:00.000000Z",
         184_250,
-        source
+        source,
+        code
     ])
 }
 
@@ -200,7 +203,7 @@ fn query_body(rows: Vec<Value>) -> Value {
         "columns": ["job_id", "benchmark_id", "benchmark_type", "metric", "value", "value_stddev",
                     "unit", "failed", "failed_reason", "model_descriptor", "runtime_descriptor",
                     "client_id", "device_name", "submitted_at", "scored_at", "device_time_ms",
-                    "failure_source"],
+                    "failure_source", "failure_code"],
         "rowCount": rows.len(),
         "rows": rows,
     })
@@ -748,6 +751,7 @@ async fn test_results_page_the_document_order_for_the_window_alone() -> anyhow::
 
 /// A client's failure reason is answered whole, and only to a reader of the
 /// fleet, since it can list client ids. Its source is named there alone too.
+/// Its code names no machine, so every tier reads it.
 async fn assert_reason_at_tier(detail: bool, tier: &str) -> anyhow::Result<()> {
     let server = MockServer::start_async().await;
     let filed = filed(Some(&server), detail).await?;
@@ -770,6 +774,10 @@ async fn assert_reason_at_tier(detail: bool, tier: &str) -> anyhow::Result<()> {
     assert_eq!(
         body.pointer("/jobs/0/result/rows/0/failure_source"),
         Some(&shown(json!("client")))
+    );
+    assert_eq!(
+        body.pointer("/jobs/0/result/rows/0/failure_code"),
+        Some(&json!("out_of_memory"))
     );
     Ok(())
 }
@@ -1001,6 +1009,124 @@ async fn assert_an_empty_count_is_filled(
         Some(Value::Null),
         "the page answers without the rows"
     );
+    Ok(())
+}
+
+/// A failure reported against a plan's job records no model, so its row reads
+/// the counts of the model the job requested, on the page and in the results
+/// file. A row that records a model the table lacks keeps empty counts.
+#[tokio::test]
+async fn test_a_row_that_records_no_model_counts_the_requested_one() -> anyhow::Result<()> {
+    let server = MockServer::start_async().await;
+    let filed = filed(Some(&server), true).await?;
+    let job_id = filed.job_id().await?;
+    filed
+        .state
+        .model_params_store
+        .put_model_params(&pipette_store_testkit::a_model_params("lfm2.5-350m", 354)?)
+        .await?;
+    let count = |page: &Value, which: &str| {
+        page.pointer(&format!(
+            "/jobs/0/result/rows/0/model_params_{which}_millions"
+        ))
+        .cloned()
+    };
+
+    let failure = rows_body(&job_id, Some("rep 2 ran past attempt_timeout_seconds"));
+    let reported = mock_rows(&server, &job_id, failure.clone()).await;
+    let page = filed.get_json(&filed.results("")).await?;
+    assert_eq!(count(&page, "total"), Some(json!(354)), "{page}");
+    assert_eq!(count(&page, "active"), Some(json!(354)), "{page}");
+    assert_eq!(
+        csv_counts(&filed, &server, failure).await?,
+        ("354".to_owned(), "354".to_owned())
+    );
+
+    reported.delete_async().await;
+    let mut measured = result_row(&job_id, None);
+    *measured.get_mut(9).context("a model_descriptor column")? = json!(
+        r#"{"org":"LiquidAI","repo_name":"LFM2-700M-MLX-4bit","source":"huggingface","type":"mlx"}"#
+    );
+    mock_rows(&server, &job_id, query_body(vec![measured])).await;
+    let page = filed.get_json(&filed.results("")).await?;
+    assert_eq!(count(&page, "total"), Some(Value::Null), "{page}");
+    assert_eq!(count(&page, "active"), Some(Value::Null), "{page}");
+    Ok(())
+}
+
+#[rstest]
+#[case::fill_from_plan(None, None, "354")]
+#[case::job_source_unavailable(Some("job-sources"), None, "")]
+#[case::document_unavailable(Some("plan-sources"), None, "")]
+#[case::stored_counts_need_no_sources(None, Some(350), "350")]
+#[case::stored_counts_survive_job_source_failure(Some("job-sources"), Some(350), "350")]
+#[case::stored_counts_survive_document_failure(Some("plan-sources"), Some(350), "350")]
+#[tokio::test]
+async fn test_csv_model_counts_do_not_require_plan_sources(
+    #[case] broken: Option<&str>,
+    #[case] stored: Option<i32>,
+    #[case] expected: &str,
+) -> anyhow::Result<()> {
+    let server = MockServer::start_async().await;
+    let mut filed = filed(Some(&server), true).await?;
+    let job_id = filed.job_id().await?;
+    filed.state.cell_cache = Arc::default();
+    filed
+        .state
+        .model_params_store
+        .put_model_params(&pipette_store_testkit::a_model_params("lfm2.5-350m", 354)?)
+        .await?;
+    if let Some(directory) = broken {
+        let file = match directory {
+            "job-sources" => format!("{job_id}.json"),
+            _ => format!("{}.toml", filed.plan_id),
+        };
+        let source = filed._dir.path().join(directory).join(file);
+        std::fs::remove_file(&source)?;
+        std::fs::create_dir(&source)?;
+        if directory == "job-sources" {
+            assert!(
+                filed
+                    .state
+                    .plan_store
+                    .get_job_sources(&[JobId::try_new(&job_id)?])
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(
+                filed
+                    .state
+                    .plan_store
+                    .get_plan_source(&filed.plan_id)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    let mut row = result_row(&job_id, Some("attempt failed"));
+    row.as_array_mut()
+        .context("a result row")?
+        .extend([json!(stored), json!(stored)]);
+    let mut body = query_body(vec![row]);
+    body["columns"]
+        .as_array_mut()
+        .context("result columns")?
+        .extend([
+            json!("model_params_total_millions"),
+            json!("model_params_active_millions"),
+        ]);
+    assert_eq!(
+        csv_counts(&filed, &server, body).await?,
+        (expected.to_owned(), expected.to_owned())
+    );
+    if stored.is_some() {
+        assert!(
+            filed.state.cell_cache.get(&filed.plan_id, 1).is_none(),
+            "stored counts must not load plan cells"
+        );
+    }
     Ok(())
 }
 

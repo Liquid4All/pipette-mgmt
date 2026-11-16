@@ -42,7 +42,7 @@ pub enum SelectorError {
     RuntimeKeyShape,
     #[error("unknown model format {0:?}: expected gguf, mlx, torch, openvino or onnx")]
     UnknownFormat(String),
-    #[error("a quantization label matches [a-z0-9_]+")]
+    #[error("a quantization label matches [a-z0-9_]+ with an optional @[a-z0-9_]+ source")]
     Quantization(#[from] QuantizationLabelError),
 }
 
@@ -535,6 +535,7 @@ mod tests {
         runtime_key(Some("macos-arm64"))
     )]
     #[case::org_model("acme/x::mlx::4bit", Some("acme"), model_key("mlx", "4bit"))]
+    #[case::sourced_model("x::gguf::q4_k_m@unsloth", None, model_key("gguf", "q4_k_m@unsloth"))]
     #[case::spaced_name("acme/Acme LM 3B::gguf::q4_0", Some("acme"), model_key("gguf", "q4_0"))]
     fn member_selector_round_trips(
         #[case] input: &str,
@@ -569,6 +570,9 @@ mod tests {
     #[case::bad_qualifier("a b/x::linux", DescriptorKind::Runtime)]
     #[case::unknown_format("x::safetensors::bf16", DescriptorKind::Model)]
     #[case::uppercase_quantization("x::gguf::Q4_0", DescriptorKind::Model)]
+    #[case::leading_at("x::gguf::@unsloth", DescriptorKind::Model)]
+    #[case::trailing_at("x::gguf::q4_0@", DescriptorKind::Model)]
+    #[case::two_ats("x::gguf::q4_0@a@b", DescriptorKind::Model)]
     #[case::bare_model("AcmeLM-3B", DescriptorKind::Model)]
     #[case::format_only("AcmeLM-3B::gguf", DescriptorKind::Model)]
     #[case::model_key_on_runtime("Foo-1::gguf::q4_0", DescriptorKind::Runtime)]

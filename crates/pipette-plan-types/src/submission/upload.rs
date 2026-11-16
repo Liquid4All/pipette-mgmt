@@ -199,10 +199,12 @@ pub struct SuccessInput {
     /// Opaque runtime configuration, typically JSON but any string (e.g.
     /// `--n-gpu-layers 999`); stored verbatim, never validated.
     pub runtime_flags: Option<NonEmptyTrimmedString>,
-    /// The **resolved** harness configuration (readiness gating, timeouts, loop
-    /// detection) as a JSON string. Canonicalized and stored with a `_sha256`,
-    /// like the descriptors: it groups runs measured the same way. A client
-    /// submits the value it ran with, never null; see `docs/storage.md`.
+    /// The harness configuration (readiness gating, timeouts, loop detection)
+    /// as a JSON string. Canonicalized and stored with a `_sha256`, like the
+    /// descriptors: it groups runs measured the same way. A client submits the
+    /// readiness block it ran with, never null, and the timeouts as the plan
+    /// set them, absent when it set none, so a run on the client's default
+    /// keeps grouping with older rows; see `docs/storage.md`.
     pub benchmark_flags: Option<String>,
     /// The host environment the client forwarded into the runtime, as a
     /// `{"envs":[...]}` JSON string. A measurement condition, so it enters no
@@ -300,6 +302,12 @@ pub struct SuccessInput {
     /// reply ran no decode loop and adds 0. Over `turns`, the request-mean
     /// accept length the pooled counters cannot give.
     pub vl_spec_decode_turn_accept_length_sum: Option<f32>,
+    /// `decision_latency`: one request on the client's clock, a mean over reps,
+    /// and with more than one in flight the whole batch's wall time.
+    pub decision_latency_request_ms: Option<PositiveMillis>,
+    pub decision_latency_request_ms_stddev: Option<NonNegativeMillis>,
+    pub decision_latency_batch_ms: Option<PositiveMillis>,
+    pub decision_latency_batch_ms_stddev: Option<NonNegativeMillis>,
 
     // Not namespaced by benchmark type, so every type that serves a corpus
     // answers "which corpus did this row measure?" in one column.
@@ -312,8 +320,9 @@ pub struct SuccessInput {
     pub observation_output_digest: Option<Sha256>,
 }
 
-/// What kind of failure a client reported, for grouping failures without
-/// parsing `failure_reason`. Spelled the same in request bodies, retry records,
+/// The type of failure that a client reported. Use this code to group failures
+/// without a parser for `failure_reason`. Spelled the same in request bodies,
+/// retry records,
 /// `queue_denials` and the warehouse; renaming a variant needs a backfill of
 /// all four.
 #[derive(
@@ -323,6 +332,8 @@ pub struct SuccessInput {
     Default,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Serialize,
     Deserialize,
     strum::Display,
@@ -343,16 +354,28 @@ pub enum FailureCode {
     OutOfMemory,
     /// An attempt ran past the job's `attempt_timeout_seconds`.
     AttemptTimeout,
-    /// The runtime or the app's engine crashed, exited, aborted, refused the
-    /// model or an op, answered with something other than what was asked, or
-    /// ran past a limit other than `attempt_timeout_seconds`.
+    /// The runtime or the app's engine failed in one of these ways:
+    /// - Crashed, exited or aborted.
+    /// - Refused the model or an operation.
+    /// - Answered with something other than what was asked.
+    /// - Ran past a limit other than `attempt_timeout_seconds`.
     RuntimeError,
-    /// The device or its host failed: a reboot, a readiness wait, an
-    /// unreachable device.
+    /// The device or its host failed:
+    /// - It rebooted or was unreachable.
+    /// - Its readiness check could not read a sensor or had a sensor set up
+    ///   wrong.
+    /// - A host check (battery, GPU driver) refused the run.
     DeviceError,
-    /// The client around the runtime failed before or after it ran: a vault
-    /// fetch, an install, the spec, a missing model, the submit, or a download
-    /// or wait that timed out.
+    /// The readiness wait timed out: the device stayed too hot or busy to
+    /// measure. Sent with `retriable: false`.
+    DeviceNotReady,
+    /// The client failed before or after the runtime ran:
+    /// - A vault fetch, an install or the spec failed.
+    /// - A model was missing.
+    /// - The submit failed.
+    /// - A download or wait timed out.
+    /// - The readiness wait timed out, sent with `retriable: false` by a
+    ///   pipette build from before [`Self::DeviceNotReady`].
     HarnessError,
 }
 

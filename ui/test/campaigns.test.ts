@@ -2,9 +2,9 @@ import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
 import {
   CAMPAIGN_PAGES, LABELS_MAX, NAME_MAX_CHARS, NOTE_MAX_CHARS, campaignPlan, campaignQuery, campaignTable, chosenOwner, createQuery,
-  deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelLink, labelPairs, labelText, labelVocabulary, labelsBody,
+  deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelHue, labelLink, labelPairs, labelText, labelToggled, labelVocabulary, labelsBody,
   labelScope, labelsProblem, mayLabel, nameProblem, newCampaignAction, newCampaignOwners, newCampaignRefusal, noteProblem,
-  parseLabel, planTrail, progressFill, progressText, renameBody, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
+  parseLabel, planTrail, progressFill, progressText, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
   repeatedText, restoreEdit, revertOffered, revisionQuery, revisionSummary, importKey, importLine, importText, withLabel, withoutLabel, withVariantsOf,
 } from "../src/lib/campaigns";
 import { ownedEmpty, ownerBranch, underTrail } from "../src/lib/owned";
@@ -113,15 +113,27 @@ describe("the campaign listings", () => {
     expect(drawnKeys("pipette.campaigns.columns", campaignTable({}, true).columns)).toEqual(["name", "status"]);
   });
 
-  test("a row's progress counts its plan's failed jobs as done, and its status says they failed", () => {
+  test("a row's progress prints its plan's finished, failed and running jobs of all", () => {
     const counts = { total: 4, finished: 2, failed: 1, running: 1, available: 0, cancelled: 0 };
-    const row = (status: "active" | "complete") =>
-      ({ campaign_id: "campaign_1", plan: { status, cancel_requested: false, counts } }) as CampaignView;
+    const row = { campaign_id: "campaign_1", plan: { status: "active", cancel_requested: false, counts } } as CampaignView;
     const spec = campaignTable({}, false);
-    const raw = (key: string, of: CampaignView) => spec.columns.find((column) => column.key === key)?.raw(of);
-    expect([progressText(row("active")), raw("progress", row("active")), raw("status", row("active"))])
-      .toEqual(["3/4 (1)", 0.75, "active"]);
-    expect(raw("status", row("complete"))).toBe("complete_with_failures");
+    const raw = (key: string) => spec.columns.find((column) => column.key === key)?.raw(row);
+    expect([progressText(row), raw("progress")]).toEqual(["2 · 1 · 1 / 4", 0.75]);
+  });
+
+  test.each([
+    ["a plan still at work", "active", "active"],
+    ["a plan being created", "creating", "active"],
+    ["a plan waiting on clients", "pending_clients", "active"],
+    ["a cancelling plan", "cancelling", "active"],
+    ["a complete plan, whatever failed", "complete", "complete"],
+    ["a cancelled plan", "cancelled", "cancelled"],
+  ] as const)("%s reads %s in the status column and its filter", (_, status, phase) => {
+    const counts = { total: 4, finished: 2, failed: 2, running: 0, available: 0, cancelled: 0 };
+    const row = { campaign_id: "campaign_1", plan: { status, cancel_requested: false, counts } } as CampaignView;
+    const spec = campaignTable({}, false);
+    expect(spec.columns.find((column) => column.key === "status")?.raw(row)).toBe(phase);
+    expect(spec.choices?.find((choice) => choice.key === "status")?.values(row)).toEqual([phase]);
   });
 
   test.each([
@@ -133,7 +145,13 @@ describe("the campaign listings", () => {
   ] as const)("%s", (_, status, phase) => {
     const counts = { total: 8, finished: 4, failed: 2, running: 0, available: 0, cancelled: 2 };
     const row = { campaign_id: "campaign_1", plan: { status, cancel_requested: false, counts } } as CampaignView;
-    expect(progressFill(row)).toEqual({ phase, finished: 0.5, done: 0.75 });
+    expect(progressFill(row)).toEqual({ phase, finished: 0.5, done: 0.75, started: 0.75 });
+  });
+
+  test("a plan's running jobs follow its done ones", () => {
+    const counts = { total: 8, finished: 2, failed: 1, running: 3, available: 2, cancelled: 0 };
+    const row = { campaign_id: "campaign_1", plan: { status: "active", cancel_requested: false, counts } } as CampaignView;
+    expect(progressFill(row)).toEqual({ phase: "active", finished: 0.25, done: 0.375, started: 0.75 });
   });
 
   test("a campaign with no plan, no counts or no jobs draws no bar", () => {
@@ -160,6 +178,25 @@ describe("the campaign listings", () => {
     expect(labelLink("/app/orgs/acme/campaigns", ["Device", "S26 Ultra"]))
       .toBe("/app/orgs/acme/campaigns?label=Device%3DS26+Ultra");
     expect(labelLink("/app/campaigns", ["canary", ""])).toBe("/app/campaigns?label=canary");
+  });
+
+  test.each([
+    ["adds a label beside those chosen", "label=canary&status=running&offset=50", ["team", "npu"],
+      "/app/campaigns?label=canary&status=running&label=team%3Dnpu"],
+    ["takes a chosen label off", "label=canary&label=team%3Dnpu&sort=-name", ["team", "npu"],
+      "/app/campaigns?label=canary&sort=-name"],
+    ["leaves the bare listing once nothing is left", "label=canary", ["canary", ""], "/app/campaigns"],
+  ] as const)("a chip on its own listing %s", (_, query, pair, expected) => {
+    expect(labelToggled("/app/campaigns", new URLSearchParams(query), pair)).toBe(expected);
+  });
+
+  test("a label's hue is one of twelve, fixed by its key=value text", () => {
+    const pairs: [string, string][] = [["team", "npu"], ["team", "eval"], ["canary", ""], ["Device", "S26 Ultra"]];
+    const hues = pairs.map(labelHue);
+    expect(hues).toEqual(pairs.map(labelHue));
+    expect(hues.every((hue) => hue % 30 === 15)).toBe(true);
+    // The hash reads the text a chip shows, so a bare key and the key with an empty value are one label.
+    expect(labelHue(["team", "npu"])).toBe(labelHue(["team=npu", ""]));
   });
 
   test("the search matches the models a campaign's plan names, and a row without them", () => {
@@ -279,7 +316,7 @@ describe("the new-campaign form", () => {
       .toBe("name=N&owner=org_acme&note=nightly-1");
     expect(createQuery({ name: "N", owner: "", note: "  nightly-1 " })).toBe("name=N&note=nightly-1");
     expect(createQuery({ name: "N", owner: "", note: "   " })).toBe("name=N");
-    expect(() => createQuery({ name: "  ", owner: "", note: "" })).toThrow("Name the campaign");
+    expect(() => createQuery({ name: "  ", owner: "", note: "" })).toThrow("Enter a name");
     expect(() => createQuery({ name: "N", owner: "", note: "p".repeat(NOTE_MAX_CHARS + 1) }))
       .toThrow("Keep the note to 4,096 characters");
   });
@@ -342,18 +379,12 @@ describe("a campaign's page", () => {
     expect(handedAway(new Error("offline"), to)).toBeNull();
   });
 
-  test("a rename refuses a blank name in the classic words", () => {
-    expect(renameBody("Nightly v2")).toEqual({ name: "Nightly v2" });
-    expect(() => renameBody("  ")).toThrow("Name the campaign");
-  });
-
   test("a name is checked as it is typed, as the route counts it: trimmed, in characters", () => {
     expect(nameProblem("Nightly v2")).toBe("");
-    expect(nameProblem(" \t")).toBe("Name the campaign");
+    expect(nameProblem(" \t")).toBe("Enter a name");
     expect(nameProblem(`  ${"é".repeat(NAME_MAX_CHARS)}  `)).toBe("");
     expect(nameProblem("😀".repeat(NAME_MAX_CHARS))).toBe("");
     expect(nameProblem("a".repeat(NAME_MAX_CHARS + 1))).toBe("Keep the name to 4,096 characters");
-    expect(() => renameBody("a".repeat(NAME_MAX_CHARS + 1))).toThrow("Keep the name to 4,096 characters");
   });
 });
 
@@ -447,8 +478,8 @@ describe("a restore of one variant", () => {
 
 describe("a revision's preview", () => {
   const preview = { bodies: [], plan_warnings: [], imports: [], document: "", unchanged: false, carried_job_count: 3, new_job_count: 0,
-    requirements_rerun_job_count: 0, satisfied_job_count: 0, restored_job_count: 0, inherited_job_count: 0, rerun_job_count: 0, recalculated_job_count: 0, dropped_job_ids: [] as string[],
-    held_jobs: [], repeated_variants: [] as number[] };
+    requirements_rerun_job_count: 0, satisfied_job_count: 0, restored_job_count: 0, inherited_job_count: 0, rerun_job_ids: [] as string[],
+    marked_job_ids: [] as string[], recalculated_job_count: 0, dropped_job_ids: [] as string[], held_jobs: [], repeated_variants: [] as number[] };
 
   test("says what filing it does to the current plan's jobs", () => {
     expect(revisionSummary(preview)).toBe("Filing it changes no job: every job carries over as it is.");
@@ -456,11 +487,17 @@ describe("a revision's preview", () => {
       .toBe("Filing it files nothing: this is the document the campaign runs.");
     expect(revisionSummary({ ...preview, new_job_count: 2, dropped_job_ids: ["job-1"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, queues 2 new, stops 1.");
-    expect(revisionSummary({ ...preview, rerun_job_count: 1 }))
+    expect(revisionSummary({ ...preview, rerun_job_ids: ["job-1"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, runs 1 again, stops 0.");
+    // A mark alone changes a job.
+    expect(revisionSummary({ ...preview, marked_job_ids: ["job-1"] }))
+      .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, marks 1 failed, stops 0.");
+    expect(revisionSummary({ ...preview, rerun_job_ids: ["job-1"], marked_job_ids: ["job-2"] }))
+      .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, runs 1 again, marks 1 failed, stops 0.");
     expect(revisionSummary({ ...preview, requirements_rerun_job_count: 2, dropped_job_ids: ["job-1", "job-2"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
-        + "runs 2 finished again (failed, or their device or build is not known to meet the requirements), stops 2.");
+        + "runs 2 finished again (failed, their device or build is not known to meet the requirements, "
+        + "or they are not known to have passed the attempt limit), stops 2.");
     expect(revisionSummary({ ...preview, restored_job_count: 2, dropped_job_ids: ["job-1", "job-2"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
         + "brings back 2 finished from earlier plans, stops 2.");

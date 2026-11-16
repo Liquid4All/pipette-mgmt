@@ -188,8 +188,9 @@ pub struct PlanManifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub content_keys: BTreeMap<JobId, String>,
     /// The job each re-run job of this plan runs again, keyed by the re-run
-    /// job. Written at ingestion, and kept by a revision that carries the job.
-    /// The scorer copies it onto the job's warehouse rows.
+    /// job. A job that a re-run's `fail` minted names the job whose cell it
+    /// marks failed. Written at ingestion, and kept by a revision that carries
+    /// the job. The scorer copies it onto the job's warehouse rows.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rerun_of: BTreeMap<JobId, JobId>,
     /// Frozen ingestion-time warnings, grouped by [`WarningKind`] and then by
@@ -1484,7 +1485,7 @@ mod tests {
         &[],
         None
     )]
-    // The same pair in the other listing order. `list_leased` fixes no order,
+    // The same pair in the other listing order. `list_leases` fixes no order,
     // so the collapse must not depend on one.
     #[case::renewal_collapses_either_order(
         &[("ev1_a", "job-1", 30), ("ev1_a", "job-1", -30)],
@@ -1662,6 +1663,9 @@ mod tests {
         let change = pipette_plan_types::RevisionChange::Rerun {
             answered: None,
             job_count: 1,
+            marked_job_count: 0,
+            group_id: None,
+            policies: Vec::new(),
         };
         let notes = PlanNotes {
             note: Some(" nightly ".to_owned()),

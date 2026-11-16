@@ -9,6 +9,15 @@ annotated example, and [cli.md](cli.md#configuration-file) says how the file is
 found and where credentials come from. A missing `evals_server_url` fails the
 load.
 
+Every environment needs a `[database]` section, because the records and the job
+queue are in PostgreSQL. A config without `[database]` fails to load. A bare
+`[database]` section is valid: the libpq `PG*` environment variables supply the
+connection.
+
+`[todo_storage]`, `todo_attempt_timeout_secs` and `todo_operation_timeout_secs`
+are retired keys. A config that has one of them fails to load. Delete each one
+from every deployed config.
+
 `serve` holds no TLS and binds every interface by default. See
 [§5.6](#56-network-exposure-and-tls) for the deployment shape that requires.
 
@@ -233,7 +242,7 @@ For an upstream or storage error, inspect the run's `error_summary` and the
 
 ### 3.1. Job queue maintenance
 
-`queue-maintenance` reconciles everything stale in the `todo/` queue; what each
+`queue-maintenance` reconciles everything stale in the job queue; what each
 run does is [cli.md](cli.md#pipette-mgmt-queue-maintenance), and the protocol it
 maintains [queue.md](queue.md).
 
@@ -257,17 +266,16 @@ makes a tick exit immediately while the previous run is still going, rather
 than queue behind it. A skipped tick loses no work: each run reconciles
 everything outstanding at that moment.
 
-Overlapping runs *can* be destructive. The reconciliation sweep removes a
-marker only after its storage key is seen orphaned in two consecutive runs, and
-first sightings are persisted (`todo/.gc-candidates`) for the next run to read.
-Each run consumes that file as it starts, so a run that fails partway leaves no
-stale sightings behind; it merely delays GC by one interval. That rule is safe
-only because the gap between sightings is a full cron interval: long enough
-for an entity caught mid-transition (a job racing `leased/ → avail/`, a client
-racing re-registration) to become visible. Two overlapping runs can both miss
-the same in-transition entity and count as two "consecutive" sightings seconds
-apart, deleting a live job's `eligible/`/`denied/` markers, which are never
-rebuilt, and leaving it permanently unclaimable.
+Overlapping runs *can* be destructive. The plan-index GC deletes a content key,
+a membership marker or a pending-source marker only after two consecutive runs
+find it orphaned. Each run records its first sightings in the
+`plan_index_gc_candidates` table for the next run. Each run clears that table
+as it starts, so a run that fails partway leaves no stale sightings. It only
+delays GC by one interval. The rule is safe only because the gap between two
+sightings is a full cron interval. In that time, an ingest that was in
+progress writes the records that make the key live. Two overlapping runs can
+count two sightings seconds apart and delete a live key. A missing membership
+marker lets teardown retire a job that another plan still needs.
 If you deploy as a **Kubernetes CronJob**, set `concurrencyPolicy: Forbid` to
 get the same serialization the `flock -n` provides. An EventBridge schedule
 that starts an **ECS task** starts a new task at each scheduled time. Put a
@@ -279,7 +287,7 @@ family for a running task. It starts a task only if no task runs.
 `queue-maintenance: retired a job whose lease was lost {n} times`. Alert on it:
 the job is likely crashing or disconnecting the devices that run it. To give a
 retired job another chance, `campaigns rerun --job` it; to lift a count, delete
-`lost/{job_id}/`. A `serve` outage longer than the lease adds one loss to every
+the job's rows from `queue_lost_leases`. A `serve` outage longer than the lease adds one loss to every
 leased job, so before long planned `serve` downtime pause this cron or set the
 limit to `0`, which turns the count off.
 
@@ -287,6 +295,103 @@ limit to `0`, which turns the count off.
 `plan_creating_max_age_secs` (default 6 hours) marks a crashed ingest, and its
 jobs are torn down. Set it above the longest expected ingest
 ([plan-ingestion.md §8](plan-ingestion.md#8-ingestion-flow-atomic-ish)).
+
+**Campaign group policies.** Pass 11, the last, applies the
+[policies](api/campaign-groups.md#when-a-policy-acts) that are on. It reads
+their results from pipette-duckdb, so while a policy is on the host needs a
+`[duckdb]` section
+([storage.md](storage.md#what-pipette-mgmt-reads-from-pipette-duckdb)); without
+one every run fails with a `WARN` that names it. The pass starts no member
+once the run is more than 60 s past its start, the cron's cadence, so a run
+holds back the next run's lease recycling by at most one member's read and
+revision. A revision of a plan with thousands of jobs can still take minutes.
+A run takes the members by when the pass last revised each or failed to read
+its rows, longest ago first, so a member it just revised, or whose rows
+pipette-duckdb did not answer, goes behind the others. When the pass reports a
+member:
+
+- **A revision that did not advance** (`filings_not_advanced`): the campaign
+  does not run the plan the pass filed. The pass cancels that plan, in the same
+  run or the next, and logs a `WARN`. Only a revision whose campaign write has
+  an unknown outcome waits for you. Each run then fails with the `WARN`
+  `queue-maintenance: a campaign group filing whose head write is unknown
+  still runs; cancel it, or confirm the campaign runs it`, which names the
+  campaign and the plan (`filed`). Read the campaign with `campaigns show`. If
+  it runs the plan, the write landed, and the next run goes on from it.
+  Otherwise cancel the plan with `plans cancel`, but not right after the
+  failed write, which can still land
+  ([§3.5](#35-recover-from-a-failed-campaign-filing), step 1).
+- **A revision whose replaced plan still runs**: the `WARN`
+  `queue-maintenance: a campaign group filing advanced, and the plan it
+  replaced still runs` fails one run. The campaign runs the new plan
+  (`filed`), and the error names the plan that was not cancelled after "but
+  plan". No later run cancels it, and while it runs, stopping the campaign's
+  plan leaves the jobs both plans hold running. Cancel that replaced plan with
+  `plans cancel <replaced plan_id>`, never the plan the campaign runs.
+- **A campaign that waits for devices** (`members_waiting_for_devices`):
+  devices have not claimed every job the policies' last revision of it queued,
+  so nothing of it is read. The `INFO` `queue-maintenance: the jobs a campaign
+  group filing queued wait for devices, so its campaign is not read` names the
+  campaign, the revision's plan (`filed`) and how many of its jobs wait
+  (`waiting`), and the policy preview shows the same. `plans status <plan_id>
+  --explain` shows why a job waits. The hold has no time limit, so a job no
+  device can take holds the campaign until its deadline: mark it failed with
+  the campaign's re-run route (`fail`), whose revision drops the job.
+- **A member or group that does not read** (`members_unreadable`,
+  `members_skipped`, `groups_skipped`): each is a failed item, and the next run
+  reads it again. When pipette-duckdb fails or times out on a member's rows,
+  the `WARN` `pipette-duckdb did not answer the campaign's rows; it reads
+  unreadable` names the campaign, the run reads no more rows, and that member
+  goes behind the others. A store read that fails logs its error with the
+  member or group.
+- **A member state that does not decode**: the `WARN` `queue-maintenance:
+  unreadable campaign group member state, skipped` names the campaign and its
+  row (`key`), and every run fails until the state reads. Take the campaign out
+  of the group and add it back, on the group's page or with `DELETE
+  …/members/{campaign_id}` and `POST …/members`: the new row keeps no state,
+  and the next run reads the campaign's plan as new. While a policy of the
+  group other than `model_params` is on, adding it back takes `read_plans`,
+  `cancel_plans` and `read_clients` (the `_any_` grants for another owner's
+  campaign), so have someone who holds them do both steps.
+- **A plan that cannot be filed again** (`refused_heads`): the plan's document
+  is gone, no longer matches the plan, or the server refuses it, such as for a
+  deadline that has passed. The run that first meets it fails. Later runs of
+  the same release log the `WARN` `queue-maintenance: the campaign group
+  policies cannot file into this plan again; it is read again once it or the
+  policies change, or after a new release` with the reason, and do not fail.
+  The first run of a new release tries the plan once more, and fails again if
+  the plan is still refused. To have the policies act on the campaign again,
+  file a revision with a document the server takes, such as one with a later
+  `expires_at`.
+- **A job that waits for rows** (`jobs_waiting_for_rows`): an answered job
+  with no rows in pipette-duckdb yet, read again on every run. Its rows land
+  once a scoring run has scored the result, every 5 minutes with the crons
+  above, and pipette-duckdb has published them. An eval that failed every
+  scoring pass is parked, and gets no rows until it is retried
+  ([storage.md §4](storage.md#4-submission-contract)): list
+  `submissions/score-queue/parked/`, then move the body back to `to_do/` and
+  delete its `failures/` entry.
+- **Result rows that lack model params** (`models_missing_params`), while the
+  group's `model_params` policy is on: the `INFO` `queue-maintenance: result
+  rows lack model params` names the campaign, the `key` an entry for the model
+  would take, and the `rows` and `jobs` that lack it. It is no failed item. Add
+  the entry ([model params](api/model-params.md)); the pages read the table, so
+  they show the counts at once.
+- **Re-run results** (`reruns_recorded`, `reruns_judged`): a revision the
+  campaign moves onto records each re-run it queued, one row per policy that
+  re-runs it, and the run that reads a re-run's rows records its outcome, or
+  `dropped` for one with neither rows nor a record that the campaign's plan no
+  longer holds ([re-run results](api/campaign-groups.md#re-run-results)). Each
+  run reads each member's re-runs that wait, one database read, and of those
+  its plan no longer holds, whether each has a record, one storage read each,
+  and their rows, one pipette-duckdb read. A write that fails is a
+  failed item. After the `WARN` `queue-maintenance: failed to record the
+  re-runs a campaign group filing queued`, which names the campaign and the
+  plan (`filed`), run `db backfill-rerun-results` for the group
+  ([§3.6](#36-record-the-re-runs-filed-before-migration-0037)). After the
+  `WARN` `queue-maintenance: failed to record how a campaign group member's
+  re-runs answered`, the run files nothing for the member and keeps none of its
+  state, so the next run reads those re-runs again and records their outcome.
 
 **Clock synchronization.** The expiry pass judges deadlines by the maintenance
 host's clock, while `serve`'s `claim`/`reclaim` gates use their own. A
@@ -297,9 +402,6 @@ deadline, which compares the filing host's `created_at`. Keep all hosts
 NTP-synced; a lagging maintenance clock is harmless, so single-host or
 shared-clock deployments are inherently safe.
 
-On S3, an S3 lifecycle rule expiring `todo/tmp/` objects after 1 day can replace
-the `tmp/` age check.
-
 **Log lines.** Alarms and dashboards can match these `INFO` lines, each
 carrying its figures as fields:
 
@@ -307,13 +409,35 @@ carrying its figures as fields:
   phase's duration, the stored data it read (plans, probes, content keys, client
   records), the CPU time, the slowest plan, and `failed_items` for a run that
   skipped items and then exits non-zero. A run that stops on an error logs no
-  summary. `bodies_read` counts full job bodies that the run fetches from the
+  summary. `deadlines_restamped` counts the waiting jobs the run moved to the
+  earliest horizon of their plans
+  ([plan-ingestion.md §7](plan-ingestion.md#the-duplicate-job-merge)).
+  `bodies_read` counts full job bodies that the run fetches from the
   SQL queue. The count includes these reads:
   - expiration
   - lease retirement
   - corrupt bodies, which each run reads again until the row is repaired
 
   Cache hits and reads of matcher projections do not count.
+- `queue-maintenance: policy pass finished`, once per run with a `[database]`,
+  also after queue passes that stopped on an error: the `groups` with a policy
+  on and the `groups_skipped`, their `members`, the `members_read` and the
+  `members_not_reached` within the 60 s, the `members_unreadable` and
+  `members_skipped`, the `revisions` with their `rerun_jobs` and `marked_jobs`,
+  the `reruns_recorded` for them and the `reruns_judged`, whose outcome the run
+  recorded, `jobs_waiting_for_rows`, `members_waiting_for_devices`,
+  `filings_not_advanced`, the `cancel_markers_written` on them,
+  `filings_stopped` by someone stopping the plan they revise, `refused_heads`,
+  `other_owner_members`, `jobs_left_for_good`, `models_missing_params`, the
+  keys the result rows it read lack a model params entry under,
+  `failed_items`, the pass's `duration_ms`, and `run_duration_ms` from the
+  run's start, the queue passes included. A pass that cannot read the policies
+  logs no line. Alert when `run_duration_ms` passes 5 minutes: such a run holds
+  back the next one's lease recycling.
+- `queue-maintenance: result rows lack model params`, once per key and member
+  campaign while the group's `model_params` policy is on: the `campaign_id`,
+  the `key` an entry would take, and the `rows` and `jobs` read this run that
+  lack it.
 - `queue-maintenance: S3 and CPU work of a phase`, before the summary, once per
   phase (`queue_passes`, `reconcile_plans`, `plan_index_gc`): HTTP attempts of
   both S3 clients by outcome (`throttled` counts S3's `SlowDown`), the peak in
@@ -331,189 +455,18 @@ attempt. The `object_store` client waits 5 s to connect and 30 s for a
 request. To fail a stalled maintenance read sooner, set
 `queue_maintenance_read_timeout_secs`.
 
-The `todo/` queue's S3 client uses `todo_attempt_timeout_secs` (default 5 s)
-per attempt and `todo_operation_timeout_secs` (default 20 s) per call. A
-promotion `RenameObject` raises those limits to at least 20 s per attempt and
-40 s per call. Larger configured limits still apply. If a rename reports an
-error, the store reads its destination. A
-present destination means the move landed. If it is absent, only promotion
-may send once more, within a budget twice its operation timeout (80 s with
-the defaults). Its `WARN` includes the full
-first error chain. Other queue renames do not resend after an SDK failure.
-
 Each filing emits `plan job promotion latency` with its plan ID, completed
 promotion count, failure count, p50, p95, p99 and maximum call duration in
 milliseconds. The sample includes completed promotions before a filing error;
-in-flight promotions dropped on that error have no duration. Use the next
-large filing's values to size the provisional promotion timeout. The call
-duration includes any destination read and resend, so the maximum is the
-relevant bound for the whole promotion, not one RenameObject attempt.
-
-### 3.1.1. Moving the queue to PostgreSQL
-
-This procedure moves a deployment's queue from the object store to PostgreSQL.
-It assumes a deployment that runs `serve` as 2 replicas. Each replica reads its
-config from a parameter store when it starts. A rolling restart can mix
-object-store and SQL readers, so this procedure stops both replicas before the
-switch. Changing the queue backend requires a parameter update and new
-replicas, not a new image.
-
-**Preparation.**
-
-1. Save the current config parameter. Keep this object-store config until
-   the rollback period ends. If the parameter already names
-   `backend = "database"`, stop.
-2. Calculate the heartbeat wait: half of `plan_lease_duration_secs`, rounded
-   up. If the config has no `plan_lease_duration_secs`, the server uses the
-   default of 300 seconds, and the wait is 150 seconds.
-3. Agree on a time for the pause with the campaign operators. The pause
-   starts at cutover step 3 and ends when cutover step 8 finishes. Require
-   all ingests to finish before cutover step 3. Stop administrative commands
-   that can change the queue during the pause. An ingest that spans the
-   switch can promote jobs into the old queue. Prevent other deployments and
-   config edits until cutover step 9 finishes.
-
-Run each queue command below as a one-off task of the deployment. The task
-uses the image, the config and the network of `serve`, with a different
-command. Wait for each task to stop, read its logs, and require exit code
-zero. Do not start a second copy while the first copy runs.
-
-**Cutover.** Follow these nine steps in order.
-
-1. Deploy a release that includes the SQL queue and `queue import`/`export`.
-   Keep the object-store queue config for this deployment. Run `db migrate`
-   with the new image and the old config before the deployment, because
-   `serve` checks the database before it accepts requests. After the
-   deployment, confirm that the config parameter did not change, and run
-   `db check`.
-2. Run the timing gate before you schedule the pause:
-
-   ```bash
-   pipette-mgmt queue import --dry-run
-   pipette-mgmt queue import
-   ```
-
-   Record both reports. Each report gives Read, Written, Deleted, Unchanged,
-   Skipped, Unreadable, and elapsed time per keyspace. Require exit code zero
-   and no unreadable entries. Investigate each skipped entry before you
-   continue. The dry run reads the whole queue, so its elapsed time is a lower
-   bound for the cold pass. If the dry run takes more than one minute,
-   postpone the pause and make the slow keyspaces faster. Repeat the warm pass
-   close to the pause if the gate ran earlier.
-3. Disable the `queue-maintenance` schedule. A disabled schedule does not stop
-   a task that is already running. Wait until no maintenance task runs. Do not
-   run manual maintenance during the pause.
-4. Scale `serve` to 0 replicas. Wait until no replica runs. Zero replicas
-   means that no queue writer is left. The server allows 20 seconds for
-   requests and 10 seconds for audit writes
-   ([§2.1](#21-stopping-the-server)).
-5. Make sure again that no maintenance task runs. Then run the cold copy:
-   `queue import`. Require a successful report before you change the backend.
-   A failed copy can leave a partial SQL queue. Retry only after the first
-   task stops and you fix the cause. At this point, the object store holds the
-   authoritative queue. Both copy commands reject `backend = "database"`,
-   because it names no object-store queue.
-6. Make the SQL config from the saved config. Replace the complete
-   `[todo_storage]` section, including its bucket settings, with this:
-
-   ```toml
-   [todo_storage]
-   backend = "database"
-   ```
-
-   Change nothing else. Write the SQL config to the config parameter. Then run
-   `config check` and `db check`. Keep `serve` stopped if either check fails.
-   Do not deploy during the pause.
-7. Scale `serve` back to 2 replicas. Require two healthy replicas. Look in the
-   startup logs for a failed check of the database or the storage. Confirm
-   that device requests succeed. Record the length of the outage.
-
-   Plan for an outage of about five minutes. The outage includes the drain,
-   the cold copy, the parameter checks, and the replica start. The production
-   cutover on 2026-11-05 measured these times:
-
-   - the drain: 2 minutes
-   - the cold copy: 1 minute (15 seconds of copy, plus the task start)
-   - the parameter checks: 1 minute (the two checks ran at the same time)
-   - the replica start: 1 minute
-
-   Each one-off task adds the time of its task start. The copy itself takes
-   seconds. Use the result of the timing gate to plan the outage.
-8. Wait one heartbeat interval after healthy service returns. Then enable the
-   `queue-maintenance` schedule again. Wait for a new
-   `queue-maintenance: run finished` entry with `failed_items = 0`.
-
-   A heartbeat can renew an expired lease while that lease still exists.
-   A recycle pass can remove an expired lease before the heartbeat arrives.
-   The wait lets live devices retry and renew their leases before maintenance
-   can recycle them, so the wait is mandatory. If device retries still fail,
-   keep maintenance disabled longer.
-9. Make the deployment tooling render the SQL config. A deployment that
-   renders the object-store config writes it to the parameter, and each new
-   replica then serves the old queue. After the next deployment, compare the
-   deployed parameter with the SQL config. If they differ, write the SQL
-   config back and fix the deployment tooling. Other deployments can start
-   again after this step.
-
-**Rollback.** Step 3 has two cases. Use the case that matches the last
-authoritative queue. If you are not sure that SQL accepted requests, and the
-cold import succeeded, treat SQL as authoritative. An export from a complete
-cold import changes almost nothing if SQL accepted no request.
-
-1. Disable maintenance and wait for its tasks to stop. Stop administrative
-   writers and ingestion. Scale `serve` to 0 replicas and wait for all
-   replicas to stop. Do this step also after cutover step 8, because SQL
-   maintenance can retire jobs after that step.
-2. Write the saved object-store config to the config parameter. Run
-   `config check`.
-3. Skip the export only if you know that SQL accepted no request. The object
-   store stays authoritative in these cases:
-
-   - The warm copy stopped before it finished.
-   - The cold copy failed.
-   - No SQL replica became healthy.
-
-   An export from a partial SQL queue can delete valid object-store jobs.
-
-   In all other cases, SQL is authoritative. Export its current queue with
-   all writers stopped:
-
-   ```bash
-   pipette-mgmt queue export --dry-run
-   pipette-mgmt queue export
-   ```
-
-   Review the dry-run deletion counts before the real export. Require a
-   successful export with no unreadable entries before you start `serve`.
-   The export deletes object-store jobs that SQL no longer holds. If the
-   export fails, keep the writers stopped, fix the error, and repeat the
-   export. Do not import the old object-store queue into the authoritative
-   SQL queue.
-4. Scale `serve` back to 2 replicas and confirm that the service is healthy.
-   Wait one heartbeat interval. Enable maintenance and confirm its first
-   successful run.
-5. If cutover step 9 finished, make the deployment tooling render the
-   object-store config again.
-
-**Observation.** Watch the first hour after either direction of the switch.
-Check the maintenance duration and `failed_items`. Check claim `204` rates,
-heartbeat `404` and `409` responses, and lost-lease warnings in the `serve` and
-maintenance logs. Expect connection errors during the pause, which clients
-retry. Investigate new lost leases after recovery.
-
-Keep the object-store bucket and its access grants for rollback. Restrict
-access to the saved configuration files.
+in-flight promotions dropped on that error have no duration.
 
 ### 3.2. Eligible index maintenance
 
-The `todo/eligible/` index is maintained by `queue-maintenance` alone; `serve`
+The eligible index is maintained by `queue-maintenance` alone; `serve`
 replicas only read it ([queue.md](queue.md#the-eligible-index)). No operator
 action is needed after `clients approve`, a permission change or a profile
-update: the next run reflects it. Each run also writes each worker's backlog to
-`todo/.backlog`, and the backlog by campaign to `todo/.backlog-campaigns`. The
-console shows both ([queue.md](queue.md#device-backlog)). A failed write logs a
-warning. A run with nothing new touches only empty prefixes and a few small
-objects.
+update: the next run reflects it. The console counts each worker's backlog from
+the index at each request ([queue.md](queue.md#device-backlog)).
 
 ### 3.3. Forcing an eligible index rebuild
 
@@ -538,7 +491,8 @@ run deletes them.
 ### 3.5. Recover from a failed campaign filing
 
 A filing writes its plan and jobs before it writes the campaign. If it fails
-while staging, the plan can remain `creating` with promoted jobs in `avail/`.
+while staging, the plan can remain `creating` with promoted jobs in the job
+queue.
 Queue maintenance leaves those jobs out of the eligible index while no final
 plan also holds them ([queue.md](queue.md#committed-filings)). A job already
 leased to a device can continue running. **Refile before you cancel or wait
@@ -584,6 +538,30 @@ manifest. Check the new campaign and plan, not only its HTTP status. Keep the
 original plan uncancelled while you retry; a later maintenance pass can then
 release its joined jobs to the successful filing.
 
+### 3.6. Record the re-runs filed before migration 0037
+
+From the release that adds migration `0037`, the policy pass records each
+re-run it files ([§3.1](#31-job-queue-maintenance)). The re-runs it filed
+before have no row until `db backfill-rerun-results` records them
+([cli.md](cli.md#pipette-mgmt-db-backfill-rerun-results-group_id)). Run the
+command once, after the deploy, not before: until then the older binary still
+files re-runs and records none.
+
+1. Run `db migrate` before the deploy, as for every migration
+   ([§5](#5-docker-deployment)).
+2. Deploy the release.
+3. With the deployed release and its config, name each group whose policies
+   filed re-runs (`GET /api/v1/campaign-groups` lists the groups):
+
+   ```
+   pipette-mgmt db backfill-rerun-results <group_id>...
+   ```
+
+   The command reads pipette-duckdb, so its config needs a `[duckdb]` section;
+   without one it exits naming it. It prints the filings it read and the rows it
+   recorded. A run that fails can run again: a second run records only the
+   rows still missing.
+
 ## 4. Reprocessing
 
 **Whole warehouse.** To re-score everything: move files from
@@ -625,13 +603,14 @@ storage locks. Everything else comes from the TOML config. Set
 `PIPETTE_MGMT_LOG_FORMAT=json` where a collector reads the container's log; see
 [cli.md § Logging](cli.md#logging).
 
-A deployment keeps its records (plans, campaigns, identities, vault records) on
-PostgreSQL through `[database]`
+A deployment keeps its records (plans, campaigns, identities, vault records)
+and the job queue on PostgreSQL through `[database]`
 ([design/sql-record-store.md](design/sql-record-store.md)); run `db migrate`
 before a binary that needs a newer schema
 ([cli.md](cli.md#pipette-mgmt-db-migrate---to-version---dry-run-and-db-check)).
-The examples below show the object-store sections, which keep the queue,
-submissions, the warehouse, blobs and the dataset cache.
+The examples below show `[database]` and the object-store sections, which keep
+submissions, the warehouse, blobs and the dataset cache. Each example reads the
+database connection from the libpq `PG*` environment variables.
 
 ### 5.1. Local filesystem (mounted volume)
 
@@ -649,6 +628,8 @@ data_dir = "/data"
 [auth_storage]
 backend = "local_fs"
 data_dir = "/data"
+
+[database]
 ```
 
 ```bash
@@ -684,17 +665,21 @@ backend = "s3"
 bucket = "my-pipette-auth"
 region = "us-east-1"
 
-# The todo/ queue needs atomic RenameObject, so a separate S3 Express One Zone
-# bucket (docs/storage.md §8).
-[todo_storage]
-backend = "s3"
-bucket = "my-pipette-todo--use1-az4--x-s3"  # Express One Zone bucket naming convention
-region = "us-east-1"
+# The records and the job queue; the libpq PG* environment variables supply
+# the connection.
+[database]
 
 # The eval corpora the scores service packs, which mgmt only reads (§3.0).
 [eval_packages_storage]
 backend = "s3"
 bucket = "my-eval-datasets"
+region = "us-east-1"
+
+# Vault blobs and staged uploads, apart from [storage]. Copy vault-resources/
+# here before adding this section, or the existing blobs read as missing.
+[vault_storage]
+backend = "s3"
+bucket = "my-pipette-vault"
 region = "us-east-1"
 ```
 
@@ -712,32 +697,14 @@ On EC2/ECS/EKS, omit the access-key env vars and let the standard AWS
 credential chain pick up the instance role / task role / IRSA token:
 `object_store` resolves the same env vars and metadata endpoints as the AWS
 SDK (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
-EC2 IMDSv2). Use **separate buckets** for `[storage]`, `[auth_storage]`, and
-`[todo_storage]` so benchmark/warehouse data, private client identities, and
-the job queue can have different IAM policies. Without `[database]`, write
-access to `[storage]` is an authority too: it holds the memberships, device
-ownerships and campaign and vault owners that decide access
-([storage.md §3.2](storage.md#32-organizations)), so grant bucket-wide writes on
-it only to roles you would let write `[auth_storage]`. With `[database]`, those
-live in PostgreSQL, and the database credentials are that authority. The `[todo_storage]`
-bucket must be Express One Zone (see
-[storage.md §8](storage.md#todo-requires-s3-express-one-zone)).
+EC2 IMDSv2). Use **separate buckets** for `[storage]` and `[auth_storage]` so
+benchmark/warehouse data and private client identities can have different IAM
+policies. The memberships, device ownerships and campaign and vault owners that
+decide access ([storage.md §3.2](storage.md#32-organizations)) live in
+PostgreSQL, and the database credentials are that authority.
 
-Three commands rename against `todo/`: `serve` (claim, heartbeat),
-`queue-maintenance` (lease recycle), and the `campaigns` commands that file a
-plan (promotion into `avail/`). Each validates the bucket at startup and **refuses to start** if the
-rename does not work. The probe stages a temporary object under `todo/tmp/` and
-proves that a rename moves it.
-[storage.md §8](storage.md#todo-requires-s3-express-one-zone) lists the steps
-and the failure verdicts. This catches a misconfigured regular-S3 bucket before
-it can silently corrupt claims (a non-atomic copy would let two clients win the
-same job). Probe keys carry the `.rename-probe-` prefix; the stale-`todo/tmp/`
-sweep collects one that survives a failed delete. The `clients` admin commands
-only list and delete markers, never rename, so they skip the probe.
-
-`[storage]` and `[auth_storage]` are probed the same way for conditional `PUT`,
-which the storage mutate lock is built on, and without `[database]` the
-exactly-once pre-auth key spend too. A backend that answers `200` to a write it should have refused **refuses to
+`[storage]` and `[auth_storage]` are probed for conditional `PUT`, which the
+storage mutate lock is built on. A backend that answers `200` to a write it should have refused **refuses to
 start** the process. The locked batch commands (`process-submissions`,
 `score-eval`, `fix-*`, `requeue-eval`) probe `[storage]` for both a conflicting
 `If-None-Match: *` create and an `If-Match` compare-and-swap against a superseded
@@ -826,6 +793,8 @@ backend = "s3"
 bucket = "pipette-auth"
 region = "auto"
 endpoint = "https://<account_id>.r2.cloudflarestorage.com"
+
+[database]
 ```
 
 ```bash
@@ -864,6 +833,8 @@ backend = "s3"
 bucket = "pipette-auth"
 region = "us-east-1"
 endpoint = "http://minio:9000"
+
+[database]
 ```
 
 ```bash

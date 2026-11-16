@@ -1,5 +1,5 @@
-//! This module seeds the `todo/` tree through `TodoStore`. It reads the tree and runs
-//! the maintenance passes.
+//! This module seeds the job queue through `TodoStore`. It reads queue and plan
+//! records and runs the maintenance passes.
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -94,7 +94,7 @@ pub async fn assert_nothing_staged(state: &AppState) -> anyhow::Result<()> {
         "a refused submission wrote a plan manifest"
     );
     assert!(
-        state.todo_store.list_avail().await?.is_empty(),
+        state.todo_store.list_avail_entries().await?.is_empty(),
         "a refused submission staged a job"
     );
     Ok(())
@@ -133,13 +133,13 @@ pub async fn clear_pending_reindex(
     todo: &dyn TodoStore,
     client_id: &ClientId,
 ) -> anyhow::Result<()> {
-    for (_, key) in todo
+    for request in todo
         .list_pending_reindex()
         .await?
-        .into_iter()
-        .filter(|(flagged, _)| flagged == client_id)
+        .iter()
+        .filter(|r| r.client_id == *client_id)
     {
-        todo.delete_pending_reindex(&key).await?;
+        todo.delete_pending_reindex(request).await?;
     }
     Ok(())
 }
@@ -149,7 +149,7 @@ pub async fn run_qm(state: &AppState) -> anyhow::Result<()> {
     run_qm_with_tmp_age(state, std::time::Duration::from_secs(86_400)).await
 }
 
-/// Run every pass, choosing the `todo/tmp/` age.
+/// Set the age limit for staged job bodies. Run every pass.
 pub async fn run_qm_with_tmp_age(
     state: &AppState,
     tmp_age: std::time::Duration,

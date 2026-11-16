@@ -56,8 +56,8 @@ pub use permissions::{ClientPermission, PermissionName, PermissionNameError, Use
 
 mod ids;
 pub use ids::{
-    AuditEventId, CampaignId, ClientPreauthKeyId, ExpiresAt, ExpiresAtError, IdError, JobId,
-    ModelKey, PlanId, UserPreauthKeyId,
+    AuditEventId, CampaignGroupId, CampaignId, ClientPreauthKeyId, ExpiresAt, ExpiresAtError,
+    IdError, JobId, ModelKey, PlanId, UserPreauthKeyId,
 };
 
 mod huggingface;
@@ -112,8 +112,8 @@ pub use model::{
 mod runtime;
 pub use runtime::{
     AppleCoreAiMacosPipette, AppleCoreAiMacosPipetteSource, AppleFoundation, CoreAiSwiftStack,
-    DockerIpcMode, DockerSglang, DockerShmSize, DockerShmSizeError, DockerVllm, EnvForward,
-    EnvForwardError, LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor,
+    CudartAssetError, DockerIpcMode, DockerSglang, DockerShmSize, DockerShmSizeError, DockerVllm,
+    EnvForward, EnvForwardError, LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor,
     LlamacppCliStockTools, LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource,
     LlamacppFlashAttention, LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
     MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
@@ -170,15 +170,15 @@ pub use benchmark::{
     BatchSize, BatchSizeError, BeamLengthPenalty, BeamLengthPenaltyError, BeamRepetitionPenalty,
     BeamRepetitionPenaltyError, BenchmarkDefinition, BenchmarkDefinitionError, BenchmarkEntry,
     BenchmarkId, BenchmarkIdError, BenchmarkParams, BenchmarkParamsError, BenchmarkSource,
-    BenchmarkType, BenchmarkTypeError, DecodeThroughputBenchmark, EndToEndLatencyBenchmark,
-    EvalBenchmark, EvalId, KnownAsrEvalTask, KnownAsrPromptProfile, KnownEvalId, KnownVlmEvalTask,
-    KnownVlmPromptProfile, LanguageSubtag, LanguageSubtagError, MaxContextError,
-    MaxMemoryUsageBenchmark, MinP, MinPError, NumBeams, NumBeamsError, PrefillThroughputBenchmark,
-    PresencePenalty, PresencePenaltyError, RecipeRepo, RepeatPenalty, RepeatPenaltyError,
-    SamplingSeed, SamplingSeedError, SamplingTemperature, SamplingTemperatureError, SeedRule,
-    Thinking, TopK, TopKError, TopP, TopPError, VlMaxMemoryBenchmark, VlSpecDecodeBenchmark,
-    VlThroughputBenchmark, VlmEvalBenchmark, VlmEvalRecipe, VlmEvalRecipeError, VlmEvalRecipeModel,
-    VlmEvalTask, VlmPromptProfile,
+    BenchmarkType, BenchmarkTypeError, DecisionBenchmark, DecodeThroughputBenchmark,
+    EndToEndLatencyBenchmark, EvalBenchmark, EvalId, KnownAsrEvalTask, KnownAsrPromptProfile,
+    KnownEvalId, KnownVlmEvalTask, KnownVlmPromptProfile, LanguageSubtag, LanguageSubtagError,
+    MaxContextError, MaxMemoryUsageBenchmark, MinP, MinPError, NumBeams, NumBeamsError,
+    PrefillThroughputBenchmark, PresencePenalty, PresencePenaltyError, RecipeRepo, RepeatPenalty,
+    RepeatPenaltyError, SamplingSeed, SamplingSeedError, SamplingTemperature,
+    SamplingTemperatureError, SeedRule, Thinking, TopK, TopKError, TopP, TopPError,
+    VlMaxMemoryBenchmark, VlSpecDecodeBenchmark, VlThroughputBenchmark, VlmEvalBenchmark,
+    VlmEvalRecipe, VlmEvalRecipeError, VlmEvalRecipeModel, VlmEvalTask, VlmPromptProfile,
 };
 
 // The schemas the `schemars` derive cannot write, and the flag enums' transform.
@@ -192,7 +192,7 @@ mod cell;
 pub use cell::{
     AsrEvalLlamacppCliStockToolsGgufVision, AsrMaxMemoryLlamacppCliStockToolsGgufVision,
     AsrThroughputLlamacppCliStockToolsGgufVision, BenchmarkFlagRef, BenchmarkFlags,
-    BenchmarkFlagsError, BenchmarkFlagsRecordError, ClientRunSpec,
+    BenchmarkFlagsError, BenchmarkFlagsRecordError, ClientRunSpec, DecisionLlamacppCliStockTools,
     DecodeThroughputLlamacppCliStockToolsGgufText, DecodeThroughputOvmsOpenvino,
     DecodeThroughputUvOpenvinoOpenvino, EndToEndLatencyLlamacppCliStockToolsGgufText,
     EndToEndLatencyOvmsOpenvino, EndToEndLatencyUvOpenvinoOpenvino, EvalContextError,
@@ -247,7 +247,7 @@ pub use run::{DeclaredBound, RunRequest, RunRequestError, RunResponse, TurnObser
 
 mod body_values;
 pub use body_values::{
-    ErrorBody, FleetDetail, ListOrder, comma_list, empty_as_none, parsed, parsed_list,
+    ErrorBody, FleetDetail, ListOrder, comma_list, empty_as_none, parsed, parsed_list, parsed_map,
 };
 
 mod list;
@@ -302,25 +302,39 @@ pub use users::{
     UserPreauthUsage, UserStatus, UserView,
 };
 
+mod policy_kind;
+pub use policy_kind::PolicyKind;
+
 mod plans;
 pub use plans::{
-    Answered, CancelOutcome, ClaimAnswer, ClaimedJob, Counts, DocumentState, ImportAction,
-    IngestEvent, IssueSeverity, JobExpiry, JobPlans, PlanAnswer, PlanCancelRequested, PlanDryRun,
-    PlanFiled, PlanIssue, PlanJobs, PlanJobsQuery, PlanListQuery, PlanReadQuery, PlanStatus,
-    PlanSummary, PlanValidation, PlanVariants, PlanView, PlannedImport, ProgressSnapshot,
-    RequestedScope, RestoredVariant, RestoredVariantError, RevisionChange, StarvedClauses,
-    StarvedGroup, UndecodableClaim, UpdatePlanRequest, Warning, WarningKind, unmatched_warning,
+    Answered, CachedArtifacts, CancelOutcome, ClaimAnswer, ClaimRequest, ClaimedJob, Counts,
+    DocumentState, ImportAction, IngestEvent, IssueSeverity, JobExpiry, JobPlans, PlanAnswer,
+    PlanCancelRequested, PlanDryRun, PlanFiled, PlanIssue, PlanJobs, PlanJobsQuery, PlanListQuery,
+    PlanReadQuery, PlanStatus, PlanSummary, PlanValidation, PlanVariants, PlanView, PlannedImport,
+    ProgressSnapshot, RequestedScope, RestoredVariant, RestoredVariantError, RevisionChange,
+    StarvedClauses, StarvedGroup, UndecodableClaim, UpdatePlanRequest, Warning, WarningKind,
+    unmatched_warning,
 };
 
 mod campaigns;
 pub use campaigns::{
-    Campaign, CampaignAnswer, CampaignCreated, CampaignDocument, CampaignListQuery,
+    Campaign, CampaignAnswer, CampaignCreated, CampaignDocument, CampaignGroup, CampaignListQuery,
     CampaignOverview, CampaignOverviewQuery, CampaignPlanDocumentQuery, CampaignPlanRow,
     CampaignPlans, CampaignReadQuery, CampaignRevised, CampaignState, CampaignVariants,
     CampaignView, CreateCampaignQuery, DeviceTimeTotal, HeldJob, RecalculateJobsRequest,
     RerunJobsQuery, RerunJobsRequest, RevertCampaignQuery, RevertCampaignRequest,
     ReviseCampaignQuery, Revised, RevisionAnswer, RevisionBase, RevisionDryRun, RevisionPreview,
     SetCampaignOwnerRequest, UpdateCampaignRequest,
+};
+
+mod campaign_groups;
+pub use campaign_groups::{
+    AddCampaignGroupMembersRequest, CampaignGroupPolicies, CampaignGroupPolicy,
+    CampaignGroupPolicyPreview, CampaignGroupRerunResults, CampaignGroupView,
+    CreateCampaignGroupRequest, MAX_RERUNS, MemberPolicyPreview, ModelParamsGap, PolicyBase,
+    PolicyCheckCounts, PolicyFiling, PolicyMemberState, PolicyRerun, PolicyRerunSummary,
+    PolicySettings, PolicySettingsError, PolicySkipReason, RerunOutcome, RerunResultsQuery,
+    SetCampaignGroupPolicyRequest, SmallerFailure, UpdateCampaignGroupRequest,
 };
 
 mod clients;

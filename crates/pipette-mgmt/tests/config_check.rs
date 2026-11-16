@@ -6,8 +6,7 @@ use rstest::rstest;
 
 use pipette_core::config::Config;
 
-const MINIMAL_CONFIG: &str =
-    "evals_server_url = \"http://localhost:8000\"\n\n[auth_storage]\nbackend = \"local_fs\"\n";
+const MINIMAL_CONFIG: &str = "evals_server_url = \"http://localhost:8000\"\n\n[auth_storage]\nbackend = \"local_fs\"\n\n[database]\n";
 
 /// The binary with `args`, no config path in its environment, and no AWS
 /// credentials, so a check that reaches for storage fails.
@@ -135,7 +134,6 @@ fn strict_passes_when_every_known_flavor_has_a_rule() -> anyhow::Result<()> {
     "evals_server_ur"
 )]
 #[case::section(format!("{MINIMAL_CONFIG}\n[storag]\nbackend = \"s3\"\n"), "storag")]
-#[case::todo_storage(format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"local_fs\"\ndata_dri = \"./queue\"\n"), "todo_storage.data_dri")]
 fn warns_on_an_unknown_key_and_strict_fails(
     #[case] content: String,
     #[case] key: &str,
@@ -159,18 +157,30 @@ fn warns_on_an_unknown_key_and_strict_fails(
     Ok(())
 }
 
-#[test]
-fn database_queue_without_database_section_fails_config_check() -> anyhow::Result<()> {
+/// `config check` fails on a config that keeps a retired queue key, or that
+/// has no `[database]` section, with a message that names PIP-839.
+#[rstest]
+#[case::database_queue(
+    format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"database\"\n"),
+    "`todo_storage` is retired"
+)]
+#[case::s3_queue(
+    format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"s3\"\nbucket = \"queue--x-s3\"\n"),
+    "`todo_storage` is retired"
+)]
+#[case::attempt_timeout(
+    format!("todo_attempt_timeout_secs = 5\n{MINIMAL_CONFIG}"),
+    "`todo_attempt_timeout_secs` is retired"
+)]
+#[case::no_database(MINIMAL_CONFIG.replace("\n[database]\n", ""), "no [database] section")]
+fn a_retired_queue_config(#[case] content: String, #[case] expected: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = write_config(
-        dir.path(),
-        &format!("{MINIMAL_CONFIG}\n[todo_storage]\nbackend = \"database\"\n"),
-    )?;
+    let path = write_config(dir.path(), &content)?;
     let output = run(&["config", "check", "--config", &path.to_string_lossy()])?;
     let message = stderr(&output);
     assert!(!output.status.success(), "{message}");
     assert!(
-        message.contains("[todo_storage]") && message.contains("[database]"),
+        message.contains(expected) && message.contains("PIP-839"),
         "{message}"
     );
     Ok(())

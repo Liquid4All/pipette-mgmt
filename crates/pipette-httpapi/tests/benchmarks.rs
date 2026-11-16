@@ -18,10 +18,11 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{BenchmarkType, ClientId, ClientOwner, UserId, UserKeyId, UserStatus};
 use pipette_web_testkit::{
     auth_headers, authed_get, authed_get_with_headers, authed_post, authed_user_get, benchmark_ids,
-    body_json, make_state, make_state_with_evals_url, own_client, own_client_by_org,
+    body_json, make_object_state, make_object_state_from_config, own_client, own_client_by_org,
     register_and_approve, register_pending, registered_user, seed_org, set_user_org,
     set_user_status, setup_benchmarks, setup_private_benchmark, setup_scheduler_benchmarks,
-    unauthed_get, unauthed_get_with_headers, user_auth_headers, valid_submission,
+    test_config_with_evals_url, unauthed_get, unauthed_get_with_headers, user_auth_headers,
+    valid_submission,
 };
 
 /// The private entry every visibility test seeds, beside the four public ones.
@@ -33,7 +34,7 @@ async fn state_with_a_private_entry(
     dir: &std::path::Path,
 ) -> anyhow::Result<(AppState, Organization)> {
     setup_benchmarks(dir)?;
-    let state = make_state(dir).await?;
+    let state = make_object_state(dir).await?;
     let acme = seed_org(&state, "acme").await?;
     setup_private_benchmark(dir, PRIVATE, &acme.org_id)?;
     Ok((state, acme))
@@ -548,7 +549,7 @@ async fn the_type_filter_reads_a_benchmark_type(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, &format!("{route}{query}")).await?;
     assert_eq!(resp.status(), StatusCode::OK, "{query}");
@@ -567,7 +568,7 @@ async fn an_unknown_type_is_refused_with_the_known_types(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, &format!("{route}?type=prefill")).await?;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -589,7 +590,7 @@ async fn an_unknown_type_is_refused_with_the_known_types(
 async fn v2_serves_each_entry_as_its_declared_pair() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let eval = json!({
         "benchmark_id": "eval_test",
         "benchmark_type": "eval",
@@ -783,7 +784,7 @@ revision = "0123456789abcdef0123456789abcdef01234567"
 identity = "2923603292c7dd463ad01a119f57965817778fc3"
 digest   = "2222222222222222222222222222222222222222222222222222222222222222""#,
     )?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let expected = json!({
         "benchmark_id": benchmark_id,
         "benchmark_type": benchmark_type,
@@ -808,7 +809,7 @@ digest   = "2222222222222222222222222222222222222222222222222222222222222222""#,
 async fn a_v2_pair_is_accepted_on_a_submission() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let (key, client_id) = register_and_approve(&state).await?;
 
     let entry = body_json(
@@ -834,7 +835,7 @@ async fn a_v2_pair_is_accepted_on_a_submission() -> anyhow::Result<()> {
 async fn test_unauthed_client_can_list_benchmarks() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, "/benchmarks").await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -860,7 +861,7 @@ async fn test_benchmark_list_honors_if_none_match(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, route).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -882,7 +883,7 @@ async fn test_benchmark_list_honors_if_none_match(
 async fn test_unauthed_client_can_get_benchmark() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, "/benchmarks/prefill_throughput_256").await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -907,7 +908,7 @@ async fn test_get_benchmark_honors_if_none_match(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, route).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -941,7 +942,7 @@ async fn if_none_match_is_read_in_each_form_a_cache_sends(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     for uri in ["/benchmarks", "/benchmarks/prefill_throughput_256"] {
         let resp = unauthed_get(&state, uri).await?;
@@ -969,7 +970,7 @@ async fn if_none_match_is_read_in_each_form_a_cache_sends(
 async fn test_get_benchmark_404_when_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, "/benchmarks/does_not_exist").await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -980,7 +981,7 @@ async fn test_get_benchmark_404_when_missing() -> anyhow::Result<()> {
 async fn test_eval_benchmark_returns_502_when_upstream_unreachable() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
 
     let resp = unauthed_get(&state, "/benchmarks/eval_test").await?;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1008,7 +1009,11 @@ async fn test_eval_benchmark_returns_502_on_malformed_upstream_response() -> any
             .await;
         let dir = tempfile::tempdir()?;
         setup_benchmarks(dir.path())?;
-        let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+        let state = make_object_state_from_config(test_config_with_evals_url(
+            dir.path(),
+            &evals.base_url(),
+        ))
+        .await?;
 
         let resp = unauthed_get(&state, "/benchmarks/eval_test").await?;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1036,7 +1041,11 @@ async fn an_upstream_error_status_is_a_502_whatever_its_body() -> anyhow::Result
             .await;
         let dir = tempfile::tempdir()?;
         setup_benchmarks(dir.path())?;
-        let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+        let state = make_object_state_from_config(test_config_with_evals_url(
+            dir.path(),
+            &evals.base_url(),
+        ))
+        .await?;
 
         let resp = unauthed_get(&state, "/benchmarks/eval_test").await?;
         assert_eq!(
@@ -1077,7 +1086,9 @@ async fn test_eval_benchmark_embeds_the_upstream_samples() -> anyhow::Result<()>
         .await;
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+    let state =
+        make_object_state_from_config(test_config_with_evals_url(dir.path(), &evals.base_url()))
+            .await?;
 
     let resp = unauthed_get(&state, "/benchmarks/eval_test").await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1128,7 +1139,9 @@ async fn a_vlm_eval_serves_its_corpus_pin_not_its_samples() -> anyhow::Result<()
             ),
         )?;
     }
-    let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+    let state =
+        make_object_state_from_config(test_config_with_evals_url(dir.path(), &evals.base_url()))
+            .await?;
 
     for (benchmark_id, profile) in entries {
         let resp = unauthed_get(&state, &format!("/benchmarks/{benchmark_id}")).await?;
@@ -1190,7 +1203,9 @@ async fn asr_corpus_pin(holder: Option<&str>, status: StatusCode) -> anyhow::Res
         .await;
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+    let state =
+        make_object_state_from_config(test_config_with_evals_url(dir.path(), &evals.base_url()))
+            .await?;
     let acme = seed_org(&state, "acme").await?;
     let org_dir = dir.path().join("org-benchmarks").join(acme.org_id.as_str());
     std::fs::create_dir_all(&org_dir)?;

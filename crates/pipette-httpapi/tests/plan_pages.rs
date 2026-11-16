@@ -23,10 +23,11 @@ use pipette_pipeline::plan_results::DEVICE_COLUMNS;
 use pipette_plan_types::canonical_json as canonicalize;
 use pipette_plan_types::{ClientId, ClientRunSpec, JobId, PlanId, PlanStatus, UserPermission};
 use pipette_web_testkit::{
-    DUCKDB_BASIC_AUTH, NAMED_CLIENT_ID, ONE_CELL_PLAN, UserSigner, approved_client, body_json,
-    created_campaign_from, file_job_bodies, grant_user, json_str, plan_ids, post_plan_document,
-    put_idle_campaign, put_loose_plan, registered_user, registered_user_with_detail, run_mocked,
-    seed_org, set_user_org, signed_empty, submit_plan_as, user_address, with_duckdb,
+    DUCKDB_BASIC_AUTH, NAMED_CLIENT_ID, ONE_CELL_PLAN, UserSigner, approved_client,
+    approved_object_client, body_json, created_campaign_from, file_job_bodies, grant_user,
+    json_str, plan_ids, post_plan_document, put_idle_campaign, put_loose_plan, registered_user,
+    registered_user_with_detail, run_mocked, seed_org, set_user_org, signed_empty, submit_plan_as,
+    user_address, with_duckdb,
 };
 
 async fn read(
@@ -490,10 +491,13 @@ async fn test_the_jobs_page_names_its_devices_at_the_full_tier() -> anyhow::Resu
 }
 
 /// A server-declared failure's reason can name clients, so it reaches a fleet
-/// reader alone; below that only `expired` and `lease_lost` keep their source.
+/// reader alone; below that only `expired`, `lease_lost`, `marked` and
+/// `smaller_run_failed` keep their source.
 #[rstest]
 #[case::lease_lost("lease_lost", true)]
 #[case::expired("expired", true)]
+#[case::marked("marked", true)]
+#[case::smaller_run_failed("smaller_run_failed", true)]
 #[case::all_clients_denied("all_clients_denied", false)]
 #[case::unmatchable("unmatchable", false)]
 fn test_the_jobs_page_names_a_server_declared_failure(
@@ -909,7 +913,7 @@ async fn test_the_document_orders_the_jobs() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_a_queued_job_without_a_source_reads_its_body() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (state, _key, client_id) = approved_object_client(dir.path()).await?;
     let filer = registered_user_with_detail(&state, true).await?;
     let plan_id = filed(&state, &filer, &client_id, "older", 1).await?;
     let manifest = state
@@ -1084,19 +1088,19 @@ fn export_rows(job_id: &str) -> Value {
         "columns": ["job_id", "benchmark_id", "benchmark_type", "metric", "value", "value_stddev",
                     "unit", "failed", "failed_reason", "model_descriptor", "runtime_descriptor",
                     "client_extras", "client_id", "device_name", "submitted_at", "scored_at",
-                    "device_time_ms", "failure_source", "parameter_prefill_tokens",
-                    "client_version", "rescored_from", "run_submitted_at",
-                    "score_runtime_version", "device_os_name", "device_chip_model",
-                    "observation_max_swap_bytes"],
+                    "device_time_ms", "failure_source", "failure_code",
+                    "parameter_prefill_tokens", "client_version", "rescored_from",
+                    "run_submitted_at", "score_runtime_version", "device_os_name",
+                    "device_chip_model", "observation_max_swap_bytes"],
         "rows": [[job_id, "prefill_throughput_256", "perf", "tokens_per_second", 42.5, 1.5,
                   "tok/s", false, null, null, null, "{\"peak_rss_kib\":10}", "client-1",
-                  "Pixel 9", null, "2026-09-29T10:05:00.000000Z", 184_250, null, 256, "1.4.0",
-                  "job-0", "2026-09-01T08:00:00.000000Z", "1.2.3", "Android", "Tensor G4",
-                  1_048_576],
+                  "Pixel 9", null, "2026-09-29T10:05:00.000000Z", 184_250, null, null, 256,
+                  "1.4.0", "job-0", "2026-09-01T08:00:00.000000Z", "1.2.3", "Android",
+                  "Tensor G4", 1_048_576],
                  [job_id, "prefill_throughput_256", "perf", "ttft", null, null, "ms", true,
                   "=out of memory", null, null, null, "client-1", "Pixel 9", null,
-                  "2026-09-29T10:05:00.000000Z", null, "client", 256, "1.4.0", "job-0",
-                  "2026-09-01T08:00:00.000000Z", null, "Android", null, null]],
+                  "2026-09-29T10:05:00.000000Z", null, "client", "out_of_memory", 256, "1.4.0",
+                  "job-0", "2026-09-01T08:00:00.000000Z", null, "Android", null, null]],
     })
 }
 
@@ -1123,8 +1127,9 @@ fn header_of(resp: &Response<Body>, name: HeaderName) -> anyhow::Result<Option<S
 }
 
 /// The file holds every row from one unpaged query, as the console's download
-/// writes it, with the fleet's columns empty below `read_clients`. The client,
-/// observation and device columns follow the parameters.
+/// writes it, with the fleet's columns empty below `read_clients`; the failure
+/// code is at both tiers. The client, observation and device columns follow
+/// the parameters.
 #[rstest]
 #[case::full(
     true,
@@ -1162,11 +1167,12 @@ fn test_the_export_holds_every_row(
          client_id,device_name,submitted_at,scored_at,device_time_ms,failure_source,\
          parameter_prefill_tokens,client_version,rescored_from,run_submitted_at,\
          score_runtime_version,model_params_total_millions,model_params_active_millions,\
-         runtime_catalog_name,model_catalog_name,observation_max_swap_bytes,{devices}\n\
+         runtime_catalog_name,model_catalog_name,failure_code,observation_max_swap_bytes,\
+         {devices}\n\
          job-1,prefill_throughput_256,perf,tokens_per_second,42.5,1.5,tok/s,false,,,,,,,,,,,\
-         ,{extras},{fleet},,2026-09-29T10:05:00Z,184250,,256,{version},job-0,2026-09-01T08:00:00Z,1.2.3,,,,,1048576,{first}\n\
+         ,{extras},{fleet},,2026-09-29T10:05:00Z,184250,,256,{version},job-0,2026-09-01T08:00:00Z,1.2.3,,,,,,1048576,{first}\n\
          job-1,prefill_throughput_256,perf,ttft,,,ms,true,{reason},,,,,,,,,,,,{fleet},,\
-         2026-09-29T10:05:00Z,,{source},256,{version},job-0,2026-09-01T08:00:00Z,,,,,,,{second}\n",
+         2026-09-29T10:05:00Z,,{source},256,{version},job-0,2026-09-01T08:00:00Z,,,,,,out_of_memory,,{second}\n",
         devices = DEVICE_COLUMNS.join(","),
         first = device(&[
             ("device_os_name", "Android"),

@@ -165,6 +165,26 @@ pub enum BenchmarkParams {
         text_tokens: NonNegativeCount,
         decode_tokens: AsrDecodeTokens,
     },
+    DecisionLatency {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_width: Option<PositiveCount>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_height: Option<PositiveCount>,
+        text_tokens: NonNegativeCount,
+        num_images: NonNegativeCount,
+        questions: PositiveCount,
+        batch_size: BatchSize,
+    },
+    DecisionMaxMemory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_width: Option<PositiveCount>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_height: Option<PositiveCount>,
+        text_tokens: NonNegativeCount,
+        num_images: NonNegativeCount,
+        questions: PositiveCount,
+        batch_size: BatchSize,
+    },
 }
 
 impl BenchmarkParams {
@@ -182,6 +202,118 @@ impl BenchmarkParams {
             Self::VlSpecDecode { .. } => BenchmarkType::VlSpecDecode,
             Self::AsrThroughput { .. } => BenchmarkType::AsrThroughput,
             Self::AsrMaxMemory { .. } => BenchmarkType::AsrMaxMemory,
+            Self::DecisionLatency { .. } => BenchmarkType::DecisionLatency,
+            Self::DecisionMaxMemory { .. } => BenchmarkType::DecisionMaxMemory,
+        }
+    }
+
+    /// The params that scale a run's work, each under its field name, in one
+    /// order per type: a run takes more time and memory as any of them grows.
+    /// Every other param, ASR sample rate and channels included, is not a size.
+    /// An absent `vl_max_memory` decode count is the one token it decodes, and
+    /// absent decision image sides are the 0 pixels of a state with no image.
+    /// Empty for a type whose runs have no such scale. At most six: the
+    /// database queue compares six (migration 0035).
+    pub fn sizes(&self) -> Vec<(&'static str, i64)> {
+        let count = |n: NonNegativeCount| i64::from(n.into_inner());
+        let positive = |n: PositiveCount| i64::from(n.into_inner());
+        let batch = |n: BatchSize| i64::from(n.as_u32());
+        match *self {
+            Self::PrefillThroughput {
+                prefill_tokens,
+                batch_size,
+            } => vec![
+                ("prefill_tokens", count(prefill_tokens)),
+                ("batch_size", batch(batch_size)),
+            ],
+            Self::DecodeThroughput {
+                prefill_tokens,
+                decode_tokens,
+                batch_size,
+            }
+            | Self::EndToEndLatency {
+                prefill_tokens,
+                decode_tokens,
+                batch_size,
+            } => vec![
+                ("prefill_tokens", count(prefill_tokens)),
+                ("decode_tokens", positive(decode_tokens)),
+                ("batch_size", batch(batch_size)),
+            ],
+            Self::MaxMemoryUsage { prefill_tokens } => {
+                vec![("prefill_tokens", count(prefill_tokens))]
+            }
+            Self::VlThroughput {
+                image_width,
+                image_height,
+                text_tokens,
+                decode_tokens,
+                num_images,
+            } => vec![
+                ("image_width", positive(image_width)),
+                ("image_height", positive(image_height)),
+                ("num_images", count(num_images)),
+                ("text_tokens", count(text_tokens)),
+                ("decode_tokens", positive(decode_tokens)),
+            ],
+            Self::VlMaxMemory {
+                image_width,
+                image_height,
+                text_tokens,
+                decode_tokens,
+                num_images,
+            } => vec![
+                ("image_width", positive(image_width)),
+                ("image_height", positive(image_height)),
+                ("num_images", count(num_images)),
+                ("text_tokens", count(text_tokens)),
+                ("decode_tokens", decode_tokens.map_or(1, positive)),
+            ],
+            Self::AsrThroughput {
+                audio_duration_ms,
+                audio_sample_rate_hz: _,
+                audio_channels: _,
+                text_tokens,
+                decode_tokens,
+            }
+            | Self::AsrMaxMemory {
+                audio_duration_ms,
+                audio_sample_rate_hz: _,
+                audio_channels: _,
+                text_tokens,
+                decode_tokens,
+            } => vec![
+                ("audio_duration_ms", i64::from(audio_duration_ms.as_u32())),
+                ("text_tokens", count(text_tokens)),
+                ("decode_tokens", i64::from(decode_tokens.as_u32())),
+            ],
+            Self::DecisionLatency {
+                image_width,
+                image_height,
+                text_tokens,
+                num_images,
+                questions,
+                batch_size,
+            }
+            | Self::DecisionMaxMemory {
+                image_width,
+                image_height,
+                text_tokens,
+                num_images,
+                questions,
+                batch_size,
+            } => vec![
+                ("image_width", image_width.map_or(0, positive)),
+                ("image_height", image_height.map_or(0, positive)),
+                ("num_images", count(num_images)),
+                ("text_tokens", count(text_tokens)),
+                ("questions", positive(questions)),
+                ("batch_size", batch(batch_size)),
+            ],
+            Self::Eval { .. }
+            | Self::VlmEval { .. }
+            | Self::AsrEval { .. }
+            | Self::VlSpecDecode { .. } => Vec::new(),
         }
     }
 }
@@ -304,6 +436,22 @@ impl From<&BenchmarkDefinition> for BenchmarkParams {
                 audio_channels: b.parameter_audio_channels,
                 text_tokens: b.parameter_text_tokens,
                 decode_tokens: b.parameter_decode_tokens,
+            },
+            BenchmarkDefinition::DecisionLatency(b) => Self::DecisionLatency {
+                image_width: b.parameter_image_width,
+                image_height: b.parameter_image_height,
+                text_tokens: b.parameter_text_tokens,
+                num_images: b.parameter_num_images,
+                questions: b.parameter_questions,
+                batch_size: b.parameter_batch_size,
+            },
+            BenchmarkDefinition::DecisionMaxMemory(b) => Self::DecisionMaxMemory {
+                image_width: b.parameter_image_width,
+                image_height: b.parameter_image_height,
+                text_tokens: b.parameter_text_tokens,
+                num_images: b.parameter_num_images,
+                questions: b.parameter_questions,
+                batch_size: b.parameter_batch_size,
             },
         }
     }
@@ -580,6 +728,18 @@ mod tests {
         json!({"benchmark_id": "b", "benchmark_type": "asr_max_memory", "parameter_audio_duration_ms": 9400, "parameter_audio_sample_rate_hz": 48000, "parameter_audio_channels": 2, "parameter_decode_tokens": 256}),
         json!({"benchmark_type": "asr_max_memory", "audio_duration_ms": 9400, "audio_sample_rate_hz": 48000, "audio_channels": 2, "text_tokens": 0, "decode_tokens": 256}),
     )]
+    #[case::decision_latency_text(
+        json!({"benchmark_id": "b", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_questions": 3}),
+        json!({"benchmark_type": "decision_latency", "text_tokens": 64, "num_images": 0, "questions": 3, "batch_size": 1}),
+    )]
+    #[case::decision_latency_image(
+        json!({"benchmark_id": "b", "benchmark_type": "decision_latency", "parameter_image_width": 384, "parameter_image_height": 256, "parameter_text_tokens": 0, "parameter_num_images": 2, "parameter_questions": 1}),
+        json!({"benchmark_type": "decision_latency", "image_width": 384, "image_height": 256, "text_tokens": 0, "num_images": 2, "questions": 1, "batch_size": 1}),
+    )]
+    #[case::decision_max_memory(
+        json!({"benchmark_id": "b", "benchmark_type": "decision_max_memory", "parameter_text_tokens": 3400, "parameter_questions": 1}),
+        json!({"benchmark_type": "decision_max_memory", "text_tokens": 3400, "num_images": 0, "questions": 1, "batch_size": 1}),
+    )]
     fn a_definition_maps_to_its_params(
         #[case] definition: Value,
         #[case] expected: Value,
@@ -588,6 +748,68 @@ mod tests {
         let params = BenchmarkParams::from(&definition);
         assert_eq!(serde_json::to_value(&params)?, expected);
         assert_eq!(params.benchmark_type(), definition.benchmark_type());
+        Ok(())
+    }
+
+    /// Each size is named after its field of the params, so ingestion can take
+    /// exactly the sizes out of a cell. Only an absent optional size has none.
+    #[rstest]
+    #[case::decode(
+        json!({"benchmark_id": "b", "benchmark_type": "decode_throughput", "parameter_prefill_tokens": 512, "parameter_decode_tokens": 256, "parameter_batch_size": 8}),
+        vec![("prefill_tokens", 512), ("decode_tokens", 256), ("batch_size", 8)],
+        &[],
+    )]
+    #[case::max_memory(
+        json!({"benchmark_id": "b", "benchmark_type": "max_memory_usage", "parameter_prefill_tokens": 1024}),
+        vec![("prefill_tokens", 1024)],
+        &[],
+    )]
+    #[case::vl_throughput(
+        json!({"benchmark_id": "b", "benchmark_type": "vl_throughput", "parameter_image_width": 224, "parameter_image_height": 336, "parameter_text_tokens": 8, "parameter_decode_tokens": 64, "parameter_num_images": 3}),
+        vec![("image_width", 224), ("image_height", 336), ("num_images", 3), ("text_tokens", 8), ("decode_tokens", 64)],
+        &[],
+    )]
+    #[case::vl_max_memory_one_token(
+        json!({"benchmark_id": "b", "benchmark_type": "vl_max_memory", "parameter_image_width": 224, "parameter_image_height": 336}),
+        vec![("image_width", 224), ("image_height", 336), ("num_images", 1), ("text_tokens", 0), ("decode_tokens", 1)],
+        &["decode_tokens"],
+    )]
+    #[case::asr(
+        json!({"benchmark_id": "b", "benchmark_type": "asr_throughput", "parameter_audio_duration_ms": 9400, "parameter_audio_sample_rate_hz": 16000, "parameter_audio_channels": 1, "parameter_text_tokens": 1024, "parameter_decode_tokens": 128}),
+        vec![("audio_duration_ms", 9400), ("text_tokens", 1024), ("decode_tokens", 128)],
+        &[],
+    )]
+    #[case::decision_without_images(
+        json!({"benchmark_id": "b", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_questions": 3}),
+        vec![("image_width", 0), ("image_height", 0), ("num_images", 0), ("text_tokens", 64), ("questions", 3), ("batch_size", 1)],
+        &["image_width", "image_height"],
+    )]
+    #[case::eval(
+        json!({"benchmark_id": "b", "benchmark_type": "eval", "parameter_eval_id": "mmlu_pro", "parameter_dataset_name": "edge_2026.03.1", "parameter_max_tokens": 256}),
+        vec![],
+        &[],
+    )]
+    #[case::vl_spec_decode(
+        json!({"benchmark_id": "b", "benchmark_type": "vl_spec_decode", "parameter_draft_length": 7, "parameter_max_tokens": 2048, "parameter_batch_size": 8, "parameter_temperature": 0.7, "dataset": mmspec_corpus()}),
+        vec![],
+        &[],
+    )]
+    fn a_runs_sizes_are_fields_of_its_params(
+        #[case] definition: Value,
+        #[case] sizes: Vec<(&str, i64)>,
+        #[case] absent: &[&str],
+    ) -> anyhow::Result<()> {
+        let definition: BenchmarkDefinition = serde_json::from_value(definition)?;
+        let params = BenchmarkParams::from(&definition);
+        assert_eq!(params.sizes(), sizes);
+        let fields = serde_json::to_value(&params)?;
+        let unnamed: Vec<&str> = params
+            .sizes()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| fields.get(name).is_none())
+            .collect();
+        assert_eq!(unnamed, absent);
         Ok(())
     }
 

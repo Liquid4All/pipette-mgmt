@@ -100,8 +100,8 @@ pub struct DeniedClient {
     pub record: Option<DenialRecord>,
 }
 
-/// The code most members' denials name, `unspecified` ones aside, for a job
-/// every roster member denied. A tie goes to the code declared first.
+/// For a job that every roster member denied, return the most frequent code
+/// other than `unspecified`. A tie goes to the code declared first.
 pub fn prevailing_failure_code(denials: &[DeniedClient]) -> FailureCode {
     FailureCode::iter()
         .filter(|code| *code != FailureCode::Unspecified)

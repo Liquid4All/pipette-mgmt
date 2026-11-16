@@ -37,6 +37,16 @@ pub(crate) async fn migrate(
     run(db, &migrator(), to, dry_run).await
 }
 
+/// Apply every migration to a scratch schema, which only its own test
+/// migrates. sqlx keys its lock on the database name, and every scratch schema
+/// shares one database, so the lock would migrate the tests one at a time.
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) async fn migrate_scratch(db: &SqlDatabase) -> anyhow::Result<SchemaMove> {
+    let mut migrator = migrator();
+    migrator.set_locking(false);
+    run(db, &migrator, None, false).await
+}
+
 async fn run(
     db: &SqlDatabase,
     migrator: &Migrator,

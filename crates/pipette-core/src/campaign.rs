@@ -2,11 +2,14 @@
 //! mints its plans and points at the head; the plans' `previous_plan_id` chain
 //! is the history. It holds no jobs, and gates only new plans while archived.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
-    CampaignId, CampaignState, Labels, NonEmptyTrimmedString, PlanId, PrincipalOwner,
+    CampaignGroupId, CampaignGroupPolicy, CampaignId, CampaignState, JobId, Labels,
+    NonEmptyTrimmedString, PlanId, PrincipalOwner,
 };
 
 use crate::types::Mint;
@@ -164,6 +167,101 @@ impl Campaign {
         self.updated_at = at;
         true
     }
+}
+
+/// Per-device campaigns listed together, so they can be checked against each
+/// other: the body of a `campaign_groups` row. The members are rows of their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignGroup {
+    pub group_id: CampaignGroupId,
+    /// What to print for a human; nothing keys on it.
+    pub name: NonEmptyTrimmedString,
+    /// The owner of its member campaigns: the routes add only its campaigns and a
+    /// hand-off takes a campaign out (`campaign_admin::leave_group`). The store
+    /// checks neither.
+    pub owner: CampaignOwner,
+    pub created_at: DateTime<Utc>,
+    /// When the name last changed; `created_at` on a fresh record.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl CampaignGroup {
+    /// Minted here so no caller can choose an id that collides.
+    pub fn new(name: NonEmptyTrimmedString, owner: CampaignOwner, at: DateTime<Utc>) -> Self {
+        Self {
+            group_id: CampaignGroupId::mint(),
+            name,
+            owner,
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    /// Returns whether anything changed; the current name writes nothing and keeps `updated_at`.
+    pub fn rename(&mut self, name: NonEmptyTrimmedString, at: DateTime<Utc>) -> bool {
+        if self.name == name {
+            return false;
+        }
+        self.name = name;
+        self.updated_at = at;
+        true
+    }
+}
+
+impl From<CampaignGroup> for pipette_plan_types::CampaignGroup {
+    fn from(group: CampaignGroup) -> Self {
+        Self {
+            group_id: group.group_id,
+            name: group.name,
+            owner: group.owner,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+        }
+    }
+}
+
+/// What queue-maintenance's policy pass keeps for one member campaign of a
+/// group: the JSON of its `campaign_group_members` row's `policy_state`. The
+/// row, and this with it, goes when the campaign leaves the group. The default
+/// is a row the pass has not written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupPolicyState {
+    /// The acting policies, as read, when `decided` and `refusal` were written.
+    pub policies: Vec<CampaignGroupPolicy>,
+    /// Jobs of the head the pass is done with under `policies`: kept, or left
+    /// for good.
+    pub decided: BTreeSet<JobId>,
+    /// The pass's last filing into the campaign.
+    pub filed: Option<GroupFiling>,
+    /// The head whose filing was refused, held while the build stays the same.
+    pub refusal: Option<Refusal>,
+    /// When pipette-duckdb last failed on the member's rows, which takes it
+    /// behind the others in the next round; cleared once they read.
+    pub unreadable_at: Option<DateTime<Utc>>,
+}
+
+/// A revision the policy pass filed into a member campaign.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupFiling {
+    pub plan_id: PlanId,
+    /// The jobs the filed plan holds that the plan it replaced did not: its
+    /// re-runs, its marks, and the lapsed cells it placed afresh.
+    pub queued: BTreeSet<JobId>,
+    /// The filing ended in `CommitUnknown`, so only an operator may cancel the
+    /// plan.
+    pub commit_unknown: bool,
+    /// With `unreadable_at`, when the pass last filed into or failed to read the
+    /// member: a round takes the longest ago first.
+    pub filed_at: DateTime<Utc>,
+}
+
+/// A head the policy pass could not file again, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub plan_id: PlanId,
+    pub reason: String,
+    /// [`crate::BUILD_VERSION`] when recorded: a new release may fix the cause.
+    pub build: String,
 }
 
 #[cfg(test)]

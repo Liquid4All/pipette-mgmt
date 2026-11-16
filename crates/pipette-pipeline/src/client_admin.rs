@@ -12,9 +12,11 @@ use pipette_core::client::{Client, ClientStatus};
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_plan_types::{ClientId, ClientPermission, ContactEmail, NonEmptyTrimmedString};
 use pipette_store::{
-    ClientPermissionMutation, ClientStore, KeyIndexStore, OrgStore, STORAGE_CONCURRENCY, TagStore,
-    TodoStore, purge_client_todo_state,
+    ClientPermissionMutation, ClientStore, KeyIndexStore, OrgStore, STORAGE_CONCURRENCY,
+    SubmissionStore, TagStore, TodoStore, purge_client_todo_state,
 };
+
+use crate::queue_maintenance::{LeaseResolution, resolve_or_recycle_lease};
 
 /// The mutable details of a device record. `organization` is the free-text
 /// label the device sent, not its [`pipette_plan_types::ClientOwner`].
@@ -207,13 +209,16 @@ pub async fn reject(
 /// rerun finishes a partial teardown; the bool says whether a record existed.
 ///
 /// The record goes first: it is the existence authority, so every key left
-/// after it is inert and the cleanups that follow are best-effort.
+/// after it is inert and the cleanups that follow are best-effort. Each lease
+/// that the device holds goes back to the queue, or goes if its job already
+/// has a result.
 pub async fn delete(
     clients: &dyn ClientStore,
     key_index: &dyn KeyIndexStore,
     orgs: &dyn OrgStore,
     tags: &dyn TagStore,
     todo: &dyn TodoStore,
+    submissions: &dyn SubmissionStore,
     client_id: &ClientId,
 ) -> Result<bool, ClientAdminError> {
     let existed = clients.get_client(client_id).await?.is_some();
@@ -233,9 +238,59 @@ pub async fn delete(
     release_ownership(orgs, client_id).await;
     release_tags(tags, client_id).await;
     purge_client_todo_state(todo, client_id).await;
+    settle_leases(todo, submissions, client_id).await;
 
     tracing::info!(client_id = %client_id, existed, "client deleted");
     Ok(existed)
+}
+
+/// Best-effort: a lease left behind lapses, and `queue-maintenance` then
+/// settles it.
+async fn settle_leases(
+    todo: &dyn TodoStore,
+    submissions: &dyn SubmissionStore,
+    client_id: &ClientId,
+) {
+    let leases = match todo.leases_for_client(client_id).await {
+        Ok(leases) => leases,
+        Err(e) => {
+            tracing::warn!(client_id = %client_id, error = %e,
+                "failed to list the leases of a deleted client");
+            return;
+        }
+    };
+    stream::iter(&leases)
+        .for_each(|lease| async move {
+            match resolve_or_recycle_lease(
+                todo,
+                submissions,
+                &lease.job_id,
+                lease.expires_at,
+                &lease.client_id,
+                lease.lease_expiry,
+            )
+            .await
+            {
+                Ok(LeaseResolution::Recycled) => tracing::info!(
+                    client_id = %client_id,
+                    job_id = %lease.job_id,
+                    "recycled the lease of a deleted client"
+                ),
+                Ok(LeaseResolution::ResolvedStale) => tracing::info!(
+                    client_id = %client_id,
+                    job_id = %lease.job_id,
+                    "deleted the lease of a deleted client: its job already has a result"
+                ),
+                Ok(LeaseResolution::Gone) => {}
+                Err(e) => tracing::warn!(
+                    client_id = %client_id,
+                    job_id = %lease.job_id,
+                    error = %e,
+                    "failed to settle the lease of a deleted client"
+                ),
+            }
+        })
+        .await;
 }
 
 /// Best-effort: registration clears a leftover before the id is reused.
@@ -350,7 +405,7 @@ fn wire_names(permissions: &BTreeSet<ClientPermission>) -> Vec<&str> {
 }
 
 /// Flag each device in `client_ids` so the next `queue-maintenance` run
-/// rebuilds its `todo/eligible/` markers against the current record. The
+/// rebuilds its eligibility against the current record. The
 /// caller confirms each exists; one deleted since leaves a flag cleanup drops.
 pub async fn flag_reindex(
     todo: &dyn TodoStore,
@@ -375,20 +430,20 @@ mod tests {
     use chrono::Utc;
 
     use pipette_core::types::Mint;
-    use pipette_plan_types::{ClientOwner, OrgId};
+    use pipette_plan_types::{ClientOwner, ExpiresAt, OrgId};
     use pipette_store::Stores;
     use pipette_store_fs::build_local_fs_stores;
 
     use super::*;
 
-    fn stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
+    async fn stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
         let dir = tempfile::tempdir()?;
         let config = pipette_core::config::Config {
             storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)?;
         Ok((dir, stores))
     }
 
@@ -411,7 +466,7 @@ mod tests {
     /// A body naming nothing reports `Unchanged` rather than writing.
     #[tokio::test]
     async fn an_update_reports_only_what_moved() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let client = seed(&stores, "ev1_rig").await?;
 
         assert!(matches!(
@@ -448,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_status_write_reports_the_transition_once() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let client = seed(&stores, "ev1_rig").await?;
         let (clients, client_id) = (&*stores.clients, &client.client_id);
         let change = |from, to| Some(StatusChange { from, to });
@@ -487,7 +542,7 @@ mod tests {
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(());
         };
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let stores = pipette_store_sql::overlay(db.db(), stores);
         let client = seed(&stores, "ev1_rig").await?;
         let (clients, client_id) = (&*stores.clients, &client.client_id);
@@ -523,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_client_is_refused_not_created() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let absent = ClientId::try_new("ev1_nobody")?;
 
         assert!(matches!(
@@ -540,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_is_idempotent_and_reports_what_it_found() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let client = seed(&stores, "ev1_rig").await?;
 
         assert!(
@@ -550,6 +605,7 @@ mod tests {
                 &*stores.orgs,
                 &*stores.tags,
                 &*stores.todo,
+                &*stores.submissions,
                 &client.client_id,
             )
             .await?
@@ -568,6 +624,7 @@ mod tests {
                 &*stores.orgs,
                 &*stores.tags,
                 &*stores.todo,
+                &*stores.submissions,
                 &client.client_id,
             )
             .await?,
@@ -576,9 +633,88 @@ mod tests {
         Ok(())
     }
 
+    /// On the database queue, a delete leaves no eligibility, reindex request,
+    /// liveness, worker or lease that names the device. A held job goes back
+    /// to the queue; a job with a result leaves it. The denial stays with
+    /// its job.
+    #[tokio::test]
+    async fn a_delete_clears_the_devices_queue_state() -> anyhow::Result<()> {
+        let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let (_dir, stores) = stores().await?;
+        let stores = db.stores(stores);
+        let client = seed(&stores, "ev1_gone").await?;
+        let client_id = &client.client_id;
+        let todo = &*stores.todo;
+        let queue = |id: &'static str| async move {
+            let job = pipette_plan_types::JobId::try_new(id)?;
+            todo.write_tmp(&job, &serde_json::json!({ "job_id": id }))
+                .await?;
+            todo.promote_avail(&job, ExpiresAt::Never, None).await?;
+            anyhow::Ok(job)
+        };
+        let (free, held, done) = (
+            queue("job-free").await?,
+            queue("job-held").await?,
+            queue("job-done").await?,
+        );
+        let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+        stream::iter([&held, &done])
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|job| async move {
+                todo.claim_job(job, ExpiresAt::Never, client_id, lease_expiry)
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await?;
+        stores
+            .submissions
+            .write_processed(&done, &serde_json::json!({ "job_id": "job-done" }))
+            .await?;
+        todo.write_eligible(client_id, &free, ExpiresAt::Never)
+            .await?;
+        todo.write_denied(
+            &free,
+            client_id,
+            &pipette_core::denial::DenialRecord::default(),
+        )
+        .await?;
+        todo.write_lost_lease(&free, client_id, lease_expiry)
+            .await?;
+        todo.write_pending_reindex(client_id).await?;
+        todo.stamp_liveness(client_id).await?;
+        todo.write_workers(&std::collections::HashSet::from([client_id.clone()]))
+            .await?;
+
+        delete(
+            &*stores.clients,
+            &*stores.key_index,
+            &*stores.orgs,
+            &*stores.tags,
+            todo,
+            &*stores.submissions,
+            client_id,
+        )
+        .await?;
+
+        assert!(todo.list_eligible_for_client(client_id).await?.is_empty());
+        assert!(!todo.has_pending_reindex(client_id).await?);
+        assert!(todo.read_liveness(client_id).await?.is_none());
+        assert!(todo.read_workers().await?.is_empty());
+        assert!(todo.leases_for_client(client_id).await?.is_empty());
+        assert!(todo.get_avail_by_job(&held).await?.is_some());
+        assert!(todo.get_avail_by_job(&done).await?.is_none());
+        assert!(todo.is_denied(&free, client_id).await?);
+        assert_eq!(todo.list_lost_leases(&free).await?.len(), 1);
+        todo.delete_avail_by_job(&free).await?;
+        assert!(todo.list_lost_leases(&free).await?.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_removed_device_leaves_no_ownership_or_tags() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let owner = ClientOwner::Org {
             org_id: OrgId::mint(),
         };
@@ -607,6 +743,7 @@ mod tests {
             &*stores.orgs,
             &*stores.tags,
             &*stores.todo,
+            &*stores.submissions,
             &deleted.client_id,
         )
         .await?;

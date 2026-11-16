@@ -16,11 +16,11 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{UserId, UserPermission, UserStatus};
 use pipette_web_testkit::{
     MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner, assert_nothing_staged, auth_headers, authed_post,
-    body_json, created_campaign, json_str, make_state, make_state_from_config,
-    make_state_with_default_body_limit, make_state_with_plan_body_limit,
-    make_state_with_submission_body_limit, own_campaign_plans_uri, post_plan_document, raw_request,
-    register_and_approve, register_pending, registered_user, set_user_status, setup_benchmarks,
-    signed_json, test_config, unauthed_post, user_auth_headers,
+    body_json, created_campaign, json_str, make_state, make_state_with_default_body_limit,
+    make_state_with_plan_body_limit, make_state_with_submission_body_limit, own_campaign_plans_uri,
+    post_plan_document, raw_request, register_and_approve, register_pending, registered_user,
+    set_user_status, setup_benchmarks, signed_json, test_config, test_http_client, unauthed_post,
+    user_auth_headers,
 };
 
 /// Past the default `default_body_limit_bytes` (64 KiB). Raising that default
@@ -154,6 +154,24 @@ async fn submission_limited_state(dir: &std::path::Path) -> anyhow::Result<AppSt
     make_state_with_submission_body_limit(dir, limit).await
 }
 
+/// A [`submission_limited_state`] for a test that pauses the clock: see
+/// [`paused_clock_state`].
+async fn paused_submission_limited_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+    let mut config = test_config(dir);
+    config.submission_body_limit_bytes =
+        NonZeroUsize::new(TEST_SUBMISSION_BODY_LIMIT).context("limit is non-zero")?;
+    paused_clock_state(config).await
+}
+
+/// A state on the local_fs record stores with no queue, for a test that pauses
+/// the clock: on a paused clock, a wait for a database connection times out at
+/// once.
+async fn paused_clock_state(config: pipette_core::config::Config) -> anyhow::Result<AppState> {
+    let stores =
+        pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
+    AppState::new(config, stores, test_http_client()?).await
+}
+
 /// Without a ceiling any signed device could make the server buffer any size.
 #[rstest]
 #[case::single("/benchmarks")]
@@ -230,7 +248,7 @@ async fn test_submission_routes_refuse_bodies_dense_in_values(
 async fn test_a_submission_body_that_stalls_times_out() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = submission_limited_state(dir.path()).await?;
+    let state = paused_submission_limited_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let headers = auth_headers(&sk, &client_id, "POST", "/benchmarks")?;
 
@@ -261,7 +279,7 @@ async fn test_a_submission_body_that_stalls_times_out() -> anyhow::Result<()> {
 async fn test_a_stalled_submission_holds_up_only_its_device() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = submission_limited_state(dir.path()).await?;
+    let state = paused_submission_limited_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let (other_sk, other_id) = register_and_approve(&state).await?;
     let headers = auth_headers(&sk, &client_id, "POST", "/benchmarks")?;
@@ -301,7 +319,7 @@ async fn test_stalled_held_submissions_leave_approved_devices_room() -> anyhow::
     config.submission_body_limit_bytes =
         NonZeroUsize::new(TEST_SUBMISSION_BODY_LIMIT).context("limit is non-zero")?;
     config.unverified_submissions.enabled = true;
-    let state = make_state_from_config(config).await?;
+    let state = paused_clock_state(config).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let pending = futures::future::try_join_all((0..4).map(|_| register_pending(&state))).await?;
     let headers = pending
@@ -343,7 +361,7 @@ async fn test_stalled_held_submissions_leave_approved_devices_room() -> anyhow::
 async fn test_a_submission_waits_for_the_trees_in_flight() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = submission_limited_state(dir.path()).await?;
+    let state = paused_submission_limited_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
     let all = u32::try_from(state.submissions_in_flight.available_permits())?;
     let bodies = state.submission_bodies.available_permits();

@@ -3,7 +3,7 @@
 // what they did, and the records it named.
 
 import { ownOrg } from "./orgs";
-import { campaignLink, clientLink, href, orgLink, planLink, userLink, vaultLink } from "./routes";
+import { campaignGroupLink, campaignLink, clientLink, href, orgLink, planLink, userLink, vaultLink } from "./routes";
 import type { Choice } from "./table";
 import type { AuditActor, AuditEvent, AuditTarget, OwnUserView } from "./api-types";
 
@@ -145,6 +145,11 @@ export function actionShown(event: Pick<AuditEvent, "action" | "outcome" | "summ
     return { text: `Renamed catalog entry ${action.old_name} to ${action.new_name}`,
              title: `${action.scope}: ${action.old_name} → ${action.new_name}`, status: null };
   }
+  if (action.type === "group_policy") {
+    return { text: `Campaign group policies ${action.kinds.join(", ")}: re-run ${action.rerun_job_count}, `
+               + `marked ${action.marked_job_count} failed`,
+             title: action.group_id, status: null };
+  }
   if (action.type === "catalog_merge") {
     return { text: `Merged catalog entry ${action.old_name} into ${action.into_name}`,
              title: `${action.scope}: ${action.old_name} → ${action.into_name}`
@@ -162,6 +167,7 @@ export function targetId(target: AuditTarget): string {
     case "user": return target.user_id;
     case "client": return target.client_id;
     case "campaign": return target.campaign_id;
+    case "campaign_group": return target.group_id;
     case "plan": return target.plan_id;
     case "job": return target.job_id;
     case "vault_resource": return target.resource_id;
@@ -169,13 +175,14 @@ export function targetId(target: AuditTarget): string {
 }
 
 /**
- * A target's page, an organization by its handle. `names` covers every kind but plans and jobs, so an unnamed
- * one is out of the reader's reach or gone; a job has no page of its own.
+ * A target's page, an organization by its handle. `names` covers every kind but groups, plans and jobs, so an
+ * unnamed one is out of the reader's reach or gone; a job has no page of its own.
  */
 export function targetHref(target: AuditTarget, names: Record<string, string>): string | null {
   const id = targetId(target);
   const name = names[id];
   switch (target.type) {
+    case "campaign_group": return campaignGroupLink(id);
     case "plan": return planLink(id);
     case "job": return null;
     case "org": return name ? orgLink({ slug: name, org_id: id }) : null;
@@ -192,13 +199,18 @@ export function targetShown(target: AuditTarget, names: Record<string, string>):
   return { text: name ?? id, href: targetHref(target, names), title: name ? id : undefined, id: !name };
 }
 
+/** The log the reader administers: the whole log, or its organization's; `null` for none. */
+export function auditLog(reader: Pick<OwnUserView, "may" | "org_id" | "org_slug">): string | null {
+  const own = reader.may.administer_roster === "own" ? ownOrg(reader) : null;
+  return reader.may.administer_roster === "every" ? "/app/server/audit" : own ? orgLink(own, "/audit") : null;
+}
+
 /**
  * A record page's "Audit": the events naming record `id` or acting as it, of every kind, on the log the reader
  * administers; `null` for a reader administering none.
  */
 export function auditAction(reader: Pick<OwnUserView, "may" | "org_id" | "org_slug">, id: string) {
   const filters: AuditFilters = { outcome: [], actor: [], target: id, limit: "" };
-  const own = reader.may.administer_roster === "own" ? ownOrg(reader) : null;
-  const path = reader.may.administer_roster === "every" ? "/app/server/audit" : own ? orgLink(own, "/audit") : null;
+  const path = auditLog(reader);
   return path ? { href: auditLink(path, filters), label: "Audit" } : null;
 }

@@ -9,8 +9,12 @@ A result row has a `null` `model_params_total_millions` if the scoring pass
 ran before its model had a row. A plan's jobs page
 (`GET /api/v1/plans/{plan_id}/jobs?results=true`) and results file
 (`GET /api/v1/plans/{plan_id}/results.csv`) then take both counts from the row
-that its descriptor resolves to. A stored count wins. The `fix-model-param`
-command rewrites the warehouse.
+that its descriptor resolves to. A result row without a model uses counts for
+the model that its job requested. Historical rows without a model keep null
+counts. A stored count wins. The `fix-model-param` command rewrites the warehouse.
+
+The results file remains available if a plan-source read fails. Stored counts
+stay intact. Missing counts that depend on the requested model remain empty.
 
 ## Rows
 

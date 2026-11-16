@@ -62,7 +62,7 @@
   }
   const rerunFailed = () => filing("failed", { verb: "rerun", body: { answered: "failed" } }, {
     title: "Re-run failed jobs?", action: "Re-run failed jobs",
-    text: `Every job whose recorded result is a failure runs again on a device. ${REVISION}`,
+    text: `Every job whose recorded result is a failure runs again on a device, except jobs marked failed. ${REVISION}`,
   });
   const recalculateAll = () => filing("evals", { verb: "recalculate", body: { all_evals: true } }, {
     title: "Recalculate all finished evals?", action: "Recalculate all finished evals", phrase: PHRASES.evals,
@@ -113,10 +113,10 @@
       {#if data?.may_edit_note}<PlanNote {plan} {onchange} />{/if}
       {#if rerunIn}
         <SettingRow title="Re-run failed jobs"
-                    text="Runs every job whose recorded result is a failure again on a device, in a revision that replaces this plan.">
+                    text="Runs every job whose recorded result is a failure again on a device, except jobs marked failed, in a revision that replaces this plan.">
           {#snippet control()}
             <button type="button" aria-haspopup="dialog" aria-disabled={filer.busy || failed === 0}
-                    title={failed === 0 ? "No job of this plan has failed" : undefined}
+                    title={failed === 0 ? "No failed job to re-run: none failed, or each was marked failed" : undefined}
                     onclick={() => ask(rerunFailed, failed === 0)}>{
               label("failed", failed === null ? "Re-run failed jobs" : `Re-run failed jobs (${failed})`)}</button>
           {/snippet}

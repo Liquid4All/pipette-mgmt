@@ -206,7 +206,9 @@ mod tests {
             storage: StorageConfig::local_fs(dir.to_path_buf()),
             ..Default::default()
         };
-        let public = pipette_store_fs::build_local_fs_stores(&config)?.catalog;
+        let public =
+            pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
+                .catalog;
         Ok(SqlCatalogStore::new(db.clone(), public))
     }
 

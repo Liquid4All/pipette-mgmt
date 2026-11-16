@@ -6,7 +6,7 @@ files a plan as a TOML **plan document**. The server completes these tasks:
 - The server stores the document.
 - The server expands the document into individual **job bodies**.
 - The server validates the bodies.
-- The server stages the bodies in the job queue (`todo/`).
+- The server stages the bodies in the job queue.
 - The server tracks the plan lifecycle.
 
 This document also defines the capability-based matching model that the queue
@@ -33,13 +33,13 @@ contains a scheduling **envelope** that the server owns. The envelope wraps a
 | `job_id` | envelope | server-minted at ingestion; the sole task identity |
 | `requires`, `any_of`, `clients` | envelope | eligibility: the inputs to capability matching |
 | `excludes`, `not_all_of`, `exclude_clients` | envelope | the negative eligibility clauses. Who the job must **not** run on |
-| `expires_at` | envelope | resolved at ingestion and encoded into the `avail/` filename, which every scheduling path reads; the body keeps a stamped copy |
+| `expires_at` | envelope | resolved at ingestion and stored on the job's queue row, which every scheduling path reads; the body keeps a stamped copy |
 | `merge_duplicates` | envelope | whether this job may join a job that already runs the same cell (§7); default `true`. `false` still lets a later plan join the job this one mints |
 | `required_flags` | envelope | written at ingestion from the `tag:` and `client_version:` flags a plan marks `:required` (§4): the routing flags a carried run must be shown to have held (§7). A submitted body may not set it |
 | `spec` | — | the run specification, **stored and forwarded untouched** |
 | `spec.benchmark` | spec | resolved against the benchmark catalog: fills the claim response's `benchmark_id`, and attributes synthetic failure records |
 | `spec.model`, `spec.runtime` | spec | **presence checked** at ingestion; their contents are read only to derive an opaque `model_descriptor` / `runtime_descriptor` for a synthetic failure record, `spec.model` is parsed in full to check coverage in the model parameter table, and a spec this build parses must pair a runtime with a model it loads (§6.2) |
-| `spec.model_flags`, `spec.runtime_flags`, `spec.benchmark_flags` | spec | copied, canonicalized, into the `requested_*_flags` columns of the run's warehouse rows ([storage.md §5](storage.md#requested_model_flags--requested_runtime_flags--requested_benchmark_flags)). `spec.runtime_flags` is also checked against the runtime and model, and on an eval benchmark against the catalog entry's context bound and output cap (§6.2), and scoring reads `spec.model_flags`' `enable_thinking` back from that column and forwards it to the scoring service ([scoring-service.md](scoring-service.md#post-score)); nothing else in them is interpreted |
+| `spec.model_flags`, `spec.runtime_flags`, `spec.benchmark_flags` | spec | copied, canonicalized, into the `requested_*_flags` columns of the run's warehouse rows ([storage.md §5](storage.md#requested_model_flags--requested_runtime_flags--requested_benchmark_flags)). `spec.runtime_flags` is also checked against the runtime and model, on an eval benchmark against the catalog entry's context bound and output cap, and on a decision benchmark as a decision cell's, with `parallel` set (§6.2), and scoring reads `spec.model_flags`' `enable_thinking` back from that column and forwards it to the scoring service ([scoring-service.md](scoring-service.md#post-score)). A revision's carry reads `spec.benchmark_flags`' `attempt_timeout_seconds`, and reads a `benchmark_flags` object that holds only its three type keys as `null`, to match a cell whose limit changed with its finished run (§7); nothing else in them is interpreted |
 | `time_window` | response only | the lease increment, written by the claim handler; never stored, and ignored if a job body carries it |
 
 Ingestion reads each of these keys as an opaque value. It resolves
@@ -106,7 +106,7 @@ sequenceDiagram
     participant Pl as Planner
     participant Ing as Ingestion
     participant Store as [storage]
-    participant Todo as todo/ queue
+    participant Todo as job queue
 
     Op->>Tr: plan.toml
     Tr->>Pl: the document
@@ -244,10 +244,10 @@ indistinguishable once stored: the body records the clause, not its author.
 
 **The server injects a clause at ingestion or at spawn, never after
 promotion.** A promoted body is immutable ([queue.md](queue.md#jobs)), and the
-eligible index rests on that: `queue-maintenance` skips the `avail/` keys it
-has indexed, and `claim` trusts a marker without re-running the matcher, so a
-clause added after indexing would narrow the body while the markers still name
-the clients it excludes. To narrow a job that is already promoted, retire it
+eligible index rests on that: `queue-maintenance` skips the jobs it has
+indexed, and `claim` trusts an eligibility row without re-running the matcher,
+so a clause added after indexing would narrow the body while the eligibility
+rows still name the clients it excludes. To narrow a job that is already promoted, retire it
 and mint a replacement.
 
 **A rollback across a matcher change widens eligibility.** The envelope schema
@@ -278,7 +278,7 @@ The empty-list forms (`excludes: []`, `not_all_of: [[]]` and the rest), and
 what a device with an empty set matches, follow from the rule;
 [Devices: Capability matching](api/devices.md#capability-matching) states them.
 
-The eligible set is materialized as `eligible/` markers by `queue-maintenance`
+The eligible set is materialized as eligibility rows by `queue-maintenance`
 ([queue.md](queue.md#the-eligible-index)) rather than recomputed on each claim.
 
 **Exact match is deliberate**, RAM included (`ram_bytes:17179869184`). Lab
@@ -525,10 +525,10 @@ Rejections:
 - A `spec` that parses as this build's `ClientRunSpec` and cannot run
   (`ClientRunSpec::validate`): the runtime cannot load the model, or
   `runtime_flags` are for another runtime or model. A client refuses such a spec
-  for good at claim. The benchmark is checked only by the eval rule below, and
-  `model_flags` and `benchmark_flags` are left to the client, but for a
-  vlm_eval's or asr_eval's recipe below. A spec that does not parse (a partner's format, or
-  one newer than this build) is not checked here.
+  for good at claim. The benchmark is checked only by the eval and decision
+  rules below, and `model_flags` and `benchmark_flags` are left to the client,
+  but for a vlm_eval's or asr_eval's recipe below. A spec that does not parse
+  (a partner's format, or one newer than this build) is not checked here.
 - A `spec` that parses, on an eval benchmark, whose cell cannot run the entry
   as the catalog defines it (`EvalBenchmark::check_cell_context`, in
   `crates/pipette-plan-types/src/cell/context_bound.rs`). A client would run
@@ -541,6 +541,23 @@ Rejections:
     pins `max_model_len` at or under `parameter_max_tokens`. That bounds a
     context the entry leaves unbounded, and on a client that sends
     `max_tokens` every request gets vLLM's HTTP 400.
+- A `spec` that parses, on a decision_latency or decision_max_memory
+  benchmark, whose flags the clients' conversion to a decision cell refuses.
+  Filing runs that conversion (`DecisionLlamacppCliStockTools::try_from`) on
+  the flags a client would build, so it refuses what every client would:
+  `runtime_flags` absent or leaving `parallel` unset (`DecisionParallelUnset`),
+  since tasks per request depend on the model and no default slot count fits
+  ([benchmarks.md §2.13](benchmarks.md#213-decision-latency)), and flags for
+  another cell or a runtime and model with no decision cell
+  (`DecisionCellUnrunnable`).
+- A `spec` that parses, on a decision_latency or decision_max_memory entry
+  with images, whose `model` is `gguf_text` (`DecisionImagesOnTextModel`).
+  Only a `gguf_vision` model's projector encodes images: llama-server would
+  refuse every attempt, each eligible client would fail the job once, and it
+  would stay queued until the all-denied pass retires it (a `clients` roster)
+  or it expires.
+  Checked before `parallel`, so a cell that fails both is refused for its
+  model.
 - A **vlm_eval job off its entry's recipe** ([benchmarks.md
   §2.9](benchmarks.md#29-vlm-eval-accuracy)): the spec's `model` is not from a
   Hugging Face repo the entry's `[recipe]` covers, or loads another projector
@@ -661,7 +678,7 @@ reuse, the stored document, the progress stream and the statuses. The steps:
   check of the rewritten bodies (above) runs under the filer's reach.
 
 The token exists only in request memory while the import runs. No token reaches
-`job-sources/`, `todo/`, a manifest, the content key or a log. Two bodies that
+`job-sources/`, the job queue, a manifest, the content key or a log. Two bodies that
 name one commit with different tokens rewrite to the same records, so they merge
 onto one job (§7).
 
@@ -763,54 +780,73 @@ record and joins its job.
 **The deadline model.** A job runs under **one horizon per member plan**. Each
 plan records its own horizon in a `job-plans/{job_id}/{plan_id}.{expires_at}`
 membership marker, and a plan's effective horizon is the latest of its markers.
-The job's `avail/` key carries one official deadline: the latest horizon any
-member held when that key was last written. The expiry pass moves it only once
-it has lapsed.
+The job's queue row carries one official deadline: the earliest horizon among
+its members that has not passed, where `never` ranks after every date. A job
+carries `never` only while every such horizon is `never`.
 
-A joiner therefore **accepts the deadline the key carries**, whatever horizon it
-asked for. A plan that wants the cell for less time joins and stops waiting at
-its own horizon; one that wants it for longer joins, and the job moves onto its
-horizon once the shorter one lapses. The one bar to a join is a job that is
-already dead: an `avail/` entry past its own deadline. The deadlines need not
-match, which is what makes merging reachable: two plans filed minutes apart
-resolve default deadlines minutes apart.
+A joiner **accepts the deadline the queue row carries** at the join, whatever
+horizon it asked for, and the next `queue-maintenance` run brings the row to the
+earliest horizon (**Lapse and re-date**, below). A plan that wants the cell for
+less time joins, and the job moves onto its horizon; one that wants it for
+longer joins, and the job moves onto its horizon once the shorter ones lapse.
+The one bar to a join is a job that is already dead: an available job past its
+own deadline. The deadlines need not match, which is what makes merging
+reachable: two plans filed minutes apart resolve default deadlines minutes
+apart.
 
 A plan that mints or joins a job writes one marker, at the latest horizon among
 its inputs that share the cell. A plan that joins the same cell again in a later
 ingest adds its own, which is why readers take the latest marker.
 
-**Lapse and re-date.** Each `queue-maintenance` run settles two things, in order.
-First, **a member's lapse**: a plan whose horizon for a job has passed, with no
-submission record, gains an `expired_jobs` entry, loses its markers on the job,
-counts it `failed` and stops waiting. The job itself is untouched. Second, **the
-job's own deadline**: a lapsed `avail/` key is renamed onto the latest remaining
-member horizon, or, with none left, the job becomes a synthetic `"system"`
-failure ([queue.md](queue.md#expiration)).
+**Lapse and re-date.** Each `queue-maintenance` run settles three things, in
+order. First, **a member's lapse**: a plan whose horizon for a job has passed,
+with no submission record, gains an `expired_jobs` entry, loses its markers on
+the job, counts it `failed` and stops waiting. The job itself is untouched.
+Second, **a lapsed deadline**: the job is re-dated onto the earliest remaining
+member horizon, or, with none left, becomes a synthetic `"system"` failure
+([queue.md](queue.md#expiration)). Last, **every waiting job's deadline**: one
+statement sets each available job's deadline to the earliest horizon of its
+members, where its row differs, earlier or later. A leased job keeps its
+deadline, which names its lease ([queue.md](queue.md#lease-naming)), and moves
+in the first run after it is back in the queue. A job with no member whose
+horizon is still ahead keeps its row, for the expiry pass to settle once it
+lapses. The run line counts the jobs moved (`deadlines_restamped`).
 
-The key carries the **latest** member horizon rather than the most proximate
-one, for three reasons. A lapse is final, so serving the job past a lapsed
-member's horizon costs that member nothing and still answers the survivors. One
-rename per lapse of the encoded date is fewer renames than one per member
-boundary. And a job stays claimable throughout, with no gap at each
-intermediate boundary. The cost is claim ranking, which orders a shared job by
-its least-urgent member.
+The queue row carries the **earliest** member horizon, so a claim ranks a shared
+job by its most urgent member: a campaign re-dated earlier moves its waiting
+jobs ahead, the ones it shares with a later plan included. A lapse is final, so
+a job past its earliest horizon is re-dated onto the next one and stays
+claimable for every plan that still needs it, up to the last member's horizon.
+The cost is a gap at each member horizon that passes unanswered: until the next
+run re-dates the job, at most one cron interval, a claim skips it and a plan
+filed meanwhile runs the cell on a job of its own.
 
-The rename moves a deadline only while it is already lapsed, and the claim gate
-refuses a lapsed key with the same predicate. So a claim and a re-date compete
-for one key only when the deadline passes inside one request, and the claim path
-retries under the job's current key.
+The re-date moves a deadline only while it is already lapsed, and the claim
+gate refuses a lapsed deadline with the same predicate. So a claim and a
+re-date compete for one job only when the deadline passes inside one request,
+and the claim path retries under the job's current deadline. The last step
+also moves a deadline that has not lapsed, but only on a row with no lease, in
+one statement: a claim that leases the row first keeps the deadline it read,
+which names its lease, and the statement then leaves the row; a claim after it
+reads the new deadline.
 
-**The merge window.** There is no multi-object atomic write, so between finding
-a live job and recording membership the job can be claimed, completed, expired
-or retired by another plan's cancel. The invariant: **a joiner writes its
-membership marker before it re-checks the job**, with fresh reads of `avail/`,
-`leased/`, `avail/` again, and the submission record. Every forward transition
-writes its destination before it deletes its source, and the second `avail/`
-read covers the two backward ones (lease recycle, teardown's restore). A job
-that completed inside the window is the wanted outcome: the joiner reads the
-same record. A job every read misses was retired, so the joiner drops its marker
-and mints a fresh job. Writing the marker first is what lets teardown trust its
-own listing of members (§9).
+**The merge window.** After a plan finds a live job, these events can occur
+before it writes membership:
+
+- A client claims the job.
+- A client completes the job.
+- The job expires.
+- Another plan's cancellation retires the job.
+
+The joiner writes its membership marker and the job's queue row in one
+transaction. Teardown deletes that row in its own transaction (§9). The two
+transactions write the same row, so one of them fails and runs again against
+the result of the other. If the queue no longer holds the job, the joiner
+writes no marker.
+
+A job that completed inside the window is the wanted outcome: the joiner reads
+the same record and keeps its marker. Another path retired any other job that
+left the queue. The joiner deletes its marker and creates a new job.
 
 **A stranded key.** A content-key record whose job is in neither queue may
 belong to an ingest that is still staging. Inside `plan_creating_max_age_secs`
@@ -832,15 +868,10 @@ reads a live job as gone, a lapsed-in-place job refused by the dead-check) or
 residue that the age-gated GC collects (§10). An ingest that fails partway
 through step 2 (§8) leaves membership markers on the jobs it joined; until the
 GC's manifest-gone arm collects them, a teardown of the owning plan releases
-such a job instead of retiring it, so it runs once more. Two gaps are worse.
-Teardown can lose a job a plan joined inside a retire window when the body it
-would restore is gone; that plan counts the cell `cancelled`. A restore that
-fails on an I/O error loses the job the same way; it is logged and the run
-exits non-zero, while a process that dies mid-teardown loses it silently. And
-a job whose key says `never` can outlive its last member, because a `never` key
-never lapses; an operator can delete its `avail/` entry, and PIP-569 closes the
-gap by bounding `never` at ingestion. Closing the others needs an atomic
-multi-key read the queue does not have.
+such a job instead of retiring it, so it runs once more. One gap is worse. A
+job whose deadline is `never` can outlive its last member, because a `never`
+deadline never lapses. An operator can delete its queue row, and PIP-569 closes the
+gap by bounding `never` at ingestion.
 
 ### Carrying a campaign's jobs over
 
@@ -860,7 +891,7 @@ whatever state it is in:
   superseded plan did. The fleet match at ingestion skips it, because no client
   has anything left to run. The record's presence is checked first, and a job
   that has one is finished whatever the queue still holds of it.
-- **Queued**, in `avail/` or `leased/`: the revision joins it as the merge does.
+- **Queued**, available or leased: the revision joins it as the merge does.
   It writes its membership marker, then re-checks the job, so a teardown of the
   superseded plan that runs later finds a member and releases the job instead of
   retiring it.
@@ -870,12 +901,25 @@ whatever state it is in:
 A job the superseded plan lost to a lapse (`expired_jobs`) is not carried: that
 plan never got an answer for it, so the revision places the cell afresh.
 
+A plan filed by an older build can list a job under the digest of a body that
+this build reads differently: the types drop a field they retired, such as
+`bench_timeout_seconds`, and fill in a default. Where the job's stored source
+has the digest the plan lists, or the plan lists the job under a digest its
+document no longer expands to, the revision matches the job by that source as
+this build reads it, provided the superseded plan's document still expands to
+that body. The second case covers a job a revision carried: it lists the job
+under the cell as the build that filed it read the cell, not under the source.
+So a planner change that only drops or fills such a field moves no cell. A body
+that differs in a field this build reads keeps its old digest.
+
 **A change of requirements moves where a cell runs next, not a run it already
 has.** The digest covers eligibility, so a placement whose clauses changed finds
 no match above. It then takes a finished job of the superseded plan for the same
-cell (the same body, eligibility aside) whose run still answers it:
+cell (the same body, eligibility and the attempt limit aside) whose run still
+answers it:
 
 - The record is a success. A failed run runs again.
+- The run answers under the cell's attempt limit (below).
 - With the routing flags left out of both bodies (`tag:` and `client_version:`
   flags the body's `required_flags` does not list, and the `clients` and
   `exclude_clients` rosters), the clauses are unchanged, and the old body's
@@ -897,17 +941,73 @@ dropping or unmarking it keeps them all. A required tag is held only by a run
 the old body already required it of. Marking or unmarking a flag changes the
 body, so the next revision checks the head's runs against it.
 
+**A change of the attempt limit keeps a run that is known to have passed the
+new one.** The limit is `spec.benchmark_flags.attempt_timeout_seconds`. The
+digest covers it, so a placement whose limit changed finds no match above
+either. For this step, two bodies that differ in the limit alone are one cell.
+A `benchmark_flags` object left with its three type keys counts as the `null`
+of a body that sets no flag. A finished run of that cell answers when one of
+these holds:
+
+- A body that vouches for the run sets the limit that the cell sets, or
+  neither sets one. Or both set one, and that body's is not above the cell's.
+  Two bodies vouch: the one the run was requested with, which is its job
+  source, and the one the superseded plan lists the job under, where that plan
+  took the run for a cell under other clauses or another limit. So raising a
+  limit keeps a run whose requested limit, or the limit the superseded plan
+  holds it under, is not above the new one.
+- A plan on offer (below) lists the job under the digest of this very body.
+  That plan held the run for the body, so the run comes back with it. A revert
+  offers every earlier plan, so it takes back what its target held.
+- The filer set `carry_across_limit`, and the run is the superseded plan's
+  own or a plan on offer brings it. The switch reaches no other earlier run of
+  the cell ([below](#satisfying-a-cell-from-an-earlier-run)).
+
+Any other run runs again. A body with no limit runs under the default of its
+client, which the server does not know. A failed run runs again whatever the
+limits, a timeout included, and a queued job gives way to a new one under the
+new limit. Everywhere else the limit is part of the cell: in a first plan, in
+the duplicate merge, in the job-cell index and in the reuse of an earlier run.
+
+A revision that changes the limit of a cell reads the run of every job of the
+superseded plan for that cell that no placement draws by digest. With
+`[database]`, one `finished` outcome row with no `run_flags` among them stops
+the dry run and the filing with the error that names
+`pipette-mgmt db backfill-job-cells` (below), before the revision writes
+anything of its plan.
+
+More than one run can answer a placement. Two variants that differ in the limit
+alone hold one cell under two limits, and their placements share the finished
+runs of that cell. A plan on offer can hold a run of it too. Each placement
+first takes a run that its plan holds under exactly the placement's limit, or
+that a plan on offer lists under its digest. The limit a plan holds a run
+under is that of the body it lists the job under, which is the job source
+unless the plan took the run for a changed cell. The placements still open
+then take, in the order of the expansion, the first run left that answers by
+the rules above. So a placement whose limit did not change keeps its own run.
+Two variants whose limits both changed can still take each other's runs, and
+one of them may then run again. The dry run shows it.
+
 A job with no record is not taken: its queued body keeps the clauses it was
 filed under, so the cell is placed afresh and the old job is stopped with the
 superseded plan. The revision keys a job it takes under the new digest, so the
 next revision carries it by digest. The job keeps the source it was first
-stored with.
+stored with. A later revision that places the cell afresh finds the second
+vouching body by the digest that the superseded plan recorded for the job: it
+expands that plan's document again and takes the body with that digest. So a
+run that `carry_across_limit` kept needs the switch again only for a limit
+that neither body covers: each of the two sets no limit where the cell sets
+one, a limit above the cell's, or a limit where the cell sets none. Where the
+document no longer expands, only the job source vouches.
 
 With `[database]`, a run's outcome and flags come from its `submission_outcomes`
 row ([storage.md §4.3](storage.md#43-the-outcome-index)), so the revision reads
-no record of tens of megabytes. A job with no row, or a `finished` row with no
-`run_flags`, is read from its record. A row outlives a record pruned from
-`processed/`, so its job counts as one with a record.
+no record of tens of megabytes. A job with no row counts as one with no record,
+unless a write of its record is pending: its record is then read. A `finished`
+row with no `run_flags` fails the read, with an error that names the job and
+`pipette-mgmt db backfill-job-cells`, the command that fills the row. A row
+outlives a record pruned from `processed/`, so its job counts as one with a
+record.
 
 **A revision may also take finished runs from other plans.** With
 `carry_earlier`, the campaign's earlier plans offer their finished jobs, newest
@@ -919,11 +1019,13 @@ is offered, not the chain behind it. `add_from`
 each plan whose variants it copies as `inherit_from` does, and `restore` offers
 the plan of each variant that it copies. The same rules
 apply: a success whose run still answers the cell. Left out are a job that
-lapsed, and a job that a later plan of its campaign re-ran, since that re-run was
-asked for. A cell whose carried job is still queued takes such a run in its
-place, and the queued job stops with the superseded plan. A named plan's job
-that is still queued or running is not on offer: the duplicate merge joins it.
-Either switch files the head's own document too, which otherwise files nothing.
+lapsed, and a job that a later plan of its campaign re-ran or marked failed,
+since that was asked for. A cell whose carried job is still queued takes such a
+run in its place, and the queued job stops with the superseded plan. A named
+plan's job that is still queued or running is not on offer: the duplicate merge
+joins it. Either switch files the head's own document too, which otherwise files
+nothing. `carry_across_limit` alone does not: it changes no job of that
+document.
 
 Carrying ignores `merge_duplicates`. The flag keeps a plan off *other* plans'
 runs of a cell, and the superseded plan's run is the campaign's own. A plan
@@ -936,15 +1038,15 @@ each placement of their digest that no other carried job takes is minted as a
 fresh job. It reads no index and joins nothing, as an opted-out input does, but
 still publishes its key when the digest has none. Joining is not an option: the
 index may still name the answered job, and a job whose result is recorded can
-sit in `leased/` until its lease is torn down, so a join would take the old
+stay leased until its lease is torn down, so a join would take the old
 run and run nothing. The re-run names jobs with a recorded result only, so the
-minted job never duplicates a run in flight. A lapse is not a result: the job
-may still run for another plan. The manifest's `rerun_of` maps each minted job
-to the job it runs again.
+minted job duplicates no run in flight, except where it re-runs a mark
+(below). A lapse is not a result: the job may still run for another plan. The
+manifest's `rerun_of` maps each minted job to the job it runs again.
 
 **A recalculation answers the jobs it names.** It withholds them from the carry
 as a re-run does, and each placement of their digest that no carried job takes
-is minted as a fresh job. That job is never staged into `todo/` and holds no
+is minted as a fresh job. That job is never staged into the job queue and holds no
 membership marker. In its place, a copy of the named job's submission record
 goes to `submissions/incoming/`, under the fresh `job_id`, submitted now and
 naming that job in `rescored_from`. The copy keeps the
@@ -965,17 +1067,64 @@ named recalculation of that job fails.
 
 The copies run after the staging writes (§8, step 3), at most four at a time.
 Each copy reads and checks the whole record. The minted jobs of the revision
-go into `avail/` only after every copy succeeds. A record that is not an eval's
+go into the job queue only after every copy succeeds. A record that is not an eval's
 success passes the check and then fails its copy. The filing then stops with
 the revision in `creating`, and no job of it is claimable. A copy is written
 before the plan is finalized, so a filing that fails later leaves its copies to
 be scored under jobs of a plan that maintenance tears down as stranded (§8).
 
-**A re-run or a recalculation places every cell again.** It files the superseded plan's own
+**A mark answers the jobs it names.** A re-run's `fail`
+([`POST /api/v1/campaigns/{campaign_id}/rerun`](api/campaigns/rerun_jobs.md))
+withholds them from the carry as a recalculation does, and each placement of
+their digest that no carried job takes is minted as a fresh job. That job is
+never staged into the job queue, holds no membership marker, reads no index and
+publishes no key. In its place, the server writes a failure to
+`submissions/incoming/` under the fresh `job_id`, as `queue-maintenance` writes
+one ([Synthetic failure records](#synthetic-failure-records)): attributed to
+the reserved `"system"` client, not retriable, with `failure_source` `marked`,
+`failure_code` `unspecified` and the caller's reason. The manifest's `rerun_of`
+maps the minted job to the job it replaces, so the scorer copies that link onto
+the failure's rows. The failures are written after the copies, before any job
+of the revision goes into the job queue; the job id is fresh, so a record already
+under it fails the filing. Like a copy, a failure is written before the plan
+is finalized. The fleet match skips the job, and the jobs read shows it
+`failed` once `queue-maintenance` reads its record, or once pipette-duckdb
+publishes its rows, as for a recalculation's copy.
+
+A whole-plan re-run of the failures (`answered: failed`) leaves such a job
+out, so it does not undo the mark. It reads the record of each failed job that
+has a parent in `rerun_of`, as every mark has, and skips one whose
+`failure_source` is `marked`. `answered: all` takes it.
+
+A mark names a job with a record or without one, unlike a re-run and a
+recalculation. The failure is built from the minted job's own body, and no
+record of the job it replaces is read. The mark comes ahead of the lapse rule
+above: a job the superseded plan lost to a lapse is marked too, and its cell
+is not queued again. The revision writes no membership marker on a replaced
+job. One still queued, available or leased, is therefore left to the teardown of
+the superseded plan (§9): retired at the next `queue-maintenance` run, lease
+included, or released where another plan holds it. A result that a running job
+submits before that run is recorded under its own `job_id`. A re-run of the
+minted job does not join the replaced job, so the cell runs twice where
+another plan still runs that job.
+
+A mark holds while the cell keeps its digest: a later revision carries the
+minted job by digest, as it carries any job with a record. A revision that
+places the cell under a new digest, as a change of requirements or of the
+attempt limit does, takes only a success for it, so the cell runs again. The
+replaced job stays named in `rerun_of`, so neither an earlier-run satisfaction
+nor `carry_earlier` or `inherit_from` takes its run. The mark reaches the readers
+that go through a plan: the plan's reads, its results CSV and the console's
+Jobs table show the cell failed. A replaced job that ran keeps its measured
+rows in the warehouse, and nothing on them records the mark, so a read of the
+benchmark across the warehouse still sees that run.
+
+**A re-run, a mark or a recalculation places every cell again.** It files the superseded plan's own
 document, so each job it carries must find its cell, and each named cell must
-be placed. A shortfall means the document expands differently now, under a
+be placed. A shortfall means the document expands to other cells now, under a
 changed planner, and filing it would run cells nobody named. Ingestion refuses
-it before the first placement, so nothing is written.
+it before the first placement, so nothing is written. A body that this build
+only reads differently is no shortfall (above).
 
 ### Satisfying a cell from an earlier run
 
@@ -985,23 +1134,25 @@ names the input `satisfied`.
 
 **The index.** Staging records the cell of each job that it mints in the
 `job_cells` table. The key of a row is the cell digest. The cell digest is the
-content key without the eligibility clauses and `required_flags`. A submission records the flags of a
+content key without the eligibility clauses and `required_flags`. It keeps the
+attempt limit, so an earlier run answers a cell only under the limit it ran
+with. A submission records the flags of a
 finished run in `submission_outcomes.run_flags`
 ([storage.md §4.4](storage.md#44-the-job-cell-index)). Only the SQL store keeps
-the index. A deployment without `[database]` satisfies no cell: each cell takes
-a job by the other rules below.
+the index.
 
 **The rule.** The rule covers a unit that would mint a job. It also covers a
-unit that would carry a queued job of the superseded plan. Such a unit takes an
-earlier job of its cell if all of these hold:
+unit that would carry a queued job of the superseded plan that no client is
+running. Such a unit takes an earlier job of its cell if all of these hold:
 
 - The run finished. A failed run does not answer.
 - The run answers the clauses of the unit, by the rule that a change of
   requirements uses (above). The recorded device must meet the new clauses. The
   new clauses must not add an exclusion. A run through a `clients` roster can
   answer a unit that targets an OS, if its recorded device has that OS.
-- No later plan re-ran the job. A re-run asks for a new answer, so the job that
-  it replaced answers nothing. If that re-run fails, the cell runs again.
+- No later plan re-ran the job or marked it failed. Either asks for a new
+  answer, so the job that it replaced answers nothing. If that re-run fails, the
+  cell runs again.
 - No other unit of the plan holds the job. One run answers one unit.
 - The job has the scope of the campaign
   ([storage.md §4.4](storage.md#44-the-job-cell-index)). A campaign of an
@@ -1021,15 +1172,23 @@ benchmark a new id.
 
 1. A recorded job of the superseded plan, failed ones included, a job that
    answers a changed cell, a re-run, or a recalculation (above).
-2. An earlier finished run that answers the cell, unless the input opted out.
-3. A queued job of the superseded plan. Carrying ignores `merge_duplicates`.
-4. The opt-out. An input with `merge_duplicates: false` mints.
-5. The duplicate merge onto a queued job of any plan.
-6. A fresh mint.
+2. A job of the superseded plan that a client is running.
+3. An earlier finished run that answers the cell, unless the input opted out.
+4. A queued job of the superseded plan. Carrying ignores `merge_duplicates`.
+5. The opt-out. An input with `merge_duplicates: false` mints.
+6. The duplicate merge onto a queued job of any plan.
+7. A fresh mint.
 
-A queued job of the superseded plan is not carried if an earlier run answers
-the cell. It stops with the superseded plan, as a queued job does when another
-plan's run takes its place.
+A queued job of the superseded plan that no client is running is not carried
+if an earlier run answers the cell, or a run of a plan on offer does
+(`carry_earlier`, `inherit_from`, `add_from`, restore, revert). It stops with
+the superseded plan, as a queued job does when another plan's run takes its
+place. A job a client is running stays in both cases, so its run is not lost:
+it finishes, and the plan takes its result. A client is running a job while its
+lease has not lapsed and the job's deadline has not passed. A revision still
+stops a running job whose cell it changes or removes, or one its `fail` names.
+A queued job that gave way can still be claimed until the next
+`queue-maintenance` run tears the superseded plan down, and that run is lost.
 
 **What the plan holds.** The plan lists the earlier job in `job_ids` and keys it
 under its own digest in `content_keys`, so a later revision carries it. It
@@ -1056,9 +1215,9 @@ matches its jobs. The server needs no knowledge of what any revision means.
 
 ## 8. Ingestion flow (atomic-ish)
 
-Every transport runs this one flow. Ingestion is an uncoordinated `todo/`
-writer: it stages complete job bodies and promotes its own `tmp/` writes into
-`avail/`, and the atomic rename hides any partial write
+Every transport runs this one flow. Ingestion is an uncoordinated job queue
+writer: it stages complete job bodies in `queue_tmp` and promotes its own
+staged bodies into `queue_jobs`, so a reader never sees a partial body
 ([queue.md](queue.md#jobs)). There is no multi-object atomic write, so
 ingestion stages first and promotes second, gated by the manifest status:
 
@@ -1076,8 +1235,9 @@ ingestion stages first and promotes second, gated by the manifest status:
    On a campaign route, a disconnect during the import, and the re-read of the
    campaign after it, are as
    [Campaigns: What a failed filing leaves](api/campaigns.md#errors) states.
-   From step 2 on, the filing runs to completion. A revision advances the
-   campaign only if the owner and the head are still the ones it read;
+   From step 2 on, the filing runs to completion. A filing advances the
+   campaign only if the owner and the head are still the ones it read,
+   writing again over a rename, relabel or archive, three tries in all;
    otherwise it cancels its own plan.
 2. **Mint and record.** Mint the `plan_id`, and place each input on a job: mint
    a `job_id` for it, or merge it onto a job that already runs the same cell
@@ -1104,9 +1264,9 @@ ingestion stages first and promotes second, gated by the manifest status:
    `job-plan-links/{job_id}/{plan_id}`, and, for a **minted** job only, the
    membership marker `job-plans/{job_id}/{plan_id}.{expires_at}`. A merged job
    is already queued, and its marker was written before the merge was
-   confirmed (§7). Then the recalculation copies run (§7), and after them, for
-   each minted job, `write_tmp` and the promote. Three orders hold within a
-   job:
+   confirmed (§7). Then the recalculation copies and the marks' failures run
+   (§7), and after them, for each minted job they do not answer, `write_tmp`
+   and the promote. Three orders hold within a job:
 
    - the job source before the link, so every link names a stored job source;
    - the job source before the promote, so each queued job has one before a
@@ -1115,7 +1275,7 @@ ingestion stages first and promotes second, gated by the manifest status:
      minting plan's membership absent.
 
    A job source is **the body that the job ran**: write-once, and it outlives
-   the job's time in `todo/`. A job source can hold a token from before the
+   the job's time in the job queue. A job source can hold a token from before the
    import step existed, so a reader drops every token before it serves one
    ([`GET /api/v1/jobs/{job_id}/plans`](api/plans/list_job_plans.md)).
 4. **Settle.** Write the manifest status: `active` if at least one job matches a
@@ -1125,10 +1285,10 @@ ingestion stages first and promotes second, gated by the manifest status:
    per-input `merges` (§11, [cli.md](cli.md)); the HTTP routes answer a
    narrower form ([Campaigns: Response `201 Created`](api/campaigns.md#response-201-created)).
 
-If ingestion fails partway, promoted jobs stay in `avail/`. Queue maintenance
+If ingestion fails partway, promoted jobs stay in the job queue. Queue maintenance
 leaves a job out of the eligible index while all its memberships point to
 `creating` or missing plans. A job also held by an active plan stays eligible.
-The stale-`tmp/` cleanup removes staged `tmp/` files. The cancel teardown also
+The staged body cleanup removes staged job bodies. The cancel teardown also
 handles a manifest stuck in `creating` (§9). The job sources and links a failed
 ingest wrote stay with its manifest.
 `queue-maintenance` treats a `creating` manifest as stranded once it is
@@ -1141,14 +1301,14 @@ stay live under a plan that nothing retires. A longer wait only delays a
 teardown, so the default is generous. An operator who wants a plan stopped
 sooner cancels it, which teardown acts on at once.
 
-`queue-maintenance` indexes the new `avail/` jobs into `eligible/` markers on its
+`queue-maintenance` indexes the new available jobs into eligibility rows on its
 next run, so claimability lags ingestion by up to one cron interval.
 
 ## 9. Plan lifecycle
 
 A plan manifest (`plans/{plan_id}.json` in the `[storage]` backend) tracks
 the plan through its life. Manifests live in durable storage, not the
-ephemeral `todo/` queue, so a finished or cancelled plan stays queryable long
+ephemeral job queue, so a finished or cancelled plan stays queryable long
 after its jobs have left the queue. Nothing deletes a manifest (see
 [Retention](#retention) below).
 
@@ -1159,7 +1319,7 @@ stateDiagram-v2
     creating --> pending_clients: jobs promoted, no client matches yet
     active --> pending_clients: fleet changed, nothing matches now
     pending_clients --> active: a matching client (re)appears
-    creating --> cancelling: ingest cancelled, or stranded</br>past the deadline (staged <code>tmp/</code> reaped)
+    creating --> cancelling: ingest cancelled, or stranded</br>past the deadline (staged bodies reaped)
     active --> complete: every job reached a terminal state
     pending_clients --> complete: every job terminal (e.g. all expired unrun)
     active --> cancelling: <code>plans cancel</code> marker,</br>latched by <code>queue-maintenance</code>
@@ -1174,16 +1334,16 @@ means to a reader and where it moves. What the server does in each:
 
 - **creating**: the manifest is written with the full job-id list (§8 step 2)
   before any body is staged. The plan makes none of its jobs claimable while it
-  is `creating`, even after a job is promoted into `avail/`.
+  is `creating`, even after a job is promoted into the job queue.
 - **active** / **pending_clients**: ingestion writes one of the two by the
   same fleet check (§8 step 4), and `queue-maintenance` reconciles them on every run against
   the working fleet. A plan
   queued ahead of the fleet, one whose only capable clients have
   deregistered, and one whose only capable clients hold no `perform_work` yet
   all read **pending_clients**, which is the honest state, not an error.
-- **cancelling**: `queue-maintenance` retires the plan's live jobs from
-  `avail/` and `leased/`, across as many runs as it takes. A job the lease
-  recycler returns to `avail/` delays the settle, but never returns the plan to
+- **cancelling**: `queue-maintenance` retires the plan's live jobs, available
+  and leased, across as many runs as it takes. A job the lease recycler returns
+  to the queue delays the settle, but never returns the plan to
   **active**. A plan that stays here across many runs means teardown keeps
   failing, which the run's non-zero exit reports.
 - **complete** / **cancelled**: latches. No pass revisits them. A plan reaches
@@ -1192,7 +1352,7 @@ means to a reader and where it moves. What the server does in each:
 
 **A run that retires any of a plan's jobs writes cancelling; only a run that
 retired none settles the plan.** `queue-maintenance` deletes a lease by the
-expiry it listed, and a heartbeat that renamed the lease first turns that delete
+expiry it read, and a heartbeat that moved the lease first turns that delete
 into a no-op that still reports success. So a run cannot trust "nothing
 outstanding" read from its own teardown, and **cancelled** is a latch no later
 run revisits. A cancel on a plan with live jobs therefore shows **cancelling**
@@ -1214,7 +1374,7 @@ gives the projection a reader sees. The rules that span fields:
   satisfied job (§7). Both hold no marker.
 - **The six counts partition the plan's jobs.** A job in `expired_jobs` counts
   `failed` ahead of every other rule. Otherwise `available` and `running` come
-  from the run's `avail/` and `leased/` listings, and the rest by submission
+  from the run's reads of the available and leased jobs, and the rest by submission
   record: `finished` for success (a job in `incoming/` or the score queue
   included), `failed` for failure. `cancelled` counts jobs teardown retired,
   absent from both queues with no record.
@@ -1229,8 +1389,9 @@ gives the projection a reader sees. The rules that span fields:
   writes `progress_snapshot` in the same run. It leaves a live **creating**
   manifest alone, because every listed job reads as absent before promotion and
   a completion check would latch **complete** at once. For the same reason a run
-  lists the manifests before `avail/` and `leased/`: a manifest it reads past
-  **creating** had every job promoted before the queue listings. It acts on
+  lists the manifests before it reads the available and leased jobs: a
+  manifest it reads past **creating** had every job promoted before the queue
+  reads. It acts on
   **creating** only for a cancel marker or a stranded manifest (§8), both ending
   **cancelled**.
 
@@ -1244,31 +1405,28 @@ answers and when it lands, and which jobs are released rather than retired.
 This section records how teardown does it.
 
 `plans cancel` writes a **cancel marker** at `cancelled_plans/{plan_id}` and
-stops. It mutates neither `todo/` nor the manifest. `queue-maintenance` owns the
+stops. It mutates neither the job queue nor the manifest. `queue-maintenance` owns the
 **cancelling** / **cancelled** latch as well as the teardown, because a status
 write from the command would race the pass's own status refresh, and a delete
 from the command could be undone by the pass's lease recycler. The marker is an
 idempotent write, so cancelling twice is a no-op.
 
-For each still-present job the pass drops this plan's membership marker and
-re-reads the job's members, fresh:
+For each still-present job, the pass deletes this plan's membership markers and
+counts the markers that remain, in one database transaction:
 
 - **Markers remain: the job is *released*.** Another plan still wants it, so it
   stays claimable and runs to a result those plans read.
-- **No marker remains: the job is *retired*.** The pass deletes its `avail/`
-  entry and every lease on it, and the same run's orphan sweep takes its
-  markers. A running client gets `404` on its next heartbeat and stops.
+- **No marker remains: the job is *retired*.** The same transaction deletes the
+  job's queue row, lease included. The database deletes the job's eligibility,
+  denial and lost-lease rows with it. A running client gets `404` on its next
+  heartbeat and stops.
 
 The invariants that keep this safe:
 
-- **The marker before the re-check.** A joiner writes its marker before it
-  re-checks the job (§7), so a marker this listing misses belongs to a joiner
-  that will find the job retired and mint its own.
-- **Restore on a late joiner.** Teardown reads the body before the deletes and
-  the members again after them. A member that appeared in between gets the job
-  back: the pass restores it to `avail/` under its original key, flags it for
-  re-indexing, and counts it released. A body it cannot read means the job left
-  the queue on its own, so the pass releases it and declares nothing terminal.
+- **One transaction against each joiner.** A joiner writes its marker and the
+  job's row in one transaction (§7). If the joiner commits first, teardown runs
+  again, counts the joiner's marker and releases the job. If teardown commits
+  first, the joiner finds no job and mints its own.
 - **A job with no marker at all is retired**: marker absence counts as a
   release only when another plan's marker proves it.
 - **Teardown follows the status, not the marker.** It runs every pass while the
@@ -1294,7 +1452,10 @@ plan already terminal, or its manifest gone on a fresh read. Until the latch,
 
 `queue-maintenance` retires a job without a client result in four cases
 ([queue.md](queue.md#consequences-of-failure)), and writes a terminal synthetic
-failure for each, so the outcome is recorded.
+failure for each, so the outcome is recorded. Ingestion writes one more, for
+the job a mark mints and never queues (§7). A device's final `attempt_timeout`
+or `out_of_memory` writes one for each larger run of its job's family still
+queued ([queue.md](queue.md#client-reported-failure)).
 [Plans: Failures no client sent](api/plans.md#failures-no-client-sent) lists
 the cases, the `failure_source` and `failed_reason` a reader gets, and why a
 synthetic row's descriptors must not be joined on. The record takes `job_id`
@@ -1326,7 +1487,7 @@ operator could ever fix it:
 
 - **`spec.benchmark` names a benchmark the catalog does not know.** Restoring the
   definition makes the same body recordable, so the job is **kept** (left in
-  `avail/` with its markers intact), and the maintenance run exits non-zero every
+  available with its eligibility rows intact), and the maintenance run exits non-zero every
   time, so the misconfiguration surfaces through cron monitoring until someone
   acts.
 - **The body structurally cannot yield a record**: no `job_id`, no `spec`, no

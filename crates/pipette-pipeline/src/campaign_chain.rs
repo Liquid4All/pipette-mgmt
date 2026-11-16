@@ -47,6 +47,18 @@ pub async fn walk_links(plans: &dyn PlanStore, campaign: &Campaign) -> anyhow::R
     Ok(chain)
 }
 
+/// The manifests [`walk_links`] reads, newest first, with no ceiling.
+pub async fn chain_manifests(
+    plans: &dyn PlanStore,
+    campaign: &Campaign,
+) -> anyhow::Result<Vec<PlanManifest>> {
+    let (ChainLinks { links, .. }, _) = links(plans, campaign, usize::MAX).await?;
+    Ok(links
+        .into_iter()
+        .filter_map(|(_, manifest)| manifest)
+        .collect())
+}
+
 /// Every readable plan filed into the campaign, unbounded: the whole chain and
 /// any plan the store files under it that the chain misses.
 pub async fn every_plan(
@@ -407,6 +419,28 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("the target plan is gone"))?;
 
         assert_eq!(position(store.as_ref(), &plan).await?, expected);
+        Ok(())
+    }
+
+    /// It reads past the ceiling, and a cycle ends it.
+    #[rstest::rstest]
+    #[case::past_the_ceiling(CHAIN_MAX + 2, Damage::Intact)]
+    #[case::a_cycle(3, Damage::CloseCycle)]
+    #[tokio::test]
+    async fn chain_manifests_read_each_plan_of_the_chain_once(
+        #[case] depth: usize,
+        #[case] damage: Damage,
+    ) -> anyhow::Result<()> {
+        let (dir, store) = store()?;
+        let ids = chain_of(store.as_ref(), depth).await?;
+        damage.apply(dir.path(), store.as_ref(), &ids).await?;
+        let campaign = campaign_on(ids.last().cloned())?;
+        let read: Vec<PlanId> = chain_manifests(store.as_ref(), &campaign)
+            .await?
+            .into_iter()
+            .map(|manifest| manifest.plan_id)
+            .collect();
+        assert_eq!(read, ids.into_iter().rev().collect::<Vec<_>>());
         Ok(())
     }
 

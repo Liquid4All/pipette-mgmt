@@ -144,12 +144,18 @@ impl ModelParamTable {
         let Ok(model) = serde_json::from_str::<pipette_plan_types::Model>(descriptor) else {
             return TypedMatch::Unparsed;
         };
-        lookup_names(&model)
-            .into_iter()
-            .find_map(|name| self.lookup(name).map(|entry| (normalize(name), entry)))
+        self.resolve_model(&model)
             .map_or(TypedMatch::Uncatalogued, |(key, entry)| {
                 TypedMatch::Resolved { key, entry }
             })
+    }
+
+    /// Resolve a typed model, such as the one a job requested, by the names it
+    /// could be catalogued under.
+    pub fn resolve_model(&self, model: &pipette_plan_types::Model) -> Option<(String, ModelEntry)> {
+        lookup_names(model)
+            .into_iter()
+            .find_map(|name| self.lookup(name).map(|entry| (normalize(name), entry)))
     }
 
     /// Resolve a warehouse row's `model_descriptor`, then its
@@ -945,7 +951,10 @@ mod tests {
     #[tokio::test]
     async fn load_reads_the_stores_rows_and_none_is_an_empty_table() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&test_config(dir.path()))?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &test_config(dir.path()),
+            pipette_store_testkit::no_queue(),
+        )?;
         let store = stores.model_params.as_ref();
         assert!(ModelParamTable::load(store).await?.is_empty());
 
@@ -967,7 +976,10 @@ mod tests {
     #[tokio::test]
     async fn import_adds_missing_rows_and_keeps_an_edited_one() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&test_config(dir.path()))?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &test_config(dir.path()),
+            pipette_store_testkit::no_queue(),
+        )?;
         let store = stores.model_params.as_ref();
         let edited = pipette_store_testkit::a_model_params("lfm2-700m", 742)?;
         store.put_model_params(&edited).await?;
@@ -1014,7 +1026,10 @@ mod tests {
     #[tokio::test]
     async fn import_adds_nothing_from_a_file_with_a_bad_key() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&test_config(dir.path()))?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &test_config(dir.path()),
+            pipette_store_testkit::no_queue(),
+        )?;
         let store = stores.model_params.as_ref();
         let file = ModelParamTable::from_toml("\"LFM2-700M\" = 700\n\"ZZ Bad\" = 100\n")?;
 

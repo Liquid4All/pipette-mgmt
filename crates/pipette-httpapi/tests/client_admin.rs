@@ -667,7 +667,7 @@ async fn a_reject_or_a_delete_frees_the_keypair_ownership_and_queue_state() -> a
             .list_pending_reindex()
             .await?
             .iter()
-            .any(|(c, _)| c == &working),
+            .any(|r| r.client_id == working),
         "the pending-reindex flag is listed"
     );
 
@@ -713,7 +713,7 @@ async fn a_reject_or_a_delete_frees_the_keypair_ownership_and_queue_state() -> a
             .list_pending_reindex()
             .await?
             .iter()
-            .any(|(c, _)| c == &working),
+            .any(|r| r.client_id == working),
         "a delete purges the pending-reindex flags"
     );
     Ok(())

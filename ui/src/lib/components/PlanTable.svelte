@@ -8,7 +8,7 @@
   // - the progress
   // `DataTable` filters, sorts and pages the rows.
   import { progress } from "../format";
-  import { planTable, shownStatus } from "../plans";
+  import { planTable } from "../plans";
   import { userLink } from "../routes";
   import type { PlanView } from "../api-types";
   import Clamped from "./Clamped.svelte";
@@ -30,7 +30,7 @@
 </script>
 
 {#snippet status(plan: PlanView)}
-  <StatusPill status={shownStatus(plan.status, plan.progress_snapshot?.counts)} />{#if plan.cancel_requested}{" "}(cancel requested){/if}
+  <StatusPill status={plan.status} />{#if plan.cancel_requested}{" "}(cancel requested){/if}
 {/snippet}
 <!-- An account since deleted has no address, and the id stands in. -->
 {#snippet submitted_by(plan: PlanView)}

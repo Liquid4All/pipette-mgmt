@@ -16,8 +16,7 @@ use serde_json::json;
 use pipette_core::plan::sample_manifest;
 use pipette_plan_types::{ExpiresAt, PlanId, PlanStatus};
 use pipette_web_testkit::{
-    QueueBackend, capture_logs_at_level, job, job_spec, run_qm, seed_avail, seeded_queue_state,
-    setup_benchmarks,
+    capture_logs_at_level, job, job_spec, run_qm, seed_avail, seeded_queue_state, setup_benchmarks,
 };
 
 /// A `field` ending in `=` matches by key only; any other must match a whole
@@ -36,7 +35,7 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+            let Some(queue) = seeded_queue_state(dir.path()).await? else {
                 return Ok(false);
             };
             let state = &queue.state;
@@ -107,6 +106,7 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
             slowest_probes,
             "content_keys_read=0",
             "client_records_drained=0",
+            "deadlines_restamped=0",
             "cpu_user_ms=",
             "cpu_system_ms=",
             "failed_items=0",
@@ -157,6 +157,68 @@ fn assert_fields(line: &str, fields: &[&str]) {
     assert!(missing.is_none(), "`{missing:?}` is missing: {line}");
 }
 
+/// The re-stamp later in the run would also bring a later target down to the
+/// earliest horizon, so the re-date's own line is read.
+#[test]
+fn a_lapsed_job_is_re_dated_to_the_earliest_live_horizon() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
+        runtime.block_on(async {
+            setup_benchmarks(dir.path())?;
+            let Some(queue) = seeded_queue_state(dir.path()).await? else {
+                return Ok(false);
+            };
+            let state = &queue.state;
+            // A job that requires a tag can match a later client, so the run
+            // keeps it in `avail/`.
+            let mut body = job_spec();
+            body["requires"] = json!(["gpu"]);
+            let queued = seed_avail(
+                state.todo_store.as_ref(),
+                "job-queued",
+                "20200101T000000Z".parse()?,
+                &body,
+            )
+            .await?;
+            let manifest = |plan_id| {
+                anyhow::Ok(pipette_core::plan::PlanManifest {
+                    job_ids: vec![queued.clone()],
+                    content_keys: BTreeMap::new(),
+                    rerun_of: BTreeMap::new(),
+                    expired_jobs: BTreeMap::new(),
+                    ..sample_manifest(plan_id, PlanStatus::Active, false)?
+                })
+            };
+            let sooner = PlanId::from_uuid(uuid::Uuid::from_u128(1));
+            let later = PlanId::from_uuid(uuid::Uuid::from_u128(2));
+            state
+                .plan_store
+                .write_job_plan_marker(&queued, &sooner, "20980101T000000Z".parse()?)
+                .await?;
+            state
+                .plan_store
+                .write_job_plan_marker(&queued, &later, ExpiresAt::Never)
+                .await?;
+            state.plan_store.put_plan(&manifest(sooner)?).await?;
+            state.plan_store.put_plan(&manifest(later)?).await?;
+            run_qm(state).await?;
+            anyhow::Ok(true)
+        })
+    })?;
+    if !outcome? {
+        return Ok(());
+    }
+    let redates: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("queue-maintenance: re-dated a job"))
+        .collect();
+    let [redate] = redates[..] else {
+        anyhow::bail!("one re-date expected: {logs}");
+    };
+    assert_fields(redate, &["to=20980101T000000Z"]);
+    Ok(())
+}
+
 /// A terminal, a still-creating, and a quiet plan (nothing probed, status
 /// unchanged) log no `INFO` line. The live plan's recorded job is probed once,
 /// then counted from the stored outcome.
@@ -172,7 +234,7 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+            let Some(queue) = seeded_queue_state(dir.path()).await? else {
                 return Ok(false);
             };
             let state = &queue.state;
@@ -279,6 +341,20 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn assert_body_read_summaries(logs: &str, reads: [u64; 2], failures: u64) -> anyhow::Result<()> {
+    let summaries: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("queue-maintenance: run finished"))
+        .collect();
+    let [first, second] = summaries[..] else {
+        anyhow::bail!("two summaries expected: {logs}");
+    };
+    let failures = format!("failed_items={failures}");
+    assert_fields(first, &[&format!("bodies_read={}", reads[0]), &failures]);
+    assert_fields(second, &[&format!("bodies_read={}", reads[1]), &failures]);
+    Ok(())
+}
+
 /// Expiration reads its body before the shared cache exists. An earlier store
 /// read belongs to setup, and an empty follow-up run reads no bodies.
 #[test]
@@ -287,8 +363,7 @@ fn a_run_counts_expired_bodies_and_resets_its_body_read_total() -> anyhow::Resul
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await?
-            else {
+            let Some(mut queue) = seeded_queue_state(dir.path()).await? else {
                 return Ok(false);
             };
             // The store wrapper must preserve the underlying read counter.
@@ -314,16 +389,7 @@ fn a_run_counts_expired_bodies_and_resets_its_body_read_total() -> anyhow::Resul
     if !outcome? {
         return Ok(());
     }
-    let summaries: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("queue-maintenance: run finished"))
-        .collect();
-    let [first, second] = summaries[..] else {
-        anyhow::bail!("two summaries expected: {logs}");
-    };
-    assert_fields(first, &["bodies_read=1", "failed_items=0"]);
-    assert_fields(second, &["bodies_read=0", "failed_items=0"]);
-    Ok(())
+    assert_body_read_summaries(&logs, [1, 0], 0)
 }
 
 /// Count every fetched row, the corrupt one included. The corrupt row keeps
@@ -334,7 +400,7 @@ fn a_run_counts_corrupt_rows_in_the_flagged_batch() -> anyhow::Result<()> {
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
-            let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+            let Some(queue) = seeded_queue_state(dir.path()).await? else {
                 return Ok(false);
             };
             let state = &queue.state;
@@ -377,14 +443,5 @@ fn a_run_counts_corrupt_rows_in_the_flagged_batch() -> anyhow::Result<()> {
     if !outcome? {
         return Ok(());
     }
-    let summaries: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("queue-maintenance: run finished"))
-        .collect();
-    let [first, second] = summaries[..] else {
-        anyhow::bail!("two summaries expected: {logs}");
-    };
-    assert_fields(first, &["bodies_read=2", "failed_items=1"]);
-    assert_fields(second, &["bodies_read=1", "failed_items=1"]);
-    Ok(())
+    assert_body_read_summaries(&logs, [2, 1], 1)
 }

@@ -1,9 +1,10 @@
 # Job queue
 
-This document specifies the `todo/` queue, where a plan's jobs wait to be run,
+This document specifies the job queue, where a plan's jobs wait to be run,
 and the claim, heartbeat and failure protocol that hands them to devices.
 
-The key layout of `todo/` is [storage.md §2](storage.md#2-logical-layout-and-invariants).
+The job queue is a set of PostgreSQL tables in `[database]`. The schema is
+`crates/pipette-store-sql/migrations/`.
 The wire contract of each device route is [httpapi.md §2](httpapi.md#2-endpoints),
 and how a device should drive it is [client-integration.md](client-integration.md).
 Which client may run which job is [plan-ingestion.md §5](plan-ingestion.md#5-capability-matching).
@@ -14,26 +15,29 @@ Five actors touch the queue. All of them are `pipette-mgmt`.
 
 | Actor | Process | Replicas | Responsibilities |
 |-------|---------|----------|-----------------|
-| **Plan ingestion** | `pipette-mgmt serve` (the campaign routes), or the `campaigns` commands | Any | Writes job bodies to `todo/tmp/` and promotes them to `todo/avail/` ([plan-ingestion.md §8](plan-ingestion.md#8-ingestion-flow-atomic-ish)) |
+| **Plan ingestion** | `pipette-mgmt serve` (the campaign routes), or the `campaigns` commands | Any | Stages job bodies in `queue_tmp` and promotes them into `queue_jobs` ([plan-ingestion.md §8](plan-ingestion.md#8-ingestion-flow-atomic-ish)) |
 | **Management server** | `pipette-mgmt serve` | One or more | The device routes: claim, heartbeat, reclaim, and result submission |
 | **Submission processor** | `pipette-mgmt process-submissions` (cron; `score` alias) | One at a time | Routes eval submissions, scores non-evals, finalizes scored evals, writes to the warehouse |
 | **Eval scorer** | `pipette-mgmt score-eval` (cron) | One at a time | Drains `submissions/score-queue/to_do/`, calls the upstream scoring service, and stages eval scores for finalization |
-| **Queue maintenance** | `pipette-mgmt queue-maintenance` (cron) | One at a time | Recycles expired leases, retires jobs, deletes stale `todo/tmp/` files, maintains the `eligible/` index (sole writer), and repairs pending submission outcomes |
+| **Queue maintenance** | `pipette-mgmt queue-maintenance` (cron) | One at a time | Recycles expired leases, retires jobs, deletes stale staged bodies, maintains the eligible index (sole writer), and repairs pending submission outcomes |
 
-Plan ingestion is the only writer that promotes a new job into `avail/`. The
-one other promote is teardown's restore of a job it just deleted
-([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)).
+Plan ingestion is the only writer that promotes a new job into the queue.
 
-**Multiple `serve` replicas** need no coordination. Every `todo/` transition is
-an atomic rename, submission keys are unique `job_id`s, and each ingest mints
-its own `plan_id` and `job_id`s. `serve` replicas never write `eligible/`.
+**Multiple `serve` replicas** need no coordination. Every queue transition is
+a database write, submission keys are unique `job_id`s, and each ingest mints
+its own `plan_id` and `job_id`s. `serve` replicas never write the eligible
+index.
 
 `process-submissions`, `score-eval` and `queue-maintenance` each run **once per
 schedule interval**, not once per `serve` replica. See
 [operations.md §3](operations.md#3-cron-setup).
 
-Every queue transition rests on an atomic rename, so `todo/` requires S3
-Express One Zone ([storage.md §8](storage.md#todo-requires-s3-express-one-zone)).
+A job is a row of `queue_jobs`. A row with no lease holder is **available**,
+and a row with a holder is **leased**. A claim and a reclaim run at
+`READ COMMITTED` and lock the job row with `FOR UPDATE SKIP LOCKED`, so a claim
+skips the rows that other claims hold. Every other store write runs at
+`REPEATABLE READ`
+([design/sql-record-store.md](design/sql-record-store.md)).
 
 ## Jobs
 
@@ -43,38 +47,33 @@ lists what the server reads of each field, and
 [httpapi.md §2.9.2](httpapi.md#292-response-200-ok) what a device receives.
 
 - The job id is server-minted at ingestion. The one requirement is the job-id
-  charset (`JobId::try_new`), which excludes `.` and `/`, so the id splits
-  cleanly out of every key. `job-{UUIDv7}` is the convention: listings and logs
+  charset (`JobId::try_new`), which excludes `.` and `/`. `job-{UUIDv7}` is the convention: listings and logs
   then read in arrival order.
 - The lease length is server configuration, not part of a job. The claim
   response reports it as `time_window`.
 - At least one of `clients` or `requires` must be non-empty. `any_of` alone
   only narrows, so it makes no job claimable.
 
-**The `avail/` key carries the deadline the server acts on.** `expires_at` is an
-ISO 8601 basic-format timestamp (`20240908T000000Z`) or `never`. The lease key
-keeps it while the job is out, the expiry pass retires the job by it, and the
-claim response reports it. The body's copy drives nothing; a claim logs a
-warning when the two disagree. Ingestion stamps both from one value, so a plan
-it files cannot disagree.
+**The job row carries the deadline the server acts on.** `expires_at` is a
+timestamp, or `never`. The row keeps it while the job is out, the expiry pass retires the job by it, and the
+claim response reports it. The body's copy drives nothing and keeps the value
+ingestion stamped on both.
 
-**A promoted body is immutable.** A writer promotes only a complete body, and
-the atomic `tmp/` → `avail/` rename hides any partial write. The claim path
-never promotes into `avail/` and never deletes from it: it only renames
-`avail/` → `leased/`. `queue-maintenance` is the only writer that changes an
-`avail/` key after the promote: it renames the `expires_at` component, inside
-the job's directory, and only while that deadline is already lapsed
-([Expiration](#expiration)).
+**A promoted body is immutable.** A writer stages a complete body in
+`queue_tmp`, and the promote moves it into `queue_jobs` in one write. The claim
+path never promotes a job and never deletes one: it only sets the lease of an
+available row. `queue-maintenance` is the only writer that changes a job's
+`expires_at` after the promote, and only while the job has no lease: each run
+keeps a waiting job at the earliest horizon of the plans that hold it, and
+re-dates a lapsed one ([Expiration](#expiration)).
 
 ### The eligible index
 
 `queue-maintenance` materializes the matching rules
 ([plan-ingestion.md §5](plan-ingestion.md#5-capability-matching)) as
-eligibility markers, one per client and job. Only `queue-maintenance` writes
-eligibility markers. `claim` and `reclaim` trust each marker without another
-match check. On the
-database queue a marker is a `queue_eligibility` row, and a read takes the
-deadline from the job.
+eligibility rows in `queue_eligibility`, one per client and job. Only
+`queue-maintenance` writes eligibility rows. `claim` and `reclaim` trust each
+row without another match check. A read takes the deadline from the job.
 
 - The index covers the **workers** only: approved clients that hold
   `perform_work`, the two checks `claim` makes.
@@ -86,23 +85,22 @@ deadline from the job.
   - the store records a client denial
   - a client reindex runs while the job is out on lease
 - Each run reads the bodies of the flagged available jobs only. It matches each
-  job against every worker, replaces the job's markers, and clears the flag, in
+  job against every worker, replaces the job's eligibility rows, and clears the flag, in
   one transaction per job. If a claim or re-date occurs between the read and the
   write, the job keeps its flag for the next run.
 - The first run indexes a promoted job after at least one of its plans leaves
   `creating`. Until then, the job keeps its flag. The next run indexes a job
   with no plan marker.
 - The run compares the workers with the set that the last run indexed
-  (`queue_workers`). It deletes the markers of a worker that left, and matches a
+  (`queue_workers`). It deletes the eligibility rows of a worker that left, and matches a
   worker that joined against every available job. So a change in the workers
   (an approval, a grant, a revocation) reaches the index within one cron
   interval, whichever code path made it.
 - A job out on lease keeps its flag until it returns to the queue. The run
   defers the match check until the job returns. Most leased jobs finish, so
-  their markers need no update.
-- The run deletes a job's markers when the job permanently leaves the queue.
-- The index needs the database queue. On a local_fs or S3 queue,
-  `queue-maintenance` and `plans status --explain` stop with an error.
+  their eligibility rows need no update.
+- The run deletes a job's eligibility rows when the job permanently leaves the
+  queue.
 
 The cost is up to one cron interval between a change and the index. Jobs run for
 many minutes, so that latency is acceptable.
@@ -141,22 +139,22 @@ it.
 - The change **relinquishes every lease the client holds**, before the new
   profile is persisted. A lease was granted against the old profile, and a
   client must not continue a job it may no longer match. Each job returns to
-  `avail/` with no `denied/` marker, so the client can claim it again once
+  the queue with no denial, so the client can claim it again once
   re-indexed. A lease whose job already has a submission record is deleted
   instead, so a finished job never becomes claimable again.
-- While the gate is up, every plan operation is refused **without renaming a
+- While the gate is up, every plan operation is refused **without changing a
   lease**: `claim` answers `204`; `heartbeat`, `reclaim` (both paths) and
   plan-attached submissions answer `404`. The client learns of the gate from
   `reindex_pending` ([httpapi.md §2.4](httpapi.md#24-patch-clientsme)).
-- Each request writes its own `pending-reindex/{client_id}.{uuid}` flag, and
-  `PATCH` writes two: one before it relinquishes the leases, one after the new
+- Each request writes its own `queue_reindex_requests` row, and `PATCH` writes
+  two: one before it relinquishes the leases, one after the new
   record is durable. A rebuild reads the record fresh and deletes exactly the
-  flags it captured before it started. So a rebuild never consumes a request
+  rows it captured before it started. So a rebuild never consumes a request
   newer than the record it evaluated, and back-to-back changes need no
   serialization.
 
 A client that wants to hand back a job without changing its profile reports a
-retriable failure instead, which does write a `denied/` marker. A refused
+retriable failure instead, which does write a denial. A refused
 heartbeat is a protocol violation: the client ran work while its own profile
 update relinquished it. The gate costs at most one cron interval.
 
@@ -168,7 +166,7 @@ two things before it selects a job.
 1. **Lapsed leases.** The claim settles each lapsed lease of the client as
    `queue-maintenance` does ([Heartbeat timeout](#heartbeat-timeout-dead-device)).
    The server deletes a lease if its job has a record. Any other lease counts as lost,
-   and its job goes back to `avail/`, or retires once its losses reach the
+   and its job goes back to the queue, or retires once its losses reach the
    limit. A heartbeat on a settled lease finds no lease,
    so it cannot give the client a second live lease.
 2. **An existing lease.** Claim is **idempotent**. A client that holds a live
@@ -182,38 +180,82 @@ two things before it selects a job.
    counts the lease as lost, once per lease, and a job out of
    losses is withheld with `204` ([Heartbeat timeout](#heartbeat-timeout-dead-device)).
 
-   Each claim lists all of `leased/` once to build the set of jobs other clients
-   hold; that is bounded by the number of benchmarks running at once.
-
 A device that crashes or disconnects on every run needs no operator action.
 Each idempotent hand-back counts one lost lease against the job. The server
 withholds the job, then retires it at `plan_lost_lease_limit`
 ([Heartbeat timeout](#heartbeat-timeout-dead-device)).
-On the database queue, the claim cannot grant a second live lease: one
-transaction handles the claims of a device one at a time. On the local_fs and
-S3 queues, two overlapping claims can each grant a lease. There, the guarantee
-depends on the client. It must not have two `claim` or `reclaim` requests in
-flight ([client-integration.md §4](client-integration.md#4-the-work-loop)).
+The claim cannot grant a second live lease: one transaction handles the claims
+of a device one at a time.
 
-Otherwise the server selects among the client's `eligible/` markers. It skips a
-job the client denied (`denied/{job_id}.{client_id}`) and a job past its
-`expires_at`, even one `queue-maintenance` has not swept yet. Queue maintenance withholds markers for jobs held only by creating or missing
-plans ([Committed filings](#committed-filings)). It
-does not check that a job is still in `avail/`: the claim rename is the liveness test, and a
-rename that finds no source moves on to the next candidate. A grant, or a lease
+Otherwise the server selects among the client's eligibility rows. It skips a
+leased job, a job the client denied (a `queue_denials` row), and a job past its
+`expires_at`, even one `queue-maintenance` has not swept yet. Queue maintenance withholds eligibility rows for jobs held only by creating or missing
+plans ([Committed filings](#committed-filings)). A grant, or a lease
 already held, whose job names a vault resource the client may not fetch goes
-back to `avail/`, denied to the client, and the claim moves on; a failed check
+back to the queue, denied to the client, and the claim moves on; a failed check
 puts it back without the denial. Heartbeat and reclaim refuse such a lease with
 `403` and put it back the same way, denied
 ([Vault](api/vault.md#who-may-do-what)).
 
-**Selection order.** Soonest-expiring first, `never` last, by the deadline in
-each marker. One ingest stamps many jobs with the same deadline, so **within a
-tier the order is random**, which keeps idle clients from stampeding one
-`job_id`.
+**Selection order.** Soonest-expiring first, `never` last, by the deadline of
+each job. A job several plans hold goes by the most urgent of them: its
+deadline is the earliest of their horizons ([Expiration](#expiration)). One
+ingest stamps many jobs with the same deadline. Within a tier and after the smaller runs (**Smaller runs
+first**, below), a job goes sooner the fewer other clients lease a job of its
+model. The count covers only the live leases of jobs the claiming
+client is eligible for, so a device that runs the same model for another
+device type does not count. A client rebuild writes no rows for leased jobs, so
+after one the count misses the jobs other devices already run until they finish
+or return to the queue. A job with no model counts zero. Among jobs whose
+models tie, the order is:
 
-**One lease per client.** A client holds at most one live lease. On the
-database queue, loss accounting and new grants use a transaction. It takes a
+1. A job whose model and runtime the client holds.
+2. A job whose model the client holds, but not its runtime.
+3. A job whose runtime the client holds, but not its model.
+4. Any other job.
+
+So devices that hold one model spread across the models of their campaign. On
+a tie a device keeps the model it holds instead of downloading another. It
+moves when its model has no claimable job, or when more devices run its model
+than another one. Random order within each group reduces simultaneous attempts
+by idle clients to claim the same `job_id`. The client holds what its claim
+body advertises. Without that body, it holds the model and runtime of its last
+granted job, unless it reported a failure of that job, or lost its lease and
+did not reclaim the job ([sql-job-queue.md](design/sql-job-queue.md), **Claim affinity**).
+
+**Smaller runs first.** Within one deadline and before
+the download preference, a job goes sooner the fewer smaller runs of its family
+are still in the queue, available or leased. So a device takes a family's
+smallest runs first, and takes a larger one only when it has nothing ranked
+sooner; no device waits for the order. A family is the jobs of one campaign
+that differ only in their sizes, the benchmark parameters that scale a run's
+work: they share the model and runtime, their flags (the attempt limit
+included), the benchmark type and every other parameter. Their eligibility
+clauses may differ. A run is smaller than another when none of its sizes is
+larger and one is smaller, so two runs where neither is smaller rank alike. The
+sizes of each type:
+
+| Benchmark type | Sizes |
+|---|---|
+| `prefill_throughput` | prompt tokens, batch size |
+| `decode_throughput`, `end_to_end_latency` | prompt tokens, decode tokens, batch size |
+| `max_memory_usage` | prompt tokens |
+| `vl_throughput`, `vl_max_memory` | image width and height, images, text tokens, decode tokens (absent: 1) |
+| `asr_throughput`, `asr_max_memory` | audio milliseconds, text tokens, decode tokens; the sample rate and channels must match |
+| `decision_latency`, `decision_max_memory` | image width and height (absent: 0), images, text tokens, questions, batch size |
+| `eval`, `vlm_eval`, `asr_eval`, `vl_spec_decode` | none: in no family |
+
+Ingestion stores the family and the sizes with each job whose type has sizes.
+Every other job and every job queued before migration 0035 is in no family
+and ranks first. Known limits:
+
+- A job that another campaign joins keeps the family of the campaign that
+  queued it, so it ranks only that campaign's larger runs.
+- The row of a filing that never leaves `creating` ranks its family's larger
+  runs later though no device can claim it, until the teardown of stranded
+  filings removes it (`plan_creating_max_age_secs`).
+
+**One lease per client.** A client holds at most one live lease. Loss accounting and new grants use a transaction. It takes a
 lock for the client, settles the client's lapsed leases, then returns the live
 lease or leases one job. Recycling and the lost-lease row commit with the grant.
 A job with a pending record repair or enough losses to retire stays leased
@@ -222,19 +264,16 @@ retries the claim. The
 deadline comes from the job row, and the transaction skips the jobs that other
 claims lock. The server processes two concurrent claims from one client sequentially. The
 second returns the job that the first leased. A reclaim takes the same lock, and leases
-no job while the client holds a live lease on another. The `local_fs` and S3
-queues run the same steps one call at a time. Two concurrent claims can give a client two leases on these backends. The next
-claim returns the lease with the later expiry.
+no job while the client holds a live lease on another.
 
-The claim renames `avail/{job_id}/{expires_at}.json` to
-`leased/{client_id}/{job_id}.{expires_at}.{lease_expiry}.json`, where
-`lease_expiry` is now plus the lease length. The rename is atomic, so at most
-one claimer wins. When every candidate fails, the answer is `204`. The idle
+The claim sets the row's lease holder to the client and its `lease_expiry` to
+now plus the lease length. The row lock makes sure that at most one claimer
+wins. When no candidate remains, the answer is `204`. The idle
 cadence after a `204` is the client's ([client-integration.md §5](client-integration.md#idle-polling-cadence)).
 
 ### Committed filings
 
-Ingestion promotes a job into `avail/` before its plan leaves `creating`.
+Ingestion promotes a job into the queue before its plan leaves `creating`.
 `queue-maintenance` reads the plan manifests and job memberships before it
 builds the eligible index. The run excludes a job if all its memberships name
 plans with missing manifests or `creating` status. The job keeps its reindex
@@ -242,74 +281,69 @@ flag. The first run after a plan
 leaves `creating` evaluates the job. The run immediately indexes a job that an
 active plan also holds. The next run indexes a job without membership markers.
 
-The run also removes any eligible markers it finds for a withheld job. A lease
+The run also removes any eligibility rows it finds for a withheld job. A lease
 already held by a device remains valid until the usual lease or teardown path
 handles it.
 
 ### Lease naming
 
-The lease key ([storage.md §2](storage.md#2-logical-layout-and-invariants))
-names both deadlines, because they answer different questions. `lease_expiry`
-is when this client's hold lapses. `expires_at` is the job's own deadline,
-copied unchanged from the `avail/` key. Carrying it makes a recycle one rename
-that rebuilds the exact `avail/` key with no body read, and it lets
-`queue-maintenance` keep a leased job's `avail/` key in its index set, so a
-recycled lease is not re-indexed.
-
-The `client_id` partition lets `heartbeat` and `reclaim`, which know their
-client, list one prefix. The job-id charset excludes `.` and both timestamps are
-dot-free, so the leaf splits unambiguously.
+A lease is named by four values: the job, the job's `expires_at`, the client
+and the `lease_expiry`. `lease_expiry` is when this client's hold lapses.
+`expires_at` is the job's own deadline. A recycle and a lease delete change
+the row only if all four values still match, so a writer that holds a stale
+lease changes nothing. A heartbeat changes the row only if the client still
+holds the job.
 
 ### Heartbeat, recycle and reclaim
 
-The client heartbeats at half the `time_window`. Each heartbeat renames the
+The client heartbeats at half the `time_window`. Each heartbeat moves the
 lease onto a new `lease_expiry`, one lease length from now. A lease's total
 life has no cap, by design: a running benchmark may finish. Against a device
 that renews a job without reporting, an operator revokes its `perform_work` or
 unapproves it; either refuses its heartbeats, so the lease lapses.
 
-`queue-maintenance` renames a lapsed lease back to `avail/` under exactly the
-key it was claimed from, and the job becomes claimable again.
+`queue-maintenance` clears a lapsed lease and keeps the job's `expires_at`, so
+the job becomes claimable again.
 
 `reclaim` renews the lease when the caller still holds it, which also beats the
-recycler to it. Otherwise it re-acquires the job from `avail/` with the claim's
-rename and the claim's eligibility and `denied/` checks.
+recycler to it. Otherwise it re-acquires the available job with the claim's
+eligibility and denial checks.
 [httpapi.md §2.10](httpapi.md#210-put-plansjob_idheartbeat) and
 [§2.11](httpapi.md#211-post-plansjob_idreclaim) give what each answer means.
 
 ### Device liveness
 
-Each verified, signed device request stamps the empty marker
-`todo/liveness/{client_id}`; its modification time is the device's
-`last_seen_at` ([Devices: What a device row carries](api/devices.md#what-a-device-row-carries)
+Each verified, signed device request stamps the device's `client_liveness`
+row with the database time. That time is the device's `last_seen_at` ([Devices: What a device row carries](api/devices.md#what-a-device-row-carries)
 states what a reader gets).
 
 - Every device route stamps it, even one that refuses the request.
-- On S3 the storage server's clock sets the time, so all replicas agree.
+- The database clock sets the time, so all replicas agree.
 - A failed stamp is logged and never fails the request.
-- Age never deletes the marker. `clients delete` and the `queue-maintenance`
-  orphan sweep do.
+- Age never deletes the row. `clients delete` does: the client's delete
+  cascades to its last-seen row. A stamp that arrives after deletion writes
+  nothing.
 
 ### Device backlog
 
 A device's backlog is the number of queued jobs it could claim
 ([Devices: What a device row carries](api/devices.md#what-a-device-row-carries)
-states the fields and their staleness). Each `queue-maintenance` run writes
-the counts to `todo/.backlog`, and the device listings read that one object.
-An `eligible/` marker counts when the claim would accept it: its job is in
-`avail/` under the deadline the marker names, the deadline has not passed, and
-the device has not denied the job.
+states the fields). The server counts it with one query for each
+request. An eligibility row counts when the claim would accept it: its job is
+not leased, the job's deadline has not passed, and the device has not denied
+the job. The device listing counts every device in one query.
 
-Each run also writes the backlog of each device by campaign to
-`todo/.backlog-campaigns`. Only the device page reads it
-([`GET /api/v1/clients/{client_id}`](api/devices/get_client.md)).
+The device page
+([`GET /api/v1/clients/{client_id}`](api/devices/get_client.md)) also counts
+the backlog of the device by campaign. Creating plans stop holding jobs for
+this count once they reach `plan_creating_max_age_secs`, even if teardown fails.
 [Devices: What a device row carries](api/devices.md#what-a-device-row-carries)
 states which campaign holds a job and what the page counts.
 
-### tmp/ cleanup
+### Staged body cleanup
 
-An ingest that crashes between `write_tmp` and the promote leaves a file in
-`tmp/`. `queue-maintenance` deletes it; see
+If ingestion stops between `write_tmp` and `promote_avail`, a staged body remains
+in `queue_tmp`. `queue-maintenance` deletes it; see
 [operations.md §3.1](operations.md#31-job-queue-maintenance).
 
 ## Results
@@ -327,10 +361,9 @@ write the key exclusively, so they never replace a body the client wrote. An
 ad-hoc submission (no `job_id`) gets a fresh server-minted id and no binding.
 
 **A terminal submission** (a success, or a non-retriable failure) deletes the
-job from `leased/` and `avail/`, so it is never handed out again. Its orphaned
-`eligible/` and `denied/` markers go within two `queue-maintenance` runs: a
-marker is deleted only once two consecutive sweeps see its job gone, so a job
-caught mid-transition never loses live markers.
+job's row, so it is never handed out again. The delete of the job's row also
+deletes its eligibility, denial and lost-lease rows. The database writes no such row for a job that it
+does not hold.
 
 A **retriable** failure keeps the job queued for other clients
 ([Consequences of Failure](#consequences-of-failure)).
@@ -346,13 +379,21 @@ A failure submission carries `retriable`
 ([httpapi.md §2.7.2](httpapi.md#272-failure-variant)).
 
 *Non-retriable.* The job cannot succeed anywhere. The submission is the job's
-terminal result, and the job is torn down as above.
+terminal result, and the job is torn down as above. On the database queue, an
+`attempt_timeout` or `out_of_memory` also ends each larger run of the job's
+family ([Claiming a job](#claiming-a-job)), no smaller in any size and larger
+in one, that is queued and not leased, since it would fail the same way. Before the teardown, the same request writes a
+synthetic `"system"` failure for each: `failure_source` `smaller_run_failed`,
+the reported `failure_code`, and the reason `not run: <benchmark> of this model
+failed with <code> in <job id>`. Then it deletes the job. A leased one runs on.
+A failure in this step is logged at `WARN` with the job id, leaves the rest
+queued, and does not fail the submission.
 
 *Retriable.* Something is wrong with this device, not the job. The server
-writes a `denied/{job_id}.{client_id}` marker that records the
+writes a `queue_denials` row that records the
 `failure_reason` (its last 4 KiB), the `client_version` and `runtime_version`
 (256 bytes each), and the time. It logs a `WARN` with the full reason, removes
-the client's lease, and **keeps the job in `avail/`** for other clients.
+the client's lease, and **keeps the job available** for other clients.
 
 `queue-maintenance` then asks whether any eligible client remains:
 
@@ -376,8 +417,8 @@ every synthetic record.
 
 The reason groups the roster by the reason each client gave, largest group
 first, with a count and up to three client ids per group. Reasons that differ
-only in timestamps, hex addresses or long numbers are one group. An empty
-marker reads `no reason recorded`, and an unreadable one `reason unreadable`.
+only in timestamps, hex addresses or long numbers are one group. A denial with
+no reason reads `no reason recorded`, and an unreadable one `reason unreadable`.
 
 ```text
 All eligible clients reported failure (10 clients, 2 distinct reasons):
@@ -389,15 +430,15 @@ The per-denial `WARN` keeps each reason in full.
 
 #### Heartbeat timeout (dead device)
 
-A lapsed lease returns the job to `avail/`, and the client stays eligible. One
+A lapsed lease returns the job to the queue, and the client stays eligible. One
 timeout means "device unavailable", not "job failed": the device may have run
 the benchmark the whole time. To submit, it must `reclaim` first; when the job
 was completed or re-claimed meanwhile, the reclaim fails and the result is
 dropped.
 
 Each **lost lease** still counts against the job. `queue-maintenance` writes a
-`todo/lost/{job_id}/{client_id}.{lease_expiry}` marker, and when a job's markers
-reach `plan_lost_lease_limit` (default 3) it retires the job instead of
+`queue_lost_leases` row for the job, client and `lease_expiry`, and when a
+job's rows reach `plan_lost_lease_limit` (default 3) it retires the job instead of
 recycling it, with a synthetic failure of `failure_source` `lease_lost` that
 names the clients. This bounds a job that crashes or disconnects every device
 that runs it. The count belongs to the job, so it bars no client. The bound
@@ -416,25 +457,30 @@ outage) finds its lease already recycled, or the next claim recycles it. The que
 
 #### Expiration
 
-A job whose `avail/` key has lapsed is settled against the plans that hold it
+A waiting job's `expires_at` is the earliest horizon, `never` last, among the
+plans that hold it whose horizon has not passed. Each `queue-maintenance` run
+moves an available job's row to it, earlier or later, and a leased job's once
+it is back in the queue; a job with no such plan keeps its row. An available
+job whose `expires_at` has lapsed is settled against the plans that hold it
 ([plan-ingestion.md §7](plan-ingestion.md#the-duplicate-job-merge)).
 
-- **A member plan still holds a later horizon:** the job is **re-dated**, renamed
-  within `avail/` onto the latest such horizon, and stays claimable. The plans
+- **A member plan still holds a later horizon:** the job is **re-dated** onto
+  the earliest such horizon, and stays claimable. The plans
   whose horizons passed count the job `failed`.
 - **No member horizon remains**, or the job has no member at all: the job is
   abandoned. `queue-maintenance` writes a synthetic `"system"` failure with
-  `failure_source` `expired`, deletes the entry, and the same run's sweeps take
-  its markers. A job that already has a submission record is not expired; a
-  leftover `avail/` entry is deleted and the record kept.
+  `failure_source` `expired` and deletes the job's row, which takes its
+  eligibility, denial and lost-lease rows with it. A job that already has a
+  submission record is not expired; the leftover row is deleted and the record
+  kept.
 
 A `never` job never expires. Stop it with `plans cancel`
 ([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)). Delete
-its `avail/` entry by hand only when no plan holds it any more
+its job row by hand only when no plan holds it any more
 ([plan-ingestion.md §7](plan-ingestion.md#the-duplicate-job-merge)).
 
 **The deadline bounds assignment, not running.** `claim` and `reclaim` treat a
 lapsed job as gone (`204` and `404`). `heartbeat`, and a `reclaim` that finds
 the caller still holding the lease, never fail on it, so a running benchmark
 finishes. A leased job that crosses its deadline is expired only after its lease
-lapses and it returns to `avail/`.
+lapses and it returns to the queue.

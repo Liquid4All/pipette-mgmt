@@ -179,7 +179,9 @@ fn not_in_catalog_error(
             | BenchmarkDefinition::VlMaxMemory(_)
             | BenchmarkDefinition::AsrThroughput(_)
             | BenchmarkDefinition::AsrMaxMemory(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => None,
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => None,
         })
         .collect();
     if benchmark_ids.is_empty() {
@@ -379,7 +381,7 @@ mod tests {
         write_benchmark(dir, "decode_throughput_512", THROUGHPUT_TOML)?;
         write_benchmark(dir, "vlm_eval_mmmu_val", &vlm_eval_toml())?;
         write_benchmark(dir, "asr_eval_fleurs_nl_nl_voxtral", &asr_eval_toml())?;
-        build_local_fs_stores(&local_config(dir))
+        build_local_fs_stores(&local_config(dir), pipette_store_testkit::no_queue())
     }
 
     /// A metric row for `job_id`; selection keys on `benchmark_id` alone.

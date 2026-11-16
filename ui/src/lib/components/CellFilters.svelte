@@ -37,6 +37,10 @@
 <div class="bar filters">
   {@render text("q", "search", "job id, model, runtime, runtime flags")}
   {@render choice("state", "state", choices.state)}
+  <!-- Only once a job was re-run, or where the address chose a count, so it can be let go of. -->
+  {#if choices.reruns.some(({ value }) => value !== "0") || filters.reruns.length}
+    {@render choice("reruns", "re-runs", choices.reruns)}
+  {/if}
   {@render choice("benchmark_type", "benchmark type", choices.benchmark_type)}
   {@render choice("benchmark", "benchmark", choices.benchmark)}
   <!-- Model or benchmark flags only where asked for, or where the address chose one, so it can be let go of. -->

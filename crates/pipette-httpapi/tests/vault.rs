@@ -38,6 +38,14 @@ async fn vault_state() -> anyhow::Result<(tempfile::TempDir, AppState)> {
     Ok((dir, state))
 }
 
+/// A [`vault_state`] whose records stay on the local_fs stores, for the tests
+/// that tamper with a stored record file.
+async fn object_vault_state() -> anyhow::Result<(tempfile::TempDir, AppState)> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_object_state(dir.path()).await?;
+    Ok((dir, state))
+}
+
 /// Where the filesystem store keeps `principal`'s file with `sha256`, for the
 /// tests that tamper with it behind mgmt's back.
 fn blob_path(dir: &Path, principal: &str, sha256: &str) -> PathBuf {
@@ -284,15 +292,10 @@ fn vault_job(resource_id: &str, org_id: &str) -> Value {
 const VAULT_REFUSAL: &str =
     "the job names a vault resource this client may not fetch; only a failure may be reported";
 
-#[rstest]
-#[case::local_fs(QueueBackend::LocalFs)]
-#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn revoked_vault_access_does_not_count_as_a_lost_hand_back(
-    #[case] backend: QueueBackend,
-) -> anyhow::Result<()> {
+async fn revoked_vault_access_does_not_count_as_a_lost_hand_back() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some(queue) = seeded_queue_state(dir.path(), backend).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -409,7 +412,7 @@ async fn only_a_device_that_may_fetch_the_model_reports_its_result(
         &vault_job(&resource_id, &org_id),
     )
     .await?;
-    let leases = state.todo_store.list_leased_for_client(&device_id).await?;
+    let leases = state.todo_store.leases_for_client(&device_id).await?;
 
     let mut result = if kind == "success" {
         valid_submission("prefill_throughput_256")
@@ -448,7 +451,7 @@ async fn only_a_device_that_may_fetch_the_model_reports_its_result(
     );
     if refusal.is_some() {
         assert_eq!(
-            state.todo_store.list_leased_for_client(&device_id).await?,
+            state.todo_store.leases_for_client(&device_id).await?,
             leases,
             "a refused success must not renew the lease"
         );
@@ -502,7 +505,7 @@ async fn only_a_device_that_may_fetch_the_model_holds_its_lease(
             .await?;
         job
     };
-    let leases = state.todo_store.list_leased_for_client(&device_id).await?;
+    let leases = state.todo_store.leases_for_client(&device_id).await?;
 
     let resp = match route {
         "claim" => authed_post(&state, &key, &device_id, "/plans/claim", &json!({})).await?,
@@ -532,7 +535,7 @@ async fn only_a_device_that_may_fetch_the_model_holds_its_lease(
     }
     // Every outsider lease, granted or held, goes straight back to the queue,
     // denied to the outsider.
-    let after = state.todo_store.list_leased_for_client(&device_id).await?;
+    let after = state.todo_store.leases_for_client(&device_id).await?;
     if member {
         assert_ne!(after, leases, "a member is granted or renewed a lease");
     } else {
@@ -613,6 +616,89 @@ async fn a_claim_moves_past_a_vault_job_it_puts_back(
         state.todo_store.is_denied(&vault, &device_id).await?,
         !member
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::vault_refusal(false, true)]
+#[case::vault_check_error(true, false)]
+#[tokio::test]
+async fn a_rejected_vault_grant_leaves_no_cache_affinity(
+    #[case] member: bool,
+    #[case] well_formed: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let admin = server_admin(state).await?;
+    let org_id = create_org(state, &admin, "acme").await?;
+    let other_org = create_org(state, &admin, "rival").await?;
+    let owner = org_admin(state, &org_id).await?;
+    let resource = upload_gguf_text(state, &owner, Some(&org_id), BLOB).await?;
+    let device_org = if member { &org_id } else { &other_org };
+    let (key, client) = owned_device(state, &admin, Some(org_owner(device_org))).await?;
+    let principal = if well_formed { org_id.as_str() } else { "" };
+    let body = vault_job(&resource, principal);
+    let rejected = seed_avail(
+        state.todo_store.as_ref(),
+        VAULT_JOB,
+        ExpiresAt::Never,
+        &body,
+    )
+    .await?;
+    commit_job(state, &rejected).await?;
+    state
+        .todo_store
+        .write_eligible(&client, &rejected, ExpiresAt::Never)
+        .await?;
+
+    let response = authed_post(state, &key, &client, "/plans/claim", &json!({})).await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .todo_store
+            .get_avail_by_job(&rejected)
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        state.todo_store.is_denied(&rejected, &client).await?,
+        !member
+    );
+
+    let mut same_artifacts = body;
+    same_artifacts["job_id"] = json!("job-after-rejection");
+    let next = seed_avail(
+        state.todo_store.as_ref(),
+        "job-after-rejection",
+        ExpiresAt::Never,
+        &same_artifacts,
+    )
+    .await?;
+    commit_job(state, &next).await?;
+    state
+        .todo_store
+        .write_eligible(&client, &next, ExpiresAt::Never)
+        .await?;
+    let now = chrono::Utc::now();
+    let outcome = state
+        .todo_store
+        .claim_for_client(
+            &client,
+            now + chrono::Duration::hours(1),
+            0,
+            &[],
+            None,
+            None,
+            now,
+        )
+        .await?;
+    let pipette_store::ClaimOutcome::Granted { affinity, .. } = outcome else {
+        anyhow::bail!("expected a grant, got {outcome:?}");
+    };
+    assert_eq!(affinity, pipette_store::ClaimAffinity::None);
     Ok(())
 }
 
@@ -2275,7 +2361,7 @@ async fn a_listing_query_is_validated(
 /// learns of a bad object without the surface going dark.
 #[tokio::test]
 async fn an_unreadable_record_is_counted_not_fatal() -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (dir, state) = object_vault_state().await?;
     let me = operator(&state).await?;
     let (mine, _) = own_resource(&state, &me).await?;
     std::fs::write(
@@ -2509,7 +2595,7 @@ async fn the_listing_wire_shape_is_pinned() -> anyhow::Result<()> {
 /// arrive, and its delete takes that record alone.
 #[tokio::test]
 async fn a_record_from_before_uploads_is_served_without_an_entry() -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (dir, state) = object_vault_state().await?;
     let me = operator(&state).await?;
     let (legacy, _) = own_resource(&state, &me).await?;
     let (other, _) = own_resource(&state, &me).await?;
@@ -4542,7 +4628,7 @@ async fn the_newest_come_first_when_asked() -> anyhow::Result<()> {
 /// so the pages still add up to the keyspace's count.
 #[tokio::test]
 async fn the_newest_first_count_the_unreadable_once() -> anyhow::Result<()> {
-    let (dir, state) = vault_state().await?;
+    let (dir, state) = object_vault_state().await?;
     let me = operator(&state).await?;
     let (first, _) = own_resource(&state, &me).await?;
     let (second, _) = own_resource(&state, &me).await?;
@@ -4755,7 +4841,7 @@ impl VaultStore for StatFailing {
 /// record, which has one file to show, is a redacted `500` instead.
 #[tokio::test]
 async fn a_store_fault_costs_the_listing_a_cell() -> anyhow::Result<()> {
-    let (dir, mut state) = vault_state().await?;
+    let (dir, mut state) = object_vault_state().await?;
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (resource_id, _) = own_resource(&state, &me).await?;

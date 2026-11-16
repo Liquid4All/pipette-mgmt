@@ -473,11 +473,14 @@ mod tests {
     /// [`check`] over an empty store and a catalog of [`BENCHMARK`] alone.
     async fn checked(text: &str) -> anyhow::Result<PlanValidation> {
         let dir = tempfile::tempdir()?;
-        let stores = build_local_fs_stores(&Config {
-            storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..Config::default()
-        })?;
+        let stores = build_local_fs_stores(
+            &Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )?;
         let definition = "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 512\nparameter_decode_tokens = 100";
         let catalog = HashMap::from([(
             BenchmarkId::try_new(BENCHMARK)?,

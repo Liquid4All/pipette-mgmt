@@ -95,7 +95,7 @@ and run everything.
 | `release-metadata` | always | Computes the version and image path with [`ci/version.sh`](ci/version.sh) |
 | `conventions` | always | `./ci/lint.sh`: the repo-convention checks in `ci/checks/`. No path filter and no toolchain, so a docs-only PR is checked too |
 | `rust-lint` | rust filter | `cargo fmt`, `cargo deny check licenses`, `cargo clippy`, and `cargo doc` |
-| `rust-test` | rust filter | `cargo nextest run` plus `cargo test --doc` |
+| `rust-test` | rust filter | `cargo nextest run` |
 | `catalog` | catalog filter | Parses the shipped benchmark catalog, and validates the app's example plans against it |
 | `console-ui` | console_ui filter | The Svelte app: generated types, type check, unit tests, build, and the credit of every bundled npm package |
 | `attribution` | rust filter | Regenerates `THIRD-PARTY-LICENSES.md` with `cargo about` and fails if the committed file differs |

@@ -1,6 +1,8 @@
 //! `/api/v1/model-params`: the model parameter table, one row of parameter counts per
 //! model, and the fill that puts them on result rows the warehouse left empty.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -12,9 +14,9 @@ use pipette_core::vault::VaultResource;
 use pipette_pipeline::model_params::{ModelParamTable, model_key, normalize};
 use pipette_pipeline::plan_results::ResultRow;
 use pipette_plan_types::{
-    AuditTarget, Changed, CreateModelParamsRequest, ListPage, ModelKey, ModelParamsDetail,
-    NonEmptyTrimmedString, PositiveCount, UpdateModelParamsRequest, VaultEntry, VaultEntryWithToml,
-    VaultResourceId,
+    AuditTarget, Changed, CreateModelParamsRequest, JobId, ListPage, Model, ModelKey,
+    ModelParamsDetail, NonEmptyTrimmedString, PositiveCount, UpdateModelParamsRequest, VaultEntry,
+    VaultEntryWithToml, VaultResourceId,
 };
 use pipette_store::{drain_model_params, warn_unreadable_model_params};
 
@@ -290,11 +292,14 @@ async fn write(
     Ok(params.into())
 }
 
-/// Fill the rows' empty parameter counts from the table. A failed read is
-/// logged and leaves the rows as they are, so the results still answer.
+/// Fill the rows' empty parameter counts from the table. The function matches
+/// a row without a model against its job's model in `requested`.
+/// The function logs a failed read and preserves the rows, so the results remain
+/// available.
 pub(crate) async fn fill_model_params<'a>(
     state: &AppState,
     rows: impl Iterator<Item = &'a mut ResultRow>,
+    requested: &HashMap<&JobId, &Model>,
 ) {
     let empty: Vec<_> = rows
         .filter(|row| row.model_params_total_millions.is_none())
@@ -310,7 +315,8 @@ pub(crate) async fn fill_model_params<'a>(
             return;
         }
     };
-    empty
-        .into_iter()
-        .for_each(|row| row.fill_model_params(&table));
+    empty.into_iter().for_each(|row| {
+        let model = requested.get(&row.job_id).copied();
+        row.fill_model_params(&table, model);
+    });
 }

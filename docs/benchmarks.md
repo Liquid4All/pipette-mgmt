@@ -34,6 +34,8 @@ The ASR entries are not among them: they live in the deployment's catalog
 | [ASR Throughput](#210-asr-throughput) | Audio-Language | Prefill, decode, and end-to-end timing for one audio clip + optional text + the model's transcription prompt |
 | [ASR Peak Memory](#211-asr-peak-memory) | Audio-Language | Peak host, GPU, and NPU memory for one audio clip + optional text |
 | [ASR Eval (Error Rate)](#212-asr-eval-error-rate) | Audio | Transcription word error rate on an Open ASR Leaderboard (English) or FLEURS test set |
+| [Decision Latency](#213-decision-latency) | Decision | Wall time of one request to a decision model: typed questions over a state, answered with no generated token |
+| [Decision Peak Memory](#214-decision-peak-memory) | Decision | Peak host, GPU, and NPU memory for the decision latency workload |
 
 **Text** benchmarks (2.1–2.4) use synthetic text-only prompts.
 **VL** benchmarks (2.6–2.7) use a synthetic image alongside a text prompt and
@@ -53,6 +55,8 @@ downloads, and scoring happens server-side. Its entries are org-private.
 **ASR** benchmarks (2.10–2.11) use a synthetic audio clip of a set length and
 format (see [The input clip](#the-input-clip)) and require a model with an audio
 encoder.
+**Decision** benchmarks (2.13–2.14) send a synthetic state (text, images, or
+both) to a decision model and generate no token.
 
 ### 1.1. Private benchmarks
 
@@ -156,9 +160,9 @@ artifact is not granted the job nor renewed a lease on it, and a success it
 reports is refused.
 
 This is a deliberate choice over routing by organization. The claim path trusts
-eligible markers without re-running the matcher, and they are rebuilt when a
+eligibility rows without re-running the matcher, and they are rebuilt when a
 device's profile changes or an operator reindexes, never when its owner or its
-owner's organization does. Markers keyed on membership would go stale in both
+owner's organization does. Eligibility rows keyed on membership would go stale in both
 directions, where the fetch reads membership on each request. The cost is
 disclosure of the job body (its model, runtime and benchmark id) to an outsider
 that claims it; the definition and the corpus stay private.
@@ -1984,7 +1988,9 @@ The plan is refused when it is parsed
 (`LlamacppCliStockTools::RESERVED_TEMPLATE_DERIVED`,
 `RESERVED_ASR_ENV_PREFIXES` and `asr_refuses_raw` in `pipette_plan_types`), and
 the client refuses the reasoning and template flags too. The other llama-server
-cells keep these, bar the raw reasoning flags every server cell types as knobs.
+cells keep these, bar the raw reasoning flags every server cell types as knobs
+and the raw slot count a decision cell types as `parallel`
+([§2.13](#213-decision-latency)).
 
 #### Submission fields
 
@@ -2511,6 +2517,166 @@ from each rounding. Nothing in mgmt computes a headline yet: its consumer is
 the follow-up run report, which will compute it on read from the warehouse
 rows, and it lives in the shared pipette-plan-types so that a client
 summarising its own run reads the same definition.
+
+---
+
+### 2.13. Decision Latency
+
+Measures one request to a decision model, such as `LiquidAI/d1-3B`. A decision
+model takes a state (text, images, or both) and a set of named, typed questions,
+and answers each from its distribution over the options in one forward pass. It
+generates no token, so the request's wall time is the whole measurement.
+
+#### Parameters
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `benchmark_type` | string | `decision_latency` |
+| `parameter_image_width` | integer | Image width in pixels; present exactly when `parameter_num_images > 0` |
+| `parameter_image_height` | integer | Image height in pixels; present exactly when `parameter_num_images > 0` |
+| `parameter_text_tokens` | integer | Tokens of the synthetic state (0 = no text state, the images are the whole state) |
+| `parameter_num_images` | integer | Images before the state (default 0); llama-server takes at most 8 |
+| `parameter_questions` | integer | Questions in the request, at least 1 |
+| `parameter_batch_size` | integer | Optional, default `1`. Requests kept in flight at once, each with its own state. `1` sends one at a time, the model card's latency; more is the model card's "states, packed" throughput. Must be `≥ 1` |
+
+Benchmark id grammar:
+`decision_latency_<width>x<height>_text<text_tokens>_img<num_images>_q<questions>_bs<batch_size>`,
+e.g. `decision_latency_text64_q1_bs64`; an entry without images omits
+`_<width>x<height>` and `_img<num_images>`, and a batch size of 1 omits `_bs1`.
+`decision_max_memory` ids follow the same grammar. The id's `_bs<n>` is the
+author's promise: nothing checks it against the parameter.
+
+The image and text parameters are the VL types' ([§2.6](#26-vl-throughput)),
+except that a decision request has no image unless it asks for one. A
+request needs a state, images, or both,
+so an entry with `parameter_text_tokens = 0` and no images is refused when the
+catalog loads, as is an image size without images or images without a size.
+With no text the request sends `"state": null`, which llama-server accepts
+only from the d1 types (`lfm2-d1`, `lfm2-d1-omni`), so an image-only entry runs
+on those. An entry with images needs a `gguf_vision` cell, whose projector
+encodes them, so a job that pairs one with a `gguf_text` model is refused when
+filed. llama-server still refuses the images at run time from a decision type
+that takes none, such as lev or laya.
+
+Every client sends the same questions, so a request's tokens depend on the
+entry alone. Question `q<n>`, numbered from 0, is
+
+```json
+{"type": "choice", "instructions": "Question <n>: how does the record rate?", "criteria": {"low": null, "medium": null, "high": null}}
+```
+
+The wording does not change the measurement, since a decision model generates
+nothing, but the length does, and so does the number. Where llama-server
+evaluates the state once for all the questions (most models, d1-3B among
+them), it also skips any text the questions share, so identical questions
+would cost next to nothing.
+
+The client keeps `parameter_batch_size` requests in flight, warm, each with a
+state of its own, so no two share a prompt prefix: identical states would be
+evaluated once and inflate the throughput. At `1` that is one request at a time,
+as the d1 model card measures latency.
+`parameter_batch_size` counts requests; llama-server's `-b` and `-ub` count
+tokens, so a packed batch's throughput also depends on them, set in the cell's
+`raw`. A forward pass holds at most `-ub` tokens (512 by default), and `-ub` is
+capped at `-b` (2048 by default): a pass past 512 tokens takes `-ub` raised,
+past 2048 `-b` too. On clef, vllm-decision2, lfm3-d1 and lfm3-d1-omni two
+requests never share a pass, whatever the flags.
+
+#### Runtime flags
+
+llama-server answers a request as tasks, and how many depends on the model:
+one per question on d1 and most others, two per `choice` question on lev
+(which shows the options in both orders), one for the whole request on clef.
+The cell's `parallel` runtime flag sets how many tasks run at once
+(`--parallel`), and every decision cell must set it: since the task count
+depends on the model, no default fits, so a plan whose decision cell leaves it
+unset is refused and no client picks one. A slot per task is
+`parameter_batch_size` times `parameter_questions` on most models, twice that
+on lev and `parameter_batch_size` on clef; fewer slots than tasks makes the
+tasks queue. Rows of one benchmark id can differ in `parallel`, and
+`runtime_flags` tells them apart. `parallel` is the only route to the slot
+count: a decision cell whose `raw` carries `--parallel` or `-np` is refused
+when the plan is parsed.
+
+Most models evaluate a request's state once for all its questions; laya, clef
+and lfm2-d1-omni evaluate each prompt whole, so they also need it to fit one
+physical batch: a long state takes `-ub` (and `-b`) in the cell's `raw`, where
+the default of 512 tokens refuses `parameter_text_tokens = 3400`.
+
+Per-cell settings (`benchmark_flags`): `http_timeout_seconds` bounds one request,
+`attempt_timeout_seconds` each attempt
+([client-integration.md §9](client-integration.md#9-job-configuration-fields)),
+and `readiness` gates the run like any other timing cell.
+
+#### Submission fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decision_latency_request_ms` | f32 | Wall time of one request on the client's clock, from sending it to the whole reply, the mean over repetitions. Required |
+| `decision_latency_request_ms_stddev` | f32 (optional) | Standard deviation of `decision_latency_request_ms` across repetitions |
+| `decision_latency_batch_ms` | f32 | Wall time of the whole batch, from the first send to the last reply, the mean over repetitions. Required when `parameter_batch_size > 1` |
+| `decision_latency_batch_ms_stddev` | f32 (optional) | Standard deviation of `decision_latency_batch_ms` across repetitions |
+
+#### Derived metrics
+
+| Metric | Formula | Unit | `value_stddev` |
+|--------|---------|------|----------------|
+| `decision_latency` | `decision_latency_request_ms` | ms | `decision_latency_request_ms_stddev` |
+| `decision_throughput` | `parameter_batch_size / decision_latency_batch_ms * 1000`, when `parameter_batch_size > 1` | requests/sec | `decision_throughput * decision_latency_batch_ms_stddev / decision_latency_batch_ms` |
+
+With more than one request in flight, `decision_latency_request_ms` is the mean
+**per request**, not the batch's wall clock.
+
+The state is recorded in the VL types' columns, `parameter_text_tokens`,
+`parameter_num_images`, `parameter_image_width` and `parameter_image_height`
+(the last two NULL without images), the questions per request in
+`parameter_questions`, and the requests in flight in `parameter_batch_size`.
+
+---
+
+### 2.14. Decision Peak Memory
+
+Measures peak host, GPU, and NPU memory while llama-server answers the
+[Decision Latency](#213-decision-latency) workload. Reports the same fields,
+counter semantics, and derived metrics as
+[Peak Memory Usage](#24-peak-memory-usage), and is read by the same
+[rules](#reading-the-memory-fields). One ungated run, so the cell's
+`benchmark_flags` take `http_timeout_seconds` and `attempt_timeout_seconds` and
+no `readiness`.
+
+#### Parameters
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `benchmark_type` | string | `decision_max_memory` |
+| `parameter_image_width` | integer | Image width in pixels; present exactly when `parameter_num_images > 0` |
+| `parameter_image_height` | integer | Image height in pixels; present exactly when `parameter_num_images > 0` |
+| `parameter_text_tokens` | integer | Tokens of the synthetic state, as in Decision Latency (0 = the images are the whole state) |
+| `parameter_num_images` | integer | Images before the state, as in Decision Latency (default 0) |
+| `parameter_questions` | integer | Questions in the request, at least 1 |
+| `parameter_batch_size` | integer | Optional, default `1`. Requests kept in flight at once, each with its own state, as in Decision Latency |
+
+The rules across them are [Decision Latency](#213-decision-latency)'s, and so
+are its runtime flags. The batch size, the question count and the cell's
+`parallel` runtime flag move the peak: each slot holds its own share of the
+context, and each request in flight its own state.
+
+#### Submission fields
+
+Same as [Peak Memory Usage](#24-peak-memory-usage): `max_host_bytes`,
+`max_gpu_bytes` (optional), `max_npu_bytes` (optional). Include `model_descriptor`,
+since on a `gguf_vision` cell the projector precision it records changes
+resident size.
+
+#### Derived metrics
+
+| Metric | Formula | Unit |
+|--------|---------|------|
+| `max_host_usage` | `max_host_bytes` | bytes |
+| `max_gpu_usage` | `max_gpu_bytes` | bytes (row omitted when null) |
+| `max_npu_usage` | `max_npu_bytes` | bytes (row omitted when null) |
+
+The parameters are recorded in the same columns as Decision Latency's.
 
 ---
 

@@ -14,9 +14,9 @@ mod uv;
 
 pub use build_flag::{RuntimeBuildFlagError, runtime_build_flag};
 pub use llamacpp::{
-    LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor, LlamacppCliStockTools,
-    LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource, LlamacppFlashAttention,
-    LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
+    CudartAssetError, LlamaCppFlavor, LlamacppApkPipette, LlamacppApkPipetteFlavor,
+    LlamacppCliStockTools, LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource,
+    LlamacppFlashAttention, LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
 };
 pub use mlx::{
     MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,

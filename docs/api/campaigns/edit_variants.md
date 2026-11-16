@@ -62,10 +62,11 @@ line of the stream.
 | `base_plan_id` | yes | The plan the caller read the indices off. If the campaign runs a different plan, the edit is refused with `409` and nothing is filed. Required, so a retried edit is refused rather than applied to the revision the first attempt filed |
 | `note` | no | The note for the revision, as [the request body of a filing](../campaigns.md#request-body) describes. The server records the change that the revision makes in `change` |
 | `dry_run` | no | `true` applies and expands the edit, and files nothing |
-| `carry_earlier` | no | `true` lets a cell the replaced plan has not answered take a finished run of the campaign's earlier plans, under the rules that carry the replaced plan's ([carrying jobs into a revision](../campaigns.md#carrying-jobs-into-a-revision)). A queued job of the replaced plan gives way to such a run, and stops with that plan |
+| `carry_earlier` | no | `true` lets a cell the replaced plan has not answered take a finished run of the campaign's earlier plans, under the rules that carry the replaced plan's ([carrying jobs into a revision](../campaigns.md#carrying-jobs-into-a-revision)). A queued job of the replaced plan that no client is running gives way to such a run, and stops with that plan |
 | `inherit_from` | no | Plan ids of any campaign, comma-separated, whose finished runs such a cell may take as it takes the earlier plans'. At most 32, the plans of `add_from` and `restore` included. Each must be a plan the caller can read at [`GET /api/v1/plans/{plan_id}`](../plans/get_plan.md); one it cannot, or one that is not there, is `404` and nothing is filed. A named plan's job still queued or running is not inherited: the duplicate merge joins it when the revision is filed, as it joins any live run of the cell |
 | `add_from` | no | Plan ids of any campaign, comma-separated, whose variants to append after the body's, in order. A copied variant that names no `benchmarks` takes its plan's list, so it expands to the cells that plan ran. Each plan is also offered as an `inherit_from` plan, and read under the same rule. With it, the body may be empty |
 | `restore` | no | Set `restore` to a comma-separated list of `<plan_id>:<index>` values. The server appends these variants after the `add_from` variants. The index counts the variants of the plan from 0, as [`GET /api/v1/plans/{plan_id}/variants`](../plans/get_plan_variants.md) lists them. A restored variant takes its plan's `benchmarks` as an `add_from` variant does. The server offers each source plan through `inherit_from` and checks read access. Its finished runs answer the restored cells. The revision records each variant in `change.restored`. With `remove`, the restore replaces a variant of the current plan. With it, the body may be empty |
+| `carry_across_limit` | no | `true` lets a finished run of the replaced plan, or one that `carry_earlier`, `inherit_from`, `add_from` or `restore` offers, answer its cell whatever `benchmark_flags.attempt_timeout_seconds` the run had. Without it, the run answers when the limit it was requested with, or the limit the replaced plan holds it under, is the cell's (none on both sides included) or, both being set, is not above the cell's, or when a plan on offer lists its job for the cell's very body ([carrying jobs into a revision](../campaigns.md#carrying-jobs-into-a-revision)). The revision holds the run under the cell's limit, so a later revision needs the option again only for a limit that neither of the two covers. It reaches no failed run |
 
 Responds `201 Created` with `CampaignRevised` ([the OpenAPI document](../../httpapi.md#15-the-openapi-document)):
 the replaced plan as `previous_plan_id`, what became of its jobs, and under
@@ -95,9 +96,10 @@ write begins, the rest finish even if the client disconnects.
 **Two edits at once.** The campaign is re-read before it advances, and it
 advances only if it still runs the plan the edit revised. Otherwise the edit
 lost a race: its revision is cancelled and the answer is `409`, so the loser
-lists the variants again and edits the plan that won. The re-read and the write
-are not atomic, so two edits that land in that gap both advance, and the last
-one wins. An edit that arrives after
+lists the variants again and edits the plan that won. The write lands only on
+the record as re-read, so of two edits at once one advances and the other gets
+that `409`. A rename, relabel or archive that lands in between is kept, and the
+edit advances on top of it. An edit that arrives after
 another has moved the campaign names a stale `base_plan_id`, and is refused
 rather than applied to a plan its caller did not read.
 

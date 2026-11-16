@@ -8,19 +8,20 @@ use std::path::Path;
 use anyhow::Context;
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use pipette_core::campaign::{Campaign, CampaignOwner, NewCampaign};
 use pipette_core::canonical_json::sha256_hex;
 use pipette_core::plan::{PlanManifest, SettledOutcome};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
-    Answered, BenchmarkId, BenchmarkType, CampaignId, JobId, PlanId, PlanStatus, RestoredVariant,
+    Answered, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId, ClientRunSpec,
+    FailureSource, JobId, NonEmptyTrimmedString, PlanId, PlanStatus, PolicyKind, RestoredVariant,
     RevisionChange, UserId,
 };
 use pipette_store::{
-    CampaignStore, Listing, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter, PlanStore, Stores,
-    SubmissionStore,
+    CampaignGroupStore, CampaignStore, Listing, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter,
+    PlanStore, Stores, SubmissionStore, TodoStore,
 };
 
 use crate::campaign_chain;
@@ -32,7 +33,8 @@ use crate::plan_cli::PlanInput;
 use crate::plan_document;
 use crate::plan_document::{DocumentDryRun, DryRunReport, SourceRead};
 use crate::plan_ingestion::{
-    CampaignMembership, CarryDraw, IngestContext, IngestReport, IngestSettings, Offered, draw_carry,
+    CampaignMembership, CarryDraw, IngestContext, IngestReport, IngestSettings, Offered,
+    draw_carry, lift_required_in,
 };
 use crate::variant_edit;
 use crate::variant_edit::{VariantEdit, VariantEditError};
@@ -46,11 +48,14 @@ pub struct Revised {
     pub carried_job_count: usize,
     /// The superseded plan's jobs that the new plan runs again as new jobs.
     pub rerun_job_count: usize,
+    /// The superseded plan's jobs whose cells the new plan marks failed, as
+    /// new jobs that no device runs.
+    pub marked_job_count: usize,
     /// The superseded plan's jobs whose completions the new plan scores again
     /// as new jobs.
     pub recalculated_job_count: usize,
-    /// The superseded plan's jobs that the new plan neither holds nor runs
-    /// again.
+    /// The superseded plan's jobs that the new plan neither holds, runs again,
+    /// scores again nor marks failed.
     pub dropped_job_count: usize,
     /// `false` when the superseded plan had already ended, or was already
     /// being cancelled.
@@ -63,6 +68,7 @@ impl From<Revised> for pipette_plan_types::Revised {
             previous_plan_id: revised.superseded,
             carried_job_count: revised.carried_job_count,
             rerun_job_count: revised.rerun_job_count,
+            marked_job_count: revised.marked_job_count,
             recalculated_job_count: revised.recalculated_job_count,
             dropped_job_count: revised.dropped_job_count,
             cancel_requested: revised.cancel_requested,
@@ -147,9 +153,11 @@ pub enum CampaignAdminError {
     Edit(#[from] VariantEditError),
     #[error("a re-run or a recalculation names no job")]
     NothingToRerun,
+    #[error("job {0} is named both to re-run and to mark failed")]
+    RerunAndFail(JobId),
     /// Not a job of the head, or one of a head filed before its jobs' digests
     /// were recorded, which carries nothing over.
-    #[error("plan {plan_id} holds no job {job_id} it can re-run or recalculate")]
+    #[error("plan {plan_id} holds no job {job_id} it can re-run, mark or recalculate")]
     NotInPlan { plan_id: PlanId, job_id: JobId },
     /// No result recorded. The job may still run, for another plan too once it
     /// lapsed for this one, so re-running it could duplicate work in flight.
@@ -164,15 +172,14 @@ pub enum CampaignAdminError {
     #[error("plan {0} holds no eval job with completions to recalculate")]
     NoneRescorable(PlanId),
     #[error(
-        "campaign {campaign_id} moved off {revised} or changed its owner while plan {plan_id} was filed, so it did not advance"
+        "campaign {campaign_id} moved to another plan or changed its owner while plan {plan_id} was filed, so it did not advance{}",
+        cancel_outcome(.cancelled)
     )]
     Overtaken {
         campaign_id: CampaignId,
         plan_id: PlanId,
-        revised: PlanId,
-        /// Whether [`complete_revision`] cancelled `plan_id`. `false` leaves
-        /// its jobs in the queue, unclaimable, until an operator runs
-        /// `plans cancel`.
+        /// Whether [`advance`] cancelled `plan_id`. `false` leaves its jobs in
+        /// the queue, unclaimable, until an operator runs `plans cancel`.
         cancelled: bool,
     },
     #[error(
@@ -184,6 +191,16 @@ pub enum CampaignAdminError {
         plan_id: PlanId,
         /// Whether [`advance`] cancelled `plan_id`. `false` leaves its jobs
         /// in the queue, unclaimable, until an operator runs `plans cancel`.
+        cancelled: bool,
+    },
+    #[error(
+        "campaign {campaign_id} changed during each of {REPLACE_ATTEMPTS} tries to advance it onto plan {plan_id}, so the plan did not advance{}; file it again",
+        cancel_outcome(.cancelled)
+    )]
+    AdvanceContended {
+        campaign_id: CampaignId,
+        plan_id: PlanId,
+        /// As [`Self::Overtaken`]'s.
         cancelled: bool,
     },
     /// The revision advanced, and the replaced plan was not cancelled: its
@@ -202,9 +219,15 @@ pub enum CampaignAdminError {
         campaign_id: CampaignId,
         plans: Vec<PlanId>,
     },
+    #[error("campaign {0} changed while this edit was made; nothing was written, retry")]
+    Contended(CampaignId),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
+
+/// Tries at a compare-and-set edit before contention is an error;
+/// `client_admin` uses the same count.
+pub const REPLACE_ATTEMPTS: usize = 3;
 
 fn cancel_outcome(cancelled: &bool) -> &'static str {
     if *cancelled {
@@ -241,6 +264,55 @@ pub async fn require(
         .get_campaign(campaign_id)
         .await?
         .ok_or_else(|| CampaignAdminError::NotFound(campaign_id.clone()))
+}
+
+/// Write `updated` only onto the record `read`, so an edit that landed since is
+/// kept. Otherwise nothing is written: [`CampaignAdminError::NotFound`] if the
+/// record is gone, [`CampaignAdminError::Contended`] if it changed.
+pub async fn replace(
+    campaigns: &dyn CampaignStore,
+    read: &Campaign,
+    updated: &Campaign,
+) -> Result<(), CampaignAdminError> {
+    if campaigns.replace_campaign(read, updated).await? {
+        Ok(())
+    } else {
+        // A delete fails the compare too; answer it as a retry would.
+        require(campaigns, &read.campaign_id).await?;
+        Err(CampaignAdminError::Contended(read.campaign_id.clone()))
+    }
+}
+
+/// Take a campaign out of a group of another owner, since a member has its
+/// group's owner, and name the group if it did. After the owner write, so a
+/// refused write keeps the membership, and on a hand-off that changes nothing
+/// too, so a retry finishes a removal that failed.
+pub async fn leave_group(
+    campaigns: &dyn CampaignStore,
+    groups: Option<&dyn CampaignGroupStore>,
+    campaign_id: &CampaignId,
+) -> anyhow::Result<Option<CampaignGroupId>> {
+    let Some(groups) = groups else {
+        return Ok(None);
+    };
+    let Some(group_id) = groups.group_of(campaign_id).await? else {
+        return Ok(None);
+    };
+    // The stored owner, read after the membership: a caller's copy can predate
+    // a hand-off after which the campaign joined this group.
+    let (Some(campaign), Some(group)) = (
+        campaigns.get_campaign(campaign_id).await?,
+        groups.get_group(&group_id).await?,
+    ) else {
+        // A campaign or group that is gone took its member row with it.
+        return Ok(None);
+    };
+    if campaign.owner == group.owner {
+        return Ok(None);
+    }
+    groups.remove_member(&group_id, campaign_id).await?;
+    tracing::info!(%group_id, %campaign_id, "campaign left its campaign group");
+    Ok(Some(group_id))
 }
 
 /// Resolve the `--user` / `--org` pair into the one owner a campaign must have.
@@ -328,42 +400,87 @@ pub async fn create_around(
     Ok(campaign)
 }
 
-/// Point `campaign_id` at `plan_id`, and report what it superseded.
+/// Point the campaign `before` names at `plan_id`, the plan just filed from
+/// `before`, and report what it superseded.
 ///
 /// Call this after the plan is written: a failure between leaves a filed plan
 /// that never took effect, never a campaign on a missing plan. The record is
-/// re-read, not taken from the caller, so `put_campaign` cannot clobber a
-/// rename that landed during the ingest. A campaign gone by then cancels the
-/// plan, since a [`delete`] scan can miss it.
+/// re-read and moves only while it still runs `before`'s plan for `before`'s
+/// owner, who owns the models the filing imported. The write lands only on the
+/// record as re-read, so a rename that landed meanwhile is kept; a write that
+/// meets another edit reads again, [`REPLACE_ATTEMPTS`] tries in all. A plan
+/// that a delete, a head or owner move, or [`REPLACE_ATTEMPTS`] lost writes
+/// keep from advancing is cancelled: nothing points at it, and a [`delete`]
+/// scan can miss it. A failed re-read leaves it staged
+/// ([`CampaignAdminError::NotAdvanced`]).
 pub async fn advance(
     campaigns: &dyn CampaignStore,
     plans: &dyn PlanStore,
-    campaign_id: &CampaignId,
+    before: &Campaign,
     plan_id: PlanId,
 ) -> Result<Advanced, CampaignAdminError> {
-    let campaign = reread(campaigns, plans, campaign_id, &plan_id).await?;
-    write_head(campaigns, plans, campaign, plan_id).await
+    let campaign_id = &before.campaign_id;
+    let mut tries = 0;
+    loop {
+        let campaign = reread(campaigns, plans, campaign_id, &plan_id).await?;
+        if changed_under(before, &campaign) {
+            let cancelled = cancel_unadvanced(
+                plans,
+                campaign_id,
+                &plan_id,
+                "its campaign moved to another plan or changed its owner",
+            )
+            .await;
+            return Err(CampaignAdminError::Overtaken {
+                campaign_id: campaign_id.clone(),
+                plan_id,
+                cancelled,
+            });
+        }
+        if tries == REPLACE_ATTEMPTS {
+            let cancelled = cancel_unadvanced(
+                plans,
+                campaign_id,
+                &plan_id,
+                "other edits changed its campaign on every try",
+            )
+            .await;
+            return Err(CampaignAdminError::AdvanceContended {
+                campaign_id: campaign_id.clone(),
+                plan_id,
+                cancelled,
+            });
+        }
+        tries += 1;
+        if let Some(advanced) = write_head(campaigns, plans, campaign, plan_id.clone()).await? {
+            return Ok(advanced);
+        }
+    }
 }
 
-/// [`advance`], only while the campaign still runs `from` and `owner` still
-/// owns it; `None`, writing nothing, when either changed. A revision imports
-/// gated models for `owner`, so a new owner could not fetch them. Not atomic:
-/// `put_campaign` has no CAS.
-async fn advance_from(
-    campaigns: &dyn CampaignStore,
+/// Cancel `plan_id`, which did not advance for the reason `why`, and say
+/// whether the cancel landed.
+pub(crate) async fn cancel_unadvanced(
     plans: &dyn PlanStore,
     campaign_id: &CampaignId,
-    owner: &CampaignOwner,
-    from: &PlanId,
-    plan_id: PlanId,
-) -> Result<Option<Advanced>, CampaignAdminError> {
-    let campaign = reread(campaigns, plans, campaign_id, &plan_id).await?;
-    if campaign.current_plan_id.as_ref() != Some(from) || campaign.owner != *owner {
-        return Ok(None);
+    plan_id: &PlanId,
+    why: &str,
+) -> bool {
+    match plans.write_cancel_marker(plan_id).await {
+        Ok(()) => {
+            tracing::warn!(%campaign_id, %plan_id, "filed plan cancelled: {why}");
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                %campaign_id,
+                %plan_id,
+                error = %format_args!("{e:#}"),
+                "could not cancel a filed plan that did not advance: {why}"
+            );
+            false
+        }
     }
-    write_head(campaigns, plans, campaign, plan_id)
-        .await
-        .map(Some)
 }
 
 /// The record [`advance`] moves, read fresh. A failure names the staged plan.
@@ -376,32 +493,12 @@ async fn reread(
 ) -> Result<Campaign, CampaignAdminError> {
     match require(campaigns, campaign_id).await {
         Ok(campaign) => Ok(campaign),
-        Err(CampaignAdminError::NotFound(_)) => {
-            let cancelled = plans
-                .write_cancel_marker(plan_id)
-                .await
-                .inspect_err(|e| {
-                    tracing::error!(
-                        %campaign_id,
-                        %plan_id,
-                        error = %format_args!("{e:#}"),
-                        "could not cancel a filed plan whose campaign was deleted"
-                    );
-                })
-                .is_ok();
-            if cancelled {
-                tracing::warn!(
-                    %campaign_id,
-                    %plan_id,
-                    "filed plan cancelled: its campaign was deleted before it advanced"
-                );
-            }
-            Err(CampaignAdminError::DeletedDuringFiling {
-                campaign_id: campaign_id.clone(),
-                plan_id: plan_id.clone(),
-                cancelled,
-            })
-        }
+        Err(CampaignAdminError::NotFound(_)) => Err(CampaignAdminError::DeletedDuringFiling {
+            campaign_id: campaign_id.clone(),
+            plan_id: plan_id.clone(),
+            cancelled: cancel_unadvanced(plans, campaign_id, plan_id, "its campaign was deleted")
+                .await,
+        }),
         Err(source) => Err(CampaignAdminError::NotAdvanced {
             campaign_id: campaign_id.clone(),
             plan_id: plan_id.clone(),
@@ -410,21 +507,30 @@ async fn reread(
     }
 }
 
-/// Point `campaign` at `plan_id` and write it, unless it already runs it. Read
-/// the campaign after a write reports a failure. A campaign whose history
-/// reaches `plan_id` is a success; preserve the plan otherwise.
+/// Point `read` at `plan_id` and write it onto that record, unless it already
+/// runs it; `None` when another edit changed the record first. Read the
+/// campaign after a write reports a failure. A campaign whose history reaches
+/// `plan_id` is a success; preserve the plan otherwise.
 async fn write_head(
     campaigns: &dyn CampaignStore,
     plans: &dyn PlanStore,
-    mut campaign: Campaign,
+    read: Campaign,
     plan_id: PlanId,
-) -> Result<Advanced, CampaignAdminError> {
-    let campaign_id = campaign.campaign_id.clone();
-    let superseded = campaign.current_plan_id.clone();
+) -> Result<Option<Advanced>, CampaignAdminError> {
+    let campaign_id = read.campaign_id.clone();
+    let superseded = read.current_plan_id.clone();
 
+    let mut campaign = read.clone();
     let changed = campaign.advance(plan_id.clone(), Utc::now());
-    if changed && let Err(source) = campaigns.put_campaign(&campaign).await {
-        match landed(campaigns, plans, &campaign_id, &plan_id).await {
+    let written = if changed {
+        campaigns.replace_campaign(&read, &campaign).await
+    } else {
+        Ok(true)
+    };
+    match written {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(source) => match landed(campaigns, plans, &campaign_id, &plan_id).await {
             Ok(Some(_)) => tracing::info!(
                 %campaign_id,
                 %plan_id,
@@ -458,7 +564,7 @@ async fn write_head(
                     source: source.context(readback),
                 });
             }
-        }
+        },
     }
     tracing::info!(
         %campaign_id,
@@ -467,10 +573,10 @@ async fn write_head(
         changed,
         "campaign advanced onto a new plan"
     );
-    Ok(Advanced {
+    Ok(Some(Advanced {
         superseded,
         changed,
-    })
+    }))
 }
 
 /// Read `campaign_id` back after a write that reported a failure. Return the
@@ -638,7 +744,7 @@ pub async fn ingest_into(
     let advanced = advance(
         &*stores.campaigns,
         &*stores.plans,
-        campaign_id,
+        &campaign,
         report.plan_id.clone(),
     )
     .await?;
@@ -752,7 +858,9 @@ impl Head {
             },
             rerun: BTreeSet::new(),
             recalculate: BTreeSet::new(),
+            fail: BTreeMap::new(),
             offer: Offer::default(),
+            group: None,
         })
     }
 
@@ -773,7 +881,9 @@ impl Head {
             change: Change::Document,
             rerun: BTreeSet::new(),
             recalculate: BTreeSet::new(),
+            fail: BTreeMap::new(),
             offer: Offer::default(),
+            group: None,
         })
     }
 
@@ -829,20 +939,30 @@ impl Head {
             change: Change::Revert(manifest.plan_id),
             rerun: BTreeSet::new(),
             recalculate: BTreeSet::new(),
+            fail: BTreeMap::new(),
             offer,
+            group: None,
         })
     }
 
-    /// The head's document as it is, running `job_ids` again: the revision to
-    /// file. Each must be a job of the head with a recorded result. A lapse is
-    /// not one: the job may still run for another plan.
+    /// The head's document as it is, running `job_ids` again and marking the
+    /// `fail` jobs failed for their reasons: the revision to file. Each must be a
+    /// job of the head, and none may be named in both. Each of `job_ids` must
+    /// have a recorded result (a lapse is not one: the job may still run for
+    /// another plan). A `fail` job need not: one still in the queue is left to
+    /// the head's teardown.
     pub async fn rerun(
         self,
         plans: &dyn PlanStore,
         submissions: &dyn SubmissionStore,
         job_ids: BTreeSet<JobId>,
+        fail: BTreeMap<JobId, NonEmptyTrimmedString>,
     ) -> Result<Revision, CampaignAdminError> {
-        self.require_held(&job_ids)?;
+        if let Some(job_id) = job_ids.iter().find(|job_id| fail.contains_key(*job_id)) {
+            return Err(CampaignAdminError::RerunAndFail(job_id.clone()));
+        }
+        let named: BTreeSet<JobId> = job_ids.iter().chain(fail.keys()).cloned().collect();
+        self.require_held(&named)?;
         let document = self.document(plans).await?;
         // Owned ids: a stream of borrowed ones trips higher-ranked `Send`
         // inference in the handlers that await this.
@@ -857,11 +977,18 @@ impl Head {
             .buffer_unordered(PLAN_JOB_CONCURRENCY)
             .try_collect::<()>()
             .await?;
-        Ok(self.filed_again(document, Change::Rerun(None), job_ids, BTreeSet::new()))
+        Ok(self.filed_again(
+            document,
+            Change::Rerun(None),
+            job_ids,
+            BTreeSet::new(),
+            fail,
+        ))
     }
 
     /// [`Self::rerun`] over every job of the head with a recorded result that
     /// `which` takes. A job still pending carries over, as it would anyway.
+    /// `failed` leaves out a job a mark answered, which `all` takes.
     pub async fn rerun_answered(
         self,
         plans: &dyn PlanStore,
@@ -870,13 +997,17 @@ impl Head {
     ) -> Result<Revision, CampaignAdminError> {
         // `content_keys`, not `job_ids`: a job with no digest cannot be re-run.
         let job_ids: Vec<JobId> = self.manifest.content_keys.keys().cloned().collect();
-        let rerun: BTreeSet<JobId> = submissions
+        let answered: Vec<JobId> = submissions
             .find_outcomes(&job_ids)
             .await?
             .into_iter()
             .filter(|(_, outcome)| answered_takes(which, *outcome))
             .map(|(job_id, _)| job_id)
             .collect();
+        let rerun = match which {
+            Answered::All => answered.into_iter().collect(),
+            Answered::Failed => self.unmarked(submissions, answered).await?,
+        };
         if rerun.is_empty() {
             return Err(CampaignAdminError::NoneAnswered {
                 plan_id: self.manifest.plan_id.clone(),
@@ -884,7 +1015,41 @@ impl Head {
             });
         }
         let document = self.document(plans).await?;
-        Ok(self.filed_again(document, Change::Rerun(Some(which)), rerun, BTreeSet::new()))
+        Ok(self.filed_again(
+            document,
+            Change::Rerun(Some(which)),
+            rerun,
+            BTreeSet::new(),
+            BTreeMap::new(),
+        ))
+    }
+
+    /// `failed` less each job whose failure a mark wrote. A mark always names
+    /// the job it replaces in `rerun_of`, so only those jobs' records are read.
+    async fn unmarked(
+        &self,
+        submissions: &dyn SubmissionStore,
+        failed: Vec<JobId>,
+    ) -> anyhow::Result<BTreeSet<JobId>> {
+        let (linked, unlinked): (Vec<JobId>, Vec<JobId>) = failed
+            .into_iter()
+            .partition(|job_id| self.manifest.rerun_of.contains_key(job_id));
+        let kept: Vec<Option<JobId>> = futures::stream::iter(linked)
+            .map(|job_id| async move {
+                let record = submissions.find_job(&job_id).await?;
+                let marked = record.is_some_and(|record| {
+                    record.body.get("failure_source")
+                        == Some(&serde_json::json!(FailureSource::Marked))
+                });
+                anyhow::Ok((!marked).then_some(job_id))
+            })
+            .buffer_unordered(PLAN_JOB_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(unlinked
+            .into_iter()
+            .chain(kept.into_iter().flatten())
+            .collect())
     }
 
     /// The head's document as it is, scoring the completions `job_ids`
@@ -918,6 +1083,7 @@ impl Head {
             Change::Recalculate { all: false },
             BTreeSet::new(),
             job_ids,
+            BTreeMap::new(),
         ))
     }
 
@@ -958,6 +1124,7 @@ impl Head {
             Change::Recalculate { all: true },
             BTreeSet::new(),
             recalculate,
+            BTreeMap::new(),
         ))
     }
 
@@ -1000,8 +1167,8 @@ impl Head {
         })
     }
 
-    /// Refuse a re-run or a recalculation that names no job, or one the head
-    /// cannot place again.
+    /// Refuse a re-run, mark or recalculation that names no job, or one the
+    /// head cannot place again.
     fn require_held(&self, job_ids: &BTreeSet<JobId>) -> Result<(), CampaignAdminError> {
         if job_ids.is_empty() {
             return Err(CampaignAdminError::NothingToRerun);
@@ -1025,6 +1192,7 @@ impl Head {
         change: Change,
         rerun: BTreeSet<JobId>,
         recalculate: BTreeSet<JobId>,
+        fail: BTreeMap<JobId, NonEmptyTrimmedString>,
     ) -> Revision {
         Revision {
             campaign: self.campaign,
@@ -1034,7 +1202,9 @@ impl Head {
             change,
             rerun,
             recalculate,
+            fail,
             offer: Offer::default(),
+            group: None,
         }
     }
 }
@@ -1099,7 +1269,8 @@ pub struct Revision {
     campaign: Campaign,
     previous: PlanManifest,
     /// `previous`'s document, which rekeys a job filed before job sources were
-    /// stored.
+    /// stored, and gives the body `previous` holds a job for where that is not
+    /// the job's source.
     previous_document: String,
     document: String,
     /// What the filer asked for, which [`Self::change`] records.
@@ -1109,17 +1280,28 @@ pub struct Revision {
     /// The head's jobs to score again under new jobs rather than carry. Empty
     /// but for a recalculation.
     recalculate: BTreeSet<JobId>,
+    /// The head's jobs whose cells new jobs answer with a failure for the
+    /// reason given, rather than carry. Empty but for a re-run.
+    fail: BTreeMap<JobId, NonEmptyTrimmedString>,
     /// The plans beside the head whose finished runs may answer cells too
     /// ([`Self::carrying`]).
     offer: Offer,
+    /// The campaign group whose policies file a re-run, and those policies
+    /// ([`Self::by_group`]); `None` when a person files it.
+    group: Option<(CampaignGroupId, Vec<PolicyKind>)>,
 }
 
 /// The plans beside the head whose finished runs a revision offers to the cells
-/// the head has not answered, as it offers the head's own.
+/// the head has not answered, as it offers the head's own, and whether those
+/// runs answer across an attempt limit that they are not known to have passed.
 #[derive(Debug, Clone, Default)]
 pub struct Offer {
     /// The plans before the head (`carry_earlier`).
     earlier: bool,
+    /// Whether a finished run of the head or of an offered plan answers a cell
+    /// whose attempt limit it is not known to have passed
+    /// (`carry_across_limit`).
+    across_limit: bool,
     /// Plans named to inherit from, of any campaign (`inherit_from`), in the
     /// order offered.
     plans: Vec<PlanManifest>,
@@ -1170,9 +1352,20 @@ impl Offer {
         }
         Ok(Self {
             earlier,
+            across_limit: false,
             plans: named,
             later,
         })
+    }
+
+    /// Let a finished run of the head or of an offered plan answer its cell
+    /// under another attempt limit, whatever limit it ran under
+    /// (`carry_across_limit`).
+    pub fn across_limit(self, across_limit: bool) -> Self {
+        Self {
+            across_limit,
+            ..self
+        }
     }
 
     /// The named plans, which a surface checks the caller may read.
@@ -1250,6 +1443,8 @@ impl Offer {
         Ok(variants)
     }
 
+    /// Whether no plan is on offer. `across_limit` does not count: by itself
+    /// it changes no job of the head's own document.
     fn is_empty(&self) -> bool {
         !self.earlier && self.plans.is_empty()
     }
@@ -1324,6 +1519,7 @@ impl Revision {
     /// requested. The new plan stores the change next to its note.
     pub fn change(&self) -> RevisionChange {
         let carry_earlier = self.offer.earlier;
+        let carry_across_limit = self.offer.across_limit;
         let inherit_from = || {
             self.offer
                 .plans
@@ -1340,17 +1536,25 @@ impl Revision {
                 removed_variant_count: *removed,
                 added_variant_count: *added,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from: inherit_from(),
                 restored: restored.clone(),
             },
             Change::Document => RevisionChange::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from: inherit_from(),
             },
-            Change::Rerun(answered) => RevisionChange::Rerun {
-                answered: *answered,
-                job_count: self.rerun.len(),
-            },
+            Change::Rerun(answered) => {
+                let (group_id, policies) = self.group.clone().unzip();
+                RevisionChange::Rerun {
+                    answered: *answered,
+                    job_count: self.rerun.len(),
+                    marked_job_count: self.fail.len(),
+                    group_id,
+                    policies: policies.unwrap_or_default(),
+                }
+            }
             Change::Recalculate { all } => RevisionChange::Recalculate {
                 all_evals: *all,
                 job_count: self.recalculate.len(),
@@ -1365,6 +1569,15 @@ impl Revision {
     /// `offer` names, as it takes one of the head's.
     pub fn carrying(self, offer: Offer) -> Self {
         Self { offer, ..self }
+    }
+
+    /// Name the campaign group whose `policies` file this re-run, as
+    /// [`Self::change`] records it.
+    pub fn by_group(self, group_id: CampaignGroupId, policies: Vec<PolicyKind>) -> Self {
+        Self {
+            group: Some((group_id, policies)),
+            ..self
+        }
     }
 
     pub fn owner(&self) -> &VaultOwner {
@@ -1396,6 +1609,7 @@ impl Revision {
         filed_from(&self.previous, &self.previous_document, &self.document)
             && self.rerun.is_empty()
             && self.recalculate.is_empty()
+            && self.fail.is_empty()
             && self.offer.is_empty()
     }
 
@@ -1406,6 +1620,7 @@ impl Revision {
         membership: CampaignMembership,
         bodies: &[serde_json::Value],
         plans: &dyn PlanStore,
+        todo: &dyn TodoStore,
         submissions: &dyn SubmissionStore,
         orgs: &dyn OrgStore,
     ) -> Result<RevisionPreview, crate::plan_ingestion::IngestError> {
@@ -1416,7 +1631,7 @@ impl Revision {
             satisfied,
             offered,
             held,
-        } = draw_carry(membership, bodies, plans, submissions, orgs).await?;
+        } = draw_carry(membership, bodies, plans, todo, submissions, orgs).await?;
         let named: HashSet<&PlanId> = self
             .offer
             .plans
@@ -1431,6 +1646,7 @@ impl Revision {
             .iter()
             .chain(&self.rerun)
             .chain(&self.recalculate)
+            .chain(self.fail.keys())
             .collect();
         Ok(RevisionPreview {
             unchanged: false,
@@ -1440,7 +1656,8 @@ impl Revision {
             satisfied_job_count: satisfied,
             restored_job_count: offered.len() - inherited,
             inherited_job_count: inherited,
-            rerun_job_count: self.rerun.len(),
+            rerun_job_ids: self.rerun.iter().cloned().collect(),
+            marked_job_ids: self.fail.keys().cloned().collect(),
             recalculated_job_count: self.recalculate.len(),
             dropped_job_ids: self
                 .previous
@@ -1455,12 +1672,19 @@ impl Revision {
         })
     }
 
-    /// Superseding the head, and carrying its jobs over but the re-run and
-    /// recalculated ones. v1 digests are rekeyed from stored sources, or the
-    /// head's document, so only jobs matching the v2 rule carry; an unknown
-    /// digest, such as a drift marker, stays. A sourceless job is assumed to
-    /// have run the head's body, which one joined from another plan under v1
-    /// may not have.
+    /// Superseding the head, and carrying its jobs over but the re-run, marked
+    /// and recalculated ones. v1 digests are rekeyed from stored sources, or the
+    /// head's document, so only jobs matching the v2 rule carry. A sourceless
+    /// job is assumed to have run the head's body, which one joined from
+    /// another plan under v1 may not have. A job the head took for another body
+    /// than the job was filed under goes with that body, read off the head's
+    /// document, whose attempt limit vouches for its run as the source's does.
+    /// A job listed under its source's own digest, or under one the head's
+    /// document no longer expands to, is keyed by that source as this build
+    /// reads it ([`read_digest`]) where the head's document expands to that
+    /// body, so a field retired or defaulted since the filing moves no cell.
+    /// Otherwise a job keeps the digest it is listed under, such as a drift
+    /// marker.
     pub async fn membership(&self, plans: &dyn PlanStore) -> anyhow::Result<CampaignMembership> {
         let mut previous = self.previous.clone();
         let recorded: Vec<(JobId, String)> = previous
@@ -1477,23 +1701,60 @@ impl Revision {
                 .buffer_unordered(PLAN_JOB_CONCURRENCY)
                 .try_collect()
                 .await?;
-        let from_document = if sources.iter().any(|(_, _, source)| source.is_none()) {
-            rekeyed_by_document(
+        // The head lists such a job under a digest that is not its source's.
+        let taken_over = |recorded: &str, body: &serde_json::Value| {
+            recorded != content_digest(body)
+                && recorded != legacy_content_digest(body)
+                && recorded != read_digest(body)
+        };
+        // Covers a taken-over job too: its digest is none of its source's.
+        let reads_document = sources.iter().any(|(_, recorded, source)| {
+            source
+                .as_ref()
+                .is_none_or(|body| *recorded != read_digest(body))
+        });
+        let expanded = if reads_document {
+            filed_bodies(
                 self.previous_document.clone(),
                 self.previous.benchmark_types.clone(),
             )
             .await
         } else {
-            HashMap::new()
+            Vec::new()
         };
+        let from_document = rekeyed(&expanded);
+        let by_digest: HashMap<String, &serde_json::Value> = expanded
+            .iter()
+            .map(|body| (content_digest(body), body))
+            .collect();
         let mut bodies = HashMap::new();
+        let mut held_for = HashMap::new();
         sources.into_iter().for_each(|(job_id, recorded, source)| {
             let digest = match &source {
-                Some(body) => {
-                    (legacy_content_digest(body) == recorded).then(|| content_digest(body))
+                Some(body)
+                    if [content_digest(body), legacy_content_digest(body)].contains(&recorded) =>
+                {
+                    let read = read_digest(body);
+                    Some(if by_digest.contains_key(&read) {
+                        read
+                    } else {
+                        content_digest(body)
+                    })
                 }
+                // A revision lists a job it carries under the cell as its own
+                // build read it, which a later build may read otherwise.
+                Some(body) if !by_digest.contains_key(&recorded) => {
+                    Some(read_digest(body)).filter(|read| by_digest.contains_key(read))
+                }
+                Some(_) => None,
                 None => from_document.get(&recorded).cloned(),
             };
+            if let Some(body) = &source
+                && taken_over(&recorded, body)
+                && let Some(held) = by_digest.get(&recorded)
+            {
+                held_for.insert(job_id.clone(), (*held).clone());
+            }
             if let Some(digest) = digest {
                 previous.content_keys.insert(job_id.clone(), digest);
             }
@@ -1501,22 +1762,41 @@ impl Revision {
                 bodies.insert(job_id, body);
             }
         });
-        let mut membership =
-            CampaignMembership::carrying(&self.campaign, &previous, &self.rerun, &self.recalculate);
-        let offered = if self.offer.is_empty() {
-            Vec::new()
+        let mut membership = CampaignMembership::carrying(
+            &self.campaign,
+            &previous,
+            &self.rerun,
+            &self.recalculate,
+            &self.fail,
+        );
+        let (offered, listed, excluded_runs) = if self.offer.is_empty() {
+            (Vec::new(), HashMap::new(), HashSet::new())
         } else {
             self.offered_jobs(plans).await?
         };
-        membership.carry = membership.carry.with_sources(bodies).with_offered(offered);
+        membership.carry = membership
+            .carry
+            .with_sources(bodies)
+            .with_held_for(held_for)
+            .with_offered(offered, listed, excluded_runs)
+            .across_limit(self.offer.across_limit);
         Ok(membership)
     }
 
     /// The jobs of the plans [`Offer`] names, with their filed bodies: the
     /// earlier plans newest first, then the named ones. Leaves out the head's
     /// jobs and those it re-ran, and any job one of those plans, or a plan
-    /// filed after a named one, re-ran or let lapse.
-    async fn offered_jobs(&self, plans: &dyn PlanStore) -> anyhow::Result<Vec<Offered>> {
+    /// filed after a named one, re-ran or let lapse. With them, the digests
+    /// those plans list each of their jobs under, the head's jobs included,
+    /// and the runs automatic reuse must also exclude.
+    async fn offered_jobs(
+        &self,
+        plans: &dyn PlanStore,
+    ) -> anyhow::Result<(
+        Vec<Offered>,
+        HashMap<JobId, HashSet<String>>,
+        HashSet<JobId>,
+    )> {
         let mut chain = Vec::new();
         let mut visited = HashSet::from([self.previous.plan_id.clone()]);
         let mut next = self
@@ -1557,6 +1837,19 @@ impl Revision {
             })
             .map(|(plan_id, job_id)| (plan_id.clone(), job_id.clone()))
             .collect();
+        let listed = offering
+            .iter()
+            .flat_map(|manifest| &manifest.content_keys)
+            .fold(
+                HashMap::<JobId, HashSet<String>>::new(),
+                |mut listed, (job_id, digest)| {
+                    listed
+                        .entry(job_id.clone())
+                        .or_default()
+                        .insert(digest.clone());
+                    listed
+                },
+            );
         // `buffered`, so the jobs keep the chain's order.
         let sources: Vec<Option<Offered>> = futures::stream::iter(job_ids)
             .map(|(plan_id, job_id)| async move {
@@ -1570,32 +1863,54 @@ impl Revision {
             .buffered(PLAN_JOB_CONCURRENCY)
             .try_collect()
             .await?;
-        Ok(sources.into_iter().flatten().collect())
+        let excluded_runs = rerun
+            .union(&lapsed)
+            .map(|job_id| (*job_id).clone())
+            .collect();
+        Ok((
+            sources.into_iter().flatten().collect(),
+            listed,
+            excluded_runs,
+        ))
     }
 }
 
-/// [`rekeyed`] over the bodies `document` expands to, typed by `recorded`, its
-/// manifest's `benchmark_types`. Empty if the document no longer expands.
-async fn rekeyed_by_document(
+/// The bodies `document` expands to, as ingestion digests them, typed by
+/// `recorded`, its manifest's `benchmark_types`. None if the document no
+/// longer expands.
+async fn filed_bodies(
     document: String,
     recorded: BTreeMap<BenchmarkId, BenchmarkType>,
-) -> HashMap<String, String> {
+) -> Vec<serde_json::Value> {
     let expanded = tokio::task::spawn_blocking(move || {
         let ids = pipette_planner::benchmark_ids(&document)?;
         let types = crate::plan_cells::filed_types(&recorded, &ids);
         let plan = pipette_planner::parse(&document, &types)?;
-        anyhow::Ok(pipette_planner::expand(&plan)?.bodies)
+        let mut bodies = pipette_planner::expand(&plan)?.bodies;
+        bodies.iter_mut().try_for_each(lift_required_in)?;
+        anyhow::Ok(bodies)
     })
     .await
     .map_err(anyhow::Error::new)
     .flatten();
-    match expanded {
-        Ok(bodies) => rekeyed(&bodies),
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "head document no longer expands");
-            HashMap::new()
-        }
+    expanded.unwrap_or_else(|error| {
+        tracing::warn!(error = %format!("{error:#}"), "head document no longer expands");
+        Vec::new()
+    })
+}
+
+/// [`content_digest`] of `body` with its spec as this build reads and writes
+/// it back, which drops a retired field and fills a default. A spec this
+/// build does not read is digested as it is.
+fn read_digest(body: &serde_json::Value) -> String {
+    let mut read = body.clone();
+    if let Some(spec) = read.get_mut("spec")
+        && let Ok(typed) = ClientRunSpec::deserialize(&*spec)
+        && let Ok(written) = serde_json::to_value(typed)
+    {
+        *spec = written;
     }
+    content_digest(&read)
 }
 
 /// The v1 digest of each body, mapped to its v2 digest. A v1 digest two
@@ -1669,8 +1984,10 @@ pub struct RevisionPreview {
     pub carried_job_count: usize,
     /// Cells that plan never ran, which the revision would queue.
     pub new_job_count: usize,
-    /// Cells that plan ran under other requirements, which the revision would
-    /// run again: the run failed, or its device or build is not known to meet them.
+    /// Cells that plan ran under other requirements or another attempt limit,
+    /// which the revision would run again: the run failed, its device or build
+    /// is not known to meet the requirements, or it is not known to have
+    /// passed the limit.
     pub requirements_rerun_job_count: usize,
     /// Cells that an earlier finished run answers, which the revision would
     /// hold that run for and not queue.
@@ -1679,10 +1996,15 @@ pub struct RevisionPreview {
     pub restored_job_count: usize,
     /// Finished jobs of the `inherit_from` plans the revision would hold.
     pub inherited_job_count: usize,
-    pub rerun_job_count: usize,
+    /// That plan's jobs the revision would run again, as named or as
+    /// `answered` picks them.
+    pub rerun_job_ids: Vec<JobId>,
+    /// That plan's jobs the revision would mark failed. It would stop one
+    /// still queued or running too, unless another plan holds it.
+    pub marked_job_ids: Vec<JobId>,
     pub recalculated_job_count: usize,
-    /// That plan's jobs the revision would stop: neither held, run again, nor
-    /// scored again.
+    /// That plan's jobs the revision would neither hold, run again, score
+    /// again nor mark failed, so it would stop them.
     pub dropped_job_ids: Vec<JobId>,
     /// Each body that would hold an existing job, and the plan it comes from.
     pub held_jobs: Vec<pipette_plan_types::HeldJob>,
@@ -1700,7 +2022,8 @@ impl From<RevisionPreview> for pipette_plan_types::RevisionPreview {
             satisfied_job_count: preview.satisfied_job_count,
             restored_job_count: preview.restored_job_count,
             inherited_job_count: preview.inherited_job_count,
-            rerun_job_count: preview.rerun_job_count,
+            rerun_job_ids: preview.rerun_job_ids,
+            marked_job_ids: preview.marked_job_ids,
             recalculated_job_count: preview.recalculated_job_count,
             dropped_job_ids: preview.dropped_job_ids,
             held_jobs: preview.held_jobs,
@@ -1719,7 +2042,8 @@ impl RevisionPreview {
             satisfied_job_count: 0,
             restored_job_count: 0,
             inherited_job_count: 0,
-            rerun_job_count: 0,
+            rerun_job_ids: Vec::new(),
+            marked_job_ids: Vec::new(),
             recalculated_job_count: 0,
             dropped_job_ids: Vec::new(),
             held_jobs: Vec::new(),
@@ -1757,48 +2081,11 @@ pub async fn complete_revision(
         previous,
         rerun,
         recalculate,
+        fail,
         ..
     } = revision;
+    advance(campaigns, plans, &campaign, plan_id.clone()).await?;
     let campaign_id = campaign.campaign_id;
-
-    if advance_from(
-        campaigns,
-        plans,
-        &campaign_id,
-        &campaign.owner,
-        &previous.plan_id,
-        plan_id.clone(),
-    )
-    .await?
-    .is_none()
-    {
-        let cancelled = plans
-            .write_cancel_marker(plan_id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(
-                    %campaign_id,
-                    %plan_id,
-                    error = %format_args!("{e:#}"),
-                    "could not cancel a campaign revision that lost the race to another"
-                );
-            })
-            .is_ok();
-        if cancelled {
-            tracing::warn!(
-                %campaign_id,
-                %plan_id,
-                revised = %previous.plan_id,
-                "filed revision cancelled: its campaign moved off the plan it revised or changed its owner"
-            );
-        }
-        return Err(CampaignAdminError::Overtaken {
-            campaign_id,
-            plan_id: plan_id.clone(),
-            revised: previous.plan_id,
-            cancelled,
-        });
-    }
 
     let cancel_requested = cancel_superseded(plans, &previous.plan_id)
         .await
@@ -1815,19 +2102,20 @@ pub async fn complete_revision(
         .iter()
         .filter(|job_id| held.contains(job_id))
         .count();
-    // A re-run or recalculated job is minted afresh, so the revision never
-    // holds it.
+    // A re-run, marked or recalculated job is minted afresh, so the revision
+    // never holds it.
     let rerun_job_count = rerun.len();
+    let marked_job_count = fail.len();
     let recalculated_job_count = recalculate.len();
     let revised = Revised {
         superseded: previous.plan_id,
         carried_job_count,
         rerun_job_count,
+        marked_job_count,
         recalculated_job_count,
-        dropped_job_count: previous
-            .job_ids
-            .len()
-            .saturating_sub(carried_job_count + rerun_job_count + recalculated_job_count),
+        dropped_job_count: previous.job_ids.len().saturating_sub(
+            carried_job_count + rerun_job_count + marked_job_count + recalculated_job_count,
+        ),
         cancel_requested,
     };
     tracing::info!(
@@ -1837,6 +2125,8 @@ pub async fn complete_revision(
         carried_job_count,
         rerun_job_count,
         rerun_job_ids = ?rerun,
+        marked_job_count,
+        marked_job_ids = ?fail.keys().collect::<Vec<_>>(),
         recalculated_job_count,
         recalculated_job_ids = ?recalculate,
         dropped_job_count = revised.dropped_job_count,
@@ -1937,7 +2227,12 @@ pub async fn rerun_jobs(
     let campaign = require(&*stores.campaigns, campaign_id).await?;
     let revision = Head::read(&*stores.plans, campaign, None)
         .await?
-        .rerun(&*stores.plans, &*stores.submissions, job_ids)
+        .rerun(
+            &*stores.plans,
+            &*stores.submissions,
+            job_ids,
+            BTreeMap::new(),
+        )
         .await?;
     // The head's document names each imported model as its vault arm, so a
     // re-run imports nothing.
@@ -2031,7 +2326,12 @@ pub async fn dry_run_rerun(
     let campaign = require(&*stores.campaigns, campaign_id).await?;
     let revision = Head::read(&*stores.plans, campaign, None)
         .await?
-        .rerun(&*stores.plans, &*stores.submissions, job_ids)
+        .rerun(
+            &*stores.plans,
+            &*stores.submissions,
+            job_ids,
+            BTreeMap::new(),
+        )
         .await?;
     dry_run_revision(
         stores,
@@ -2141,6 +2441,7 @@ async fn dry_run_revision(
             membership,
             &preview_bodies,
             &*stores.plans,
+            &*stores.todo,
             &*stores.submissions,
             &*stores.orgs,
         )
@@ -2158,7 +2459,9 @@ mod tests {
 
     use pipette_core::organization::Organization;
     use pipette_core::user::User;
-    use pipette_plan_types::{ContactEmail, ExpiresAt, NonEmptyTrimmedString, OrgSlug};
+    use pipette_plan_types::{
+        CampaignState, ContactEmail, ExpiresAt, NonEmptyTrimmedString, OrgSlug,
+    };
     use pipette_store::{ContentKeyCas, ContentKeyClaim, ContentKeyRecord, ContentKeyVersion};
     use pipette_store_fs::build_local_fs_stores;
 
@@ -2177,20 +2480,22 @@ mod tests {
         NoSuchOrg,
     }
 
-    fn stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
+    async fn stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
         let dir = tempfile::tempdir()?;
         let config = pipette_core::config::Config {
             storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Default::default()
         };
-        Ok((dir, build_local_fs_stores(&config)?))
+        Ok((
+            dir,
+            build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)?,
+        ))
     }
 
-    /// [`stores`] with the queue on a new database, for a test that runs
-    /// `queue-maintenance`. The records stay in the directory, where
-    /// [`as_filed_under_v1`] deletes a job source. `None` skips the test
-    /// without `TEST_DATABASE_URL`.
+    /// [`stores`] with the records and the queue on a new database, for a test
+    /// that runs `queue-maintenance`. `None` skips the test without
+    /// `TEST_DATABASE_URL`.
     async fn sql_stores() -> anyhow::Result<
         Option<(
             tempfile::TempDir,
@@ -2201,9 +2506,8 @@ mod tests {
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(None);
         };
-        let (dir, mut stores) = stores()?;
-        stores.todo = std::sync::Arc::new(pipette_store_sql::SqlTodoStore::new(db.db().clone()));
-        Ok(Some((dir, stores, db)))
+        let (dir, stores) = stores().await?;
+        Ok(Some((dir, db.stores(stores), db)))
     }
 
     fn a_new_campaign(name: &str) -> anyhow::Result<NewCampaign> {
@@ -2229,6 +2533,31 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PlanStore for CancelFails {
+        async fn end_membership(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            self.0.end_membership(job_id, plan_id).await
+        }
+        async fn join_job(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+            expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            self.0.join_job(job_id, plan_id, expires_at).await
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            self.0.read_gc_candidates().await
+        }
+        async fn write_gc_candidates(
+            &self,
+            candidates: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            self.0.write_gc_candidates(candidates).await
+        }
+
         async fn write_cancel_marker(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
             anyhow::bail!("simulated cancel marker write failure")
         }
@@ -2575,7 +2904,7 @@ mod tests {
         #[case] fault: WriteFault,
         #[case] expect: Reconciled,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let new = a_new_campaign("nightly")?;
         let campaign_id = new.campaign_id().clone();
         let plan_id = PlanId::try_new("plan-first")?;
@@ -2622,7 +2951,7 @@ mod tests {
         #[case] fault: WriteFault,
         #[case] expect: Reconciled,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let campaign_id = campaign.campaign_id.clone();
         let seed_plan = PlanId::try_new("plan-seed")?;
@@ -2636,7 +2965,7 @@ mod tests {
             ..FaultyPut::new(stores.campaigns.clone(), fault)
         };
 
-        let outcome = advance(&faulty, &*stores.plans, &campaign_id, plan_id.clone()).await;
+        let outcome = advance(&faulty, &*stores.plans, &campaign, plan_id.clone()).await;
 
         match (expect, outcome) {
             (Reconciled::Committed, Ok(advanced)) => {
@@ -2669,7 +2998,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_does_not_cancel_a_write_that_lands_after_readback() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let new = a_new_campaign("nightly")?;
         let campaign_id = new.campaign_id().clone();
         let plan_id = PlanId::try_new("plan-first")?;
@@ -2693,7 +3022,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_preserves_a_write_that_lands_after_readback() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let campaign_id = campaign.campaign_id.clone();
         let previous = PlanId::try_new("plan-seed")?;
@@ -2702,7 +3031,7 @@ mod tests {
         put_filed(&*stores.plans, &plan_id, &campaign_id, Some(&previous)).await?;
         let late = LatePut::new(stores.campaigns.clone());
 
-        let outcome = advance(&late, &*stores.plans, &campaign_id, plan_id.clone()).await;
+        let outcome = advance(&late, &*stores.plans, &campaign, plan_id.clone()).await;
 
         assert!(matches!(
             outcome,
@@ -2720,7 +3049,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_keeps_a_rename_that_lands_during_the_ingest() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let campaign_id = campaign.campaign_id.clone();
 
@@ -2734,7 +3063,7 @@ mod tests {
         let advanced = advance(
             &*stores.campaigns,
             &*stores.plans,
-            &campaign_id,
+            &campaign,
             plan_id.clone(),
         )
         .await?;
@@ -2750,22 +3079,18 @@ mod tests {
     /// The displaced plan, which both surfaces render, is left alone.
     #[tokio::test]
     async fn advance_reports_the_plan_it_supersedes() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
-        let campaign_id = seed(&stores, "nightly").await?.campaign_id;
+        let (_dir, stores) = stores().await?;
+        let campaign = seed(&stores, "nightly").await?;
+        let campaign_id = campaign.campaign_id.clone();
         let first = PlanId::try_new("plan-first")?;
         let second = PlanId::try_new("plan-second")?;
 
-        advance(
-            &*stores.campaigns,
-            &*stores.plans,
-            &campaign_id,
-            first.clone(),
-        )
-        .await?;
+        advance(&*stores.campaigns, &*stores.plans, &campaign, first.clone()).await?;
+        let on_first = require(&*stores.campaigns, &campaign_id).await?;
         let advanced = advance(
             &*stores.campaigns,
             &*stores.plans,
-            &campaign_id,
+            &on_first,
             second.clone(),
         )
         .await?;
@@ -2779,30 +3104,46 @@ mod tests {
 
     #[tokio::test]
     async fn advance_onto_the_current_plan_is_a_no_op() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
-        let campaign_id = seed(&stores, "nightly").await?.campaign_id;
+        let (_dir, stores) = stores().await?;
+        let campaign = seed(&stores, "nightly").await?;
+        let campaign_id = campaign.campaign_id.clone();
         let plan_id = PlanId::try_new("plan-first")?;
 
         advance(
             &*stores.campaigns,
             &*stores.plans,
-            &campaign_id,
+            &campaign,
             plan_id.clone(),
         )
         .await?;
         let before = require(&*stores.campaigns, &campaign_id).await?;
-        let advanced = advance(
-            &*stores.campaigns,
-            &*stores.plans,
-            &campaign_id,
-            plan_id.clone(),
-        )
-        .await?;
+        let advanced =
+            advance(&*stores.campaigns, &*stores.plans, &before, plan_id.clone()).await?;
 
         assert!(!advanced.changed);
         assert_eq!(advanced.superseded, Some(plan_id));
         let after = require(&*stores.campaigns, &campaign_id).await?;
         assert_eq!(after.updated_at, before.updated_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_answers_not_found_once_the_record_is_deleted() -> anyhow::Result<()> {
+        let (_dir, stores) = stores().await?;
+        let campaign = seed(&stores, "nightly").await?;
+        let mut renamed = campaign.clone();
+        assert!(renamed.rename(NonEmptyTrimmedString::try_new("nightly-eu")?, Utc::now()));
+        stores
+            .campaigns
+            .delete_campaign(&campaign.campaign_id)
+            .await?;
+
+        let outcome = replace(&*stores.campaigns, &campaign, &renamed).await;
+
+        let Err(CampaignAdminError::NotFound(gone)) = outcome else {
+            anyhow::bail!("a deleted record did not answer NotFound: {outcome:?}");
+        };
+        assert_eq!(gone, campaign.campaign_id);
         Ok(())
     }
 
@@ -2820,7 +3161,7 @@ mod tests {
         #[case] org_exists: bool,
         #[case] expected: Expect,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let known = User::try_new(ContactEmail::try_new("op@example.test")?, Utc::now())?;
         stores.users.put_user(&known).await?;
         let org = Organization::new(
@@ -2873,7 +3214,7 @@ mod tests {
     async fn owner_refuses_a_pair_that_names_no_single_owner(
         #[case] both: bool,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let (user, org) = if both {
             (
                 Some(UserId::try_new("user_known")?),
@@ -2903,7 +3244,7 @@ mod tests {
         #[case] cancel_requested: bool,
         #[case] refused: bool,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let plan_id = PlanId::try_new("plan-seed")?;
         stores
@@ -2950,7 +3291,7 @@ mod tests {
     /// the scan.
     #[tokio::test]
     async fn delete_refuses_when_a_filing_advances_during_the_scan() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let filed = PlanId::try_new("plan-filed")?;
         stores
@@ -2980,7 +3321,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_skips_an_unreadable_manifest() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         std::fs::write(dir.path().join("plans/plan-broken.json"), b"{")?;
         let listing = pipette_store::drain_plans(&*stores.plans, None).await?;
@@ -3011,8 +3352,8 @@ mod tests {
     async fn advance_cancels_the_plan_when_the_campaign_goes_during_the_ingest(
         #[case] cancel_works: bool,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
-        let campaign_id = seed(&stores, "nightly").await?.campaign_id;
+        let (_dir, stores) = stores().await?;
+        let campaign = seed(&stores, "nightly").await?;
         let plan_id = PlanId::try_new("plan-first")?;
         let failing = CancelFails(stores.plans.clone());
         let plans: &dyn PlanStore = if cancel_works {
@@ -3022,9 +3363,12 @@ mod tests {
         };
 
         // The caller has staged its jobs. The campaign goes before it advances.
-        stores.campaigns.delete_campaign(&campaign_id).await?;
+        stores
+            .campaigns
+            .delete_campaign(&campaign.campaign_id)
+            .await?;
 
-        let outcome = advance(&*stores.campaigns, plans, &campaign_id, plan_id.clone()).await;
+        let outcome = advance(&*stores.campaigns, plans, &campaign, plan_id.clone()).await;
 
         let Err(CampaignAdminError::DeletedDuringFiling {
             plan_id: named_plan,
@@ -3084,195 +3428,11 @@ mod tests {
         }
     }
 
-    /// An in-memory S3 queue whose second promotion reports an ambiguous
-    /// error. The destination either has the body or stays absent.
-    fn second_promotion_fails(
-        landed: bool,
-    ) -> (
-        pipette_store_s3::S3TodoStore,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        use aws_sdk_s3::error::ErrorMetadata;
-        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
-        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-        use aws_sdk_s3::operation::put_object::PutObjectOutput;
-        use aws_sdk_s3::operation::rename_object::{RenameObjectError, RenameObjectOutput};
-        use aws_sdk_s3::primitives::ByteStream;
-        use aws_sdk_s3::types::Object;
-        use aws_sdk_s3::types::error::NoSuchKey;
-        use aws_smithy_mocks::{MockResponse, RuleMode, mock};
-
-        let objects = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
-            String,
-            Vec<u8>,
-        >::new()));
-        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let failed_source = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-        let put = {
-            let objects = objects.clone();
-            mock!(aws_sdk_s3::Client::put_object).then_compute_response(move |req| {
-                let key = req.key().unwrap_or_default().to_string();
-                let bytes = req.body().bytes().unwrap_or_default().to_vec();
-                objects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(key, bytes);
-                MockResponse::Output(PutObjectOutput::builder().build())
-            })
-        };
-        let get = {
-            let objects = objects.clone();
-            mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
-                match objects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(req.key().unwrap_or_default())
-                {
-                    Some(bytes) => MockResponse::Output(
-                        GetObjectOutput::builder()
-                            .body(ByteStream::from(bytes.clone()))
-                            .build(),
-                    ),
-                    None => {
-                        MockResponse::Error(GetObjectError::NoSuchKey(NoSuchKey::builder().build()))
-                    }
-                }
-            })
-        };
-        let list = {
-            let objects = objects.clone();
-            mock!(aws_sdk_s3::Client::list_objects_v2).then_compute_response(move |req| {
-                let prefix = req.prefix().unwrap_or_default();
-                let now = aws_sdk_s3::primitives::DateTime::from_secs(Utc::now().timestamp());
-                let contents = objects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .keys()
-                    .filter(|key| key.starts_with(prefix))
-                    .map(|key| Object::builder().key(key).last_modified(now).build())
-                    .collect::<Vec<_>>();
-                MockResponse::Output(
-                    ListObjectsV2Output::builder()
-                        .set_contents(Some(contents))
-                        .is_truncated(false)
-                        .build(),
-                )
-            })
-        };
-        let delete = {
-            let objects = objects.clone();
-            mock!(aws_sdk_s3::Client::delete_object).then_compute_response(move |req| {
-                objects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(req.key().unwrap_or_default());
-                MockResponse::Output(
-                    aws_sdk_s3::operation::delete_object::DeleteObjectOutput::builder().build(),
-                )
-            })
-        };
-        let rename = {
-            let objects = objects.clone();
-            let sends = sends.clone();
-            let failed_source = failed_source.clone();
-            mock!(aws_sdk_s3::Client::rename_object).then_compute_response(move |req| {
-                let src = req.rename_source().unwrap_or_default();
-                let dst = req.key().unwrap_or_default();
-                let call = sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut failed = failed_source
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if call == 1 {
-                    *failed = Some(src.to_string());
-                }
-                let ambiguous = failed.as_deref() == Some(src);
-                if ambiguous && !landed {
-                    return MockResponse::Error(RenameObjectError::generic(
-                        ErrorMetadata::builder()
-                            .code("AccessDenied")
-                            .message("injected ambiguous promotion failure")
-                            .build(),
-                    ));
-                }
-                let moved = objects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(src);
-                if let Some(bytes) = moved {
-                    objects
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(dst.to_string(), bytes);
-                }
-                if ambiguous {
-                    MockResponse::Error(RenameObjectError::generic(
-                        ErrorMetadata::builder()
-                            .code("AccessDenied")
-                            .message("injected ambiguous promotion failure")
-                            .build(),
-                    ))
-                } else {
-                    MockResponse::Output(RenameObjectOutput::builder().build())
-                }
-            })
-        };
-        let client = aws_smithy_mocks::mock_client!(
-            aws_sdk_s3,
-            RuleMode::MatchAny,
-            &[&put, &get, &list, &delete, &rename]
-        );
-        (
-            pipette_store_s3::S3TodoStore::new(client, "test-bucket", ""),
-            sends,
-        )
-    }
-
-    #[rstest::rstest]
-    #[case::landed(true)]
-    #[case::not_landed(false)]
-    #[tokio::test]
-    async fn three_job_create_reconciles_second_promotion(
-        #[case] landed: bool,
-    ) -> anyhow::Result<()> {
-        let (dir, mut stores) = stores()?;
-        let path = afm_mlx_plan(dir.path())?;
-        let (todo, sends) = second_promotion_fails(landed);
-        stores.todo = std::sync::Arc::new(todo);
-        let new = a_new_campaign("nightly")?;
-        let campaign_id = new.campaign_id().clone();
-
-        let outcome = create(&stores, settings(ModelCheck::none()), new, &path, None).await;
-
-        if landed {
-            let (campaign, report) = outcome?;
-            assert_eq!(report.job_count, 3);
-            assert_eq!(campaign.current_plan_id, Some(report.plan_id));
-            assert!(stores.campaigns.get_campaign(&campaign_id).await?.is_some());
-            assert!(sends.load(std::sync::atomic::Ordering::SeqCst) >= 3);
-        } else {
-            assert!(
-                outcome.is_err(),
-                "an absent destination must fail the filing"
-            );
-            assert!(stores.campaigns.get_campaign(&campaign_id).await?.is_none());
-            let plans = pipette_store::drain_plans(&*stores.plans, None)
-                .await?
-                .items;
-            let [creating] = plans.as_slice() else {
-                anyhow::bail!("expected one creating plan, found {}", plans.len());
-            };
-            assert_eq!(creating.status, PlanStatus::Creating);
-            assert!(!stores.plans.has_cancel_marker(&creating.plan_id).await?);
-            assert!(sends.load(std::sync::atomic::Ordering::SeqCst) >= 3);
-        }
-        Ok(())
-    }
-
     /// `campaigns create --plan` files the document as the campaign's first
     /// plan, under the id the campaign is then written with.
     #[tokio::test]
     async fn create_files_the_first_plan_then_the_campaign() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let path = afm_mlx_plan(dir.path())?;
         let new = a_new_campaign("nightly")?;
         let campaign_id = new.campaign_id().clone();
@@ -3305,7 +3465,7 @@ mod tests {
     /// Keep the first plan available for reconciliation.
     #[tokio::test]
     async fn create_preserves_the_plan_when_the_campaign_write_fails() -> anyhow::Result<()> {
-        let (dir, mut stores) = stores()?;
+        let (dir, mut stores) = stores().await?;
         stores.campaigns = std::sync::Arc::new(PutFails(stores.campaigns.clone()));
         let path = afm_mlx_plan(dir.path())?;
         let new = a_new_campaign("nightly")?;
@@ -3335,7 +3495,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_with_strict_models_refuses_an_unknown_model() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let path = afm_mlx_plan(dir.path())?;
         // Non-empty, or every model resolves: the table names none of the plan's.
         let table = crate::model_params::ModelParamTable::from_toml(r#""LFM2-700M" = 742"#)?;
@@ -3359,13 +3519,13 @@ mod tests {
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn dry_run_document_writes_nothing() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let path = afm_mlx_plan(dir.path())?;
 
         let report = dry_run_document(
@@ -3383,13 +3543,13 @@ mod tests {
                 .items
                 .is_empty()
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn ingest_into_files_a_document_and_advances() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let campaign_id = seed(&stores, "nightly").await?.campaign_id;
         let path = afm_mlx_plan(dir.path())?;
 
@@ -3420,6 +3580,47 @@ mod tests {
             &manifest.job_ids,
         )
         .await?;
+        Ok(())
+    }
+
+    /// Another filing that moves the head before the ingest's head write wins,
+    /// and the ingest cancels its own plan.
+    #[tokio::test]
+    async fn ingest_into_loses_to_a_head_move_and_cancels_its_plan() -> anyhow::Result<()> {
+        let (dir, mut stores) = stores().await?;
+        let campaign_id = seed(&stores, "nightly").await?.campaign_id;
+        let path = afm_mlx_plan(dir.path())?;
+        let winner = PlanId::try_new("plan-winner")?;
+        let moved_to = winner.clone();
+        stores.campaigns = std::sync::Arc::new(pipette_store_testkit::RivalWrite::new(
+            stores.campaigns.clone(),
+            1,
+            move |mut stored: Campaign| {
+                stored.advance(moved_to.clone(), Utc::now());
+                Some(stored)
+            },
+        ));
+
+        let outcome = ingest_into(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign_id,
+            PlanInput::Document(&path),
+            None,
+        )
+        .await;
+
+        let Err(CampaignAdminError::Overtaken {
+            plan_id,
+            cancelled: true,
+            ..
+        }) = outcome
+        else {
+            anyhow::bail!("expected Overtaken with the plan cancelled, got {outcome:?}");
+        };
+        assert!(stores.plans.has_cancel_marker(&plan_id).await?);
+        let stored = require(&*stores.campaigns, &campaign_id).await?;
+        assert_eq!(stored.current_plan_id, Some(winner));
         Ok(())
     }
 
@@ -3477,7 +3678,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         models: ModelCheck<'_>,
         document: &str,
     ) -> anyhow::Result<GatedCampaign> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         afm_mlx_plan(dir.path())?;
         let (hub, imports) = gated_imports().await?;
         let plans = tempfile::tempdir()?;
@@ -3658,7 +3859,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         use pipette_core::vault::VaultOwner;
         use pipette_hub_testkit::GOOD_TOKEN;
 
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let campaign = seed(&stores, "gated").await?;
         afm_mlx_plan(dir.path())?;
         // The mock Hub serves until it drops.
@@ -3882,6 +4083,7 @@ benchmarks = ["decode_throughput_512_100"]
                 superseded: first.plan_id.clone(),
                 carried_job_count: 2,
                 rerun_job_count: 0,
+                marked_job_count: 0,
                 recalculated_job_count: 0,
                 dropped_job_count: 1,
                 cancel_requested: true,
@@ -3944,7 +4146,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// The revision is filed as written, comments and all.
     #[tokio::test]
     async fn a_document_revision_carries_what_it_still_describes() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let runs = |benchmark: &'static str| {
             move |body: &serde_json::Value| {
@@ -3986,6 +4188,7 @@ benchmarks = ["decode_throughput_512_100"]
                 superseded: first.plan_id.clone(),
                 carried_job_count: 2,
                 rerun_job_count: 0,
+                marked_job_count: 0,
                 recalculated_job_count: 0,
                 dropped_job_count: 1,
                 cancel_requested: true,
@@ -4026,7 +4229,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// from.
     #[tokio::test]
     async fn a_document_revision_files_nothing_it_need_not() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let (_, head) = head_document(&stores, &campaign.campaign_id).await?;
         let revise = |base: PlanId, document: String| {
@@ -4105,7 +4308,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_revision_rekeys_an_old_heads_jobs_before_carrying(
         #[case] unstored: bool,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let kept = queued_requiring(&stores, &first, "os:macos").await?;
         // Finished, so only the revision's carry keeps them: the merge joins
@@ -4261,7 +4464,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// their cells again; without it the head's document files nothing.
     #[tokio::test]
     async fn carrying_earlier_brings_back_runs_the_head_queued_again() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         let routed = routed_to(dir.path(), "lab-east")?;
@@ -4287,11 +4490,44 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// `carry_earlier` brings back an earlier run in place of a queued job, but
+    /// not in place of one a client is running: that job finishes, and the
+    /// revision takes its result.
+    #[tokio::test]
+    async fn carrying_earlier_keeps_a_job_a_client_is_running() -> anyhow::Result<()> {
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        anyhow::ensure!(!ran.is_empty(), "the macOS variant queues jobs");
+        let routed = routed_to(dir.path(), "lab-east")?;
+        let second = revise_to(&stores, &campaign, &first.plan_id, &routed, false)
+            .await?
+            .context("a changed document files a revision")?;
+        finish_on_build(&stores, &ran, Some("2026.10.05-old")).await?;
+        let requeued = queued_requiring(&stores, &second, "tag:lab-east").await?;
+        let running = requeued.first().context("a re-queued job")?;
+        lease(&stores, running).await?;
+
+        let preview =
+            carrying_earlier_preview(&stores, &campaign, &second.plan_id, &routed).await?;
+        assert_eq!(preview.restored_job_count, ran.len() - 1);
+        assert!(!preview.dropped_job_ids.contains(running));
+        let third = revise_to(&stores, &campaign, &second.plan_id, &routed, true)
+            .await?
+            .context("carrying earlier runs files a revision")?;
+
+        assert!(held(&third).contains(running));
+        assert_eq!(held(&third).len(), held(&second).len());
+        Ok(())
+    }
+
     /// Two earlier plans ran the cells the head queued again: each cell takes
     /// one run, the newer plan's.
     #[tokio::test]
     async fn carrying_earlier_takes_the_newest_earlier_run() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let oldest = queued_requiring(&stores, &first, "os:macos").await?;
         let second = revise_to(
@@ -4328,7 +4564,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// run counts it with the cells to queue, not the head's runs to repeat.
     #[tokio::test]
     async fn carrying_earlier_counts_a_failed_earlier_run_as_new() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         let (second, _) = edit_variants(
@@ -4357,7 +4593,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// A job a re-run ran again stays out: the re-run was asked for.
     #[tokio::test]
     async fn carrying_earlier_leaves_out_a_job_a_rerun_replaced() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         finish_on_build(&stores, &ran, None).await?;
@@ -4379,12 +4615,439 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// A job a mark replaced stays out too, though new requirements leave its
+    /// cell nothing of the head: a failure carries by digest alone.
+    #[tokio::test]
+    async fn carrying_earlier_leaves_out_a_job_a_mark_replaced() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let fail = ran
+            .iter()
+            .map(|job_id| anyhow::Ok((job_id.clone(), NonEmptyTrimmedString::try_new("swap")?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let revision = Head::read(&*stores.plans, campaign.clone(), None)
+            .await?
+            .rerun(&*stores.plans, &*stores.submissions, BTreeSet::new(), fail)
+            .await?;
+        let (second, _) =
+            file_cli_revision(&stores, settings(ModelCheck::none()), revision, None).await?;
+        let routed = routed_to(dir.path(), "lab-east")?;
+
+        let preview =
+            carrying_earlier_preview(&stores, &campaign, &second.plan_id, &routed).await?;
+
+        assert_eq!(preview.dropped_job_ids.len(), ran.len());
+        assert_eq!(preview.restored_job_count, 0);
+        Ok(())
+    }
+
+    /// The example document with each macOS cell under an attempt limit of
+    /// `seconds`.
+    fn limited_to(dir: &std::path::Path, seconds: u64) -> anyhow::Result<String> {
+        let flags = ["decode_throughput", "end_to_end_latency"].map(|benchmark_type| {
+            format!(
+                "{{ benchmark_type = \"{benchmark_type}\", runtime_type = \"mlx_macos_pipette\", \
+                 model_type = \"mlx\", attempt_timeout_seconds = {seconds} }}"
+            )
+        });
+        Ok(format!(
+            "{}\nbenchmark_flags = [{}]\n",
+            std::fs::read_to_string(afm_mlx_plan(dir)?)?.trim_end(),
+            flags.join(", ")
+        ))
+    }
+
+    /// `carry_across_limit`, with `carry_earlier` when `earlier`.
+    fn across_limit(earlier: bool) -> Offer {
+        Offer {
+            earlier,
+            across_limit: true,
+            ..Offer::default()
+        }
+    }
+
+    /// What a dry run says of the head's jobs: how many the revision holds,
+    /// how many cells it queues as new, and how many finished ones it runs
+    /// again.
+    fn carry_counts(preview: &RevisionPreview) -> (usize, usize, usize) {
+        (
+            preview.carried_job_count,
+            preview.new_job_count,
+            preview.requirements_rerun_job_count,
+        )
+    }
+
+    /// Raising an attempt limit keeps the finished runs, which passed a
+    /// tighter one, and queues nothing for them. Putting it back keeps them
+    /// too: they were requested under it. Lowering it further runs them again
+    /// unless the filer sets `carry_across_limit`. The option alone files
+    /// nothing for the head's own document, as the document alone does.
+    #[tokio::test]
+    async fn a_raised_limit_keeps_the_runs_and_a_lowered_one_asks() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let limited = limited_to(dir.path(), 180)?;
+        let second = revise_to(&stores, &campaign, &first.plan_id, &limited, false)
+            .await?
+            .context("the limited plan")?;
+        let ran = queued_requiring(&stores, &second, "os:macos").await?;
+        assert_eq!(ran.len(), 2);
+        finish_on_build(&stores, &ran, None).await?;
+
+        let raised = limited_to(dir.path(), 300)?;
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &second.plan_id,
+            &raised,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (3, 0, 0));
+        assert!(preview.dropped_job_ids.is_empty(), "{preview:?}");
+        let third = revise_to(&stores, &campaign, &second.plan_id, &raised, false)
+            .await?
+            .context("the raised plan")?;
+        assert!(ran.iter().all(|job_id| held(&third).contains(job_id)));
+        assert!(
+            queued_requiring(&stores, &third, "os:macos")
+                .await?
+                .is_empty()
+        );
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &third.plan_id,
+            &limited,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (3, 0, 0));
+
+        let lowered = limited_to(dir.path(), 120)?;
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &third.plan_id,
+            &lowered,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (1, 0, 2));
+        assert_eq!(
+            preview.dropped_job_ids.iter().collect::<BTreeSet<_>>(),
+            ran.iter().collect()
+        );
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &third.plan_id,
+            &lowered,
+            across_limit(false),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (3, 0, 0));
+        assert!(preview.dropped_job_ids.is_empty(), "{preview:?}");
+        let fourth = revise_offering(
+            &stores,
+            &campaign,
+            &third.plan_id,
+            &lowered,
+            across_limit(false),
+        )
+        .await?
+        .context("the lowered plan")?;
+        assert!(ran.iter().all(|job_id| held(&fourth).contains(job_id)));
+
+        let unswitched = revise_to(&stores, &campaign, &fourth.plan_id, &lowered, false).await?;
+        assert!(unswitched.is_none());
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &fourth.plan_id,
+            &lowered,
+            across_limit(false),
+        )
+        .await?;
+        assert!(preview.unchanged, "{preview:?}");
+        let again = revise_offering(
+            &stores,
+            &campaign,
+            &fourth.plan_id,
+            &lowered,
+            across_limit(false),
+        )
+        .await?;
+        assert!(again.is_none());
+        Ok(())
+    }
+
+    /// `document` with its macOS variant requiring `flags` beside the OS.
+    fn requiring(document: &str, flags: &[&str]) -> String {
+        let flags: String = flags.iter().map(|flag| format!(", \"{flag}\"")).collect();
+        document.replacen(
+            "requires = [\"os:macos\"]",
+            &format!("requires = [\"os:macos\"{flags}]"),
+            1,
+        )
+    }
+
+    /// A plan that kept runs with `carry_across_limit` lists each under the
+    /// limited body, and that limit vouches for the run as the limit it was
+    /// requested with does. A later revision with no option keeps the runs
+    /// when it raises the limit, takes it off again or changes only their
+    /// requirements, and runs them again when it lowers the limit. The body
+    /// is found where the head's document marks a flag `:required` too.
+    #[rstest::rstest]
+    #[case::unmarked(&[])]
+    #[case::a_required_tag(&["tag:lab-east:required"])]
+    #[tokio::test]
+    async fn a_plan_vouches_for_the_limit_it_holds_a_run_under(
+        #[case] flags: &[&str],
+    ) -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let unlimited = requiring(&std::fs::read_to_string(afm_mlx_plan(dir.path())?)?, flags);
+        let limited =
+            |seconds: u64| anyhow::Ok(requiring(&limited_to(dir.path(), seconds)?, flags));
+        let (campaign, first) = donor_of(&stores, dir.path(), "nightly", &unlimited).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        assert_eq!(ran.len(), 2);
+        finish_on_build(&stores, &ran, None).await?;
+        let second = revise_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &limited(180)?,
+            across_limit(false),
+        )
+        .await?
+        .context("the limited plan")?;
+        assert!(ran.iter().all(|job_id| held(&second).contains(job_id)));
+
+        let counts = |document: String| {
+            let (stores, campaign, base) = (&stores, &campaign, &second.plan_id);
+            async move {
+                let preview =
+                    preview_offering(stores, campaign, base, &document, Offer::default()).await?;
+                anyhow::Ok(carry_counts(&preview))
+            }
+        };
+        assert_eq!(counts(limited(300)?).await?, (3, 0, 0));
+        assert_eq!(counts(limited(120)?).await?, (1, 0, 2));
+        assert_eq!(counts(unlimited).await?, (3, 0, 0));
+
+        let routed = requiring(
+            &limited_to(dir.path(), 180)?,
+            &[flags, &["tag:rack-2"][..]].concat(),
+        );
+        assert_eq!(counts(routed.clone()).await?, (3, 0, 0));
+        let third = revise_to(&stores, &campaign, &second.plan_id, &routed, false)
+            .await?
+            .context("the routed plan")?;
+        assert!(ran.iter().all(|job_id| held(&third).contains(job_id)));
+        assert!(
+            queued_requiring(&stores, &third, "os:macos")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// The body a head holds a run for is read off the head's document. Where
+    /// the document no longer expands, only the limit the run was requested
+    /// with vouches for it, so a change of requirements runs the kept runs
+    /// again unless the filer sets `carry_across_limit` once more.
+    #[tokio::test]
+    async fn a_head_that_no_longer_expands_vouches_for_no_limit() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let limited = limited_to(dir.path(), 180)?;
+        let second = revise_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &limited,
+            across_limit(false),
+        )
+        .await?
+        .context("the limited plan")?;
+        // Typed as evals, no benchmark of the document takes its flags, so the
+        // document no longer parses.
+        let mut manifest = stores
+            .plans
+            .get_plan(&second.plan_id)
+            .await?
+            .context("the head manifest")?;
+        manifest
+            .benchmark_types
+            .values_mut()
+            .for_each(|kind| *kind = BenchmarkType::Eval);
+        stores.plans.put_plan(&manifest).await?;
+        let routed = requiring(&limited, &["tag:lab-east"]);
+
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &second.plan_id,
+            &routed,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (1, 0, 2));
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &second.plan_id,
+            &routed,
+            across_limit(false),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (3, 0, 0));
+        Ok(())
+    }
+
+    /// A limit set on runs requested with none keeps them only with
+    /// `carry_across_limit`, which the plan's change records. The plan then
+    /// lists each run under the limited body, so a later revision carries it by
+    /// digest, and a revert back to the plan takes it again though the head
+    /// holds it under the unlimited body.
+    #[tokio::test]
+    async fn runs_kept_across_a_limit_stay_with_the_plan_that_kept_them() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let limited = limited_to(dir.path(), 180)?;
+
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &limited,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (1, 0, 2));
+        assert_eq!(
+            preview.dropped_job_ids.iter().collect::<BTreeSet<_>>(),
+            ran.iter().collect()
+        );
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &limited,
+            across_limit(false),
+        )
+        .await?;
+        assert_eq!(carry_counts(&preview), (3, 0, 0));
+        assert!(preview.dropped_job_ids.is_empty(), "{preview:?}");
+        let second = revise_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &limited,
+            across_limit(false),
+        )
+        .await?
+        .context("the limited plan")?;
+        assert!(ran.iter().all(|job_id| held(&second).contains(job_id)));
+        assert_eq!(
+            second.change,
+            Some(RevisionChange::Document {
+                carry_earlier: false,
+                carry_across_limit: true,
+                inherit_from: Vec::new(),
+            })
+        );
+
+        let widened = format!("{limited}{MLX_700M_VARIANT}");
+        let third = revise_to(&stores, &campaign, &second.plan_id, &widened, false)
+            .await?
+            .context("the widened plan")?;
+        assert!(ran.iter().all(|job_id| held(&third).contains(job_id)));
+
+        let (stores, campaign_id) = (&stores, &campaign.campaign_id);
+        let revert = |base: PlanId, target: PlanId| async move {
+            revert_to(
+                stores,
+                settings(ModelCheck::none()),
+                campaign_id,
+                &base,
+                &target,
+                None,
+            )
+            .await
+        };
+        let (unlimited, _) = revert(third.plan_id.clone(), first.plan_id.clone())
+            .await?
+            .context("the revert to the first plan")?;
+        assert!(ran.iter().all(|job_id| held(&unlimited).contains(job_id)));
+        let dry_run = dry_run_revert(
+            stores,
+            settings(ModelCheck::none()),
+            campaign_id,
+            &unlimited.plan_id,
+            &second.plan_id,
+            None,
+        )
+        .await?;
+        assert_eq!(carry_counts(&dry_run.preview), (3, 0, 0));
+        assert!(dry_run.preview.dropped_job_ids.is_empty(), "{dry_run:?}");
+        let (relimited, _) = revert(unlimited.plan_id.clone(), second.plan_id.clone())
+            .await?
+            .context("the revert to the limited plan")?;
+        assert!(ran.iter().all(|job_id| held(&relimited).contains(job_id)));
+        Ok(())
+    }
+
+    /// `carry_across_limit` reaches the runs `carry_earlier` offers too. An
+    /// earlier plan's run, requested with no limit, answers the limited cell
+    /// that the head queued again, in place of the head's queued job.
+    #[tokio::test]
+    async fn carrying_across_a_limit_takes_an_earlier_plans_run() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        let limited = limited_to(dir.path(), 180)?;
+        let second = revise_to(&stores, &campaign, &first.plan_id, &limited, false)
+            .await?
+            .context("the limited plan")?;
+        assert!(ran.iter().all(|job_id| !held(&second).contains(job_id)));
+        finish_on_build(&stores, &ran, None).await?;
+
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &second.plan_id,
+            &limited,
+            across_limit(true),
+        )
+        .await?;
+        assert_eq!(preview.restored_job_count, ran.len());
+        let third = revise_offering(
+            &stores,
+            &campaign,
+            &second.plan_id,
+            &limited,
+            across_limit(true),
+        )
+        .await?
+        .context("carrying earlier runs files a revision")?;
+        assert!(ran.iter().all(|job_id| held(&third).contains(job_id)));
+        Ok(())
+    }
+
     /// A revision files the `--note` of the operator, trimmed. A revision also
     /// files the change that it made, with the runs that it offers. An empty
     /// `--note` is an error, as on a first plan.
     #[tokio::test]
     async fn a_revision_states_what_it_changed_beside_its_note() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         finish_on_build(&stores, &ran, None).await?;
@@ -4406,7 +5069,10 @@ benchmarks = ["decode_throughput_512_100"]
                 Some(NonEmptyTrimmedString::try_new("flaky thermals")?),
                 Some(RevisionChange::Rerun {
                     answered: None,
-                    job_count: 1
+                    job_count: 1,
+                    marked_job_count: 0,
+                    group_id: None,
+                    policies: Vec::new(),
                 })
             )
         );
@@ -4435,6 +5101,7 @@ benchmarks = ["decode_throughput_512_100"]
                     removed_variant_count: 1,
                     added_variant_count: 0,
                     carry_earlier: true,
+                    carry_across_limit: false,
                     inherit_from: vec![first.plan_id],
                     restored: Vec::new(),
                 })
@@ -4493,7 +5160,7 @@ benchmarks = ["decode_throughput_512_100"]
         #[case] stale: bool,
         #[case] expected: RevertOutcome,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         finish_on_build(&stores, &ran, None).await?;
@@ -4520,7 +5187,13 @@ benchmarks = ["decode_throughput_512_100"]
             RevertTarget::Spliced => spliced.first().context("a spliced plan")?.clone(),
             RevertTarget::Gone => {
                 let gone = spliced.first().context("a spliced plan")?.clone();
-                pipette_store_testkit::local_fs_remove_plan(dir.path(), &gone)?;
+                db.execute(
+                    "DELETE FROM plans p WHERE NOT EXISTS (
+                         SELECT 1 FROM plan_sources s WHERE s.plan_id = p.plan_id
+                     )",
+                )
+                .await?;
+                assert!(stores.plans.get_plan(&gone).await?.is_none());
                 gone
             }
             RevertTarget::Foreign => created(&stores, dir.path()).await?.1.plan_id,
@@ -4615,7 +5288,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// carried from lists it and its run was recorded since.
     #[tokio::test]
     async fn carrying_earlier_leaves_out_a_job_that_lapsed_later() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         let widened = format!(
@@ -4718,7 +5391,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// place of its own queued job, which stops with the head.
     #[tokio::test]
     async fn inheriting_takes_another_campaigns_finished_runs() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let queued = queued_requiring(&stores, &first, "os:macos").await?;
         let (_, donor) = donor(&stores, dir.path()).await?;
@@ -4762,11 +5435,84 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// A plan named in `inherit_from` vouches for the runs it lists under the
+    /// limited body, which it kept with `carry_across_limit`: a revision to
+    /// that body takes them with no option. Named through the plan that
+    /// requested them, which lists them under the unlimited body, the same
+    /// runs answer nothing.
+    #[tokio::test]
+    async fn inheriting_takes_a_run_its_plan_lists_under_the_limited_body() -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let (donor, unlimited) = donor(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &unlimited, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let document = requiring(&limited_to(dir.path(), 180)?, &["tag:lab-east"]);
+        let limited = revise_offering(
+            &stores,
+            &donor,
+            &unlimited.plan_id,
+            &document,
+            across_limit(false),
+        )
+        .await?
+        .context("the donor's limited plan")?;
+        assert!(ran.iter().all(|job_id| held(&limited).contains(job_id)));
+
+        let offer = inheriting(&stores, &unlimited.plan_id).await?;
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer).await?;
+        assert_eq!(
+            (preview.inherited_job_count, preview.new_job_count),
+            (0, ran.len())
+        );
+        let offer = inheriting(&stores, &limited.plan_id).await?;
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer.clone()).await?;
+        assert_eq!(
+            (preview.inherited_job_count, preview.new_job_count),
+            (ran.len(), 0)
+        );
+        let second = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("inheriting files a revision")?;
+        assert!(ran.iter().all(|job_id| held(&second).contains(job_id)));
+        Ok(())
+    }
+
+    /// With `carry_across_limit`, a named plan's run answers its cell whatever
+    /// limit it ran under: the runs of a plan that set no limit fill cells that
+    /// set one.
+    #[tokio::test]
+    async fn inheriting_across_a_limit_takes_a_run_under_another_limit() -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let (_, unlimited) = donor(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &unlimited, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let document = requiring(&limited_to(dir.path(), 180)?, &["tag:lab-east"]);
+        let offer = inheriting(&stores, &unlimited.plan_id)
+            .await?
+            .across_limit(true);
+
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer.clone()).await?;
+        assert_eq!(
+            (preview.inherited_job_count, preview.new_job_count),
+            (ran.len(), 0)
+        );
+        let second = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("inheriting files a revision")?;
+        assert!(ran.iter().all(|job_id| held(&second).contains(job_id)));
+        Ok(())
+    }
+
     /// Named plans offer their runs in the order named: a cell takes the first
     /// run that succeeded, past a named plan whose run failed.
     #[tokio::test]
     async fn inheriting_takes_the_first_named_success() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let (_, failed) = donor_routed(&stores, dir.path(), "lab-sf").await?;
         let (_, east) = donor_routed(&stores, dir.path(), "lab-east").await?;
@@ -4814,7 +5560,7 @@ benchmarks = ["decode_throughput_512_100"]
 
     #[tokio::test]
     async fn inheriting_queues_a_cell_no_named_plan_ran() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let (_, donor) = donor(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &donor, "os:macos").await?;
@@ -4848,7 +5594,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// key merge joins it, as it joins any live job of the cell.
     #[tokio::test]
     async fn inheriting_leaves_a_live_job_to_the_merge() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let document = format!(
             "{}{MLX_700M_VARIANT}",
@@ -4878,7 +5624,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// take its finished runs: nothing queues.
     #[tokio::test]
     async fn adding_a_plans_variants_takes_its_finished_runs() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         // Its one variant names no benchmarks, and the plan's list is not the
         // campaign's.
@@ -4933,7 +5679,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// and adds no job.
     #[tokio::test]
     async fn adding_a_variant_the_campaign_runs_reports_it_repeated() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let document = format!(
             "{}{MLX_700M_VARIANT}",
@@ -4964,7 +5710,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// `add_from` names a plan the offer read, so its read was checked.
     #[tokio::test]
     async fn adding_from_a_plan_not_offered_is_refused() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (_, first) = created(&stores, dir.path()).await?;
 
         let refused = Offer::default()
@@ -4988,7 +5734,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn restoring_a_variant_takes_its_finished_runs(
         #[case] remove: &[usize],
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         finish_on_build(&stores, &ran, None).await?;
@@ -5061,6 +5807,7 @@ benchmarks = ["decode_throughput_512_100"]
                 removed_variant_count: remove.len(),
                 added_variant_count: 1,
                 carry_earlier: false,
+                carry_across_limit: false,
                 inherit_from: vec![first.plan_id],
                 restored: restore.to_vec(),
             })
@@ -5082,7 +5829,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn restoring_a_variant_that_is_not_there_is_refused(
         #[case] refusal: RestoreRefusal,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (_, first) = created(&stores, dir.path()).await?;
         let (offer, variant_index) = match refusal {
             RestoreRefusal::OutOfRange => (inheriting(&stores, &first.plan_id).await?, 2),
@@ -5131,7 +5878,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn inheriting_leaves_out_a_run_its_campaign_gave_up(
         #[case] given_up: GivenUp,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let (donor_campaign, donor) = donor(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &donor, "os:macos").await?;
@@ -5174,17 +5921,18 @@ benchmarks = ["decode_throughput_512_100"]
         }
         let document = std::fs::read_to_string(afm_mlx_plan(dir.path())?)?;
 
-        let preview = preview_offering(
-            &stores,
-            &campaign,
-            &first.plan_id,
-            &document,
-            inheriting(&stores, &donor.plan_id).await?,
-        )
-        .await?;
+        let offer = inheriting(&stores, &donor.plan_id).await?;
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer.clone()).await?;
 
         assert_eq!(preview.inherited_job_count, 0);
-        assert!(preview.dropped_job_ids.is_empty());
+        assert!(preview.dropped_job_ids.is_empty(), "{preview:?}");
+        assert_eq!(preview.satisfied_job_count, 0);
+
+        let revised = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("a revision with the donor offer")?;
+        assert_eq!(held(&revised), held(&first));
         Ok(())
     }
 
@@ -5192,7 +5940,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// and each is counted apart.
     #[tokio::test]
     async fn inheriting_comes_after_the_campaigns_earlier_plans() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let earlier = queued_requiring(&stores, &first, "os:macos").await?;
         let routed = routed_to(dir.path(), "lab-sf")?;
@@ -5200,7 +5948,12 @@ benchmarks = ["decode_throughput_512_100"]
             .await?
             .context("the second plan")?;
         finish_on_build(&stores, &earlier, None).await?;
-        let (_, donor) = donor(&stores, dir.path()).await?;
+        // This offer needs an independent run, even if another campaign has the cell.
+        let donor_document = format!(
+            "merge_duplicates = false\n{}",
+            routed_to(dir.path(), "lab-east")?
+        );
+        let (_, donor) = donor_of(&stores, dir.path(), "lab-east", &donor_document).await?;
         let donated = queued_requiring(&stores, &donor, "os:macos").await?;
         finish_on_build(&stores, &donated, None).await?;
         let both = Offer {
@@ -5221,7 +5974,7 @@ benchmarks = ["decode_throughput_512_100"]
 
     #[tokio::test]
     async fn inheriting_from_a_missing_plan_is_refused() -> anyhow::Result<()> {
-        let (_dir, stores) = stores()?;
+        let (_dir, stores) = stores().await?;
         let missing = PlanId::try_new("plan-missing")?;
 
         let refused = Offer::read(
@@ -5273,7 +6026,7 @@ benchmarks = ["decode_throughput_512_100"]
         #[case] required: bool,
         #[case] carried: usize,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
         finish_on_build(&stores, &ran, Some("2026.10.05-old")).await?;
@@ -5357,7 +6110,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_variant_edit_of_an_ending_plan_requests_no_cancel(
         #[case] status: pipette_plan_types::PlanStatus,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let mut manifest = stores
             .plans
@@ -5413,7 +6166,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_variant_edit_that_loses_a_race_cancels_its_own_plan(
         #[case] cancel_fails: bool,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let edit = VariantEdit::parse("remove = [0]")?;
         let revision = revise(&stores, campaign.clone(), Some(&first.plan_id), &edit).await?;
@@ -5422,7 +6175,7 @@ benchmarks = ["decode_throughput_512_100"]
         advance(
             &*stores.campaigns,
             &*stores.plans,
-            &campaign.campaign_id,
+            &campaign,
             winner.clone(),
         )
         .await?;
@@ -5464,7 +6217,7 @@ benchmarks = ["decode_throughput_512_100"]
     #[tokio::test]
     async fn a_revision_whose_campaign_changed_its_owner_cancels_its_own_plan() -> anyhow::Result<()>
     {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let edit = VariantEdit::parse("remove = [0]")?;
         let revision = revise(&stores, campaign.clone(), Some(&first.plan_id), &edit).await?;
@@ -5501,12 +6254,136 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// What lands on the campaign between a revision's re-read and its head
+    /// write.
+    #[derive(Debug, Clone, Copy)]
+    enum Between {
+        Revision,
+        Rename,
+        Archive,
+        HandOver,
+        Delete,
+    }
+
+    /// The write in the gap stands. A head move, owner move or delete cancels
+    /// the revision; after a rename or an archive it advances, unless other
+    /// edits meet every try, which cancels it too. No plan the campaign runs is
+    /// cancelled.
+    #[rstest::rstest]
+    #[case::revision(Between::Revision)]
+    #[case::rename(Between::Rename)]
+    #[case::archive(Between::Archive)]
+    #[case::hand_over(Between::HandOver)]
+    #[case::delete(Between::Delete)]
+    #[tokio::test]
+    async fn a_write_between_the_reread_and_the_head_write_stands(
+        #[case] between: Between,
+        #[values(1, REPLACE_ATTEMPTS)] rivals: usize,
+    ) -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let edit = VariantEdit::parse("remove = [0]")?;
+        let revision = revise(&stores, campaign.clone(), Some(&first.plan_id), &edit).await?;
+        let report = file_revision(&stores, &revision).await?;
+        let winner = PlanId::try_new("plan-winner")?;
+        let (eu, us) = (
+            NonEmptyTrimmedString::try_new("nightly-eu")?,
+            NonEmptyTrimmedString::try_new("nightly-us")?,
+        );
+        let heir = CampaignOwner::User {
+            user_id: UserId::try_new("user_heir")?,
+        };
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+        // Renames, then `between` as the last rival write.
+        let rival = pipette_store_testkit::RivalWrite::new(
+            stores.campaigns.clone(),
+            rivals,
+            |mut stored: Campaign| {
+                let now = Utc::now();
+                let last = writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == rivals;
+                let name = if stored.name == eu { &us } else { &eu };
+                match between {
+                    _ if !last => stored.rename(name.clone(), now),
+                    Between::Revision => stored.advance(winner.clone(), now),
+                    Between::Rename => stored.rename(name.clone(), now),
+                    Between::Archive => stored.set_state(CampaignState::Archived, now),
+                    Between::HandOver => stored.set_owner(heir.clone(), now),
+                    Between::Delete => return None,
+                };
+                Some(stored)
+            },
+        );
+
+        let outcome = complete_revision(
+            &rival,
+            &*stores.plans,
+            revision,
+            &report.plan_id,
+            &report.job_ids,
+        )
+        .await;
+
+        let stored = stores.campaigns.get_campaign(&campaign.campaign_id).await?;
+        let head = stored.as_ref().and_then(|c| c.current_plan_id.clone());
+        let advanced = outcome.is_ok();
+        assert_eq!(
+            stores.plans.has_cancel_marker(&report.plan_id).await?,
+            !advanced
+        );
+        assert_eq!(
+            stores.plans.has_cancel_marker(&first.plan_id).await?,
+            advanced
+        );
+        let contended = rivals == REPLACE_ATTEMPTS;
+        match (between, &outcome) {
+            (
+                Between::Revision,
+                Err(CampaignAdminError::Overtaken {
+                    cancelled: true, ..
+                }),
+            ) => {
+                assert_eq!(head, Some(winner));
+            }
+            (
+                Between::HandOver,
+                Err(CampaignAdminError::Overtaken {
+                    cancelled: true, ..
+                }),
+            ) => {
+                assert_eq!(head, Some(first.plan_id.clone()));
+                assert_eq!(stored.map(|c| c.owner), Some(heir));
+            }
+            (
+                Between::Delete,
+                Err(CampaignAdminError::DeletedDuringFiling {
+                    cancelled: true, ..
+                }),
+            ) => assert_eq!(stored, None),
+            (
+                Between::Rename | Between::Archive,
+                Err(CampaignAdminError::AdvanceContended {
+                    cancelled: true, ..
+                }),
+            ) if contended => assert_eq!(head, Some(first.plan_id.clone())),
+            (Between::Rename, Ok(_)) if !contended => {
+                assert_eq!(head, Some(report.plan_id.clone()));
+                assert_eq!(stored.map(|c| c.name), Some(eu));
+            }
+            (Between::Archive, Ok(_)) if !contended => {
+                assert_eq!(head, Some(report.plan_id.clone()));
+                assert_eq!(stored.map(|c| c.state), Some(CampaignState::Archived));
+            }
+            _ => anyhow::bail!("{between:?} as rival write {rivals}: {outcome:?}"),
+        }
+        Ok(())
+    }
+
     /// The campaign write fails after the revision is filed. The error names
     /// the revision, and neither plan is cancelled while the write outcome is
     /// unknown.
     #[tokio::test]
     async fn a_variant_edit_that_cannot_advance_leaves_both_plans_running() -> anyhow::Result<()> {
-        let (dir, mut stores) = stores()?;
+        let (dir, mut stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         stores.campaigns = std::sync::Arc::new(PutFails(stores.campaigns.clone()));
 
@@ -5543,7 +6420,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// error names it for an operator to stop.
     #[tokio::test]
     async fn a_variant_edit_whose_cancel_fails_leaves_both_plans_running() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let edit = VariantEdit::parse("remove = [0]")?;
         let revision = revise(&stores, campaign.clone(), Some(&first.plan_id), &edit).await?;
@@ -5572,28 +6449,17 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
-    /// A job running when the edit lands keeps running: the revision carries
-    /// it, and the replaced plan's teardown releases its lease rather than
-    /// retiring it.
-    #[tokio::test]
-    async fn a_variant_edit_keeps_a_running_job_running() -> anyhow::Result<()> {
-        let Some((dir, stores, _db)) = sql_stores().await? else {
-            return Ok(());
-        };
-        let (campaign, first) = created(&stores, dir.path()).await?;
-        let running = queued_requiring(&stores, &first, "os:macos")
-            .await?
-            .first()
-            .cloned()
-            .context("a macOS job")?;
-        let name = stores
+    /// Lease the queued `job_id` to a registered client: maintenance recycles
+    /// a lease whose client the roster does not know.
+    async fn lease(stores: &Stores, job_id: &JobId) -> anyhow::Result<()> {
+        let expires_at = stores
             .todo
-            .avail_key_for_job(&running)
+            .avail_for_jobs(std::slice::from_ref(job_id))
             .await?
-            .context("the job is queued")?;
-        let (_, expires_at) = pipette_core::todo_filename::parse_avail_filename(&name)?;
-        // A registered holder: maintenance recycles a lease whose client the
-        // roster does not know, which would read as the edit stopping the job.
+            .into_iter()
+            .next()
+            .context("the job is queued")?
+            .expires_at;
         let holder = pipette_core::client::Client {
             client_id: pipette_plan_types::ClientId::try_new("ev1_a")?,
             public_key: pipette_plan_types::PublicKeyHex::try_new(
@@ -5611,13 +6477,34 @@ benchmarks = ["decode_throughput_512_100"]
         let claimed = stores
             .todo
             .claim_job(
-                &running,
+                job_id,
                 expires_at,
                 &holder.client_id,
                 Utc::now() + chrono::Duration::hours(1),
             )
             .await?;
-        assert!(matches!(claimed, pipette_store::ClaimResult::Claimed(_)));
+        anyhow::ensure!(
+            matches!(claimed, pipette_store::ClaimResult::Claimed(_)),
+            "job {job_id} was not claimed"
+        );
+        Ok(())
+    }
+
+    /// A job running when the edit lands keeps running: the revision carries
+    /// it, and the replaced plan's teardown releases its lease rather than
+    /// retiring it.
+    #[tokio::test]
+    async fn a_variant_edit_keeps_a_running_job_running() -> anyhow::Result<()> {
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let running = queued_requiring(&stores, &first, "os:macos")
+            .await?
+            .first()
+            .cloned()
+            .context("a macOS job")?;
+        lease(&stores, &running).await?;
 
         let (report, revised) = edit_variants(
             &stores,
@@ -5635,10 +6522,9 @@ benchmarks = ["decode_throughput_512_100"]
 
         let leased: Vec<JobId> = stores
             .todo
-            .list_leased()
+            .list_leases()
             .await?
-            .iter()
-            .filter_map(|key| pipette_core::todo_filename::parse_leased_key(key).ok())
+            .into_iter()
             .map(|lease| lease.job_id)
             .collect();
         assert_eq!(leased, vec![running.clone()]);
@@ -5742,7 +6628,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_rerun_runs_one_cell_again_and_keeps_the_rest(
         #[case] v1_unstored: Option<bool>,
     ) -> anyhow::Result<()> {
-        let Some((dir, stores, _db)) = sql_stores().await? else {
+        let Some((dir, stores, db)) = sql_stores().await? else {
             return Ok(());
         };
         let (campaign, first) = created(&stores, dir.path()).await?;
@@ -5758,7 +6644,11 @@ benchmarks = ["decode_throughput_512_100"]
             })
             .await?;
         if let Some(unstored) = v1_unstored {
-            as_filed_under_v1(&stores, dir.path(), &first.plan_id, unstored).await?;
+            as_filed_under_v1(&stores, dir.path(), &first.plan_id, false).await?;
+            // The first plan's jobs are the only ones filed so far.
+            if unstored {
+                db.execute("DELETE FROM job_sources").await?;
+            }
         }
         let again = jobs[0].clone();
 
@@ -5777,6 +6667,7 @@ benchmarks = ["decode_throughput_512_100"]
                 superseded: first.plan_id.clone(),
                 carried_job_count: 2,
                 rerun_job_count: 1,
+                marked_job_count: 0,
                 recalculated_job_count: 0,
                 dropped_job_count: 0,
                 cancel_requested: true,
@@ -5834,7 +6725,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// for another plan.
     #[tokio::test]
     async fn a_rerun_refuses_a_job_it_cannot_run_again() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let queued = first.job_ids[0].1.clone();
         let rerun = |job_ids: BTreeSet<JobId>| {
@@ -5903,7 +6794,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// alone, and never a job still queued.
     #[tokio::test]
     async fn a_whole_plan_rerun_takes_the_answered_jobs() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let jobs: Vec<JobId> = first
             .job_ids
@@ -5974,7 +6865,7 @@ benchmarks = ["decode_throughput_512_100"]
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(());
         };
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let object = stores.submissions.clone();
         let stores = pipette_store_sql::overlay(db.db(), stores);
         let (campaign, first) = created(&stores, dir.path()).await?;
@@ -6010,6 +6901,7 @@ benchmarks = ["decode_throughput_512_100"]
                 &*stores.plans,
                 &*stores.submissions,
                 BTreeSet::from([jobs[2].clone()]),
+                BTreeMap::new(),
             )
             .await;
 
@@ -6032,7 +6924,7 @@ benchmarks = ["decode_throughput_512_100"]
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(());
         };
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let stores = pipette_store_sql::overlay(db.db(), stores);
         let (campaign, first) = created(&stores, dir.path()).await?;
         let ran = queued_requiring(&stores, &first, "os:macos").await?;
@@ -6075,7 +6967,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// the head's document and its bodies, and writes nothing.
     #[tokio::test]
     async fn a_dry_run_rerun_checks_the_jobs_and_writes_nothing() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let queued = first.job_ids[0].1.clone();
         let dry_run = |job_ids: BTreeSet<JobId>| {
@@ -6105,13 +6997,15 @@ benchmarks = ["decode_throughput_512_100"]
             (
                 report.preview.carried_job_count,
                 report.preview.new_job_count,
-                report.preview.rerun_job_count,
+                report.preview.rerun_job_ids.len(),
                 report.preview.dropped_job_ids.len()
             ),
             (first.job_ids.len() - 1, 0, 1, 0)
         );
 
-        // The head records another digest for the cell, as if the catalog moved.
+        // The head records another digest for the cell, as if the catalog moved,
+        // for a job filed before sources were kept.
+        pipette_store_testkit::local_fs_remove_job_source(dir.path(), &queued)?;
         let mut manifest = stores
             .plans
             .get_plan(&first.plan_id)
@@ -6143,6 +7037,229 @@ benchmarks = ["decode_throughput_512_100"]
                 .len(),
             1,
             "a dry run filed a plan"
+        );
+        Ok(())
+    }
+
+    /// A re-run that marks one job failed beside the one it runs again lists
+    /// and counts the mark apart from the re-run, and drops neither.
+    #[tokio::test]
+    async fn a_rerun_counts_its_marks_apart_from_its_reruns() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let jobs: Vec<JobId> = first
+            .job_ids
+            .iter()
+            .map(|(_, job_id)| job_id.clone())
+            .collect();
+        let [again, marked, _] = jobs.as_slice() else {
+            anyhow::bail!("three jobs, not {jobs:?}");
+        };
+        futures::stream::iter([again, marked])
+            .map(Ok)
+            .try_for_each(|job_id| {
+                pipette_store_testkit::finish_job(&*stores.submissions, &*stores.todo, job_id)
+            })
+            .await?;
+        let fail = BTreeMap::from([(
+            marked.clone(),
+            NonEmptyTrimmedString::try_new("swap after 5 runs")?,
+        )]);
+        let revision = async || {
+            Head::read(&*stores.plans, campaign.clone(), None)
+                .await?
+                .rerun(
+                    &*stores.plans,
+                    &*stores.submissions,
+                    BTreeSet::from([again.clone()]),
+                    fail.clone(),
+                )
+                .await
+        };
+
+        let dry_run = dry_run_revision(
+            &stores,
+            settings(ModelCheck::none()),
+            revision().await?,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (
+                dry_run.preview.carried_job_count,
+                dry_run.preview.rerun_job_ids,
+                dry_run.preview.marked_job_ids,
+                dry_run.preview.dropped_job_ids
+            ),
+            (1, vec![again.clone()], vec![marked.clone()], Vec::new())
+        );
+
+        let revision = revision().await?;
+        assert_eq!(
+            revision.change(),
+            RevisionChange::Rerun {
+                answered: None,
+                job_count: 1,
+                marked_job_count: 1,
+                group_id: None,
+                policies: Vec::new(),
+            }
+        );
+        let (_, revised) =
+            file_cli_revision(&stores, settings(ModelCheck::none()), revision, None).await?;
+        assert_eq!(
+            revised,
+            Revised {
+                superseded: first.plan_id.clone(),
+                carried_job_count: 1,
+                rerun_job_count: 1,
+                marked_job_count: 1,
+                recalculated_job_count: 0,
+                dropped_job_count: 0,
+                cancel_requested: true,
+            }
+        );
+        Ok(())
+    }
+
+    /// A mark takes a job with no result, still queued or lapsed for the head:
+    /// the dry run lists it, and the revision answers its cell under a new job
+    /// that names it, and carries the other two.
+    #[rstest::rstest]
+    #[case::queued(false)]
+    #[case::lapsed(true)]
+    #[tokio::test]
+    async fn a_mark_takes_a_job_with_no_result(#[case] lapsed: bool) -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let unrun = first.job_ids[0].1.clone();
+        if lapsed {
+            let mut manifest = stores
+                .plans
+                .get_plan(&first.plan_id)
+                .await?
+                .context("the head")?;
+            manifest.expired_jobs.insert(
+                unrun.clone(),
+                pipette_core::plan::ExpiredJob {
+                    horizon: Utc::now() - chrono::Duration::days(1),
+                    recorded_at: Utc::now(),
+                },
+            );
+            stores.plans.put_plan(&manifest).await?;
+        }
+        let fail = BTreeMap::from([(
+            unrun.clone(),
+            NonEmptyTrimmedString::try_new("killed for memory at load")?,
+        )]);
+        let revision = async || {
+            Head::read(&*stores.plans, campaign.clone(), None)
+                .await?
+                .rerun(
+                    &*stores.plans,
+                    &*stores.submissions,
+                    BTreeSet::new(),
+                    fail.clone(),
+                )
+                .await
+        };
+
+        let dry_run = dry_run_revision(
+            &stores,
+            settings(ModelCheck::none()),
+            revision().await?,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (
+                dry_run.preview.carried_job_count,
+                dry_run.preview.marked_job_ids,
+                dry_run.preview.dropped_job_ids
+            ),
+            (2, vec![unrun.clone()], Vec::new())
+        );
+
+        let (report, revised) = file_cli_revision(
+            &stores,
+            settings(ModelCheck::none()),
+            revision().await?,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (
+                revised.carried_job_count,
+                revised.marked_job_count,
+                revised.dropped_job_count
+            ),
+            (2, 1, 0)
+        );
+        assert!(!held(&report).contains(&unrun));
+        let manifest = stores
+            .plans
+            .get_plan(&report.plan_id)
+            .await?
+            .context("the revision's manifest")?;
+        assert_eq!(manifest.rerun_of.values().collect::<Vec<_>>(), [&unrun]);
+        Ok(())
+    }
+
+    /// The revision does not carry the job a mark replaces, so the replaced
+    /// plan's teardown retires one still in the queue, a running one with its
+    /// lease, and releases a job the revision carried.
+    #[rstest::rstest]
+    #[case::queued(false)]
+    #[case::running(true)]
+    #[tokio::test]
+    async fn a_mark_stops_the_job_it_replaces(#[case] running: bool) -> anyhow::Result<()> {
+        let Some((dir, stores, _db)) = sql_stores().await? else {
+            return Ok(());
+        };
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let [(_, replaced), (_, carried), _] = first.job_ids.as_slice() else {
+            anyhow::bail!("three jobs, not {:?}", first.job_ids);
+        };
+        if running {
+            lease(&stores, replaced).await?;
+        }
+        let fail = BTreeMap::from([(
+            replaced.clone(),
+            NonEmptyTrimmedString::try_new("killed for memory at load")?,
+        )]);
+        let revision = Head::read(&*stores.plans, campaign, None)
+            .await?
+            .rerun(&*stores.plans, &*stores.submissions, BTreeSet::new(), fail)
+            .await?;
+        file_cli_revision(&stores, settings(ModelCheck::none()), revision, None).await?;
+        maintain(&stores).await?;
+
+        assert_eq!(stores.todo.get_avail_by_job(replaced).await?, None);
+        assert!(stores.todo.list_leases().await?.is_empty());
+        assert!(stores.todo.get_avail_by_job(carried).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rerun_refuses_a_job_it_also_marks() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let job_id = first.job_ids[0].1.clone();
+        pipette_store_testkit::finish_job(&*stores.submissions, &*stores.todo, &job_id).await?;
+
+        let both = Head::read(&*stores.plans, campaign, None)
+            .await?
+            .rerun(
+                &*stores.plans,
+                &*stores.submissions,
+                BTreeSet::from([job_id.clone()]),
+                BTreeMap::from([(job_id.clone(), NonEmptyTrimmedString::try_new("swap")?)]),
+            )
+            .await;
+
+        assert!(
+            matches!(&both, Err(CampaignAdminError::RerunAndFail(named)) if *named == job_id),
+            "{both:?}"
         );
         Ok(())
     }
@@ -6273,7 +7390,7 @@ benchmarks = ["decode_throughput_512_100"]
         let db = pipette_store_sql::scratch::TestDb::with_pool_size(32)
             .await?
             .context("TEST_DATABASE_URL is required")?;
-        let (dir, mut stores) = stores()?;
+        let (dir, mut stores) = stores().await?;
         stores.submissions = pipette_store_s3::in_memory_submission_store();
         let stores = pipette_store_sql::overlay(db.db(), stores);
         afm_mlx_plan(dir.path())?;
@@ -6335,7 +7452,7 @@ benchmarks = ["decode_throughput_512_100"]
         #[case] recorded: &[(&str, BenchmarkType)],
         #[case] rescorable: bool,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let mut manifest = stores
             .plans
@@ -6384,7 +7501,7 @@ benchmarks = ["decode_throughput_512_100"]
     #[tokio::test]
     async fn an_unreadable_source_is_skipped_only_by_a_whole_plan_recalculation()
     -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let (readable, unreadable) = (first.job_ids[0].1.clone(), first.job_ids[1].1.clone());
         finish(&stores, &readable, "eval").await?;
@@ -6422,7 +7539,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// stays in `creating`.
     #[tokio::test]
     async fn a_record_that_is_not_an_eval_success_fails_at_the_copy() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let id = first.job_ids[0].1.clone();
         let body = pipette_store_testkit::success_record(&id, "decode_throughput");
@@ -6445,6 +7562,251 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// A campaign whose variant runs `eval_a`, `eval_b` and a decode cell, each
+    /// with benchmark flags, and its job for `eval_a`, finished.
+    async fn flagged_evals(
+        stores: &Stores,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<(Campaign, IngestReport, JobId)> {
+        afm_mlx_plan(dir)?;
+        let path = eval_plan(
+            dir,
+            "eval-plan.toml",
+            &["eval_a", "eval_b"],
+            &["eval_a", "eval_b", "decode_throughput_512_100"],
+        )?;
+        let document = format!(
+            "{}benchmark_flags = [\n  \
+             {{ benchmark_type = \"eval\", runtime_type = \"mlx_macos_pipette\", \
+             model_type = \"mlx\", http_timeout_seconds = 600 }},\n  \
+             {{ benchmark_type = \"decode_throughput\", runtime_type = \"mlx_macos_pipette\", \
+             model_type = \"mlx\", attempt_timeout_seconds = 180 }},\n]\n",
+            std::fs::read_to_string(path)?
+        );
+        let (campaign, first) = donor_of(stores, dir, "nightly", &document).await?;
+        let evals = queued_where(stores, &first, |body| {
+            body.pointer("/spec/benchmark") == Some(&serde_json::json!("eval_a"))
+        })
+        .await?;
+        let [eval_a] = evals.as_slice() else {
+            anyhow::bail!("one eval_a job, not {evals:?}");
+        };
+        finish(stores, eval_a, "eval").await?;
+        Ok((campaign, first, eval_a.clone()))
+    }
+
+    /// Record `plan_id`'s jobs as a build that wrote other benchmark flags
+    /// filed them: `edit` rewrites the flags of each stored source, and the
+    /// plan lists the job under that source's digest.
+    async fn as_filed_with_flags(
+        stores: &Stores,
+        dir: &std::path::Path,
+        plan_id: &PlanId,
+        edit: fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> anyhow::Result<()> {
+        let mut manifest = stores
+            .plans
+            .get_plan(plan_id)
+            .await?
+            .context("the head manifest")?;
+        let job_ids: Vec<JobId> = manifest.content_keys.keys().cloned().collect();
+        manifest.content_keys = futures::stream::iter(job_ids)
+            .then(|job_id| async move {
+                let mut source = stores
+                    .plans
+                    .get_job_source(&job_id)
+                    .await?
+                    .context("the job source")?;
+                if let Some(flags) = source
+                    .pointer_mut("/spec/benchmark_flags")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    edit(flags);
+                }
+                std::fs::write(
+                    dir.join("job-sources").join(format!("{job_id}.json")),
+                    serde_json::to_vec(&source)?,
+                )?;
+                anyhow::Ok((job_id, content_digest(&source)))
+            })
+            .try_collect()
+            .await?;
+        stores.plans.put_plan(&manifest).await?;
+        Ok(())
+    }
+
+    /// An older build filed the head's jobs under bodies with
+    /// `bench_timeout_seconds`, which this build reads and drops. A mark, a
+    /// recalculation and a re-run of one job each carry the other two, so
+    /// only the named cell is placed afresh. So does a re-run of the plan that
+    /// re-run filed, after a build that reads one of its cells otherwise.
+    #[tokio::test]
+    async fn a_head_filed_before_a_flag_was_retired_places_only_the_named_cell()
+    -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first, named) = flagged_evals(&stores, dir.path()).await?;
+        as_filed_with_flags(&stores, dir.path(), &first.plan_id, |flags| {
+            flags.insert("bench_timeout_seconds".to_string(), serde_json::json!(1800));
+        })
+        .await?;
+        let head = || Head::read(&*stores.plans, campaign.clone(), None);
+        let preview = async |revision: Revision| {
+            let dry_run =
+                dry_run_revision(&stores, settings(ModelCheck::none()), revision, None).await?;
+            anyhow::Ok(dry_run.preview)
+        };
+
+        let fail = BTreeMap::from([(
+            named.clone(),
+            NonEmptyTrimmedString::try_new("swap after 5 runs")?,
+        )]);
+        let marked = preview(
+            head()
+                .await?
+                .rerun(&*stores.plans, &*stores.submissions, BTreeSet::new(), fail)
+                .await?,
+        )
+        .await?;
+        assert_eq!(
+            (
+                marked.carried_job_count,
+                marked.new_job_count,
+                marked.marked_job_ids,
+                marked.dropped_job_ids
+            ),
+            (2, 0, vec![named.clone()], Vec::new())
+        );
+        let recalculated = preview(
+            head()
+                .await?
+                .recalculate(
+                    &*stores.plans,
+                    &*stores.submissions,
+                    BTreeSet::from([named.clone()]),
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(
+            (
+                recalculated.carried_job_count,
+                recalculated.new_job_count,
+                recalculated.recalculated_job_count,
+                recalculated.dropped_job_ids
+            ),
+            (2, 0, 1, Vec::new())
+        );
+        let (filed, revised) = rerun_jobs(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign.campaign_id,
+            BTreeSet::from([named]),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            revised,
+            Revised {
+                superseded: first.plan_id.clone(),
+                carried_job_count: 2,
+                rerun_job_count: 1,
+                marked_job_count: 0,
+                recalculated_job_count: 0,
+                dropped_job_count: 0,
+                cancel_requested: true,
+            }
+        );
+
+        // A build that still wrote `doomloop` lists a carried cell with it.
+        let eval_b = queued_where(&stores, &filed, |body| {
+            body.pointer("/spec/benchmark") == Some(&serde_json::json!("eval_b"))
+        })
+        .await?;
+        let [eval_b] = eval_b.as_slice() else {
+            anyhow::bail!("one eval_b job, not {eval_b:?}");
+        };
+        let mut cell = stores
+            .plans
+            .get_job_source(eval_b)
+            .await?
+            .context("the job source")?;
+        let flags = cell
+            .pointer_mut("/spec/benchmark_flags")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("the eval flags")?;
+        flags.remove("bench_timeout_seconds");
+        flags.insert("doomloop".to_string(), serde_json::json!({}));
+        let mut head_manifest = stores
+            .plans
+            .get_plan(&filed.plan_id)
+            .await?
+            .context("the re-run's manifest")?;
+        head_manifest
+            .content_keys
+            .insert(eval_b.clone(), content_digest(&cell));
+        stores.plans.put_plan(&head_manifest).await?;
+        let again = queued_where(&stores, &filed, |body| {
+            body.pointer("/spec/benchmark") == Some(&serde_json::json!("eval_a"))
+        })
+        .await?;
+        let [again] = again.as_slice() else {
+            anyhow::bail!("one eval_a job, not {again:?}");
+        };
+        finish(&stores, again, "eval").await?;
+        let (_, revised) = rerun_jobs(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign.campaign_id,
+            BTreeSet::from([again.clone()]),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (revised.carried_job_count, revised.dropped_job_count),
+            (2, 0)
+        );
+        Ok(())
+    }
+
+    /// A body recorded with another attempt limit than the head's document now
+    /// sets differs in a field this build reads: that cell alone is drift, and
+    /// the re-run is refused.
+    #[tokio::test]
+    async fn a_head_whose_cell_changed_still_refuses_a_rerun() -> anyhow::Result<()> {
+        let (dir, stores) = stores().await?;
+        let (campaign, first, named) = flagged_evals(&stores, dir.path()).await?;
+        as_filed_with_flags(&stores, dir.path(), &first.plan_id, |flags| {
+            flags.insert("bench_timeout_seconds".to_string(), serde_json::json!(1800));
+            if let Some(limit) = flags.get_mut("attempt_timeout_seconds") {
+                *limit = serde_json::json!(300);
+            }
+        })
+        .await?;
+
+        let drifted = dry_run_rerun(
+            &stores,
+            settings(ModelCheck::none()),
+            &campaign.campaign_id,
+            BTreeSet::from([named]),
+            None,
+        )
+        .await;
+
+        let Err(CampaignAdminError::Store(e)) = &drifted else {
+            anyhow::bail!("a changed cell was not refused: {drifted:?}");
+        };
+        assert!(
+            matches!(
+                e.downcast_ref::<IngestError>(),
+                Some(IngestError::Rejected(RejectionError::RerunDrift {
+                    cells: 1
+                }))
+            ),
+            "{e:#}"
+        );
+        Ok(())
+    }
+
     /// SQL summaries answer both pre-checks even when result bodies are
     /// unreadable. A job with a record but no outcome row remains unanswered.
     #[rstest::rstest]
@@ -6458,7 +7820,7 @@ benchmarks = ["decode_throughput_512_100"]
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
             return Ok(());
         };
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         // Seed the catalog and plan before the overlay; the test only needs SQL outcomes.
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let submissions = pipette_store_sql::overlay(db.db(), stores.clone()).submissions;
@@ -6542,6 +7904,7 @@ benchmarks = ["decode_throughput_512_100"]
                 superseded: first.plan_id.clone(),
                 carried_job_count: 2,
                 rerun_job_count: 0,
+                marked_job_count: 0,
                 recalculated_job_count: 1,
                 dropped_job_count: 0,
                 cancel_requested: true,
@@ -6632,7 +7995,7 @@ benchmarks = ["decode_throughput_512_100"]
     async fn a_recalculation_refuses_a_job_with_no_eval_completions(
         #[case] recorded: Recorded,
     ) -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let job_id = first.job_ids[0].1.clone();
         match recorded {
@@ -6682,7 +8045,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// A recalculation that names no job is refused before the head is read.
     #[tokio::test]
     async fn a_recalculation_of_no_job_is_refused() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, _) = created(&stores, dir.path()).await?;
 
         let empty = recalculate(&stores, &campaign, BTreeSet::new()).await;
@@ -6698,7 +8061,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// success, and leaves a failure and another benchmark's result alone.
     #[tokio::test]
     async fn a_whole_head_recalculation_takes_only_the_finished_evals() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created_evals(&stores, dir.path()).await?;
         let [eval, failed, measured] = [0, 1, 2].map(|i| first.job_ids[i].1.clone());
         finish(&stores, &eval, "eval").await?;
@@ -6724,7 +8087,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// Neither writes anything.
     #[tokio::test]
     async fn the_cli_lists_and_dry_runs_an_edit_without_writing() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
 
         let (plan_id, listing) = current_variants(&stores, &campaign.campaign_id).await?;
@@ -6772,7 +8135,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// nothing: the campaign stays on its plan, which is not cancelled.
     #[tokio::test]
     async fn a_dry_run_document_revision_writes_nothing() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let (_, head) = head_document(&stores, &campaign.campaign_id).await?;
         let document = format!("# with the 700M model\n{head}{MLX_700M_VARIANT}");
@@ -6811,7 +8174,8 @@ benchmarks = ["decode_throughput_512_100"]
                 satisfied_job_count: 0,
                 restored_job_count: 0,
                 inherited_job_count: 0,
-                rerun_job_count: 0,
+                rerun_job_ids: Vec::new(),
+                marked_job_ids: Vec::new(),
                 recalculated_job_count: 0,
                 dropped_job_ids: Vec::new(),
                 ..dry_run.preview.clone()
@@ -6858,7 +8222,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// document to edit, and one whose document fails its digest.
     #[tokio::test]
     async fn a_variant_edit_files_nothing_it_cannot_apply() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let (campaign, first) = created(&stores, dir.path()).await?;
         let edit = VariantEdit::parse("remove = [0]")?;
 
@@ -6912,7 +8276,7 @@ benchmarks = ["decode_throughput_512_100"]
     /// campaign where it is. An unknown campaign is still refused.
     #[tokio::test]
     async fn dry_run_into_leaves_the_campaign_alone() -> anyhow::Result<()> {
-        let (dir, stores) = stores()?;
+        let (dir, stores) = stores().await?;
         let seeded = seed(&stores, "nightly").await?;
         let campaign_id = seeded.campaign_id.clone();
         let path = afm_mlx_plan(dir.path())?;
@@ -6932,7 +8296,7 @@ benchmarks = ["decode_throughput_512_100"]
                 .current_plan_id,
             seeded.current_plan_id
         );
-        assert!(stores.todo.list_avail().await?.is_empty());
+        assert!(stores.todo.list_avail_entries().await?.is_empty());
         assert_eq!(
             pipette_store_testkit::local_fs_job_record_count(dir.path()),
             0

@@ -1,8 +1,8 @@
 use std::fmt;
 
 use pipette_plan_types::{
-    AuditEventId, CampaignId, ClientId, IdError, OrgId, PublicKeyHex, UserId, UserKeyId,
-    VaultResourceId,
+    AuditEventId, CampaignGroupId, CampaignId, ClientId, IdError, OrgId, PublicKeyHex, UserId,
+    UserKeyId, VaultResourceId,
 };
 
 /// Mints a prefixed id: the type's prefix and a UUIDv7, so each keyspace lists
@@ -30,6 +30,12 @@ impl Mint for VaultResourceId {
 }
 
 impl Mint for CampaignId {
+    fn mint() -> Self {
+        mint_prefixed(Self::PREFIX)
+    }
+}
+
+impl Mint for CampaignGroupId {
     fn mint() -> Self {
         mint_prefixed(Self::PREFIX)
     }

@@ -208,7 +208,9 @@ impl SuccessInputExt for SuccessInput {
                     return Err(ValidationError::MissingMetric("total_time_ms"));
                 }
             }
-            BenchmarkDefinition::MaxMemoryUsage(_) | BenchmarkDefinition::VlMaxMemory(_) => {
+            BenchmarkDefinition::MaxMemoryUsage(_)
+            | BenchmarkDefinition::VlMaxMemory(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => {
                 if self.max_host_bytes.is_none() {
                     return Err(ValidationError::MissingMetric("max_host_bytes"));
                 }
@@ -277,6 +279,16 @@ impl SuccessInputExt for SuccessInput {
                 parameter_draft_length,
                 ..
             }) => self.validate_vl_spec_decode(parameter_draft_length.into_inner())?,
+            BenchmarkDefinition::DecisionLatency(b) => {
+                if self.decision_latency_request_ms.is_none() {
+                    return Err(ValidationError::MissingMetric(
+                        "decision_latency_request_ms",
+                    ));
+                }
+                if b.parameter_batch_size.as_u32() > 1 && self.decision_latency_batch_ms.is_none() {
+                    return Err(ValidationError::MissingMetric("decision_latency_batch_ms"));
+                }
+            }
         }
 
         validate_json_ref("model_descriptor", self.model_descriptor.as_deref())?;
@@ -705,7 +717,9 @@ pub fn answers_every_sample(
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => return Ok(()),
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => return Ok(()),
     };
     let samples = usize::try_from(sample_count.into_inner()).unwrap_or(usize::MAX);
     let failed = completions
@@ -1087,7 +1101,7 @@ impl ServedJobSource {
 #[error("job body cannot produce a failure record: {0}")]
 pub struct UnrecordableJobError(String);
 
-/// Build a terminal failure from a `todo/` job body, attributed to the reserved
+/// Build a terminal failure from a queued job body, attributed to the reserved
 /// `"system"` client.
 ///
 /// The `model_*` / `runtime_*` labels stay unset: they would need parsing the
@@ -1235,7 +1249,8 @@ pub async fn move_runtime_output(
     write_runtime_output(store, job_id, client_id, &output).await
 }
 
-/// Record a synthetic `"system"` failure for a `todo/` job.
+/// Record a synthetic `"system"` failure for a queued job, or for a job that
+/// a mark minted and never queues.
 ///
 /// The write is exclusive: a client's real submission may land on the same key
 /// after the caller's check, and must not become "nobody ran this".
@@ -1264,8 +1279,8 @@ pub async fn record_system_failure(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot resolve benchmark_type for synthetic failure (spec.benchmark: \
-                 {benchmark_id}); restore the benchmark definition or delete the job from \
-                 todo/avail/ or todo/leased/"
+                 {benchmark_id}); restore the benchmark definition or delete the job's row \
+                 from the queue_jobs table"
             )
         })?;
     let synthetic = system_failure_from_job_body(
@@ -2123,6 +2138,67 @@ parameter_decode_tokens = 256
             (Err(e), Some(expected)) => assert!(e.to_string().contains(expected), "{e}"),
             (got, refusal) => anyhow::bail!("expected {refusal:?}, got {got:?}"),
         }
+        Ok(())
+    }
+
+    /// The request time is required (no released client runs the type), the
+    /// batch time too above one in flight; the memory type needs its peak.
+    #[rstest]
+    #[case::timed("decision_latency", 1, json!({"decision_latency_request_ms": 41.5}), true)]
+    #[case::with_stddev(
+        "decision_latency",
+        1,
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_request_ms_stddev": 0.0}),
+        true
+    )]
+    #[case::untimed("decision_latency", 1, json!({}), false)]
+    #[case::zero("decision_latency", 1, json!({"decision_latency_request_ms": 0.0}), false)]
+    #[case::packed(
+        "decision_latency",
+        64,
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_batch_ms": 800.0}),
+        true
+    )]
+    #[case::packed_without_its_batch_time(
+        "decision_latency",
+        64,
+        json!({"decision_latency_request_ms": 41.5}),
+        false
+    )]
+    #[case::peak("decision_max_memory", 1, json!({"max_host_bytes": 1_000_000_000_i64}), true)]
+    #[case::time_without_its_peak(
+        "decision_max_memory",
+        1,
+        json!({"decision_latency_request_ms": 41.5}),
+        false
+    )]
+    fn a_decision_result_carries_its_measurement(
+        #[case] benchmark_type: &str,
+        #[case] batch_size: u32,
+        #[case] fields: serde_json::Value,
+        #[case] accepted: bool,
+    ) -> anyhow::Result<()> {
+        let id = format!("{benchmark_type}_text64_q1_bs{batch_size}");
+        let benchmark = Benchmark::from_toml(
+            &id,
+            &format!(
+                "benchmark_type = \"{benchmark_type}\"\nparameter_text_tokens = 64\n\
+                 parameter_questions = 1\nparameter_batch_size = {batch_size}\n"
+            ),
+        )?;
+        let device = json!({
+            "benchmark_id": id,
+            "device_name": "d",
+            "device_form_factor": "laptop",
+            "device_os_name": "macOS",
+            "device_os_version": "26.0",
+            "device_chip_model": "Apple M5 Pro",
+            "device_ram_bytes": 51_539_607_552_i64,
+        });
+        let verdict = serde_json::from_value::<SuccessInput>(merged(device, fields.clone())?)
+            .map_err(anyhow::Error::from)
+            .and_then(|input| Ok(input.validate(&benchmark)?));
+        assert_eq!(verdict.is_ok(), accepted, "{fields}: {verdict:?}");
         Ok(())
     }
 

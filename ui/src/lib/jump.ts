@@ -16,6 +16,7 @@ export type Pasted =
 /** The ID prefixes the server mints (`pipette-plan-types` `ids.rs`, `principal.rs`), each with its page. */
 const PREFIXED: [string, (id: string) => Route][] = [
   ["campaign_", (campaign_id) => ({ page: "campaign", campaign_id })],
+  ["group_", (group_id) => ({ page: "campaign-group", group_id })],
   ["plan-", (plan_id) => ({ page: "plan", plan_id })],
   ["ev1_", (client_id) => ({ page: "client", client_id })],
   ["vault_", (resource_id) => ({ page: "vault-resource", resource_id })],
@@ -53,7 +54,7 @@ export interface Lookups {
   plan: (plan_id: string) => Promise<unknown>;
 }
 
-export const UNKNOWN = "Paste the ID of a job, plan, campaign, device, vault resource, user, or organization.";
+export const UNKNOWN = "Paste the ID of a job, plan, campaign, campaign group, device, vault resource, user, or organization.";
 export const NO_JOB = "No plan that you can read holds this job.";
 export const NO_JOB_OR_PLAN = "No job or plan that you can read has this ID.";
 

@@ -1324,7 +1324,7 @@ async fn the_relations_answer_where_the_records_carried_them() -> anyhow::Result
 
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let manager = manager(&state).await?;
     let acme = create_org(&state, &manager, "acme").await?;
     let member = registered_user(&state, &[]).await?;
@@ -1945,7 +1945,12 @@ async fn test_the_fleet_narrows_to_my_devices_or_an_organizations() -> anyhow::R
 #[tokio::test]
 async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let mut state = seeded_state(dir.path()).await?;
+    state.catalog_store = pipette_store_fs::build_local_fs_stores(
+        &test_config(dir.path()),
+        pipette_store_testkit::no_queue(),
+    )?
+    .catalog;
     let root = registered_user(&state, UserPermissionGroup::ServerAdmin.permissions()).await?;
     let acme = create_org(&state, &root, "acme").await?;
     let org_id = OrgId::try_new(acme.clone())?;
@@ -2154,7 +2159,7 @@ async fn the_overview_counts_within_each_reach(
     #[case] benchmark_count: u64,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
     let root = registered_user(&state, UserPermissionGroup::ServerAdmin.permissions()).await?;
     let acme = OrgId::try_new(create_org(&state, &root, "acme").await?)?;
     setup_private_benchmark(dir.path(), "eval_acme_internal_v3", &acme)?;

@@ -12,7 +12,7 @@ const A19 = "Apple A19 Pro · 11.4 GB RAM · iOS 27.0.1 · phone";
 
 const row = (job_id: string, over: Partial<ResultRow> = {}): ResultRow => ({
   job_id, benchmark_id: "bench", benchmark_type: "decode_throughput", metric: "decode_throughput", value: 10,
-  value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null,
+  value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null, failure_code: null,
   model_params_total_millions: 1000, model_params_active_millions: 1000, model_descriptor: null, runtime_descriptor: null, runtime_descriptor_sha256: null, model_descriptor_sha256: null,
   model_flags: null, runtime_flags: null, benchmark_flags: null, model_vault_descriptor: null, requested_model_flags: null,
   requested_runtime_flags: null, requested_benchmark_flags: null, eval_metadata: null, client_extras: null, parameters: {},

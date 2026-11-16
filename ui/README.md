@@ -52,18 +52,19 @@ secure context.
 
 | Address | Draws |
 |---|---|
-| `/app/me/campaigns`, `…/vault`, `…/vault/runtimes`, `…/devices` | The campaigns, vault models and runtimes, and devices the reader owns |
+| `/app/me/campaigns`, `…/campaigns/groups`, `…/vault`, `…/vault/runtimes`, `…/devices` | The campaigns, campaign groups, vault models and runtimes, and devices the reader owns |
 | `/app/account`, `…/keys` | The reader's record and session, and its keys |
 | `/app/login/cli` | The approval of a `pipette-ctl auth login` key |
 | `/app/campaigns`, `…/new`, `…/{campaign_id}`, `…/{campaign_id}/document` | The campaigns in reach, the create form, one campaign (it opens on the plan it runs), and its plan document editor. Each campaign listing hides archived campaigns unless its `state` filter asks for `archived` or `all`; a campaign is archived and unarchived on its Settings |
 | `/app/campaigns/{campaign_id}/plans/{plan_id}/…` | That plan's tabs, below, with the campaign's record on History and its writes on Settings. An earlier plan offers a revert to it, as each earlier row of History does. The page also lets the reader restore a variant into the current plan. The reader can append it or replace a variant |
+| `/app/campaign-groups/{group_id}`, `…/policies`, `…/settings` | One campaign group's tabs: its member campaigns, with an add from the owner's other campaigns and a remove of each member, its Policies, each check's policy with its re-runs and spread's threshold, and a turn-off for one that is on, and its Settings, the group's rename and delete. Under the policies, a reader with `read_plans` and `read_clients` sees their preview, read once the tab is drawn: for each member campaign, the jobs each policy alone would re-run, mark failed and keep, and those the policies that are on would re-run and mark failed together. A group is created on the Groups tab of the reader's or an organization's campaign listing |
 | `/app/plans`, `…/{plan_id}`, `…/cells`, `…/analysis`, `…/analysis/{report}`, `…/revisions`, `…/settings` | The plan listing, and a plan's Overview, Jobs, Results (one report's charts, or `swap` or `missing`), History and Settings. `…/results` and `…/reports…` redirect |
 | `/app/vault`, `…/runtimes`, `…/new`, `…/{resource_id}` | The vault resources in reach, the upload page, one resource |
 | `/app/benchmarks`, `…/new`, `…/{org}/{benchmark_id}` | The private benchmarks the reader reads, the form, one entry |
 | `/app/clients`, `…/{client_id}` | The fleet, and one device with its forms. For a fleet reader, the device page also shows the catalog short list. Each member shows its last success and last failure on the device, and its successes on any device as weaker evidence |
 | `/app/users`, `…/new`, `…/{user_id}`, `…/{user_id}/plans`, `…/permissions`, `…/keys`, `…/preauth-keys`, `…/settings` | The roster, the create form, and one account's tabs |
 | `/app/orgs`, `…/new`, `…/{org}` | The organizations, the create form, one organization's overview |
-| `/app/orgs/{org}/campaigns`, `…/vault`, `…/vault/runtimes`, `…/benchmarks`, `…/members`, `…/devices` | One organization's listings; its device pre-auth keys sit on `…/devices` |
+| `/app/orgs/{org}/campaigns`, `…/campaigns/groups`, `…/vault`, `…/vault/runtimes`, `…/benchmarks`, `…/members`, `…/devices` | One organization's listings; its device pre-auth keys sit on `…/devices` |
 | `/app/server/users`, `…/devices`, `…/model-params` | Accounts in no organization, devices nobody owns, and the parameter counts in the model parameter table |
 | `/app/server/catalog`, `…/catalog?kind=model`, `…/catalog/{name}` | The runtime entries and model entries of every scope that the reader can read, and one entry. Each entry has a scope badge: `global`, or the slug of its organization. `{name}` is the name as the reader sees it: bare, `global/x` or `acme/x`. The Models tab shows the formats of each entry in order, and each format has its quantizations in order. A model entry shows its members as a table of formats and quantizations, with their parameter counts. The table sorts the members by format, then by quantization. For a fleet reader, each member shows its successes on any device as weaker evidence. A reader with `edit_catalog` in the entry’s organization or `edit_any_catalog` can edit an organization entry. The reader can change its state or name and change a model member’s quantization label |
 
@@ -78,6 +79,7 @@ The header box opens the page for a pasted identifier (ID). Press `/` to focus
 the box (`src/lib/jump.ts`). The ID prefix identifies the page:
 
 - `campaign_`: campaign
+- `group_`: campaign group
 - `plan-`: plan
 - `ev1_`: device
 - `vault_`: vault resource

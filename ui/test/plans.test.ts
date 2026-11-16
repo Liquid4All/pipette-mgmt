@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   MAX_DRAWN_REASON_BYTES, cancelOffered, changeText, planWrites, describeClauses, documentNote, expiresText, failedText, filedEmpty, filedQuery,
   keepTail,
-  doneShare, leaseText, measured, parametersText, planFilters, planQuery, planTable, resultsFilename, shownStatus, statusChoices,
+  doneShare, leaseText, measured, parametersText, planFilters, planQuery, planTable, resultsFilename,
   starvedLine, takenScope, withheldNotice,
 } from "../src/lib/plans";
 import { PickedColumns } from "../src/lib/picked.svelte";
@@ -39,27 +39,15 @@ describe("the plan listing", () => {
 
   const counted = (failed: number): Counts => ({ total: 4, finished: 2, failed, running: 0, available: 0, cancelled: 0 });
 
-  test("a complete plan says where any of its jobs failed, and no other status does", () => {
-    expect(shownStatus("complete", counted(2))).toBe("complete_with_failures");
-    expect(shownStatus("complete", counted(0))).toBe("complete");
-    expect(shownStatus("complete", null)).toBe("complete");
-    expect(shownStatus("active", counted(2))).toBe("active");
-    expect(shownStatus("cancelled", counted(2))).toBe("cancelled");
-  });
-
-  test("a failed job counts toward progress, and the status column and its filter read the drawn status", () => {
+  test("a failed job counts toward progress, and the status column and its filter read the plan's status", () => {
     expect(doneShare(counted(2))).toBe(1);
     expect(doneShare({ ...counted(0), total: 0 })).toBeNull();
     expect(doneShare(null)).toBeNull();
     const plan = { status: "complete", progress_snapshot: { counts: counted(1) } } as PlanView;
     const spec = planTable({}, false);
     const raw = (key: string) => spec.columns.find((column) => column.key === key)?.raw(plan);
-    expect([raw("status"), raw("progress")]).toEqual(["complete_with_failures", 0.75]);
-    // `complete` keeps it too: a filter on complete plans does not lose those with failures.
-    expect(spec.choices?.find((choice) => choice.key === "status")?.values(plan))
-      .toEqual(["complete", "complete_with_failures"]);
-    expect(statusChoices("complete", counted(0))).toEqual(["complete"]);
-    expect(statusChoices("active", counted(2))).toEqual(["active"]);
+    expect([raw("status"), raw("progress")]).toEqual(["complete", 0.75]);
+    expect(spec.choices?.find((choice) => choice.key === "status")?.values(plan)).toEqual(["complete"]);
   });
 
   test("a pick on a listing without submitted_by leaves that column drawn where it is, unless let go of there", () => {
@@ -87,10 +75,19 @@ describe("the plan page", () => {
     expect(changeText({ type: "rerun", job_count: 1 })).toBe("Re-run of 1 job.");
     expect(changeText({ type: "rerun", answered: "failed", job_count: 12 })).toBe("Re-run of all failed jobs (12).");
     expect(changeText({ type: "rerun", answered: "all", job_count: 3 })).toBe("Re-run of all finished or failed jobs (3).");
+    expect(changeText({ type: "rerun", job_count: 0, marked_job_count: 2 })).toBe("Marked 2 jobs failed.");
+    expect(changeText({ type: "rerun", job_count: 3, marked_job_count: 2 })).toBe("Re-run of 3 jobs; 2 marked failed.");
+    expect(changeText({ type: "rerun", job_count: 0, marked_job_count: 1, group_id: "group_a", policies: ["swap"] }))
+      .toBe("Marked 1 job failed. Campaign group group_a policies: swap.");
+    expect(changeText({
+      type: "rerun", job_count: 3, marked_job_count: 1, group_id: "group_a", policies: ["swap", "ttft_over_e2e"],
+    })).toBe("Re-run of 3 jobs; 1 marked failed. Campaign group group_a policies: swap, ttft_over_e2e.");
     expect(changeText({ type: "recalculate", job_count: 2 })).toBe("Recalculation of 2 evals.");
     expect(changeText({ type: "recalculate", all_evals: true, job_count: 5 }))
       .toBe("Recalculation of all finished evals (5).");
     expect(changeText({ type: "document" })).toBe("Document revised.");
+    expect(changeText({ type: "document", carry_earlier: true, carry_across_limit: true }))
+      .toBe("Document revised. Carries runs of earlier plans. Carries runs across a changed attempt limit.");
     expect(changeText({ type: "revert", to_plan_id: "plan-a" })).toBe("Reverted to plan-a.");
     expect(changeText({
       type: "variants", removed_variant_count: 1, added_variant_count: 2, inherit_from: ["plan-a"],
@@ -200,6 +197,8 @@ describe("the results", () => {
     ["all_clients_denied", "failed: every client denied it"],
     ["expired", "failed: expired"],
     ["unmatchable", "failed: no client can run it"],
+    ["marked", "failed: marked failed"],
+    ["smaller_run_failed", "failed: a smaller run failed"],
     [null, "failed"],
   ] as const)("a %s failure names the pass that declared it", (source, label) => {
     expect(failedText(source)).toBe(label);

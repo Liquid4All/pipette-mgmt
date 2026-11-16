@@ -30,11 +30,11 @@ use pipette_plan_types::{
     PublicKeyHex, Tag, UserId, UserPermission,
 };
 use pipette_web_testkit::{
-    QueueBackend, authed_get, body_json, create_user, grant, json_request, json_str, make_state,
-    make_state_from_config, make_state_require_client_preauth, make_state_with_auto_approve,
-    raw_request, register_and_approve, register_pending, registered_user, request_user_account,
-    run_qm, seed_avail, seed_org, seeded_queue_state, set_user_org, setup_benchmarks, signed_empty,
-    signed_json, test_config, unauthed_post,
+    authed_get, body_json, create_user, grant, json_request, json_str, make_object_state,
+    make_state, make_state_from_config, make_state_require_client_preauth,
+    make_state_with_auto_approve, raw_request, register_and_approve, register_pending,
+    registered_user, request_user_account, run_qm, seed_avail, seed_org, seeded_queue_state,
+    set_user_org, setup_benchmarks, signed_empty, signed_json, test_config, unauthed_post,
 };
 
 async fn mint_stored_key(state: &AppState, params: ClientPreauthParams) -> anyhow::Result<String> {
@@ -529,7 +529,7 @@ async fn test_register_with_device_profile_persists_and_flags_reindex() -> anyho
     assert_eq!(stored["device_gpu_model"], "M3 Pro GPU");
 
     let flags = state.todo_store.list_pending_reindex().await?;
-    assert!(flags.iter().any(|(flagged, _)| flagged == &client_id));
+    assert!(flags.iter().any(|r| r.client_id == client_id));
     Ok(())
 }
 
@@ -604,7 +604,7 @@ async fn test_register_with_capabilities_persists_and_flags_reindex() -> anyhow:
     );
 
     let flags = state.todo_store.list_pending_reindex().await?;
-    assert!(flags.iter().any(|(flagged, _)| flagged == &client_id));
+    assert!(flags.iter().any(|r| r.client_id == client_id));
     Ok(())
 }
 
@@ -858,7 +858,7 @@ async fn test_client_preauth_key_auto_approves_and_seeds_tags_org() -> anyhow::R
     );
     // A job can require the tag, so it alone flags the client for indexing.
     let flags = state.todo_store.list_pending_reindex().await?;
-    assert!(flags.iter().any(|(flagged, _)| flagged == &id));
+    assert!(flags.iter().any(|r| r.client_id == id));
     let client = state
         .client_store
         .get_client(&id)
@@ -874,7 +874,7 @@ async fn test_client_preauth_key_auto_approves_and_seeds_tags_org() -> anyhow::R
 async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1425,7 +1425,7 @@ async fn test_registration_seeds_around_a_template_name_it_cannot_grant() -> any
 async fn test_a_failed_permissions_write_fails_the_registration() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     std::fs::write(dir.path().join("client-permissions"), b"not a directory")?;
 
     let public_key = fresh_pubkey()?;
@@ -1460,7 +1460,7 @@ async fn test_a_failed_permissions_write_fails_the_registration() -> anyhow::Res
 async fn test_a_failed_seeded_tag_write_fails_the_registration() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let mut p = key_params(ClientPreauthUsage::SingleUse);
     p.default_tags = BTreeSet::from([Tag::try_new("lab")?]);
     let token = mint_stored_key(&state, p).await?;
@@ -1626,7 +1626,7 @@ async fn test_a_keypair_conflict_does_not_spend_a_client_preauth_key() -> anyhow
 async fn test_a_retry_after_a_store_fault_meets_its_own_claim() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let blocker = dir.path().join("client-permissions");
 
     let public_key = PublicKeyHex::try_new(fresh_pubkey()?)?;

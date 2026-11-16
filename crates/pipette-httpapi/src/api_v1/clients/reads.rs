@@ -2,7 +2,7 @@
 //! `GET /api/v1/clients/capabilities`: the fleet, read by a user. `read_clients`
 //! shows the whole fleet too, until per-submitter restrictions (PIP-526) land.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use axum::Json;
@@ -25,9 +25,7 @@ use pipette_plan_types::{
     ClientDetail, ClientId, ClientListQuery, ClientListRow, ClientOwner, ClientView, FleetOwner,
     OwnerLookupQuery, Tag, UserId,
 };
-use pipette_store::{
-    BacklogSnapshot, CampaignBacklogSnapshot, ClientStore, Page, STORAGE_CONCURRENCY,
-};
+use pipette_store::{CampaignBacklog, ClientStore, Page, STORAGE_CONCURRENCY};
 
 use crate::api_v1::clients::filters::FleetApiFilters;
 use crate::auth::{ActiveUser, Caller, HumanUser};
@@ -255,7 +253,7 @@ async fn fleet_views(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list the reindex flags: {e:#}")))?
         .into_iter()
-        .map(|(client_id, _)| client_id)
+        .map(|request| request.client_id)
         .collect();
     let seen: HashMap<ClientId, DateTime<Utc>> = state
         .todo_store
@@ -264,7 +262,7 @@ async fn fleet_views(
         .map_err(|e| AppError::Internal(format!("failed to list the liveness markers: {e:#}")))?
         .into_iter()
         .collect();
-    let snapshot = backlog_snapshot(state).await;
+    let counts = backlog_counts(state).await;
     // The forward tree, the authoritative one, so the listing agrees with
     // `GET /api/v1/clients/{client_id}`.
     let mut tags: HashMap<ClientId, BTreeSet<Tag>> = HashMap::new();
@@ -311,7 +309,7 @@ async fn fleet_views(
             ClientListRow {
                 reindex_pending: reindexing.contains(&client.client_id),
                 last_seen_at: seen.get(&client.client_id).copied(),
-                backlog: backlog(snapshot.as_ref(), &client.client_id),
+                backlog: backlog(counts.as_ref(), &client.client_id),
                 permissions: pipette_plan_types::ClientPermissionSet::from(
                     &client_permission::effective(permissions),
                 ),
@@ -327,21 +325,30 @@ async fn fleet_views(
         .collect())
 }
 
-/// The backlog snapshot, or `None` when the store cannot read it: it serves the
-/// console only, so a failed read must not fail the request.
-async fn backlog_snapshot(state: &AppState) -> Option<BacklogSnapshot> {
-    state.todo_store.read_backlog().await.unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "backlog snapshot read failed; showing no backlog");
-        None
-    })
+/// The count of claimable jobs for each device, and the time of the count.
+/// `None` when the store cannot count: the count serves the console only, so
+/// a failed count must not fail the request.
+async fn backlog_counts(state: &AppState) -> Option<BacklogCounts> {
+    let counted_at = Utc::now();
+    state
+        .todo_store
+        .backlog()
+        .await
+        .map(|jobs| (counted_at, jobs))
+        .inspect_err(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "backlog query failed; showing no backlog");
+        })
+        .ok()
 }
 
-/// A device's backlog from the snapshot: `None` before the first count, and
-/// zero for a device that the count did not name.
-fn backlog(snapshot: Option<&BacklogSnapshot>, client_id: &ClientId) -> Option<Backlog> {
-    snapshot.map(|snapshot| Backlog {
-        job_count: snapshot.jobs.get(client_id).copied().unwrap_or(0),
-        counted_at: snapshot.counted_at,
+type BacklogCounts = (DateTime<Utc>, BTreeMap<ClientId, u64>);
+
+/// A device's backlog from the counts: `None` if the count failed, and zero
+/// for a device with no claimable job.
+fn backlog(counts: Option<&BacklogCounts>, client_id: &ClientId) -> Option<Backlog> {
+    counts.map(|(counted_at, jobs)| Backlog {
+        job_count: jobs.get(client_id).copied().unwrap_or(0),
+        counted_at: *counted_at,
     })
 }
 
@@ -380,6 +387,11 @@ async fn record(
     client_id: &ClientId,
 ) -> Result<ClientDetail, AppError> {
     let row = one(state, client_id).await?;
+    // One request time for both counts, so the console pairs them.
+    let counted_at = row
+        .backlog
+        .as_ref()
+        .map_or_else(Utc::now, |backlog| backlog.counted_at);
     let (owning, reach, read, backlog_by_campaign) = futures::try_join!(
         async {
             org::owning_org(&*state.org_store, client_id)
@@ -388,7 +400,7 @@ async fn record(
         },
         crate::api_v1::clients::device_reach(state, caller),
         crate::api_v1::users::read_reach(state, caller),
-        async { Ok(campaign_backlog(state, caller, client_id).await) },
+        async { Ok(campaign_backlog(state, caller, client_id, counted_at).await) },
     )?;
     let may_administer = reach
         .as_ref()
@@ -406,45 +418,41 @@ async fn record(
     })
 }
 
-/// The device's backlog by campaign. The value is `None` if no run counted
-/// the backlog, or if the read fails. The breakdown serves the console only,
-/// so a failed read must not fail the request.
+/// The device's backlog by campaign. The value is `None` if the count fails.
+/// The breakdown serves the console only, so a failed count must not fail the
+/// request.
 async fn campaign_backlog(
     state: &AppState,
     caller: Caller<'_>,
     client_id: &ClientId,
+    counted_at: DateTime<Utc>,
 ) -> Option<BacklogByCampaign> {
-    read_campaign_backlog(state, caller, client_id)
+    read_campaign_backlog(state, caller, client_id, counted_at)
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                "campaign backlog read failed; showing no breakdown"
-            );
-            None
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "campaign backlog query failed; showing no breakdown");
         })
+        .ok()
 }
 
-/// Read the snapshot, the campaign reach of the reader, and the campaign
-/// records that the entry of the device names.
+/// Count the device's backlog by campaign, and read the campaign reach of the
+/// reader and the campaign records that the count names.
 async fn read_campaign_backlog(
     state: &AppState,
     caller: Caller<'_>,
     client_id: &ClientId,
-) -> Result<Option<BacklogByCampaign>, AppError> {
-    let snapshot = state
+    counted_at: DateTime<Utc>,
+) -> Result<BacklogByCampaign, AppError> {
+    let creating_max_age = chrono::Duration::from_std(std::time::Duration::from_secs(
+        state.config.plan_creating_max_age_secs.get(),
+    ))
+    .map_err(|error| AppError::internal(error.into()))?;
+    let entry = state
         .todo_store
-        .read_campaign_backlog()
+        .campaign_backlog(client_id, counted_at - creating_max_age)
         .await
-        .map_err(|e| AppError::internal(e.context("failed to read the campaign backlog")))?;
-    let Some(snapshot) = snapshot else {
-        return Ok(None);
-    };
-    let named: Vec<CampaignId> = snapshot
-        .devices
-        .get(client_id)
-        .map(|backlog| backlog.by_campaign.keys().cloned().collect())
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(e.context("failed to count the campaign backlog")))?;
+    let named: Vec<CampaignId> = entry.by_campaign.keys().cloned().collect();
     // A device whose backlog names no campaign needs no reach.
     let reach = if named.is_empty() {
         None
@@ -471,19 +479,18 @@ async fn read_campaign_backlog(
         })
         .try_collect()
         .await?;
-    Ok(Some(by_campaign(&snapshot, client_id, &campaigns)))
+    Ok(by_campaign(entry, counted_at, &campaigns))
 }
 
-/// Split the device's entry into the campaigns in `campaigns` and a sum of the
+/// Split the device's count into the campaigns in `campaigns` and a sum of the
 /// rest. `campaigns` holds only the records that the reader may read, so a
 /// campaign with no record goes into the sum, the same as a campaign outside
 /// the reach.
 fn by_campaign(
-    snapshot: &CampaignBacklogSnapshot,
-    client_id: &ClientId,
+    entry: CampaignBacklog,
+    counted_at: DateTime<Utc>,
     campaigns: &HashMap<CampaignId, Campaign>,
 ) -> BacklogByCampaign {
-    let entry = snapshot.devices.get(client_id).cloned().unwrap_or_default();
     let (mut readable, unreadable) = entry.by_campaign.into_iter().fold(
         (Vec::new(), 0),
         |(mut readable, unreadable), (campaign_id, jobs)| match campaigns.get(&campaign_id) {
@@ -508,14 +515,14 @@ fn by_campaign(
         campaigns: readable,
         outside_campaign_job_count: entry.outside_campaigns,
         unreadable_job_count: unreadable,
-        counted_at: snapshot.counted_at,
+        counted_at,
     }
 }
 
 /// One client's row, scoped by the same fleet grant the listing takes. Its reads
 /// are independent, so they run concurrently.
 pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetRow, AppError> {
-    let (client, permissions, reindex_pending, last_seen_at, snapshot, tags, owner) = futures::try_join!(
+    let (client, permissions, reindex_pending, last_seen_at, counts, tags, owner) = futures::try_join!(
         async {
             state
                 .client_store
@@ -546,7 +553,7 @@ pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetR
                     AppError::Internal(format!("failed to read the liveness marker: {e:#}"))
                 })
         },
-        async { Ok::<_, AppError>(backlog_snapshot(state).await) },
+        async { Ok::<_, AppError>(backlog_counts(state).await) },
         async {
             state
                 .tag_store
@@ -576,7 +583,7 @@ pub(crate) async fn one(state: &AppState, client_id: &ClientId) -> Result<FleetR
         )),
         reindex_pending,
         last_seen_at,
-        backlog: backlog(snapshot.as_ref(), client_id),
+        backlog: backlog(counts.as_ref(), client_id),
     })
 }
 

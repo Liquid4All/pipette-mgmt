@@ -205,6 +205,8 @@ pub(crate) fn a_client(client_id: ClientId, public_key: PublicKeyHex) -> anyhow:
 
 #[cfg(test)]
 mod tests {
+    use futures::{StreamExt, TryStreamExt};
+
     #[tokio::test]
     async fn the_schema_applies_and_is_current() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
@@ -414,8 +416,107 @@ mod tests {
             .fetch_one(db.pool())
         };
         assert!(has_incremental_eligibility().await?);
+        let has_campaign_groups = || exists("SELECT to_regclass('campaign_groups') IS NOT NULL");
+        let has_campaign_group_members =
+            || exists("SELECT to_regclass('campaign_group_members') IS NOT NULL");
+        assert!(has_campaign_groups().await?);
+        assert!(has_campaign_group_members().await?);
+        let has_campaign_group_policies =
+            || exists("SELECT to_regclass('campaign_group_policies') IS NOT NULL");
+        assert!(has_campaign_group_policies().await?);
+        let has_maintenance_state = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('queue_maintenance_state') IS NOT NULL",
+            )
+            .fetch_one(db.pool())
+        };
+        assert!(!has_maintenance_state().await?);
+        let has_suspensions = || exists("SELECT to_regclass('queue_suspensions') IS NOT NULL");
+        assert!(!has_suspensions().await?);
+        let has_policy_state = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'campaign_group_members' AND column_name = 'policy_state')",
+            )
+        };
+        assert!(has_policy_state().await?);
+        let has_family = || {
+            exists(
+                "SELECT count(*) = 2 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'queue_jobs'
+                     AND column_name IN ('family_key', 'sizes')",
+            )
+        };
+        assert!(has_family().await?);
+        let has_rerun_results =
+            || exists("SELECT to_regclass('campaign_group_rerun_results') IS NOT NULL");
+        assert!(has_rerun_results().await?);
+        let has_short_repetition = || {
+            exists(
+                "SELECT count(*) = 2 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'campaign_group_rerun_results'
+                     AND column_name IN ('short_repetition_ms', 'short_repetition_percent')",
+            )
+        };
+        assert!(has_short_repetition().await?);
+        let has_failed_codes = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'campaign_group_rerun_results'
+                     AND column_name = 'codes')",
+            )
+        };
+        assert!(has_failed_codes().await?);
+        let moved = crate::migrate::migrate(db, Some(38), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(38), vec![39]));
+        assert!(!has_failed_codes().await?);
+        assert!(has_short_repetition().await?);
+        let moved = crate::migrate::migrate(db, Some(37), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(37), vec![38]));
+        assert!(!has_short_repetition().await?);
+        assert!(has_rerun_results().await?);
+        let moved = crate::migrate::migrate(db, Some(36), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(36), vec![37]));
+        assert!(!has_rerun_results().await?);
+        assert!(has_policy_state().await?);
+        let moved = crate::migrate::migrate(db, Some(35), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(35), vec![36]));
+        assert!(!has_policy_state().await?);
+        assert!(has_campaign_group_members().await?);
+        let moved = crate::migrate::migrate(db, Some(34), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(34), vec![35]));
+        assert!(!has_family().await?);
+        let moved = crate::migrate::migrate(db, Some(33), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(33), vec![34]));
+        assert!(has_suspensions().await?);
+        let moved = crate::migrate::migrate(db, Some(32), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(32), vec![33]));
+        assert!(!has_maintenance_state().await?);
+        let moved = crate::migrate::migrate(db, Some(31), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(31), vec![32]));
+        assert!(has_maintenance_state().await?);
+        let moved = crate::migrate::migrate(db, Some(30), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(30), vec![31]));
+        let moved = crate::migrate::migrate(db, Some(29), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(29), vec![30]));
+        assert!(!has_campaign_group_policies().await?);
+        assert!(has_campaign_groups().await?);
+        let moved = crate::migrate::migrate(db, Some(28), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(28), vec![29]));
+        assert!(!has_campaign_groups().await?);
+        assert!(!has_campaign_group_members().await?);
+        let has_queue_cascade = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('plan_index_gc_candidates') IS NOT NULL",
+            )
+            .fetch_one(db.pool())
+        };
+        assert!(has_queue_cascade().await?);
+        let moved = crate::migrate::migrate(db, Some(27), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(27), vec![28]));
+        assert!(!has_queue_cascade().await?);
         let moved = crate::migrate::migrate(db, Some(23), false).await?;
-        assert_eq!((moved.to, moved.reverted), (Some(23), vec![26, 25, 24]));
+        assert_eq!((moved.to, moved.reverted), (Some(23), vec![27, 26, 25, 24]));
         assert!(!has_incremental_eligibility().await?);
         assert!(has_job_queue().await?);
         let moved = crate::migrate::migrate(db, Some(21), false).await?;
@@ -537,10 +638,10 @@ mod tests {
         assert_eq!(
             (moved.to, moved.applied),
             (
-                Some(26),
+                Some(39),
                 vec![
                     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                    24, 25, 26
+                    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
                 ]
             )
         );
@@ -566,7 +667,241 @@ mod tests {
         assert!(has_run_evidence().await?);
         assert!(has_job_queue().await?);
         assert!(has_incremental_eligibility().await?);
+        assert!(has_campaign_groups().await?);
+        assert!(has_campaign_group_members().await?);
+        assert!(has_campaign_group_policies().await?);
+        assert!(has_family().await?);
+        assert!(has_policy_state().await?);
+        assert!(has_rerun_results().await?);
+        assert!(has_failed_codes().await?);
         crate::migrate::check(db).await
+    }
+
+    /// Migration `0039` gives a stored failed policy and a member state's
+    /// failed policy each code it lists, else the three failed re-ran until
+    /// then, at its `max_reruns`, which becomes 0, and the failed re-runs those
+    /// three codes; the other kinds, smaller_failed among them, none. A move
+    /// down gives each failed policy its largest limit as `max_reruns` and
+    /// takes the codes off.
+    #[tokio::test]
+    async fn the_failed_codes_migration_keeps_what_failed_re_ran() -> anyhow::Result<()> {
+        use chrono::Utc;
+
+        use pipette_core::campaign::{CampaignGroup, CampaignOwner, GroupPolicyState, NewCampaign};
+        use pipette_core::types::Mint;
+        use pipette_plan_types::{
+            CampaignGroupId, CampaignGroupPolicy, CampaignId, FailureCode, PlanId, PolicyKind,
+            PolicySettings, UserId,
+        };
+        use pipette_store::{CampaignGroupStore, CampaignStore};
+
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        let store = crate::campaign_groups::SqlCampaignGroupStore::new(db.clone());
+        let owner = CampaignOwner::User {
+            user_id: UserId::mint(),
+        };
+        let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Utc::now());
+        let listing = CampaignGroup::new("aa-listed".parse()?, owner.clone(), Utc::now());
+        store.create_group(&group).await?;
+        store.create_group(&listing).await?;
+        let (group_id, listing_id) = (group.group_id, listing.group_id);
+        let campaign = NewCampaign::new("nightly".parse()?, owner)
+            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+        crate::campaigns::SqlCampaignStore::new(db.clone())
+            .put_campaign(&campaign)
+            .await?;
+        let campaign_id = campaign.campaign_id;
+        store
+            .add_members(&group_id, std::slice::from_ref(&campaign_id))
+            .await?;
+        let on = |kind: PolicyKind, group_id: &CampaignGroupId| CampaignGroupPolicy {
+            enabled: true,
+            ..kind.defaults(group_id.clone())
+        };
+        let limited =
+            |policy: &CampaignGroupPolicy, codes: &[(FailureCode, u32)]| CampaignGroupPolicy {
+                settings: PolicySettings {
+                    codes: Some(codes.iter().copied().collect()),
+                    ..PolicySettings::default()
+                },
+                ..policy.clone()
+            };
+        let older = |policy: &CampaignGroupPolicy, max_reruns: u32| CampaignGroupPolicy {
+            max_reruns,
+            settings: PolicySettings::default(),
+            ..policy.clone()
+        };
+        let failed = on(PolicyKind::Failed, &group_id);
+        let spread = on(PolicyKind::Spread, &group_id);
+        let smaller = on(PolicyKind::SmallerFailed, &group_id);
+        crate::migrate::migrate(db, Some(38), false).await?;
+        let stored = older(&failed, 3);
+        let mut listed = serde_json::to_value(older(&on(PolicyKind::Failed, &listing_id), 2))?;
+        listed["settings"]["codes"] = serde_json::json!(["harness_error", "device_not_ready"]);
+        sqlx::query(
+            "INSERT INTO campaign_group_policies (group_id, kind, body)
+             VALUES ($1, 'failed', $2), ($1, 'smaller_failed', $3), ($4, 'failed', $5)",
+        )
+        .bind(group_id.as_str())
+        .bind(serde_json::to_string_pretty(&stored)?)
+        .bind(serde_json::to_string(&smaller)?)
+        .bind(listing_id.as_str())
+        .bind(listed.to_string())
+        .execute(db.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO campaign_group_rerun_results (group_id, rerun_job_id, kind, campaign_id,
+                 rerun_of, plan_id, filed_at, attempt, benchmark_id, before)
+             SELECT $1, 'job-2', kind, 'campaign_x', 'job-1', 'plan-x', now(), 1, 'bench', 1
+             FROM unnest(ARRAY['failed', 'swap']) AS kind",
+        )
+        .bind(group_id.as_str())
+        .execute(db.pool())
+        .await?;
+        let state = |policies: &[&CampaignGroupPolicy]| GroupPolicyState {
+            policies: policies.iter().copied().cloned().collect(),
+            ..GroupPolicyState::default()
+        };
+        assert!(
+            store
+                .set_policy_state(
+                    &group_id,
+                    &campaign_id,
+                    &state(&[&stored, &spread, &smaller])
+                )
+                .await?
+        );
+        let kept = || async {
+            let state: String = sqlx::query_scalar(
+                "SELECT policy_state FROM campaign_group_members WHERE campaign_id = $1",
+            )
+            .bind(campaign_id.as_str())
+            .fetch_one(db.pool())
+            .await?;
+            anyhow::Ok(serde_json::from_str::<GroupPolicyState>(&state)?)
+        };
+
+        crate::migrate::migrate(db, None, false).await?;
+        let defaults = [
+            FailureCode::RuntimeError,
+            FailureCode::DeviceError,
+            FailureCode::Unspecified,
+        ]
+        .map(|code| (code, 3));
+        let moved = limited(&failed, &defaults);
+        assert_eq!(
+            store.list_policies(&group_id).await?,
+            [moved.clone(), smaller.clone()]
+        );
+        let codes = [
+            (FailureCode::DeviceNotReady, 2),
+            (FailureCode::HarnessError, 2),
+        ];
+        assert_eq!(
+            store.list_policies(&listing_id).await?,
+            [limited(&on(PolicyKind::Failed, &listing_id), &codes)]
+        );
+        let rerun_codes: Vec<_> = store
+            .waiting_reruns(&group_id, &CampaignId::try_new("campaign_x")?)
+            .await?
+            .into_iter()
+            .map(|rerun| (rerun.kind, rerun.codes))
+            .collect();
+        let three = defaults.map(|(code, _)| code).to_vec();
+        assert_eq!(
+            rerun_codes,
+            [(PolicyKind::Failed, Some(three)), (PolicyKind::Swap, None)]
+        );
+        assert_eq!(kept().await?, state(&[&moved, &spread, &smaller]));
+
+        let mixed = limited(
+            &failed,
+            &[
+                (FailureCode::RuntimeError, 2),
+                (FailureCode::DeviceNotReady, 4),
+            ],
+        );
+        assert!(store.replace_policy(&moved, &mixed).await?);
+        assert!(
+            store
+                .set_policy_state(
+                    &group_id,
+                    &campaign_id,
+                    &state(&[&mixed, &spread, &smaller])
+                )
+                .await?
+        );
+        crate::migrate::migrate(db, Some(38), false).await?;
+        let largest = older(&failed, 4);
+        assert_eq!(
+            store.list_policies(&group_id).await?,
+            [largest.clone(), smaller.clone()]
+        );
+        assert_eq!(kept().await?, state(&[&largest, &spread, &smaller]));
+        Ok(())
+    }
+
+    /// The `0031` body of `queue_match_clauses` gives the same stored
+    /// projections as the `0025` body. A move down restores the `0025` body.
+    #[tokio::test]
+    async fn the_linear_matcher_projection_keeps_stored_projections() -> anyhow::Result<()> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(31), false).await?;
+        let linear = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT prosrc LIKE '%array_append%' FROM pg_proc \
+                 WHERE oid = 'queue_match_clauses(text)'::regprocedure",
+            )
+            .fetch_one(db.pool())
+        };
+        let roster: Vec<String> = (0..300).map(|i| format!("client-{i}-é")).collect();
+        let bodies = [
+            serde_json::to_string(&serde_json::json!({"clients": roster}))?,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "requires": ["chip:a"],
+                "any_of": [["tag:日本"], []],
+                "exclude_clients": ["a\\b", "\"q\""],
+                "spec": {"clients": ["ignored"]},
+            }))?,
+            r#"{"requires":["\u0000"],"requires":["chip:b"],"x":"\u0000"}"#.to_owned(),
+            r#"{"clients":["\u0000"]}"#.to_owned(),
+            "{".to_owned(),
+        ];
+
+        let moved = crate::migrate::migrate(db, Some(30), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(30), vec![31]));
+        assert!(!linear().await?);
+        stream::iter(bodies.iter().enumerate())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(i, body)| async move {
+                sqlx::query("INSERT INTO queue_jobs (job_id, body, revision) VALUES ($1, $2, 1)")
+                    .bind(format!("projection-{i}"))
+                    .bind(body)
+                    .execute(db.pool())
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await?;
+
+        let moved = crate::migrate::migrate(db, Some(31), false).await?;
+        assert_eq!((moved.to, moved.applied), (Some(31), vec![31]));
+        assert!(linear().await?);
+        let differing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM queue_jobs \
+             WHERE match_clauses IS DISTINCT FROM queue_match_clauses(body)",
+        )
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(differing, 0);
+
+        let moved = crate::migrate::migrate(db, Some(30), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(30), vec![31]));
+        assert!(!linear().await?);
+        Ok(())
     }
 
     /// Migration `0008` copies `plan_name` from the body into `note`. It does
@@ -753,7 +1088,7 @@ mod tests {
             .fetch_all(db.pool())
         };
 
-        crate::migrate::migrate(db, None, false).await?;
+        crate::migrate::migrate(db, Some(24), false).await?;
         let workers: Vec<String> =
             sqlx::query_scalar("SELECT client_id FROM queue_workers ORDER BY client_id")
                 .fetch_all(db.pool())
@@ -785,6 +1120,117 @@ mod tests {
                 .fetch_one(db.pool())
                 .await?;
         assert_eq!(deadline, Some("2026-12-01T00:00:00Z".parse()?));
+        Ok(())
+    }
+
+    /// Migration `0028` deletes orphan eligibility, denial and lost-lease
+    /// rows and absent clients' liveness, then adds cascading foreign keys.
+    #[tokio::test]
+    async fn the_queue_cascade_migration_drops_orphans_and_cascades() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(27), false).await?;
+        sqlx::raw_sql(
+            "INSERT INTO clients (client_id, body, revision) VALUES ('ev1_live', '{}', 1); \
+             INSERT INTO client_liveness (client_id, last_seen_at) \
+             VALUES ('ev1_live', now()), ('ev1_gone', now()); \
+             INSERT INTO queue_jobs (job_id, body, revision) VALUES ('job-live', '{}', 1); \
+             INSERT INTO queue_eligibility (client_id, job_id) \
+             VALUES ('ev1_a', 'job-live'), ('ev1_a', 'job-gone'); \
+             INSERT INTO queue_denials (job_id, client_id) \
+             VALUES ('job-live', 'ev1_a'), ('job-gone', 'ev1_a'); \
+             INSERT INTO queue_lost_leases (job_id, client_id, lease_expiry) \
+             VALUES ('job-live', 'ev1_a', '2026-11-01T00:00:00Z'), \
+             ('job-gone', 'ev1_a', '2026-11-01T00:00:00Z'); \
+             INSERT INTO queue_maintenance_state (name, body) \
+             VALUES ('gc-candidates', '[\"plans:job-plans/x\"]'), ('backlog', '{}');",
+        )
+        .execute(db.pool())
+        .await?;
+        let jobs_named = |table: &'static str| {
+            sqlx::query_scalar::<_, String>(match table {
+                "queue_eligibility" => "SELECT job_id FROM queue_eligibility ORDER BY job_id",
+                "queue_denials" => "SELECT job_id FROM queue_denials ORDER BY job_id",
+                _ => "SELECT job_id FROM queue_lost_leases ORDER BY job_id",
+            })
+            .fetch_all(db.pool())
+        };
+        let tables = ["queue_eligibility", "queue_denials", "queue_lost_leases"];
+
+        crate::migrate::migrate(db, Some(28), false).await?;
+        futures::stream::iter(tables)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|table| async move {
+                assert_eq!(jobs_named(table).await?, ["job-live"], "{table}");
+                anyhow::Ok(())
+            })
+            .await?;
+        let state: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM queue_maintenance_state ORDER BY name")
+                .fetch_all(db.pool())
+                .await?;
+        assert_eq!(state, ["backlog"]);
+        let live_clients: Vec<String> =
+            sqlx::query_scalar("SELECT client_id FROM client_liveness ORDER BY client_id")
+                .fetch_all(db.pool())
+                .await?;
+        assert_eq!(live_clients, ["ev1_live"]);
+        sqlx::query("DELETE FROM clients WHERE client_id = 'ev1_live'")
+            .execute(db.pool())
+            .await?;
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM client_liveness")
+            .fetch_one(db.pool())
+            .await?;
+        assert_eq!(remaining, 0);
+
+        sqlx::query("DELETE FROM queue_jobs WHERE job_id = 'job-live'")
+            .execute(db.pool())
+            .await?;
+        futures::stream::iter(tables)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|table| async move {
+                assert!(jobs_named(table).await?.is_empty(), "{table}");
+                anyhow::Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_last_grant_client_migration_cleans_orphans_and_cascades() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(32), false).await?;
+        sqlx::raw_sql(
+            "INSERT INTO clients (client_id, body, revision) VALUES ('ev1_live', '{}', 1); \
+             INSERT INTO queue_client_last_grant (client_id, job_id, granted_at) \
+             VALUES ('ev1_live', 'finished', now()), ('ev1_gone', 'finished', now());",
+        )
+        .execute(db.pool())
+        .await?;
+        let grant_clients = || {
+            sqlx::query_scalar::<_, String>(
+                "SELECT client_id FROM queue_client_last_grant ORDER BY client_id",
+            )
+            .fetch_all(db.pool())
+        };
+        crate::migrate::migrate(db, Some(33), false).await?;
+        assert_eq!(grant_clients().await?, ["ev1_live"]);
+        sqlx::query("DELETE FROM clients WHERE client_id = 'ev1_live'")
+            .execute(db.pool())
+            .await?;
+        assert!(grant_clients().await?.is_empty());
+
+        crate::migrate::migrate(db, Some(32), false).await?;
+        sqlx::query(
+            "INSERT INTO queue_client_last_grant (client_id, job_id, granted_at) \
+             VALUES ('ev1_gone', 'finished', now())",
+        )
+        .execute(db.pool())
+        .await?;
+        assert_eq!(grant_clients().await?, ["ev1_gone"]);
+        crate::migrate::migrate(db, Some(33), false).await?;
+        assert!(grant_clients().await?.is_empty());
         Ok(())
     }
 

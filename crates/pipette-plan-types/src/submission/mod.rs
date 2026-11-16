@@ -446,14 +446,27 @@ pub enum BenchmarkResultData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vl_spec_decode_turn_accept_length_sum: Option<f64>,
     },
+    /// One decision request on the client's clock, send to the whole reply.
+    DecisionLatency {
+        decision_latency_request_ms: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_latency_request_ms_stddev: Option<f64>,
+        /// The whole batch, first send to last reply, when more than one
+        /// request was in flight.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_latency_batch_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_latency_batch_ms_stddev: Option<f64>,
+    },
 }
 
 impl BenchmarkResultData {
     /// The kind most variants imply: a shape hint, never the authoritative
-    /// type. Not one-to-one: `vl_max_memory` and `asr_max_memory` reuse
-    /// `MaxMemoryUsage`, and the `Eval { completions }` shape is shared by
-    /// `eval`, `vlm_eval` and `asr_eval` and reads as `Eval`. Take the true type
-    /// from the benchmark definition.
+    /// type. Not one-to-one: `vl_max_memory`, `asr_max_memory` and
+    /// `decision_max_memory` reuse `MaxMemoryUsage`, and the
+    /// `Eval { completions }` shape is shared by `eval`, `vlm_eval` and
+    /// `asr_eval` and reads as `Eval`. Take the true type from the benchmark
+    /// definition.
     pub fn benchmark_type(&self) -> BenchmarkType {
         match self {
             Self::PrefillThroughput { .. } => BenchmarkType::PrefillThroughput,
@@ -464,6 +477,7 @@ impl BenchmarkResultData {
             Self::VlThroughput { .. } => BenchmarkType::VlThroughput,
             Self::VlSpecDecode { .. } => BenchmarkType::VlSpecDecode,
             Self::AsrThroughput { .. } => BenchmarkType::AsrThroughput,
+            Self::DecisionLatency { .. } => BenchmarkType::DecisionLatency,
         }
     }
 }
@@ -517,8 +531,8 @@ pub struct BenchmarkSubmissionPayload {
     /// Canonical JSON of what the *harness* ran under (readiness gating,
     /// timeouts, loop detection), as
     /// [`BenchmarkFlags::submission_value`](crate::BenchmarkFlags::submission_value)
-    /// builds it. Resolved, not authored: the server's only record of
-    /// readiness, such as a waived thermal gate.
+    /// builds it. Its readiness block is resolved, not authored: the server's
+    /// only record of readiness, such as a waived thermal gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_flags: Option<String>,
     /// Canonical JSON of the
@@ -827,6 +841,18 @@ mod tests {
         vl_spec_decode_accepted_tokens: Some(42_302),
         vl_spec_decode_turn_accept_length_sum: Some(3_036.6),
     })]
+    #[case::decision_latency(BenchmarkResultData::DecisionLatency {
+        decision_latency_request_ms: 41.5,
+        decision_latency_request_ms_stddev: None,
+        decision_latency_batch_ms: None,
+        decision_latency_batch_ms_stddev: None,
+    })]
+    #[case::decision_latency_batched(BenchmarkResultData::DecisionLatency {
+        decision_latency_request_ms: 41.5,
+        decision_latency_request_ms_stddev: Some(1.5),
+        decision_latency_batch_ms: Some(820.0),
+        decision_latency_batch_ms_stddev: Some(12.0),
+    })]
     fn result_data_untagged_variant_round_trips(
         #[case] data: BenchmarkResultData,
     ) -> anyhow::Result<()> {
@@ -892,6 +918,10 @@ mod tests {
         vl_spec_decode_drafted_tokens: None, vl_spec_decode_accepted_tokens: None,
         vl_spec_decode_turn_accept_length_sum: None,
     }, BenchmarkType::VlSpecDecode)]
+    #[case::decision_latency(BenchmarkResultData::DecisionLatency {
+        decision_latency_request_ms: 1.0, decision_latency_request_ms_stddev: None,
+        decision_latency_batch_ms: None, decision_latency_batch_ms_stddev: None,
+    }, BenchmarkType::DecisionLatency)]
     fn benchmark_type_matches_the_variant(
         #[case] data: BenchmarkResultData,
         #[case] expected: BenchmarkType,
@@ -1031,7 +1061,8 @@ mod tests {
             | BenchmarkResultData::Eval { .. }
             | BenchmarkResultData::VlThroughput { .. }
             | BenchmarkResultData::AsrThroughput { .. }
-            | BenchmarkResultData::VlSpecDecode { .. }) => {
+            | BenchmarkResultData::VlSpecDecode { .. }
+            | BenchmarkResultData::DecisionLatency { .. }) => {
                 anyhow::bail!("expected MaxMemoryUsage, got {other:?}")
             }
         }

@@ -2,14 +2,26 @@ import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
 import { PHRASES, unlocks } from "../src/lib/danger";
 import {
-  REVISION, boxOver, failedCount, filingFailure, filingName, filingStatus, parentLink, rerunIds, rerunQuestion, rowOffers,
+  REVISION, boxOver, failedCount, filingFailure, filingName, filingStatus, markFiling, markQuestion, parentLink, rerunIds,
+  rerunQuestion, rowOffers,
 } from "../src/lib/rerun";
-import type { JobResult, JobState } from "../src/lib/api-types";
+import type { ExpiredJob, FailureSource, JobResult, JobState, ResultRow } from "../src/lib/api-types";
 
 describe("the re-run controls", () => {
   test("name what they file as the classic forms do", () => {
     expect(filingName({ verb: "rerun", body: { answered: "failed" } })).toBe("re-run");
     expect(filingName({ verb: "recalculate", body: { all_evals: true } })).toBe("recalculation");
+    expect(filingName({ verb: "rerun", body: { fail: { "job-a": "swap" } } })).toBe("mark");
+  });
+
+  test("mark a row failed for the reason given, and file nothing without one", () => {
+    expect(markFiling("job-a", "  swap after 5 runs ")).toEqual(
+      { verb: "rerun", body: { fail: { "job-a": "swap after 5 runs" } } });
+    expect(markFiling("job-a", "   ")).toBeNull();
+    expect(markQuestion("job-a")).toEqual({
+      title: "Mark job-a failed?", action: "Mark failed",
+      text: `A failure giving your reason answers its cell under a new job, which no device runs. ${REVISION}`,
+    });
   });
 
   test("offer a re-run on an answered row and a recalculation where the read says so", () => {
@@ -80,13 +92,33 @@ describe("the checked jobs a re-run takes", () => {
 });
 
 describe("the failed jobs a re-run takes", () => {
-  const jobs = (...states: JobState[]) => states.map((state) => ({ state }));
+  /** A job in `state` read as `result`, running another job again where `linked`, and lapsed where `lapsed`. */
+  const job = (state: JobState, result: JobResult = { status: "not_run" }, linked = false,
+               lapsed: ExpiredJob | null = null) => {
+    const rerun_of = linked ? { job_id: "job-a", plan_id: "plan-1" } : null;
+    return { state, result, plan: { lapsed, rerun_history: [], rerun_of } };
+  };
+  const jobs = (...states: JobState[]) => states.map((state) => job(state));
+  const failedBy = (failure_source: FailureSource): JobResult =>
+    ({ status: "scored", rows: [{ failure_source } as ResultRow], rescored_from: null, earlier_runs: [], recalculable: false });
 
   test("are counted where every answered job is settled", () => {
     expect(failedCount(jobs("failed", "finished", "failed", "available"), "ok", "active")).toBe(2);
     expect(failedCount(jobs("finished"), "ok", "active")).toBe(0);
     // Without pipette-duckdb the states are read from the records.
     expect(failedCount(jobs("failed", "cancelled"), "off", "complete")).toBe(1);
+  });
+
+  test("leave out a mark, which only a linked job's scored rows can show", () => {
+    const mark = job("failed", failedBy("marked"), true);
+    expect(failedCount([mark, job("failed", failedBy("client"), true), job("failed")], "ok", "active")).toBe(2);
+    expect(failedCount([mark], "ok", "active")).toBe(0);
+    // A linked job the server failed after a smaller run failed is no mark.
+    expect(failedCount([mark, job("failed", failedBy("smaller_run_failed"), true)], "ok", "active")).toBe(1);
+    expect(failedCount([job("failed", { status: "unknown" }, true), job("failed")], "off", "active")).toBeNull();
+    // A re-run that lapsed is never scored for the plan, and a mark never lapses.
+    const lapse = { expires_at: "2026-10-07T08:00:00Z", recorded_at: "2026-10-07T11:00:00Z" };
+    expect(failedCount([mark, job("failed", { status: "not_run" }, true, lapse)], "ok", "active")).toBe(1);
   });
 
   test("are not counted where a recorded failure may read otherwise", () => {

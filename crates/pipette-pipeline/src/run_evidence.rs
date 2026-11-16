@@ -339,7 +339,8 @@ mod tests {
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..pipette_core::config::Config::default()
         };
-        let stores = pipette_store_fs::build_local_fs_stores(&config)?;
+        let stores =
+            pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         let rows = [
             row("ev1_a", Some(false), 5)?,
             row("ev1_a", Some(true), 9)?,

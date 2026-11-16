@@ -41,21 +41,57 @@ use crate::PrincipalIdError;
 )]
 pub struct CampaignId(String);
 
-/// Charset plus prefix, [`OrgId`](crate::OrgId)'s rule one keyspace over.
-fn validate_campaign_id(s: &str) -> Result<(), IdError> {
-    check_id(s, "campaign_id", "[A-Za-z0-9_-]", &['_', '-'])?;
-    if !s.starts_with(CampaignId::PREFIX) {
-        return Err(IdError::MissingPrefix {
-            field: "campaign_id",
-            prefix: CampaignId::PREFIX,
-        });
+/// Charset plus prefix, [`OrgId`](crate::OrgId)'s rule.
+fn check_prefixed_id(s: &str, field: &'static str, prefix: &'static str) -> Result<(), IdError> {
+    check_id(s, field, "[A-Za-z0-9_-]", &['_', '-'])?;
+    if !s.starts_with(prefix) {
+        return Err(IdError::MissingPrefix { field, prefix });
     }
     Ok(())
+}
+
+fn validate_campaign_id(s: &str) -> Result<(), IdError> {
+    check_prefixed_id(s, "campaign_id", CampaignId::PREFIX)
 }
 
 impl CampaignId {
     /// Prefix on **every** campaign id, for [`OrgId::PREFIX`](crate::OrgId::PREFIX)'s reason.
     pub const PREFIX: &'static str = "campaign_";
+
+    pub fn as_str(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+/// Unique identifier for a campaign group: `group_` followed by a UUIDv7, which
+/// mgmt mints. Prefixed for [`CampaignId`]'s reason.
+#[nutype::nutype(
+    validate(with = validate_campaign_group_id, error = IdError),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        AsRef,
+        Display,
+        Into,
+        Serialize,
+        Deserialize,
+        TryFrom,
+        FromStr,
+    ),
+)]
+pub struct CampaignGroupId(String);
+
+fn validate_campaign_group_id(s: &str) -> Result<(), IdError> {
+    check_prefixed_id(s, "group_id", CampaignGroupId::PREFIX)
+}
+
+impl CampaignGroupId {
+    pub const PREFIX: &'static str = "group_";
 
     pub fn as_str(&self) -> &str {
         self.as_ref()
@@ -86,14 +122,7 @@ impl CampaignId {
 pub struct AuditEventId(String);
 
 fn validate_audit_event_id(s: &str) -> Result<(), IdError> {
-    check_id(s, "audit_event_id", "[A-Za-z0-9_-]", &['_', '-'])?;
-    if !s.starts_with(AuditEventId::PREFIX) {
-        return Err(IdError::MissingPrefix {
-            field: "audit_event_id",
-            prefix: AuditEventId::PREFIX,
-        });
-    }
-    Ok(())
+    check_prefixed_id(s, "audit_event_id", AuditEventId::PREFIX)
 }
 
 impl AuditEventId {
@@ -105,22 +134,30 @@ impl AuditEventId {
 }
 
 #[cfg(test)]
-mod campaign_id_tests {
+mod prefixed_id_tests {
     use rstest::rstest;
 
     use super::*;
 
-    /// A plan id does not pass for a campaign id: the prefix makes it a `400`.
+    /// A campaign or group id refuses any other id: the prefix makes it a `400`.
     #[rstest]
-    #[case::prefixed("campaign_anything".to_string(), true)]
-    #[case::a_plan_id("plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e".to_string(), false)]
-    #[case::an_org_id("org_a3f8c2".to_string(), false)]
-    #[case::bare("nightly".to_string(), false)]
-    #[case::empty(String::new(), false)]
-    fn a_campaign_id_requires_its_prefix(#[case] raw: String, #[case] accepted: bool) {
+    #[case::campaign("campaign_anything", true, false)]
+    #[case::group("group_anything", false, true)]
+    #[case::a_plan_id("plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", false, false)]
+    #[case::an_org_id("org_a3f8c2", false, false)]
+    #[case::bare("nightly", false, false)]
+    #[case::empty("", false, false)]
+    fn a_prefixed_id_requires_its_prefix(
+        #[case] raw: &str,
+        #[case] campaign: bool,
+        #[case] group: bool,
+    ) {
         assert_eq!(
-            CampaignId::try_new(raw.clone()).is_ok(),
-            accepted,
+            (
+                CampaignId::try_new(raw.to_string()).is_ok(),
+                CampaignGroupId::try_new(raw.to_string()).is_ok()
+            ),
+            (campaign, group),
             "{raw:?}"
         );
     }
@@ -239,8 +276,8 @@ pub enum IdError {
 
 /// The one charset check for every id newtype: non-empty, and every character
 /// ASCII-alphanumeric or in `extra`. No caller allows `/` or `:`, so a valid id
-/// is a safe path segment; the `todo/`-tree ids also exclude `.`, which keeps
-/// `.`-delimited filenames unambiguous.
+/// is a safe path segment; the queue's ids also exclude `.`, which keeps its
+/// `.`-delimited key strings unambiguous.
 fn check_id(
     s: &str,
     field: &'static str,
@@ -264,7 +301,7 @@ fn check_id(
 ///
 /// The derived `Ord` (declaration order) sorts sooner expiries first and
 /// `Never` last; the claim handler relies on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExpiresAt {
     At(DateTime<Utc>),
     Never,
@@ -559,7 +596,7 @@ mod tests {
     #[case("job_1", false)] // '_' is outside the job_id charset (unlike client_id)
     #[case("a/b", false)] // path separator
     #[case("..", false)] // traversal
-    #[case("a.b", false)] // '.' is the todo/ filename & marker delimiter
+    #[case("a.b", false)] // '.' is the delimiter in lease keys and plan markers
     #[case("has space", false)]
     fn job_id_try_new_charset(#[case] input: &str, #[case] valid: bool) {
         assert_eq!(JobId::try_new(input).is_ok(), valid, "{input:?}");

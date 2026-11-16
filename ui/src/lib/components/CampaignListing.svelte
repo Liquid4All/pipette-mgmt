@@ -1,3 +1,8 @@
+<script module lang="ts">
+  // A campaign group's page draws its members with these cells too.
+  export { name, status, progress, progressHead };
+</script>
+
 <script lang="ts">
   // The classic console's campaign listing (`campaigns.html`) under any branch:
   // every page of `GET /api/v1/campaigns` narrowed to the branch, newest first, each row
@@ -5,10 +10,9 @@
   // filtered, sorted and paged in `DataTable`, the plan id and the state by the server,
   // a job id by the campaigns of the plans that asked for it.
   import { campaigns, jobPlans } from "../api";
-  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, progressFill,
+  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, phaseOf, progressFill,
     progressText, soughtEmpty } from "../campaigns";
   import { ownedEmpty, type OwnedBranch } from "../owned";
-  import { shownStatus } from "../plans";
   import { here, href } from "../route.svelte";
   import { campaignLink, pathOf } from "../routes";
   import { session } from "../session.svelte";
@@ -65,18 +69,23 @@
 <!-- A plan the reader may not read is its id alone, as in the campaign's history. -->
 {#snippet status(row: CampaignView)}
   {#if row.state === "archived"}<StatusPill status="archived" />
-  {:else if row.plan}<StatusPill status={shownStatus(row.plan.status, row.plan.counts)} />{#if row.plan.cancel_requested}{" "}(cancel requested){/if}
+  {:else if row.plan}<StatusPill status={phaseOf(row.plan.status)} />{#if row.plan.cancel_requested}{" "}(cancel requested){/if}
   {:else}—{/if}
 {/snippet}
-<!-- A bar fills the cell behind the text: the finished jobs, then the failed ones, in the colors of the plan's phase.
-     The text's tooltip names the failed count. -->
+<!-- A bar fills the cell behind the text: the finished jobs, then the failed ones, in the colors of the plan's phase,
+     then the running ones. -->
 {#snippet progress(row: CampaignView)}
   {@const fill = progressFill(row)}
-  {@const failed = row.plan?.counts?.failed}
   {#if fill}<span class="fill" data-phase={fill.phase} data-failed={fill.done > fill.finished || undefined}
+                  data-running={fill.started > fill.done || undefined}
                   style:--finished="{fill.finished * 100}%"
-                  style:--done="{fill.done * 100}%"></span>{/if}<span
-    title={failed ? `${failed} failed` : undefined}>{progressText(row)}</span>
+                  style:--done="{fill.done * 100}%"
+                  style:--started="{fill.started * 100}%"></span>{/if}{progressText(row)}
+{/snippet}
+<!-- The finished share's color changes with the plan's phase, so only failed and running get a swatch. -->
+{#snippet progressHead()}
+  <span class="key">finished · <i class="swatch" data-of="failed"></i>failed ·
+    <i class="swatch" data-of="running"></i>running / total</span>
 {/snippet}
 <!-- The rows stay drawn while a new label is read back. -->
 {#snippet labels(row: CampaignView)}
@@ -97,7 +106,8 @@
     <DataTable {spec} rows={listed.items} id={(row) => row.campaign_id} noun="campaigns" {path}
                empty={sought ? soughtEmpty(branch, sought)
                  : ownedEmpty(branch, stateAsked === "all" ? "campaigns" : `${stateAsked || "active"} campaigns`)}
-               columnsKey="pipette.campaigns.columns" cells={{ name, owner, status, progress, labels }} />
+               columnsKey="pipette.campaigns.columns" cells={{ name, owner, status, progress, labels }}
+               heads={{ progress: progressHead }} />
   {/snippet}
 </Loaded>
 <!-- A refused id draws no table, so no box to correct it in. -->

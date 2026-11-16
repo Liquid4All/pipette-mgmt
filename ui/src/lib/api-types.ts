@@ -628,7 +628,19 @@ export type AuditAction =
   | {
       prior_keys: UserKey[];
       type: "first_clerk_sign_in";
+    }
+  | {
+      group_id: string;
+      kinds: PolicyKind[];
+      marked_job_count: number;
+      rerun_job_count: number;
+      type: "group_policy";
     };
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyKind".
+ */
+export type PolicyKind = "swap" | "spread" | "failed" | "ttft_over_e2e" | "model_params" | "smaller_failed";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "AuditActor".
@@ -677,6 +689,10 @@ export type AuditTarget =
   | {
       campaign_id: string;
       type: "campaign";
+    }
+  | {
+      group_id: string;
+      type: "campaign_group";
     }
   | {
       plan_id: string;
@@ -737,6 +753,36 @@ export type BenchmarkFlags =
       http_timeout_seconds?: number | null;
       model_type: "gguf_vision";
       readiness?: ReadinessOverrides | null;
+      runtime_type: "llamacpp_cli_stock_tools";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decision_latency";
+      http_timeout_seconds?: number | null;
+      model_type: "gguf_text";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "llamacpp_cli_stock_tools";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decision_latency";
+      http_timeout_seconds?: number | null;
+      model_type: "gguf_vision";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "llamacpp_cli_stock_tools";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decision_max_memory";
+      http_timeout_seconds?: number | null;
+      model_type: "gguf_text";
+      runtime_type: "llamacpp_cli_stock_tools";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decision_max_memory";
+      http_timeout_seconds?: number | null;
+      model_type: "gguf_vision";
       runtime_type: "llamacpp_cli_stock_tools";
     }
   | {
@@ -1351,7 +1397,9 @@ export type BenchmarkType =
   | "asr_eval"
   | "vl_spec_decode"
   | "asr_throughput"
-  | "asr_max_memory";
+  | "asr_max_memory"
+  | "decision_latency"
+  | "decision_max_memory";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PrincipalOwner".
@@ -1372,6 +1420,7 @@ export type PrincipalOwner =
 export type RevisionChange =
   | {
       added_variant_count: number;
+      carry_across_limit?: boolean;
       carry_earlier?: boolean;
       inherit_from?: string[];
       removed_variant_count: number;
@@ -1379,13 +1428,17 @@ export type RevisionChange =
       type: "variants";
     }
   | {
+      carry_across_limit?: boolean;
       carry_earlier?: boolean;
       inherit_from?: string[];
       type: "document";
     }
   | {
       answered?: Answered | null;
+      group_id?: string | null;
       job_count: number;
+      marked_job_count?: number;
+      policies?: PolicyKind[];
       type: "rerun";
     }
   | {
@@ -1412,6 +1465,48 @@ export type WarningKind = "fleet" | "uncatalogued_model" | string;
  * via the `definition` "CampaignState".
  */
 export type CampaignState = "active" | "archived";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicySkipReason".
+ */
+export type PolicySkipReason = "no_content_key" | "chain_read_failed" | "earlier_run_without_rows" | "unreadable_plan";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "FailureCode".
+ */
+export type FailureCode =
+  | "unspecified"
+  | "out_of_memory"
+  | "attempt_timeout"
+  | "runtime_error"
+  | "device_error"
+  | "device_not_ready"
+  | "harness_error";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "FailureSource".
+ */
+export type FailureSource =
+  "client" | "expired" | "all_clients_denied" | "unmatchable" | "lease_lost" | "marked" | "smaller_run_failed";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyMemberState".
+ */
+export type PolicyMemberState =
+  | "evaluated"
+  | "other_owner"
+  | "no_plan"
+  | "not_ready"
+  | "cancelled"
+  | "unreadable"
+  | "waiting_for_devices"
+  | "filing_not_advanced"
+  | "refused";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "RerunOutcome".
+ */
+export type RerunOutcome = "cleared" | "flagged" | "failed" | "dropped";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PlanStatus".
@@ -1567,11 +1662,6 @@ export type DockerIpcMode = "host" | "private" | "shareable" | "none";
  * via the `definition` "DocumentState".
  */
 export type DocumentState = ("present" | "collected") | "none" | "mismatch";
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "FailureSource".
- */
-export type FailureSource = "client" | "expired" | "all_clients_denied" | "unmatchable" | "lease_lost";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "IssueSeverity".
@@ -1804,6 +1894,66 @@ export type RuntimeFlags =
       model_type: "gguf_vision";
       no_cache?: boolean | null;
       number_gpu_layers?: number | null;
+      raw?: string[];
+      runtime_type: "llamacpp_cli_stock_tools";
+      threads?: number | null;
+    }
+  | {
+      benchmark_type: "decision_latency";
+      ctx_size?: number | null;
+      envs?: string[];
+      flash_attention?: LlamacppFlashAttention | null;
+      load_mode?: LlamacppLoadMode | null;
+      mmap?: boolean | null;
+      model_type: "gguf_text";
+      no_cache?: boolean | null;
+      number_gpu_layers?: number | null;
+      parallel?: number | null;
+      raw?: string[];
+      runtime_type: "llamacpp_cli_stock_tools";
+      threads?: number | null;
+    }
+  | {
+      benchmark_type: "decision_latency";
+      ctx_size?: number | null;
+      envs?: string[];
+      flash_attention?: LlamacppFlashAttention | null;
+      load_mode?: LlamacppLoadMode | null;
+      mmap?: boolean | null;
+      model_type: "gguf_vision";
+      no_cache?: boolean | null;
+      number_gpu_layers?: number | null;
+      parallel?: number | null;
+      raw?: string[];
+      runtime_type: "llamacpp_cli_stock_tools";
+      threads?: number | null;
+    }
+  | {
+      benchmark_type: "decision_max_memory";
+      ctx_size?: number | null;
+      envs?: string[];
+      flash_attention?: LlamacppFlashAttention | null;
+      load_mode?: LlamacppLoadMode | null;
+      mmap?: boolean | null;
+      model_type: "gguf_text";
+      no_cache?: boolean | null;
+      number_gpu_layers?: number | null;
+      parallel?: number | null;
+      raw?: string[];
+      runtime_type: "llamacpp_cli_stock_tools";
+      threads?: number | null;
+    }
+  | {
+      benchmark_type: "decision_max_memory";
+      ctx_size?: number | null;
+      envs?: string[];
+      flash_attention?: LlamacppFlashAttention | null;
+      load_mode?: LlamacppLoadMode | null;
+      mmap?: boolean | null;
+      model_type: "gguf_vision";
+      no_cache?: boolean | null;
+      number_gpu_layers?: number | null;
+      parallel?: number | null;
       raw?: string[];
       runtime_type: "llamacpp_cli_stock_tools";
       threads?: number | null;
@@ -2586,6 +2736,13 @@ export interface ApiSchema {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "AddCampaignGroupMembersRequest".
+ */
+export interface AddCampaignGroupMembersRequest {
+  campaign_ids: string[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "AddDescriptorMemberRequest".
  */
 export interface AddDescriptorMemberRequest {
@@ -2956,11 +3113,212 @@ export interface RevisionBase {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "CampaignPlanRow".
+ * via the `definition` "CampaignGroup".
  */
-export interface CampaignPlanRow {
-  plan: PlanSummary | null;
+export interface CampaignGroup {
+  created_at: string;
+  group_id: string;
+  name: string;
+  owner: PrincipalOwner;
+  updated_at: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupPage".
+ */
+export interface CampaignGroupPage {
+  items: CampaignGroup[];
+  next_cursor: string | null;
+  unreadable: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupPolicies".
+ */
+export interface CampaignGroupPolicies {
+  policies: CampaignGroupPolicy[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupPolicy".
+ */
+export interface CampaignGroupPolicy {
+  enabled: boolean;
+  enabled_at: string | null;
+  enabled_by: string | null;
+  group_id: string;
+  kind: PolicyKind;
+  max_reruns: number;
+  settings: PolicySettings;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicySettings".
+ */
+export interface PolicySettings {
+  codes?: {
+    [k: string]: number;
+  } | null;
+  percent?: number | null;
+  short_repetition_ms?: number | null;
+  short_repetition_percent?: number | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupPolicyPreview".
+ */
+export interface CampaignGroupPolicyPreview {
+  members: MemberPolicyPreview[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "MemberPolicyPreview".
+ */
+export interface MemberPolicyPreview {
+  answered_job_count: number;
+  campaign_id: string;
+  checks: PolicyCheckCounts[];
+  deadline_passed: boolean;
+  earliest_deadline: string | null;
+  filing_plan_id: string | null;
+  kept_job_count: number;
+  last_filing: PolicyFiling | null;
+  marked_job_ids: string[];
+  missing_model_params: ModelParamsGap[];
+  plan_id: string | null;
+  rerun_job_ids: string[];
+  skipped: {
+    [k: string]: PolicySkipReason;
+  };
+  smaller_failed: SmallerFailure[];
+  state: PolicyMemberState;
+  triggered: PolicyKind[];
+  unclaimed_job_count: number;
+  waiting_job_count: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyCheckCounts".
+ */
+export interface PolicyCheckCounts {
+  flagged: number;
+  kept: number;
+  kind: PolicyKind;
+  marked: number;
+  on: boolean;
+  rerun: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyFiling".
+ */
+export interface PolicyFiling {
+  filed_at: string;
   plan_id: string;
+  queued_job_count: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ModelParamsGap".
+ */
+export interface ModelParamsGap {
+  job_count: number;
+  key: string;
+  row_count: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "SmallerFailure".
+ */
+export interface SmallerFailure {
+  benchmark_id: string;
+  clean_benchmark_id: string;
+  clean_job_id: string;
+  failure_code: FailureCode | null;
+  failure_source: FailureSource | null;
+  job_id: string;
+  model_key: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupRerunResults".
+ */
+export interface CampaignGroupRerunResults {
+  limit: number;
+  offset: number;
+  rows: PolicyRerun[];
+  summary: PolicyRerunSummary[];
+  total: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyRerun".
+ */
+export interface PolicyRerun {
+  after: number | null;
+  after_code: string | null;
+  attempt: number;
+  before: number;
+  before_code: string | null;
+  benchmark_id: string;
+  campaign_id: string;
+  codes: FailureCode[] | null;
+  filed_at: string;
+  judged_at: string | null;
+  kind: PolicyKind;
+  model_key: string | null;
+  outcome: RerunOutcome | null;
+  plan_id: string;
+  rerun_job_id: string;
+  rerun_of: string;
+  short_repetition_ms: number | null;
+  short_repetition_percent: number | null;
+  threshold: number | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyRerunSummary".
+ */
+export interface PolicyRerunSummary {
+  cleared: number;
+  dropped: number;
+  failed: number;
+  flagged: number;
+  kind: PolicyKind;
+  median_after: number | null;
+  median_before: number | null;
+  reruns: number;
+  waiting: number;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignGroupView".
+ */
+export interface CampaignGroupView {
+  created_at: string;
+  group_id: string;
+  members: CampaignView[];
+  name: string;
+  owner: PrincipalOwner;
+  updated_at: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignView".
+ */
+export interface CampaignView {
+  campaign_id: string;
+  created_at: string;
+  current_plan_id?: string | null;
+  labels?: {
+    [k: string]: string;
+  };
+  models?: string[] | null;
+  name: string;
+  owner: PrincipalOwner;
+  plan?: PlanSummary | null;
+  state?: CampaignState;
+  updated_at: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -2991,12 +3349,21 @@ export interface Counts {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CampaignPlanRow".
+ */
+export interface CampaignPlanRow {
+  plan: PlanSummary | null;
+  plan_id: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CampaignRevised".
  */
 export interface CampaignRevised {
   cancel_requested: boolean;
   carried_job_count: number;
   dropped_job_count: number;
+  marked_job_count: number;
   plan: PlanFiled;
   previous_plan_id: string;
   recalculated_job_count: number;
@@ -3009,24 +3376,6 @@ export interface CampaignRevised {
 export interface CampaignVariants {
   base: RevisionBase;
   variants: string[];
-}
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "CampaignView".
- */
-export interface CampaignView {
-  campaign_id: string;
-  created_at: string;
-  current_plan_id?: string | null;
-  labels?: {
-    [k: string]: string;
-  };
-  models?: string[] | null;
-  name: string;
-  owner: PrincipalOwner;
-  plan?: PlanSummary | null;
-  state?: CampaignState;
-  updated_at: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3070,6 +3419,32 @@ export interface CatalogImportRuns {
 export interface ChangeDescriptorEntryStateRequest {
   action: DescriptorEntryAction;
   confirmation?: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ChangedCampaignGroup".
+ */
+export interface ChangedCampaignGroup {
+  changed: boolean;
+  created_at: string;
+  group_id: string;
+  name: string;
+  owner: PrincipalOwner;
+  updated_at: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ChangedCampaignGroupPolicy".
+ */
+export interface ChangedCampaignGroupPolicy {
+  changed: boolean;
+  enabled: boolean;
+  enabled_at: string | null;
+  enabled_by: string | null;
+  group_id: string;
+  kind: PolicyKind;
+  max_reruns: number;
+  settings: PolicySettings;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3351,6 +3726,14 @@ export interface ClientRunEvidence {
 export interface RunMark {
   at: string;
   client_version: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CreateCampaignGroupRequest".
+ */
+export interface CreateCampaignGroupRequest {
+  name: string;
+  owner?: VaultPrincipalId | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3688,6 +4071,7 @@ export interface ResultRow {
     | null;
   failed: boolean | null;
   failed_reason: string | null;
+  failure_code: FailureCode | null;
   failure_source: FailureSource | null;
   job_id: string;
   metric: string;
@@ -3805,6 +4189,7 @@ export interface NamedCampaignOverview {
   current_plan_id?: string | null;
   device_time_all_plans: DeviceTimeTotal | null;
   device_time_current_plan: DeviceTimeTotal | null;
+  group: CampaignGroup | null;
   history: CampaignPlanRow[];
   history_truncated: boolean;
   labels?: {
@@ -4237,6 +4622,15 @@ export interface PlanViewPage {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyBase".
+ */
+export interface PolicyBase {
+  enabled: boolean;
+  max_reruns: number;
+  settings: PolicySettings;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "RecalculateJobsRequest".
  */
 export interface RecalculateJobsRequest {
@@ -4284,6 +4678,9 @@ export interface RenameDescriptorEntryRequest {
  */
 export interface RerunJobsRequest {
   answered?: Answered | null;
+  fail?: {
+    [k: string]: string;
+  };
   job_ids?: string[] | null;
   note?: string | null;
 }
@@ -4307,15 +4704,26 @@ export interface RevisionDryRun {
   held_jobs: HeldJob[];
   imports: PlannedImport[];
   inherited_job_count: number;
+  marked_job_ids: string[];
   new_job_count: number;
   plan_warnings: string[];
   recalculated_job_count: number;
   repeated_variants: number[];
   requirements_rerun_job_count: number;
-  rerun_job_count: number;
+  rerun_job_ids: string[];
   restored_job_count: number;
   satisfied_job_count: number;
   unchanged: boolean;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "SetCampaignGroupPolicyRequest".
+ */
+export interface SetCampaignGroupPolicyRequest {
+  base: PolicyBase;
+  enabled: boolean;
+  max_reruns: number;
+  settings: PolicySettings;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -4344,6 +4752,13 @@ export interface SetUserOrgRequest {
  */
 export interface SetUserPermissionsRequest {
   permissions: UserPermission[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "UpdateCampaignGroupRequest".
+ */
+export interface UpdateCampaignGroupRequest {
+  name: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema

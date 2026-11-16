@@ -29,6 +29,9 @@ type PgQueryAs<'q, T> = QueryAs<'q, Postgres, T, PgArguments>;
 #[derive(Clone, Debug)]
 pub struct SqlDatabase {
     pool: PgPool,
+    /// The scratch schema of a test database. The last clone drops it.
+    #[cfg(any(test, feature = "testkit"))]
+    scratch: Option<std::sync::Arc<crate::scratch::Schema>>,
 }
 
 impl SqlDatabase {
@@ -73,7 +76,18 @@ impl SqlDatabase {
                 })
             })
             .connect_lazy_with(options);
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(any(test, feature = "testkit"))]
+            scratch: None,
+        }
+    }
+
+    /// This database, which keeps `schema` until its last clone drops.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn owning(mut self, schema: crate::scratch::Schema) -> Self {
+        self.scratch = Some(std::sync::Arc::new(schema));
+        self
     }
 
     pub(crate) fn pool(&self) -> &PgPool {

@@ -241,7 +241,9 @@ impl ModelFlags {
             | BenchmarkType::VlMaxMemory
             | BenchmarkType::VlSpecDecode
             | BenchmarkType::AsrThroughput
-            | BenchmarkType::AsrMaxMemory => None,
+            | BenchmarkType::AsrMaxMemory
+            | BenchmarkType::DecisionLatency
+            | BenchmarkType::DecisionMaxMemory => None,
         }
     }
 }

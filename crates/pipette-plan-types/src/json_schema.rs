@@ -11,14 +11,14 @@ use serde_json::{Map, Value, json};
 use strum::IntoEnumIterator as _;
 
 use crate::{
-    AbsolutePath, AuditEventId, BenchmarkId, BenchmarkType, CampaignId, CapabilityFlag,
-    CatalogName, ClientId, ClientPreauthKeyId, ContactEmail, DockerShmSize, ElapsedMillis,
-    EnvForward, FileName, HfOrg, HfRepoName, HfRevision, JobId, Labels, LlamaCppFlavor, ModelKey,
-    ModelType, NonEmptyString, NonEmptyTrimmedString, OnnxExecutionProvider, OpenvinoDevice, OrgId,
-    OrgSlug, OvmsFlavor, PlanId, PositiveCount, PositiveSeconds, PublicKeyHex, RelativePath,
-    RemoteArchiveUrl, RepoSubpath, RepositoryUrl, ResourceUrl, RuntimeType, SemverWithBuild,
-    Sha256, SkinCelsius, Tag, TrtEdgellmFlavor, UserId, UserKeyId, UserPreauthKeyId, UvBuild,
-    UvPythonVersion, UvServerVersion, VaultResourceId,
+    AbsolutePath, AuditEventId, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId,
+    CapabilityFlag, CatalogName, ClientId, ClientPreauthKeyId, ContactEmail, DockerShmSize,
+    ElapsedMillis, EnvForward, FileName, HfOrg, HfRepoName, HfRevision, JobId, Labels,
+    LlamaCppFlavor, ModelKey, ModelType, NonEmptyString, NonEmptyTrimmedString,
+    OnnxExecutionProvider, OpenvinoDevice, OrgId, OrgSlug, OvmsFlavor, PlanId, PositiveCount,
+    PositiveSeconds, PublicKeyHex, RelativePath, RemoteArchiveUrl, RepoSubpath, RepositoryUrl,
+    ResourceUrl, RuntimeType, SemverWithBuild, Sha256, SkinCelsius, Tag, TrtEdgellmFlavor, UserId,
+    UserKeyId, UserPreauthKeyId, UvBuild, UvPythonVersion, UvServerVersion, VaultResourceId,
 };
 
 /// A newtype is its wire primitive, inlined: TS sees `string`, not an alias.
@@ -39,7 +39,7 @@ macro_rules! primitive_schema {
 }
 
 primitive_schema!({ "type": "string" }:
-    AbsolutePath, AuditEventId, BenchmarkId, CampaignId, ClientId, ClientPreauthKeyId, ContactEmail, DockerShmSize, EnvForward, FileName, HfOrg, HfRepoName, HfRevision, JobId, ModelKey, NonEmptyString, NonEmptyTrimmedString, OrgId, OrgSlug, PlanId, PublicKeyHex, RelativePath, RemoteArchiveUrl, RepoSubpath, RepositoryUrl, ResourceUrl, SemverWithBuild, Sha256, Tag, UserId, UserKeyId, UserPreauthKeyId, UvBuild, UvPythonVersion, UvServerVersion, VaultResourceId,
+    AbsolutePath, AuditEventId, BenchmarkId, CampaignGroupId, CampaignId, ClientId, ClientPreauthKeyId, ContactEmail, DockerShmSize, EnvForward, FileName, HfOrg, HfRepoName, HfRevision, JobId, ModelKey, NonEmptyString, NonEmptyTrimmedString, OrgId, OrgSlug, PlanId, PublicKeyHex, RelativePath, RemoteArchiveUrl, RepoSubpath, RepositoryUrl, ResourceUrl, SemverWithBuild, Sha256, Tag, UserId, UserKeyId, UserPreauthKeyId, UvBuild, UvPythonVersion, UvServerVersion, VaultResourceId,
 );
 // The type also refuses non-ASCII uppercase, which the pattern does not check.
 primitive_schema!({ "type": "string", "pattern": "^[^\\sA-Z]+$" }: CapabilityFlag);

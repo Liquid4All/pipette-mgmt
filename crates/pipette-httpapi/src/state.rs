@@ -10,10 +10,10 @@ use pipette_pipeline::hf_import::HfImports;
 use pipette_pipeline::plan_cells::CellCache;
 use pipette_pipeline::plan_results::ResultsDb;
 use pipette_store::{
-    AuditStore, CampaignStore, CatalogImportRunStore, CatalogStore, ClientStore, DatasetCacheStore,
-    DescriptorCatalogStore, EvalPackageStore, EvalSampleResultStore, KeyIndexStore,
-    ModelParamsStore, OrgStore, PlanStore, RunEvidenceStore, Stores, SubmissionStore, TagStore,
-    TodoStore, UserStore, VaultStore, WarehouseStore,
+    AuditStore, CampaignGroupStore, CampaignStore, CatalogImportRunStore, CatalogStore,
+    ClientStore, DatasetCacheStore, DescriptorCatalogStore, EvalPackageStore,
+    EvalSampleResultStore, KeyIndexStore, ModelParamsStore, OrgStore, PlanStore, RunEvidenceStore,
+    Stores, SubmissionStore, TagStore, TodoStore, UserStore, VaultStore, WarehouseStore,
 };
 
 use crate::api_schema::openapi::OpenApi;
@@ -78,13 +78,15 @@ pub struct AppState {
     pub submission_store: Arc<dyn SubmissionStore>,
     pub warehouse_store: Arc<dyn WarehouseStore>,
     pub eval_sample_result_store: Arc<dyn EvalSampleResultStore>,
-    /// `todo/` job-queue tree, backed by `config.todo_storage()`.
+    /// The job queue.
     pub todo_store: Arc<dyn TodoStore>,
     /// `plans/` manifest tree.
     pub plan_store: Arc<dyn PlanStore>,
     /// `campaigns/`, written only by the `/api/v1/campaigns` routes; no cron
     /// pass touches it.
     pub campaign_store: Arc<dyn CampaignStore>,
+    /// `None` without a `[database]`, which alone keeps campaign groups.
+    pub campaign_group_store: Option<Arc<dyn CampaignGroupStore>>,
     /// `model-params/`: the model parameter table, written by `/api/v1/model-params`
     /// and read for a filing's coverage warning and a result row's empty counts.
     pub model_params_store: Arc<dyn ModelParamsStore>,
@@ -183,6 +185,7 @@ impl AppState {
             todo_store: stores.todo,
             plan_store: stores.plans,
             campaign_store: stores.campaigns,
+            campaign_group_store: stores.campaign_groups,
             model_params_store: stores.model_params,
             audit_store: stores.audit,
             audit_writes: tokio_util::task::TaskTracker::new(),

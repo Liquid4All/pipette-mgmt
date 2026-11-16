@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuditEventId, CampaignId, CatalogName, CatalogScope, ClientId, JobId, OrgId, PlanId, UserId,
-    UserKey, UserKeyId, VaultResourceId, empty_as_none,
+    AuditEventId, CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId, JobId, OrgId,
+    PlanId, PolicyKind, PrincipalOwner, UserId, UserKey, UserKeyId, VaultResourceId, empty_as_none,
 };
 
 /// Who acted.
@@ -116,6 +116,15 @@ pub enum AuditAction {
     /// An account's first Clerk sign-in, when it already held keys: each was
     /// registered before its owner signed in.
     FirstClerkSignIn { prior_keys: Vec<UserKey> },
+    /// A revision that `queue-maintenance` filed into a member campaign of a
+    /// group for the group's policies, `failed` unless the campaign moved onto
+    /// it.
+    GroupPolicy {
+        group_id: CampaignGroupId,
+        kinds: Vec<PolicyKind>,
+        rerun_job_count: usize,
+        marked_job_count: usize,
+    },
 }
 
 #[derive(
@@ -155,6 +164,7 @@ pub enum AuditTarget {
     User { user_id: UserId },
     Client { client_id: ClientId },
     Campaign { campaign_id: CampaignId },
+    CampaignGroup { group_id: CampaignGroupId },
     Plan { plan_id: PlanId },
     Job { job_id: JobId },
     VaultResource { resource_id: VaultResourceId },
@@ -192,9 +202,19 @@ impl AuditTarget {
             Self::User { user_id } => user_id.as_str(),
             Self::Client { client_id } => client_id.as_str(),
             Self::Campaign { campaign_id } => campaign_id.as_str(),
+            Self::CampaignGroup { group_id } => group_id.as_str(),
             Self::Plan { plan_id } => plan_id.as_str(),
             Self::Job { job_id } => job_id.as_str(),
             Self::VaultResource { resource_id } => resource_id.as_str(),
+        }
+    }
+}
+
+impl From<PrincipalOwner> for AuditTarget {
+    fn from(owner: PrincipalOwner) -> Self {
+        match owner {
+            PrincipalOwner::Org { org_id } => Self::Org { org_id },
+            PrincipalOwner::User { user_id } => Self::User { user_id },
         }
     }
 }
@@ -348,6 +368,7 @@ mod tests {
     #[case::user(json!({"type": "user", "user_id": "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"}))]
     #[case::client(json!({"type": "client", "client_id": "ev1_abc"}))]
     #[case::campaign(json!({"type": "campaign", "campaign_id": "campaign_0195c3e2"}))]
+    #[case::campaign_group(json!({"type": "campaign_group", "group_id": "group_0195c3e2"}))]
     #[case::plan(json!({"type": "plan", "plan_id": "plan-1"}))]
     #[case::job(json!({"type": "job", "job_id": "job-1"}))]
     #[case::vault_resource(json!({"type": "vault_resource", "resource_id": "vault_0195c3e2"}))]

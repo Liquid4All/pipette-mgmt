@@ -8,7 +8,7 @@ use toml::Table;
 
 use pipette_plan_types::{
     BatchSize, BenchmarkDefinition, BenchmarkEntry, BenchmarkId, BenchmarkParams, BenchmarkType,
-    Dataset, OrgId, VlmEvalRecipe, VlmPromptProfile,
+    Dataset, DecisionBenchmark, OrgId, VlmEvalRecipe, VlmPromptProfile,
 };
 
 /// Wire fields every submission may report, whatever it measured: the scorer
@@ -36,7 +36,8 @@ pub fn measurement_fields(benchmark_type: BenchmarkType) -> &'static [&'static s
         BenchmarkType::EndToEndLatency => &["total_time_ms", "total_time_ms_stddev"],
         BenchmarkType::MaxMemoryUsage
         | BenchmarkType::VlMaxMemory
-        | BenchmarkType::AsrMaxMemory => &[
+        | BenchmarkType::AsrMaxMemory
+        | BenchmarkType::DecisionMaxMemory => &[
             "max_host_bytes",
             "max_ram_bytes",
             "max_gpu_bytes",
@@ -80,6 +81,12 @@ pub fn measurement_fields(benchmark_type: BenchmarkType) -> &'static [&'static s
             "vl_spec_decode_drafted_tokens",
             "vl_spec_decode_accepted_tokens",
             "vl_spec_decode_turn_accept_length_sum",
+        ],
+        BenchmarkType::DecisionLatency => &[
+            "decision_latency_request_ms",
+            "decision_latency_request_ms_stddev",
+            "decision_latency_batch_ms",
+            "decision_latency_batch_ms_stddev",
         ],
     }
 }
@@ -177,6 +184,10 @@ impl Benchmark {
             BenchmarkType::VlSpecDecode => BenchmarkDefinition::VlSpecDecode(strict(body)?),
             BenchmarkType::AsrThroughput => BenchmarkDefinition::AsrThroughput(strict(body)?),
             BenchmarkType::AsrMaxMemory => BenchmarkDefinition::AsrMaxMemory(strict(body)?),
+            BenchmarkType::DecisionLatency => BenchmarkDefinition::DecisionLatency(strict(body)?),
+            BenchmarkType::DecisionMaxMemory => {
+                BenchmarkDefinition::DecisionMaxMemory(strict(body)?)
+            }
         };
         Self::from_def(def)
     }
@@ -203,7 +214,9 @@ impl Benchmark {
             | BenchmarkDefinition::MaxMemoryUsage(_)
             | BenchmarkDefinition::VlThroughput(_)
             | BenchmarkDefinition::VlMaxMemory(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => false,
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => false,
         };
         if stamped {
             anyhow::bail!("unknown field `samples`");
@@ -226,7 +239,9 @@ impl Benchmark {
             | BenchmarkDefinition::MaxMemoryUsage(_)
             | BenchmarkDefinition::VlThroughput(_)
             | BenchmarkDefinition::VlMaxMemory(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => false,
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => false,
         };
         if rule_without_seed {
             anyhow::bail!(
@@ -271,6 +286,8 @@ impl Benchmark {
                 )
                 .map_err(anyhow::Error::from)
                 .and_then(|()| check_asr_recipe(b.recipe.as_ref()).map_err(anyhow::Error::from)),
+                BenchmarkDefinition::DecisionLatency(b)
+                | BenchmarkDefinition::DecisionMaxMemory(b) => check_decision_request(b),
                 BenchmarkDefinition::PrefillThroughput(_)
                 | BenchmarkDefinition::AsrThroughput(_)
                 | BenchmarkDefinition::AsrMaxMemory(_)
@@ -318,6 +335,24 @@ impl Benchmark {
     pub fn parameter_batch_size(&self) -> Option<BatchSize> {
         self.def.batch_size()
     }
+}
+
+/// Cross-field rules serde cannot express.
+fn check_decision_request(b: &DecisionBenchmark) -> anyhow::Result<()> {
+    let images = b.parameter_num_images.into_inner() > 0;
+    match (images, b.parameter_image_width, b.parameter_image_height) {
+        (true, Some(_), Some(_)) | (false, None, None) => {}
+        (true, ..) => anyhow::bail!(
+            "parameter_num_images > 0 requires parameter_image_width and parameter_image_height"
+        ),
+        (false, ..) => anyhow::bail!(
+            "parameter_image_width and parameter_image_height require parameter_num_images > 0"
+        ),
+    }
+    if !images && b.parameter_text_tokens.into_inner() == 0 {
+        anyhow::bail!("a decision request needs parameter_text_tokens > 0 or images");
+    }
+    Ok(())
 }
 
 /// `T` from `body`, refused for a top-level key `T` does not name, or one
@@ -1084,7 +1119,9 @@ digest   = "2222222222222222222222222222222222222222222222222222222222222222"
             ("vl_spec_decode_corpus_test_k8", VL_CORPUS_DECODE_TOML),
             ("prefill_throughput_256", PREFILL_THROUGHPUT_TOML),
             ("decode_throughput_512_100", DECODE_THROUGHPUT_TOML),
-            ("end_to_end_latency_256_256", E2E_LATENCY_TOML)
+            ("end_to_end_latency_256_256", E2E_LATENCY_TOML),
+            ("decision_latency_text64_q1", DECISION_LATENCY_TOML),
+            ("decision_max_memory_384x384_text0_img1_q1", DECISION_MAX_MEMORY_TOML)
         )]
         fixture: (&str, &str),
     ) {
@@ -1129,6 +1166,21 @@ parameter_text_tokens = 0
 parameter_decode_tokens = 256
 "#;
 
+    const DECISION_LATENCY_TOML: &str = r#"
+benchmark_type = "decision_latency"
+parameter_text_tokens = 64
+parameter_questions = 1
+"#;
+
+    const DECISION_MAX_MEMORY_TOML: &str = r#"
+benchmark_type = "decision_max_memory"
+parameter_image_width = 384
+parameter_image_height = 384
+parameter_text_tokens = 0
+parameter_num_images = 1
+parameter_questions = 1
+"#;
+
     const VL_MAX_MEMORY_TOML: &str = r#"
 benchmark_type = "vl_max_memory"
 parameter_image_width = 224
@@ -1158,6 +1210,8 @@ parameter_num_images = 5
     #[case::vl_max_memory(VL_MAX_MEMORY_TOML)]
     #[case::asr_throughput(ASR_THROUGHPUT_TOML)]
     #[case::asr_max_memory(ASR_MAX_MEMORY_TOML)]
+    #[case::decision_latency(DECISION_LATENCY_TOML)]
+    #[case::decision_max_memory(DECISION_MAX_MEMORY_TOML)]
     #[case::vl_max_memory_decode(VL_MAX_MEMORY_DECODE_TOML)]
     #[case::vlm_eval(&vlm_eval("", None))]
     #[case::vlm_eval_penalties(&vlm_eval(
@@ -1310,6 +1364,11 @@ parameter_num_images = 5
         VL_MAX_MEMORY_TOML,
         "parameter_num_images = 1",
         "parameter_num_images = 4294967295"
+    )]
+    #[case::zero_questions(
+        DECISION_LATENCY_TOML,
+        "parameter_questions = 1",
+        "parameter_questions = 0"
     )]
     #[case::zero_draft_length(
         VL_CORPUS_DECODE_TOML,
@@ -2456,6 +2515,54 @@ parameter_decode_tokens = 128
         assert_eq!(parameter_text_tokens.into_inner(), 32);
         assert_eq!(parameter_decode_tokens.into_inner(), 128);
         assert_eq!(parameter_num_images.into_inner(), 1);
+        Ok(())
+    }
+
+    /// A decision entry parses when its image size and image count agree and
+    /// it sends something to decide on; the catalog refuses the rest.
+    #[rstest]
+    #[case::text("parameter_text_tokens = 64", None)]
+    #[case::image(
+        "parameter_text_tokens = 0\nparameter_num_images = 1\nparameter_image_width = 384\nparameter_image_height = 384",
+        None
+    )]
+    #[case::images_without_size(
+        "parameter_text_tokens = 0\nparameter_num_images = 1",
+        Some("parameter_num_images > 0 requires parameter_image_width and parameter_image_height")
+    )]
+    #[case::half_a_size(
+        "parameter_text_tokens = 0\nparameter_num_images = 1\nparameter_image_width = 384",
+        Some("parameter_num_images > 0 requires parameter_image_width and parameter_image_height")
+    )]
+    #[case::size_without_images(
+        "parameter_text_tokens = 64\nparameter_image_width = 384\nparameter_image_height = 384",
+        Some("parameter_image_width and parameter_image_height require parameter_num_images > 0")
+    )]
+    #[case::nothing_to_decide_on(
+        "parameter_text_tokens = 0",
+        Some("a decision request needs parameter_text_tokens > 0 or images")
+    )]
+    #[case::packed("parameter_text_tokens = 64\nparameter_batch_size = 64", None)]
+    #[case::no_batch_of_zero(
+        "parameter_text_tokens = 64\nparameter_batch_size = 0",
+        Some("parameter_batch_size")
+    )]
+    fn a_decision_entry_is_checked_across_its_fields(
+        #[case] fields: &str,
+        #[case] refused: Option<&str>,
+        #[values(BenchmarkType::DecisionLatency, BenchmarkType::DecisionMaxMemory)]
+        benchmark_type: BenchmarkType,
+    ) -> anyhow::Result<()> {
+        let toml =
+            format!("benchmark_type = \"{benchmark_type}\"\nparameter_questions = 1\n{fields}\n");
+        match (
+            Benchmark::from_toml(&format!("{benchmark_type}_x"), &toml),
+            refused,
+        ) {
+            (Ok(b), None) => assert_eq!(b.benchmark_type(), benchmark_type),
+            (Err(e), Some(reason)) => assert!(e.to_string().contains(reason), "{e}"),
+            (got, want) => anyhow::bail!("{toml}: got {got:?}, want refusal {want:?}"),
+        }
         Ok(())
     }
 

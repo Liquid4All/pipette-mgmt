@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { e2eText, pairingText, ttftText } from "../src/lib/findings";
 import {
   canonical, cellText, chartNames, chartRefs, descriptorText, deviceNames, deviceType, drawnRows, effortOf, estimate, familyOf, index, modelLabels, pageControls, partText, reportFilters, reportPairs, runtimeLabels, shortLabel, thinkingOf, speculativeJobs, view,
-  ASR_SWAPPED, BEYOND_LIMIT, SWAPPED, toggledRuntime, ttftOver, VL_SWAPPED, withFilter, type BarChart, type LineChart, type ReportFilters,
+  ASR_SWAPPED, BEYOND_LIMIT, DECISION_SWAPPED, SWAPPED, toggledRuntime, ttftOver, VL_SWAPPED, withFilter, type BarChart, type LineChart, type ReportFilters,
 } from "../src/lib/report";
 import type { FleetDetail, Model, ModelFlags, ResultRow, Runtime } from "../src/lib/api-types";
 import type { DescriptorNames } from "../src/lib/descriptor-names";
@@ -36,7 +36,7 @@ function row(over: Partial<ResultRow> = {}): ResultRow {
   next++;
   return {
     job_id: `job-${next}`, benchmark_id: "bench", benchmark_type: "prefill_throughput", metric: "prefill_throughput",
-    value: 100, value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null,
+    value: 100, value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null, failure_code: null,
     model_params_total_millions: 1000, model_params_active_millions: 1000,
     model_descriptor: gguf("Tiny-1B"), runtime_descriptor: MAC, runtime_descriptor_sha256: null, model_descriptor_sha256: null, model_flags: null,
     runtime_flags: null, benchmark_flags: null,
@@ -429,6 +429,17 @@ describe("families and metrics", () => {
     expect(bars(peaks.charts).flatMap((c) => c.bars.map((b) => [b.label.includes("Gemma"), b.cell.beyond === true]))
       .sort()).toEqual([[false, false], [true, true]]);
     expect(note(peaks)).toBeDefined();
+  });
+
+  test("the decision families open on their latency and on the peak", () => {
+    const ix = index([
+      ...job("decision_max_memory", [["max_host_usage", 3e9, "bytes"]]),
+      ...job("decision_latency", [["decision_latency", 40, "ms"]]),
+    ], "full");
+    expect(ix.families.map((f) => [f.key, f.label, f.metric])).toEqual([
+      ["decision_latency", "decision latency", "decision_latency"],
+      ["decision_max_memory", "decision peak memory", "peak_memory"],
+    ]);
   });
 
   test("VL throughput's metrics run as their text twins' tabs do, any other after by name; it opens on E2E latency", () => {
@@ -1887,8 +1898,10 @@ describe("the index's families", () => {
   const BOX_A = `Box · ${BOX_RT}`;
 
   test("names each type by its short label, an unknown one by its key", () => {
-    expect(["prefill_throughput", "vl_max_memory", "asr_throughput", "asr_max_memory", "custom_probe"].map(shortLabel))
-      .toEqual(["Prefill", "VL memory", "ASR throughput", "ASR memory", "custom_probe"]);
+    expect(["prefill_throughput", "vl_max_memory", "asr_throughput", "asr_max_memory", "decision_latency",
+            "decision_max_memory", "custom_probe"].map(shortLabel))
+      .toEqual(["Prefill", "VL memory", "ASR throughput", "ASR memory", "Decision latency", "Decision memory",
+                "custom_probe"]);
   });
 
   test("the Overview counts measured and failed jobs by cause, columns and models", () => {
@@ -2052,6 +2065,27 @@ describe("swap", () => {
     expect(drawn.caption).toEqual([G("Tiny-1B"), "audio_channels=1", "audio_sample_rate_hz=16000",
       "decode_tokens=256"]);
     // An ASR row never reads on the text Swap, whose prompt is a prefill length.
+    expect(view(ix, { ...none, benchmark: SWAPPED }).charts.flatMap((c) => drawnRows([c], new Set()).size)).toEqual([1]);
+  });
+
+  test("charts the decision types' swap apart, over their state's parameters", () => {
+    const at = (type: string, text: number, gb: number) => job(type,
+      type === "decision_latency" ? [["decision_latency", 40, "ms"]] : [["max_host_usage", 3e9, "bytes"]],
+      { parameters: { text_tokens: text, num_images: 0, batch_size: 1 }, observations: { max_swap_bytes: gb * 1e9 } });
+    const decision = [...at("decision_latency", 64, 0), ...at("decision_latency", 3400, 1),
+                      ...at("decision_max_memory", 64, 0), ...at("decision_max_memory", 3400, 2)];
+    const ix = index([...decision, row({ observations: { max_swap_bytes: 1e9 } })], "full");
+    expect(ix.families.slice(-2).map((f) => [f.key, f.types])).toEqual([
+      [SWAPPED, ["prefill_throughput"]], [DECISION_SWAPPED, ["decision_latency", "decision_max_memory"]]]);
+    expect(chartRefs(ix).slice(-1).map((c) => c.name)).toEqual(["Decision swap"]);
+    const drawn = view(ix, { ...none, benchmark: DECISION_SWAPPED });
+    const chart = lines(drawn.charts)[0]!;
+    expect([chart.x, chart.rungs.map((r) => r.x)]).toEqual(["text_tokens", [64, 3400]]);
+    expect(chart.panels.map((p) => p.title)).toEqual(["Bench A · decision latency", "Bench A · decision peak memory"]);
+    expect([medians(chart, 0), medians(chart, 1)]).toEqual([[[0, 1]], [[0, 2]]]);
+    // The parameters both types name: the state's, and the requests in flight.
+    expect(drawn.caption).toEqual([G("Tiny-1B"), "batch_size=1", "num_images=0"]);
+    // A decision row never reads on the text Swap, whose prompt is a prefill length.
     expect(view(ix, { ...none, benchmark: SWAPPED }).charts.flatMap((c) => drawnRows([c], new Set()).size)).toEqual([1]);
   });
 

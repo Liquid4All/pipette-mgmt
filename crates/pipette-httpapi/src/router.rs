@@ -30,6 +30,10 @@ pub(crate) const ADMINISTER_CAMPAIGN: Gate = AnyOf(
 );
 /// An organization's devices are its roster and the fleet at once.
 pub(crate) const READ_ORG_DEVICES: Gate = AllOf(&[ReadOrgs, ReadClients]);
+/// The policy preview and the re-run results read the members' plans, and
+/// the failed check counts device failures, which only `read_clients`
+/// discloses.
+pub(crate) const PREVIEW_POLICIES: Gate = AllOf(&[ReadPlans, ReadClients]);
 /// The fleet reads. `GET /api/v1/users/me` answers these three gates in
 /// `may`, so they are named once.
 pub(crate) const READ_FLEET: Gate = Needs(ReadClients);
@@ -84,6 +88,7 @@ pub fn app(state: AppState) -> Router {
                     campaign_id = tracing::field::Empty,
                     benchmark_id = tracing::field::Empty,
                     resource_id = tracing::field::Empty,
+                    group_id = tracing::field::Empty,
                 );
                 next.run(req).instrument(span)
             },
@@ -558,6 +563,76 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             put(gate(
                 ADMINISTER_CAMPAIGN,
                 api_v1::campaigns::set_campaign_owner,
+            )),
+        )
+        // ── campaign groups ─────────────────────────────────────────────────
+        .route(
+            "/api/v1/campaign-groups",
+            get(gate(
+                READ_CAMPAIGN,
+                api_v1::campaign_groups::list_campaign_groups,
+            ))
+            .post(gate(
+                FILE_PLANS,
+                api_v1::campaign_groups::create_campaign_group,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}",
+            get(gate(
+                READ_CAMPAIGN,
+                api_v1::campaign_groups::get_campaign_group,
+            ))
+            .patch(gate(
+                ADMINISTER_CAMPAIGN,
+                api_v1::campaign_groups::update_campaign_group,
+            ))
+            .delete(gate(
+                ADMINISTER_CAMPAIGN,
+                api_v1::campaign_groups::delete_campaign_group,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}/members",
+            post(gate(
+                FILE_PLANS,
+                api_v1::campaign_groups::add_campaign_group_members,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}/members/{campaign_id}",
+            delete(gate(
+                FILE_PLANS,
+                api_v1::campaign_groups::remove_campaign_group_member,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}/policies",
+            get(gate(
+                READ_CAMPAIGN,
+                api_v1::campaign_groups::list_campaign_group_policies,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}/policies/{kind}",
+            put(gate(
+                FILE_PLANS,
+                api_v1::campaign_groups::set_campaign_group_policy,
+            )),
+        )
+        // Beside `/policies/{kind}`, not under it.
+        .route(
+            "/api/v1/campaign-groups/{group_id}/policy-preview",
+            get(gate(
+                PREVIEW_POLICIES,
+                api_v1::campaign_groups::preview_campaign_group_policies,
+            )),
+        )
+        .route(
+            "/api/v1/campaign-groups/{group_id}/rerun-results",
+            get(gate(
+                PREVIEW_POLICIES,
+                api_v1::campaign_groups::list_campaign_group_rerun_results,
             )),
         )
         // ── the vault ───────────────────────────────────────────────────────

@@ -84,8 +84,10 @@ answer `404`; only a result that landed before the teardown pass is kept.
 
 ## Failures no client sent
 
-The server retires a job unrun, and writes a failure for it, in four cases.
-`failure_source` names which; a failure a client reported reads `client`.
+The server writes a failure for a job no client ran in six cases: it retires
+a job unrun in the first five, and a campaign re-run marks a job's cell failed
+in the sixth. `failure_source` names which; a failure a client reported reads
+`client`.
 
 | `failure_source` | The job |
 |---|---|
@@ -93,10 +95,17 @@ The server retires a job unrun, and writes a failure for it, in four cases.
 | `all_clients_denied` | Names its clients by id only, and every one of them reported a retriable failure for it |
 | `unmatchable` | Has eligibility clauses no possible client can satisfy |
 | `lease_lost` | Was taken and lost by clients too many times (3 by default), as a job that crashes the device does |
+| `smaller_run_failed` | Was queued, and not running, when a smaller run of its family (no larger in any size, smaller in one) failed with `attempt_timeout` or `out_of_memory`, not retriable ([queue.md](../queue.md#client-reported-failure)) |
+| `marked` | Was minted, and never queued, by a re-run's `fail` in place of a job it marks failed ([`POST /api/v1/campaigns/{campaign_id}/rerun`](./campaigns/rerun_jobs.md)) |
 
 `failed_reason` is the server's message: the deadline that passed, the clause
-that fired, the clients' reasons, or the clients that lost the job. A cancel
-writes no failure: the retired jobs count `cancelled` and have no result.
+that fired, the clients' reasons, the clients that lost the job, the smaller
+run's failure (`not run: <benchmark> of this model failed with <code> in
+<job id>`), or the reason the mark gave. A cancel writes no failure: the
+retired jobs count `cancelled` and have no result. `failure_code` is
+`unspecified`, except on an `all_clients_denied` failure, which takes the code
+most of the clients' denials name, and on a `smaller_run_failed` failure,
+which takes the smaller run's code.
 
 A synthetic failure's `model_descriptor` and `runtime_descriptor` are the
 job's `spec.model` and `spec.runtime` without `auth_token`, canonicalized as
@@ -133,12 +142,13 @@ row, `value_stddev` is set where the client reported spread):
 | `prefill_throughput` | `ttft` (ms), `prefill_throughput` (tokens/sec) |
 | `decode_throughput` | `decode_throughput` (tokens/sec) |
 | `end_to_end_latency` | `end_to_end_latency` (ms) |
-| `max_memory_usage`, `vl_max_memory`, `asr_max_memory` | `max_host_usage`, and `max_gpu_usage` / `max_npu_usage` where measured (bytes) |
+| `max_memory_usage`, `vl_max_memory`, `asr_max_memory`, `decision_max_memory` | `max_host_usage`, and `max_gpu_usage` / `max_npu_usage` where measured (bytes) |
 | `eval` | `accuracy` (ratio) |
 | `vl_throughput`, `asr_throughput` | `ttft`, `prefill_throughput`, `decode_throughput`, and `end_to_end_latency` when submitted |
 | `vl_spec_decode` | `decode_throughput` (tokens/sec), the per-request timings `ttft_ms`, `decode_ms`, `e2e_ms`, `runtime_ttft`, `runtime_e2e_ms` (ms), and, with speculation on only, the acceptance metrics `accept_length`, `accept_length_per_request` (tokens), `draft_acceptance_rate` (ratio) |
 | `vlm_eval` | `accuracy`, `headline_score` (the task's official headline, 0-1; its meaning varies by task) |
 | `asr_eval` | `wer` (ratio: summed edits over summed reference words; lower is better), or `error_rate` (ratio) for a task this build does not know |
+| `decision_latency` | `decision_latency` (ms), and `decision_throughput` (requests/sec) with more than one request in flight |
 
 `device` holds the row's device fields without the `device_` prefix.
 Unified-memory devices (phones, tablets, Apple Silicon) leave the GPU and NPU

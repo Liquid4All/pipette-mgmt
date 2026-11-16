@@ -752,7 +752,7 @@ async fn audited_state(
     let log = Arc::new(CapturingAuditStore::default());
     let stores = Stores {
         audit: Some(log.clone()),
-        ..build_local_fs_stores(&config)?
+        ..build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
     };
     let state = AppState::new(config, stores, test_http_client()?).await?;
     Ok((state, log))
@@ -828,7 +828,8 @@ async fn test_the_first_sign_in_surfaces_the_keys_held_before_it(
                 AuditAction::Http { .. }
                 | AuditAction::Cli { .. }
                 | AuditAction::CatalogRename { .. }
-                | AuditAction::CatalogMerge { .. } => None,
+                | AuditAction::CatalogMerge { .. }
+                | AuditAction::GroupPolicy { .. } => None,
             })
             .collect()
     };

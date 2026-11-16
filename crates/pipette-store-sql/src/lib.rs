@@ -3,6 +3,7 @@
 //! conditional statement, never a lock; [`retry`] reruns it on a conflict.
 
 mod audit;
+mod campaign_groups;
 mod campaigns;
 mod catalog;
 mod catalog_import_runs;
@@ -48,11 +49,12 @@ pub(crate) struct ClaimVanishedError {
     pub(crate) name: String,
 }
 
-/// Replace the record stores in `stores` with ones on `db`. The catalog, vault
-/// and submission store wrap the ones they replace, which keep the public half,
-/// the blobs and the submission records.
+/// Replace the record stores and the queue in `stores` with ones on `db`. The
+/// catalog, vault and submission store wrap the ones they replace, which keep
+/// the public half, the blobs and the submission records.
 pub fn overlay(db: &SqlDatabase, stores: Stores) -> Stores {
     Stores {
+        todo: Arc::new(SqlTodoStore::new(db.clone())),
         catalog: Arc::new(catalog::SqlCatalogStore::new(db.clone(), stores.catalog)),
         clients: Arc::new(clients::SqlClientStore::new(db.clone())),
         users: Arc::new(users::SqlUserStore::new(db.clone())),
@@ -61,6 +63,9 @@ pub fn overlay(db: &SqlDatabase, stores: Stores) -> Stores {
         key_index: Arc::new(key_index::SqlKeyIndexStore::new(db.clone())),
         plans: Arc::new(plans::SqlPlanStore::new(db.clone())),
         campaigns: Arc::new(campaigns::SqlCampaignStore::new(db.clone())),
+        campaign_groups: Some(Arc::new(campaign_groups::SqlCampaignGroupStore::new(
+            db.clone(),
+        ))),
         model_params: Arc::new(model_params::SqlModelParamsStore::new(db.clone())),
         audit: Some(Arc::new(audit::SqlAuditStore::new(db.clone()))),
         descriptor_catalog: Some(Arc::new(
@@ -86,6 +91,9 @@ pub fn audit_stores(db: &SqlDatabase) -> AuditStores {
     AuditStores {
         orgs: Arc::new(orgs::SqlOrgStore::new(db.clone())),
         campaigns: Arc::new(campaigns::SqlCampaignStore::new(db.clone())),
+        campaign_groups: Some(Arc::new(campaign_groups::SqlCampaignGroupStore::new(
+            db.clone(),
+        ))),
         plans: Arc::new(plans::SqlPlanStore::new(db.clone())),
         vault: Arc::new(vault::SqlVaultRecords::new(db.clone())),
         log: Arc::new(audit::SqlAuditStore::new(db.clone())),

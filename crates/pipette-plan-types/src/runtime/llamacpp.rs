@@ -122,6 +122,44 @@ impl LlamacppCliStockTools {
                 .release_asset_name(release.repository_version.as_ref()),
         }
     }
+
+    /// The `cudart-llama-bin-<suffix>` asset holding the CUDA runtime DLLs a
+    /// Windows CUDA build needs beside it. `None` for other flavors, other
+    /// sources and tags the flavor never shipped; Linux CUDA hosts carry a
+    /// system CUDA at least as new as the build. Errs when a declared `asset`
+    /// is not `llama-<tag>-bin-<suffix>`.
+    pub fn cudart_asset(&self) -> Result<Option<String>, CudartAssetError> {
+        let LlamacppCliStockToolsSource::GithubRelease(release) = &self.source else {
+            return Ok(None);
+        };
+        let windows_cuda = matches!(
+            self.flavor,
+            LlamaCppFlavor::WindowsX64Cuda124
+                | LlamaCppFlavor::WindowsX64Cuda131
+                | LlamaCppFlavor::WindowsX64Cuda13
+                | LlamaCppFlavor::WindowsArm64Cuda13
+        );
+        let Some(asset) = self.release_asset().filter(|_| windows_cuda) else {
+            return Ok(None);
+        };
+        // shortcut: wrong for b5317 and older, where upstream spelled the two files differently; give the cudart name per tag if a plan pins one of those.
+        let suffix = asset
+            .strip_prefix(&format!("llama-{}-bin-", release.repository_version))
+            .ok_or_else(|| CudartAssetError {
+                asset: asset.clone(),
+                tag: release.repository_version.to_string(),
+            })?;
+        Ok(Some(format!("cudart-llama-bin-{suffix}")))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "asset {asset:?} is not named llama-{tag}-bin-<suffix>, so the CUDA runtime asset beside it cannot be named"
+)]
+pub struct CudartAssetError {
+    asset: String,
+    tag: String,
 }
 
 /// The Android pipette app's in-process llama.cpp, always built from a git
@@ -263,12 +301,12 @@ pub enum LlamaCppFlavor {
     #[strum(serialize = "linux-cuda-12-8")]
     LinuxX64Cuda128,
     /// The wire name omits the CUDA minor version. Upstream renamed the asset
-    /// from CUDA 13.3 to 13.4.
+    /// from CUDA 13.3 to 13.4, then to 13.5.
     #[strum(serialize = "linux-x64-cuda-13")]
     LinuxX64Cuda13,
     LinuxArm64Cpu,
     /// The wire name omits the CUDA minor version. Upstream renamed the asset
-    /// from CUDA 13.3 to 13.4.
+    /// from CUDA 13.3 to 13.4, then to 13.5.
     #[strum(serialize = "linux-arm64-cuda-13")]
     LinuxArm64Cuda13,
     LinuxArm64Vulkan,
@@ -295,11 +333,11 @@ pub enum LlamaCppFlavor {
     #[strum(serialize = "windows-x64-cuda-13-1")]
     WindowsX64Cuda131,
     /// The wire name omits the CUDA minor version. Upstream renamed the asset
-    /// from CUDA 13.3 to 13.4.
+    /// from CUDA 13.3 to 13.4, then to 13.5.
     #[strum(serialize = "windows-x64-cuda-13")]
     WindowsX64Cuda13,
-    /// The wire name omits the CUDA minor version. Upstream ships the asset
-    /// with CUDA 13.4.
+    /// The wire name omits the CUDA minor version. Upstream renamed the asset
+    /// from CUDA 13.4 to 13.5.
     #[strum(serialize = "windows-arm64-cuda-13")]
     WindowsArm64Cuda13,
     /// The wire name omits the OpenVINO version. Upstream first shipped this
@@ -388,13 +426,19 @@ impl LlamaCppFlavor {
             Self::LinuxX64Vulkan => (&[], Some("ubuntu-vulkan-x64")),
             Self::LinuxX64Cuda128 => (&[], Some("ubuntu-cuda-12.8-x64")),
             Self::LinuxX64Cuda13 => (
-                &[(11070, "ubuntu-cuda-13.3-x64")],
-                Some("ubuntu-cuda-13.4-x64"),
+                &[
+                    (11070, "ubuntu-cuda-13.3-x64"),
+                    (12167, "ubuntu-cuda-13.4-x64"),
+                ],
+                Some("ubuntu-cuda-13.5-x64"),
             ),
             Self::LinuxArm64Cpu => (&[], Some("ubuntu-arm64")),
             Self::LinuxArm64Cuda13 => (
-                &[(11070, "ubuntu-cuda-13.3-arm64")],
-                Some("ubuntu-cuda-13.4-arm64"),
+                &[
+                    (11070, "ubuntu-cuda-13.3-arm64"),
+                    (12167, "ubuntu-cuda-13.4-arm64"),
+                ],
+                Some("ubuntu-cuda-13.5-arm64"),
             ),
             Self::LinuxArm64Vulkan => (&[], Some("ubuntu-vulkan-arm64")),
             Self::LinuxArm64Snapdragon => (&[], Some("linux-arm64-snapdragon")),
@@ -422,8 +466,14 @@ impl LlamaCppFlavor {
                 Some("win-cuda-12.4-x64"),
             ),
             Self::WindowsX64Cuda131 => (&[(9360, "win-cuda-13.1-x64")], None),
-            Self::WindowsX64Cuda13 => (&[(10976, "win-cuda-13.3-x64")], Some("win-cuda-13.4-x64")),
-            Self::WindowsArm64Cuda13 => (&[], Some("win-cuda-13.4-arm64")),
+            Self::WindowsX64Cuda13 => (
+                &[(10976, "win-cuda-13.3-x64"), (12167, "win-cuda-13.4-x64")],
+                Some("win-cuda-13.5-x64"),
+            ),
+            Self::WindowsArm64Cuda13 => (
+                &[(12167, "win-cuda-13.4-arm64")],
+                Some("win-cuda-13.5-arm64"),
+            ),
             Self::WindowsX64Openvino => (
                 &[
                     (9816, "win-openvino-2026.2-x64"),
@@ -727,48 +777,53 @@ flavor = "macos-arm64""#,
     }
 
     /// The catalog importer ignores the six `cudart-*` archives, `*-ui.tar.gz`,
-    /// and the xcframework. Every other `b11669` asset is a distinct build flavor.
-    #[test]
-    fn every_b11669_build_asset_has_one_flavor() {
+    /// and the xcframework. Every other asset of each release is a distinct
+    /// build flavor, except b12170's `ubuntu-26.04-s390x` and `ubuntu-zdnn-s390x`,
+    /// which no flavor names.
+    #[rstest::rstest]
+    #[case("b11669", "13.4")]
+    #[case("b12170", "13.5")]
+    fn every_build_asset_has_one_flavor(#[case] tag: &str, #[case] cuda13: &str) {
         use std::collections::BTreeSet;
 
         let expected: BTreeSet<_> = [
-            "llama-b11669-bin-android-arm64-snapdragon.tar.gz",
-            "llama-b11669-bin-android-arm64.tar.gz",
-            "llama-b11669-bin-linux-arm64-snapdragon.tar.gz",
-            "llama-b11669-bin-macos-arm64.tar.gz",
-            "llama-b11669-bin-macos-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-arm64.tar.gz",
-            "llama-b11669-bin-ubuntu-cuda-12.8-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-cuda-13.4-arm64.tar.gz",
-            "llama-b11669-bin-ubuntu-cuda-13.4-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-openvino-2026.4.1-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-rocm-10.0-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-s390x.tar.gz",
-            "llama-b11669-bin-ubuntu-sycl-fp16-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-sycl-fp32-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz",
-            "llama-b11669-bin-ubuntu-vulkan-x64.tar.gz",
-            "llama-b11669-bin-ubuntu-x64.tar.gz",
-            "llama-b11669-bin-win-cpu-arm64.zip",
-            "llama-b11669-bin-win-cpu-x64.zip",
-            "llama-b11669-bin-win-cuda-12.4-x64.zip",
-            "llama-b11669-bin-win-cuda-13.4-arm64.zip",
-            "llama-b11669-bin-win-cuda-13.4-x64.zip",
-            "llama-b11669-bin-win-opencl-adreno-arm64.zip",
-            "llama-b11669-bin-win-openvino-2026.4.1-x64.zip",
-            "llama-b11669-bin-win-rocm-10.0-x64.zip",
-            "llama-b11669-bin-win-sycl-x64.zip",
-            "llama-b11669-bin-win-vulkan-arm64.zip",
-            "llama-b11669-bin-win-vulkan-x64.zip",
+            "android-arm64-snapdragon.tar.gz",
+            "android-arm64.tar.gz",
+            "linux-arm64-snapdragon.tar.gz",
+            "macos-arm64.tar.gz",
+            "macos-x64.tar.gz",
+            "ubuntu-arm64.tar.gz",
+            "ubuntu-cuda-12.8-x64.tar.gz",
+            &format!("ubuntu-cuda-{cuda13}-arm64.tar.gz"),
+            &format!("ubuntu-cuda-{cuda13}-x64.tar.gz"),
+            "ubuntu-openvino-2026.4.1-x64.tar.gz",
+            "ubuntu-rocm-10.0-x64.tar.gz",
+            "ubuntu-s390x.tar.gz",
+            "ubuntu-sycl-fp16-x64.tar.gz",
+            "ubuntu-sycl-fp32-x64.tar.gz",
+            "ubuntu-vulkan-arm64.tar.gz",
+            "ubuntu-vulkan-x64.tar.gz",
+            "ubuntu-x64.tar.gz",
+            "win-cpu-arm64.zip",
+            "win-cpu-x64.zip",
+            "win-cuda-12.4-x64.zip",
+            &format!("win-cuda-{cuda13}-arm64.zip"),
+            &format!("win-cuda-{cuda13}-x64.zip"),
+            "win-opencl-adreno-arm64.zip",
+            "win-openvino-2026.4.1-x64.zip",
+            "win-rocm-10.0-x64.zip",
+            "win-sycl-x64.zip",
+            "win-vulkan-arm64.zip",
+            "win-vulkan-x64.zip",
         ]
         .into_iter()
+        .map(|suffix| format!("llama-{tag}-bin-{suffix}"))
         .collect();
         assert_eq!(expected.len(), 28);
         let actual: Vec<_> = LlamaCppFlavor::known()
-            .filter_map(|flavor| flavor.release_asset_name("b11669"))
+            .filter_map(|flavor| flavor.release_asset_name(tag))
             .collect();
-        let unique: BTreeSet<_> = actual.iter().map(String::as_str).collect();
+        let unique: BTreeSet<_> = actual.iter().cloned().collect();
         assert_eq!(actual.len(), unique.len(), "two flavors named one asset");
         assert_eq!(unique, expected);
     }
@@ -778,6 +833,7 @@ flavor = "macos-arm64""#,
     #[case("b9360")]
     #[case("b10976")]
     #[case("b11070")]
+    #[case("b12167")]
     fn no_two_flavors_name_one_asset_at_a_rename(#[case] version: &str) {
         let actual: Vec<_> = LlamaCppFlavor::known()
             .filter_map(|flavor| flavor.release_asset_name(version))
@@ -847,6 +903,30 @@ flavor = "macos-arm64""#,
     )]
     #[case(LlamaCppFlavor::WindowsX64Cuda13, "b10976", Some("win-cuda-13.3-x64"))]
     #[case(LlamaCppFlavor::WindowsX64Cuda13, "b10977", Some("win-cuda-13.4-x64"))]
+    #[case(LlamaCppFlavor::WindowsX64Cuda13, "b12167", Some("win-cuda-13.4-x64"))]
+    #[case(LlamaCppFlavor::WindowsX64Cuda13, "b12170", Some("win-cuda-13.5-x64"))]
+    #[case(
+        LlamaCppFlavor::WindowsArm64Cuda13,
+        "b12167",
+        Some("win-cuda-13.4-arm64")
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsArm64Cuda13,
+        "b12170",
+        Some("win-cuda-13.5-arm64")
+    )]
+    #[case(LlamaCppFlavor::LinuxX64Cuda13, "b12167", Some("ubuntu-cuda-13.4-x64"))]
+    #[case(LlamaCppFlavor::LinuxX64Cuda13, "b12170", Some("ubuntu-cuda-13.5-x64"))]
+    #[case(
+        LlamaCppFlavor::LinuxArm64Cuda13,
+        "b12167",
+        Some("ubuntu-cuda-13.4-arm64")
+    )]
+    #[case(
+        LlamaCppFlavor::LinuxArm64Cuda13,
+        "b12170",
+        Some("ubuntu-cuda-13.5-arm64")
+    )]
     #[case(
         LlamaCppFlavor::WindowsX64Openvino,
         "b9816",
@@ -985,6 +1065,84 @@ flavor = "macos-arm64""#,
             url: RemoteArchiveUrl::try_new("https://ex.com/a.tar.gz".to_owned())?,
         };
         assert_eq!(runtime.release_asset(), None);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda124,
+        "b12170",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-12.4-x64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda131,
+        "b9360",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-13.1-x64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda13,
+        "b12167",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-13.4-x64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda13,
+        "b12170",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-13.5-x64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsArm64Cuda13,
+        "b12167",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-13.4-arm64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsArm64Cuda13,
+        "b12170",
+        None,
+        Ok(Some("cudart-llama-bin-win-cuda-13.5-arm64.zip"))
+    )]
+    #[case(LlamaCppFlavor::WindowsX64Cuda131, "b9361", None, Ok(None))]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda131,
+        "b11399",
+        Some("llama-b11399-bin-win-cuda-13.4-x64.zip"),
+        Ok(Some("cudart-llama-bin-win-cuda-13.4-x64.zip"))
+    )]
+    #[case(
+        LlamaCppFlavor::WindowsX64Cuda131,
+        "b11399",
+        Some("acme-llama-win-cuda.zip"),
+        Err(CudartAssetError {
+            asset: "acme-llama-win-cuda.zip".to_owned(),
+            tag: "b11399".to_owned(),
+        })
+    )]
+    #[case(LlamaCppFlavor::LinuxX64Cuda13, "b12170", None, Ok(None))]
+    #[case(LlamaCppFlavor::LinuxArm64Cuda13, "b12170", None, Ok(None))]
+    #[case(LlamaCppFlavor::LinuxX64Cuda128, "b12170", None, Ok(None))]
+    #[case(LlamaCppFlavor::WindowsArm64Vulkan, "b12170", None, Ok(None))]
+    fn cudart_asset_tracks_the_build_asset(
+        #[case] flavor: LlamaCppFlavor,
+        #[case] tag: &str,
+        #[case] asset: Option<&str>,
+        #[case] expected: Result<Option<&str>, CudartAssetError>,
+    ) -> anyhow::Result<()> {
+        let mut release = cli_release(tag)?;
+        release.asset = asset
+            .map(|asset| FileName::try_new(asset.to_owned()))
+            .transpose()?;
+        let runtime = LlamacppCliStockTools {
+            source: LlamacppCliStockToolsSource::GithubRelease(release),
+            flavor,
+        };
+        assert_eq!(
+            runtime.cudart_asset(),
+            expected.map(|name| name.map(str::to_owned))
+        );
         Ok(())
     }
 

@@ -51,7 +51,7 @@ pub fn test_app(state: AppState) -> Router {
 
 /// Write the model-params rows the scoring tests expect, including one MoE row
 /// to exercise the `total != active` path.
-pub async fn setup_models(dir: &std::path::Path) -> anyhow::Result<()> {
+pub async fn setup_models(state: &AppState) -> anyhow::Result<()> {
     let rows = ModelParamTable::from_toml(
         r#""LFM2-700M" = 700
 "llama-3.2-1b" = 1000
@@ -59,8 +59,14 @@ pub async fn setup_models(dir: &std::path::Path) -> anyhow::Result<()> {
 "LFM2.5-8B-A1B" = { total = 8340, active = 1500 }
 "#,
     )?;
-    let stores = build_local_fs_stores(&test_config(dir))?;
-    model_params::import(&*stores.model_params, &rows, false).await?;
+    let store = &*state.model_params_store;
+    // The database seeds some of these models with other counts. An import
+    // keeps an existing row, so replace those rows.
+    let report = model_params::import(store, &rows, false).await?;
+    for key in &report.differing {
+        store.delete_model_params(key).await?;
+    }
+    model_params::import(store, &rows, false).await?;
     Ok(())
 }
 
@@ -167,44 +173,25 @@ pub struct SqlState {
     _db: TestDb,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum QueueBackend {
-    LocalFs,
-    Database,
-}
-
 /// A queue test state that owns its scratch database until the test ends.
 pub struct QueueState {
     pub state: AppState,
-    _db: Option<TestDb>,
+    db: TestDb,
 }
 
 impl QueueState {
-    /// Run `sql` in the scratch database of a `Database` state. Tests use it to
-    /// inject faults or create otherwise unreachable states.
+    /// Run `sql` in the scratch database. Tests use it to inject faults or
+    /// create otherwise unreachable states.
     pub async fn execute_sql(&self, sql: &'static str) -> anyhow::Result<()> {
-        self._db
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("the local_fs queue has no database"))?
-            .execute(sql)
-            .await
+        self.db.execute(sql).await
     }
 }
 
-/// Returns a seeded state for the chosen queue backend. The `Database` backend
-/// puts the record stores and the queue in one new database. It returns `None`
-/// if `TEST_DATABASE_URL` is not set and the run is not in CI.
-pub async fn seeded_queue_state(
-    dir: &std::path::Path,
-    backend: QueueBackend,
-) -> anyhow::Result<Option<QueueState>> {
-    match backend {
-        QueueBackend::LocalFs => Ok(Some(QueueState {
-            state: seeded_state(dir).await?,
-            _db: None,
-        })),
-        QueueBackend::Database => sql_queue_state_from_config(dir, test_config(dir)).await,
-    }
+/// Returns a seeded state whose record stores and queue are in one new
+/// database. It returns `None` if `TEST_DATABASE_URL` is not set and the run is
+/// not in CI.
+pub async fn seeded_queue_state(dir: &std::path::Path) -> anyhow::Result<Option<QueueState>> {
+    sql_queue_state_from_config(dir, test_config(dir)).await
 }
 
 /// Returns a state on the database queue, built from `config`, for a test that
@@ -214,11 +201,11 @@ pub async fn sql_queue_state_from_config(
     dir: &std::path::Path,
     config: Config,
 ) -> anyhow::Result<Option<QueueState>> {
-    Ok(seeded_sql_state_from(dir, config, true)
+    Ok(seeded_sql_state_from(dir, config)
         .await?
         .map(|sql| QueueState {
             state: sql.state,
-            _db: Some(sql._db),
+            db: sql._db,
         }))
 }
 
@@ -226,7 +213,7 @@ pub async fn sql_queue_state_from_config(
 /// returns `None` if `TEST_DATABASE_URL` is not set and the run is not in CI.
 /// The test then skips.
 pub async fn seeded_sql_state(dir: &std::path::Path) -> anyhow::Result<Option<SqlState>> {
-    seeded_sql_state_from(dir, test_config(dir), false).await
+    seeded_sql_state_from(dir, test_config(dir)).await
 }
 
 /// A [`seeded_sql_state`] that reads Hugging Face at `endpoint`, for the tests
@@ -237,24 +224,19 @@ pub async fn seeded_sql_state_with_hf_endpoint(
 ) -> anyhow::Result<Option<SqlState>> {
     let mut config = test_config(dir);
     config.hf_import_endpoint = endpoint.to_string();
-    seeded_sql_state_from(dir, config, false).await
+    seeded_sql_state_from(dir, config).await
 }
 
 async fn seeded_sql_state_from(
     dir: &std::path::Path,
     config: Config,
-    sql_queue: bool,
 ) -> anyhow::Result<Option<SqlState>> {
     let Some(db) = TestDb::new().await? else {
         return Ok(None);
     };
     setup_benchmarks(dir)?;
-    let base = build_local_fs_stores(&config)?;
-    let stores = if sql_queue {
-        db.stores(base)
-    } else {
-        pipette_store_sql::overlay(db.db(), base)
-    };
+    let base = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
+    let stores = db.stores(base);
     let state = AppState::new(config, stores, test_http_client()?).await?;
     Ok(Some(SqlState { state, _db: db }))
 }
@@ -269,11 +251,61 @@ pub async fn make_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
     make_state_with_evals_url(dir, "http://localhost:9999").await
 }
 
-/// Build an [`AppState`] over local_fs stores. Every `make_state_*` delegates
-/// here, so a new store or `AppState` field is wired in one place.
+/// Build an [`AppState`] whose records and queue are in a new PostgreSQL
+/// schema, as a `[database]` deployment has them, over local_fs object stores.
+/// Every `make_state_*` helper delegates here. Add each new store or `AppState`
+/// field here.
 pub async fn make_state_from_config(config: Config) -> anyhow::Result<AppState> {
-    let stores = build_local_fs_stores(&config)?;
+    let base = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
+    let stores = pipette_store_sql::scratch::stores(base).await?;
     AppState::new(config, stores, test_http_client()?).await
+}
+
+/// An [`AppState`] whose records stay on the local_fs object stores, with the
+/// queue in a new PostgreSQL schema. It is for a test of those record stores,
+/// or of a server without the stores that only the database keeps.
+pub async fn make_object_state_from_config(config: Config) -> anyhow::Result<AppState> {
+    let stores = build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)?;
+    AppState::new(config, stores, test_http_client()?).await
+}
+
+/// A [`make_object_state_from_config`] state on [`test_config`].
+pub async fn make_object_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+    make_object_state_from_config(test_config(dir)).await
+}
+
+/// A [`make_object_state`] state with the benchmark catalog seeded.
+pub async fn seeded_object_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+    setup_benchmarks(dir)?;
+    make_object_state(dir).await
+}
+
+/// The stores that `state` serves, for a test that runs a pipeline pass on the
+/// same records and queue.
+pub fn stores_of(state: &AppState) -> pipette_store::Stores {
+    pipette_store::Stores {
+        catalog: state.catalog_store.clone(),
+        clients: state.client_store.clone(),
+        users: state.user_store.clone(),
+        orgs: state.org_store.clone(),
+        tags: state.tag_store.clone(),
+        key_index: state.key_index_store.clone(),
+        submissions: state.submission_store.clone(),
+        warehouse: state.warehouse_store.clone(),
+        eval_sample_results: state.eval_sample_result_store.clone(),
+        todo: state.todo_store.clone(),
+        plans: state.plan_store.clone(),
+        campaigns: state.campaign_store.clone(),
+        campaign_groups: state.campaign_group_store.clone(),
+        model_params: state.model_params_store.clone(),
+        audit: state.audit_store.clone(),
+        descriptor_catalog: state.descriptor_catalog_store.clone(),
+        catalog_import_runs: state.catalog_import_runs.clone(),
+        run_evidence: state.run_evidence.clone(),
+        dataset_cache: state.dataset_cache_store.clone(),
+        eval_packages: state.eval_packages.clone(),
+        vault: state.vault_store.clone(),
+    }
 }
 
 /// Build an [`AppState`] with `accept_legacy_signatures` toggled.

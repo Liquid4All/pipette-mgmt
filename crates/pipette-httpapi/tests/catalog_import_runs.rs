@@ -11,7 +11,7 @@ use rstest::rstest;
 use pipette_plan_types::{CatalogImportRuns, CatalogName, UserPermission};
 use pipette_store::{CatalogImportRunFinish, CatalogImportRunStore};
 use pipette_web_testkit::{
-    body_json, registered_user, seeded_sql_state, seeded_state, signed_empty, unauthed_get,
+    body_json, registered_user, seeded_object_state, seeded_sql_state, signed_empty, unauthed_get,
 };
 
 const ROUTE: &str = "/api/v1/descriptor-catalog/import-runs";
@@ -60,7 +60,7 @@ impl CatalogImportRunStore for EmptyRuns {
 #[tokio::test]
 async fn the_route_requires_a_fleet_reader_and_a_database() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut state = seeded_state(dir.path()).await?;
+    let mut state = seeded_object_state(dir.path()).await?;
     assert_eq!(
         unauthed_get(&state, ROUTE).await?.status(),
         StatusCode::UNAUTHORIZED
@@ -96,7 +96,7 @@ async fn the_route_requires_a_fleet_reader_and_a_database() -> anyhow::Result<()
 #[tokio::test]
 async fn a_bad_limit_is_refused_before_the_store(#[case] query: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut state = seeded_state(dir.path()).await?;
+    let mut state = seeded_object_state(dir.path()).await?;
     let runs = Arc::new(EmptyRuns::default());
     state.catalog_import_runs = Some(runs.clone());
     let reader = registered_user(&state, &[UserPermission::ReadClients]).await?;

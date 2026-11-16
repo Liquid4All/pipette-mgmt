@@ -605,11 +605,14 @@ mod tests {
     fn fixture() -> anyhow::Result<Fixture> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
-        let stores = build_local_fs_stores(&Config {
-            storage: StorageConfig::local_fs(root.clone()),
-            auth_storage: StorageConfig::local_fs(root.clone()),
-            ..Config::default()
-        })?;
+        let stores = build_local_fs_stores(
+            &Config {
+                storage: StorageConfig::local_fs(root.clone()),
+                auth_storage: StorageConfig::local_fs(root.clone()),
+                ..Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )?;
         Ok(Fixture {
             clients: Arc::new(LocalFsClientStore::new(root.clone())),
             users: Arc::new(LocalFsUserStore::new(root.clone())),

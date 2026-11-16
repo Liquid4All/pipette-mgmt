@@ -234,6 +234,23 @@ jobs:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.catalog == 'true'
     runs-on: ubuntu-24.04
+    # The app test serves from PostgreSQL, as rust-test's do.
+    services:
+      postgres:
+        image: postgres:17@sha256:ae69c452f483507a6b99fb654cf93aad7fe156ffd2c56247707eef4e36d3c12b
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports:
+          - 5432:5432
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
@@ -260,13 +277,19 @@ jobs:
           POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
         ports:
           - 5432:5432
+        # In memory: the server is thrown away with the job, so commits need
+        # not wait for a disk.
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U postgres"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
     env:
       TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+      # Line tables keep file and line in a panic backtrace; full debug info
+      # makes every test binary larger and slower to link.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
@@ -278,12 +301,8 @@ jobs:
         with:
           tool: nextest
       - name: Test
-        # nextest runs the test binaries in parallel but does not execute
-        # doctests, so keep a `--doc` pass to preserve that coverage. The
-        # examples in the module docs are the ones a reader copies.
-        run: |
-          cargo nextest run --workspace --locked
-          cargo test --workspace --doc --locked
+        # nextest skips doctests, and the workspace has none.
+        run: cargo nextest run --workspace --locked
       - name: Test plan-types without `schemars`
         # pipette-pipeline turns the feature on, so the run above always builds
         # it; a client builds it off.
@@ -373,7 +392,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
-          key: bin-${{ matrix.target }}
+          key: bin-mgmt-${{ matrix.target }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 22
@@ -388,7 +407,9 @@ jobs:
         env:
           # Fails the build rather than embedding the placeholder page.
           PIPETTE_REQUIRE_UI: "1"
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        # Only the shipped binary: a workspace build also compiles the three
+        # testkit crates.
+        run: cargo build --release --locked -p pipette-mgmt --target ${{ matrix.target }}
       - name: Package tarball
         id: pkg
         env:
