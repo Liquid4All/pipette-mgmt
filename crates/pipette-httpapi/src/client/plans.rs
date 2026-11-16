@@ -17,15 +17,18 @@ use pipette_core::todo_filename::Lease;
 use pipette_pipeline::org_catalog::server_catalog;
 use pipette_pipeline::queue_maintenance::{client_tags, settle_expired_lease};
 use pipette_plan_types::{
-    AuditTarget, ClaimAnswer, ClaimedJob, ClientId, ExpiresAt, FailureCode, JobId, UndecodableClaim,
+    AuditTarget, CachedArtifacts, ClaimAnswer, ClaimRequest, ClaimedJob, ClientId, ExpiresAt,
+    FailureCode, JobId, UndecodableClaim,
 };
-use pipette_store::{ClaimOutcome, ReclaimOutcome, RenewLeaseResult, SubmissionStore, TodoStore};
+use pipette_store::{
+    ClaimAffinity, ClaimOutcome, ReclaimOutcome, RenewLeaseResult, SubmissionStore, TodoStore,
+};
 
 use crate::audit::Audit;
 use crate::auth::WorkingClient;
 use crate::client::benchmarks::submissions::own_leased_body;
 use crate::error::AppError;
-use crate::extract::{ApiPath, Parsed};
+use crate::extract::{ApiJson, ApiPath, Parsed};
 use crate::state::AppState;
 use crate::vault_access::client_may_fetch_job;
 
@@ -50,6 +53,9 @@ async fn revert_claim_if_void(
     {
         return Ok(false);
     }
+    todo.forget_last_grant(&lease.job_id, &lease.client_id)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to forget the reverted grant")))?;
     // Every resolution counts as reverted, Gone included: a racing relinquish
     // resolved it.
     let resolution = pipette_pipeline::queue_maintenance::resolve_or_recycle_lease(
@@ -191,6 +197,11 @@ async fn put_back_out_of_vault_reach(
             .await
             .map_err(|e| AppError::internal(e.context("failed to deny the client the job")))?;
     }
+    state
+        .todo_store
+        .forget_last_grant(job_id, client_id)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to forget the vault-refused grant")))?;
     let resolution = pipette_pipeline::queue_maintenance::resolve_or_recycle_lease(
         &*state.todo_store,
         &*state.submission_store,
@@ -291,24 +302,13 @@ fn claim_response(
     // From the `avail/` key, not the body: the key is the deadline every
     // scheduling path enforces. `never` is omitted rather than sent as a literal.
     let deadline = matches!(expires_at, ExpiresAt::At(_)).then(|| expires_at.to_string());
-    match field("expires_at") {
-        Some(serde_json::Value::String(s)) if s.parse::<ExpiresAt>().ok() != Some(expires_at) => {
-            tracing::warn!(
-                job_id = ?job_id,
-                body_expires_at = %s,
-                key_expires_at = %expires_at,
-                "job body's `expires_at` disagrees with its `avail/` key; the key wins and \
-                 the claim response carries it — either queue-maintenance re-dated the job, \
-                 or the body is wrong at its source"
-            )
-        }
-        Some(v) if !v.is_string() && !v.is_null() => tracing::warn!(
+    if field("expires_at").is_some_and(|v| !v.is_string() && !v.is_null()) {
+        tracing::warn!(
             job_id = ?job_id,
             key_expires_at = %expires_at,
             "job body's `expires_at` is not a string; the key wins and the claim response \
              carries it — fix the body at its source"
-        ),
-        _ => {}
+        );
     }
     let time_window = iso8601_duration(secs);
     match (job_id, benchmark) {
@@ -376,10 +376,23 @@ pub async fn claim(
     State(state): State<AppState>,
     WorkingClient(client): WorkingClient,
     audit: Audit,
+    body: Option<ApiJson<ClaimRequest>>,
 ) -> Result<Response, AppError> {
+    let cached = body.and_then(|ApiJson(request)| request.cached);
+    if let Some(cached) = &cached
+        && let Some((list, entries)) = [("models", &cached.models), ("runtimes", &cached.runtimes)]
+            .into_iter()
+            .find(|(_, entries)| entries.len() > CachedArtifacts::MAX_ENTRIES)
+    {
+        return Err(AppError::BadRequest(format!(
+            "`cached.{list}` holds {} entries; the limit is {}",
+            entries.len(),
+            CachedArtifacts::MAX_ENTRIES
+        )));
+    }
     let started = Instant::now();
     let mut timing = ClaimTiming::default();
-    let response = claim_timed(&state, &client, &audit, &mut timing).await;
+    let response = claim_timed(&state, &client, &audit, cached.as_ref(), &mut timing).await;
     timing.log(started.elapsed());
     response
 }
@@ -388,6 +401,7 @@ async fn claim_timed(
     state: &AppState,
     client: &Client,
     audit: &Audit,
+    cached: Option<&CachedArtifacts>,
     timing: &mut ClaimTiming,
 ) -> Result<Response, AppError> {
     // Both refusals — status and permission — are the extractor's.
@@ -429,12 +443,13 @@ async fn claim_timed(
                 limit,
                 &passed_over,
                 checked_lease.as_ref(),
+                cached,
                 now,
             )
             .await
             .map_err(|e| AppError::internal(e.context("failed to claim a job")))?;
         timing.transaction_ms += elapsed_ms(transaction);
-        let (lease, body, handed_back, check_held) = match outcome {
+        let (lease, body, handed_back, check_held, affinity) = match outcome {
             ClaimOutcome::SettlementRequired => {
                 settle_lapsed_leases(state, client_id, None, now).await?;
                 continue;
@@ -462,9 +477,13 @@ async fn claim_timed(
                 );
                 return Ok(StatusCode::NO_CONTENT.into_response());
             }
-            ClaimOutcome::CheckHeldLease { lease, body } => (lease, body, true, true),
-            ClaimOutcome::HandedBack { lease, body } => (lease, body, true, false),
-            ClaimOutcome::Granted { lease, body } => (lease, body, false, false),
+            ClaimOutcome::CheckHeldLease { lease, body } => (lease, body, true, true, None),
+            ClaimOutcome::HandedBack { lease, body } => (lease, body, true, false, None),
+            ClaimOutcome::Granted {
+                lease,
+                body,
+                affinity,
+            } => (lease, body, false, false, Some(affinity)),
         };
         tracing::Span::current().record("job_id", tracing::field::display(&lease.job_id));
 
@@ -529,7 +548,12 @@ async fn claim_timed(
             );
             u64::try_from((lease.lease_expiry - now).num_seconds()).unwrap_or(0)
         } else {
-            tracing::info!(%lease_expiry, "job claimed");
+            tracing::info!(
+                %lease_expiry,
+                affinity = affinity.map(ClaimAffinity::as_str),
+                cache_source = if cached.is_some() { "advertised" } else { "last_grant" },
+                "job claimed"
+            );
             lease_secs
         };
         return Ok(Json(claim_response(
@@ -671,8 +695,9 @@ pub async fn reclaim(
 mod tests {
     use rstest::rstest;
 
-    use pipette_core::config::StorageConfig;
-    use pipette_store_fs::{LocalFsSubmissionStore, build_local_fs_todo_store};
+    use pipette_store_fs::LocalFsSubmissionStore;
+    use pipette_store_sql::SqlTodoStore;
+    use pipette_store_sql::scratch::TestDb;
     use pipette_store_testkit::seed_leased_until;
 
     use super::*;
@@ -682,11 +707,11 @@ mod tests {
     #[case::no_flag_keeps_lease(false)]
     #[tokio::test]
     async fn revert_claim_only_when_void(#[case] flagged: bool) -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let config = StorageConfig::LocalFs {
-            data_dir: dir.path().to_path_buf(),
+        let Some(db) = TestDb::new().await? else {
+            return Ok(());
         };
-        let todo = build_local_fs_todo_store(&config)?;
+        let todo = SqlTodoStore::new(db.db().clone());
+        let dir = tempfile::tempdir()?;
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
 
         let job = JobId::new_unchecked("job-revert");
@@ -698,7 +723,7 @@ mod tests {
             lease_expiry: Utc::now() + chrono::Duration::hours(1),
         };
         seed_leased_until(
-            &*todo,
+            &todo,
             job.as_str(),
             lease.expires_at,
             &client,
@@ -710,7 +735,7 @@ mod tests {
             todo.write_pending_reindex(&client).await?;
         }
 
-        let reverted = revert_claim_if_void(&*todo, &submissions, &lease).await?;
+        let reverted = revert_claim_if_void(&todo, &submissions, &lease).await?;
 
         assert_eq!(reverted, flagged);
         assert_eq!(todo.get_avail_by_job(&job).await?.is_some(), flagged);
@@ -739,6 +764,58 @@ mod tests {
         assert_eq!(claimed.time_window, "PT5M");
         assert_eq!(claimed.expires_at, None);
         assert_eq!(claimed.client_versions, ["1.2.0"]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::reindex_discards_affinity(true, ClaimAffinity::None)]
+    #[case::accepted_grant_keeps_affinity(false, ClaimAffinity::Both)]
+    #[tokio::test]
+    async fn a_reindex_rejection_forgets_the_undelivered_grant(
+        #[case] flagged: bool,
+        #[case] expected: ClaimAffinity,
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((queue, _, client)) =
+            pipette_web_testkit::approved_queue_client(dir.path()).await?
+        else {
+            return Ok(());
+        };
+        let todo = queue.state.todo_store.as_ref();
+        let job = pipette_web_testkit::seed_avail(
+            todo,
+            "job-reindex-affinity",
+            ExpiresAt::Never,
+            &serde_json::json!({"spec": {"model": {"name": "M"}, "runtime": {"name": "R"}}}),
+        )
+        .await?;
+        todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
+        let now = Utc::now();
+        let until = now + chrono::Duration::hours(1);
+        let outcome = todo
+            .claim_for_client(&client, until, 0, &[], None, None, now)
+            .await?;
+        let ClaimOutcome::Granted { lease, .. } = outcome else {
+            anyhow::bail!("expected a grant, got {outcome:?}");
+        };
+        if flagged {
+            todo.write_pending_reindex(&client).await?;
+        }
+        assert_eq!(
+            revert_claim_if_void(todo, queue.state.submission_store.as_ref(), &lease).await?,
+            flagged
+        );
+        if !flagged {
+            todo.recycle_lease(&job, lease.expires_at, &client, lease.lease_expiry)
+                .await?;
+        }
+        let outcome = todo
+            .claim_for_client(&client, until, 0, &[], None, None, now)
+            .await?;
+        let ClaimOutcome::Granted { affinity, .. } = outcome else {
+            anyhow::bail!("expected a grant after recycling, got {outcome:?}");
+        };
+        assert_eq!(affinity, expected);
         Ok(())
     }
 

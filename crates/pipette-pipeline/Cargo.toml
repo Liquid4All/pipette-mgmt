@@ -67,10 +67,5 @@ pipette-store-testkit.workspace = true
 pipette-store-sql = { workspace = true, features = ["testkit"] }
 # The fake stores in the test modules here implement the async store traits.
 async-trait.workspace = true
-# The mock transport the queue-maintenance sweep test builds its bucket from. A
-# dev-dependency, so `test-util` and the hyper 0.14 connector it requires stay
-# out of every release build.
-aws-sdk-s3 = { workspace = true, features = ["test-util"] }
-aws-smithy-mocks.workspace = true
 rstest.workspace = true
 tempfile.workspace = true

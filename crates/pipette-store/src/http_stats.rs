@@ -1,5 +1,5 @@
 //! Process-wide counters for the HTTP attempts of both S3 clients
-//! (`object_store` and the `todo/` queue's `aws-sdk-s3`); `queue-maintenance`
+//! (`object_store` and the vault part copies' `aws-sdk-s3`); `queue-maintenance`
 //! logs them per phase.
 
 use std::sync::atomic::{AtomicU64, Ordering};

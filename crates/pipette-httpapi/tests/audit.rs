@@ -96,7 +96,8 @@ fn route_of(event: &AuditEvent) -> (&str, &str, u16) {
         AuditAction::Cli { .. }
         | AuditAction::FirstClerkSignIn { .. }
         | AuditAction::CatalogRename { .. }
-        | AuditAction::CatalogMerge { .. } => ("", "", 0),
+        | AuditAction::CatalogMerge { .. }
+        | AuditAction::GroupPolicy { .. } => ("", "", 0),
     }
 }
 
@@ -882,7 +883,7 @@ async fn an_unreadable_model_params_row_still_deletes() -> anyhow::Result<()> {
         audit: Some(log.clone()),
         descriptor_catalog: None,
         model_params: Arc::new(UnreadableModelParams),
-        ..build_local_fs_stores(&config)?
+        ..build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
     };
     let state = AppState::new(config, stores, test_http_client()?).await?;
     let admin = registered_user(
@@ -918,7 +919,7 @@ async fn an_unreadable_model_params_row_still_deletes() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_server_without_a_database_keeps_no_log() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
     assert!(state.audit_store.is_none());
     let acme = seed_org(&state, "acme").await?.org_id;
     let server = registered_user(&state, &[UserPermission::ManageAnyOrgs]).await?;

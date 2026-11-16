@@ -161,8 +161,9 @@ describe("the listings' tables", () => {
     const spec = campaignTable({ org_a: "Acme" }, true);
     const ids = (query: string) => tableView(spec, tableState(spec, new URLSearchParams(query)), rows).map((r) => r.campaign_id);
     expect(ids("sort=-progress")).toEqual(["c3", "c1", "c2"]);
-    // Progress reads as the plan's jobs finished of all; a campaign with no plan, or none counted, has none to print.
-    expect(rows.map(progressText)).toEqual(["5/10", "—", "10/10"]);
+    // Progress reads as the plan's jobs finished, failed and running of all; a campaign with no plan, or none
+    // counted, has none to print.
+    expect(rows.map(progressText)).toEqual(["5 · 0 · 0 / 10", "—", "10 · 0 · 0 / 10"]);
     // One box searches the id, the name and the labels; a campaign has no id box of its own.
     const named = [{ ...row("campaign_1", 5, "active"), name: "nightly" }, { ...row("campaign_2", 5, "active"), name: "24b-perf" }];
     const found = (query: string) => tableView(spec, tableState(spec, new URLSearchParams(query)), named).map((r) => r.campaign_id);

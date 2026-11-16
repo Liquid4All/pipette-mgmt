@@ -1,5 +1,5 @@
 //! The `pipette-mgmt queue-maintenance` command: all cron reconciliation for
-//! the `todo/` job queue. Runs must be serialized and the host clock must not
+//! the job queue. Runs must be serialized and the host clock must not
 //! run ahead of `serve`'s (`docs/operations.md`); see `docs/queue.md`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -16,31 +16,20 @@ use pipette_core::denial::{DeniedClient, prevailing_failure_code, summarize_deni
 use pipette_core::matching;
 use pipette_core::matching::{FleetTags, capability_clauses_malformed, job_matches_client};
 use pipette_core::plan::PlanManifest;
-use pipette_core::todo_filename::{
-    Lease, avail_filename, denied_marker_filename, eligible_filename, parse_avail_filename,
-    parse_leased_key,
-};
+use pipette_core::todo_filename::Lease;
 use pipette_plan_types::{
-    BenchmarkId, CampaignId, ClientId, ExpiresAt, FailureCode, FailureSource, JobId, PlanId,
-    PlanStatus,
+    BenchmarkId, ClientId, ExpiresAt, FailureCode, FailureSource, JobId, PlanId, PlanStatus,
 };
 use pipette_store::decode_stats::{DecodeCounts, S3_DECODE};
 use pipette_store::http_stats::{HttpCounts, S3_HTTP};
 use pipette_store::{
-    BacklogSnapshot, CampaignBacklog, CampaignBacklogSnapshot, ClientStore, CreateOutcome,
-    JobPlanMarker, PlanStore, RecycleResult, RedateResult, ReindexJob, STORAGE_CONCURRENCY,
-    SubmissionStore, TagStore, TodoStore, drain_clients, drain_plans, warn_unreadable_clients,
+    AvailEntry, ClientStore, CreateOutcome, JobPlanMarker, PlanStore, RecycleResult, RedateResult,
+    ReindexJob, ReindexRequest, STORAGE_CONCURRENCY, SubmissionStore, TagStore, TodoStore,
+    drain_clients, drain_plans, warn_unreadable_clients,
 };
 
 use crate::submission::{UnrecordableJobError, record_system_failure};
 use crate::{plan_ingestion, plan_maintenance};
-
-/// One `avail/` entry, parsed once in [`collect_all_avail`].
-pub struct AvailKey {
-    pub key: String,
-    pub job_id: JobId,
-    pub expires_at: ExpiresAt,
-}
 
 /// The settings [`run`] takes from config. Named fields, because two bare
 /// `Duration` arguments are swappable at a call site without a compile error.
@@ -69,8 +58,8 @@ pub async fn run(
     let now = Utc::now();
     // Cleared at once, so a failed run leaves no sightings a later run would
     // mistake as consecutive; GC is then delayed one interval, the safe side.
-    let prior_gc_candidates = todo.read_gc_candidates().await?;
-    todo.write_gc_candidates(&HashSet::new()).await?;
+    let prior_gc_candidates = plans.read_gc_candidates().await?;
+    plans.write_gc_candidates(&HashSet::new()).await?;
 
     // Markers before manifests: the reverse could show a fresh plan's marker
     // with no manifest, which reads as an orphan. Manifests before the queue:
@@ -91,21 +80,14 @@ pub async fn run(
 
     // Listed after the recycle so recycled jobs are included. A job racing
     // these listings can miss the live set once; two-sighting GC spares it.
-    let avail_keys = collect_all_avail(todo).await?.keys;
-    // Unparseable keys were already warned about in `settle_expired_leases`.
-    let leases: Vec<Lease> = todo
-        .list_leased()
-        .await?
-        .iter()
-        .filter_map(|k| parse_leased_key(k).ok())
-        .collect();
+    let avail_keys = todo.list_avail_entries().await?;
+    let leases = todo.list_leases().await?;
 
     // Teardown precedes every queue reader, so no pass indexes a doomed job.
     // One `job-plans/` listing per run, so a plan with many jobs costs none.
     let job_plan_markers = plans.list_all_job_plan_markers().await?;
     let membership = plan_maintenance::Membership::new(job_plan_markers.clone());
     let teardown = plan_maintenance::tear_down_plans(
-        todo,
         plans,
         &manifests,
         &cancel_markers,
@@ -158,14 +140,9 @@ pub async fn run(
     let failed_items = failed_items + unreadable.len();
     let flagged_ids: HashSet<JobId> = flagged.iter().map(|job| job.job_id.clone()).collect();
     // The cache owns each flagged body; the index pass borrows it back below.
-    let mut bodies: HashMap<String, Value> = flagged
+    let mut bodies: HashMap<AvailEntry, Value> = flagged
         .iter_mut()
-        .map(|job| {
-            (
-                avail_filename(&job.job_id, job.expires_at),
-                std::mem::take(&mut job.body),
-            )
-        })
+        .map(|job| (reindex_entry(job), std::mem::take(&mut job.body)))
         .collect();
     // Retirement first, so an unmatchable body is not reported as an exhausted
     // roster.
@@ -198,7 +175,7 @@ pub async fn run(
         .filter(|id| !withheld.contains(id) && !unreadable.contains(id))
         .collect();
 
-    // Confirmed terminal for this run's GC sweeps.
+    // Removed by this run, so the live set leaves them out.
     let mut terminal_now = expired_now;
     terminal_now.extend(retired_now);
     terminal_now.extend(escalated_now);
@@ -222,8 +199,8 @@ pub async fn run(
                 .filter(|id| !terminal_now.contains(id)),
         )
         .collect();
-    // One snapshot for every index pass and plan reconciliation, so the index
-    // agrees with the persisted worker set; a mid-run change is next run's diff.
+    // One fleet snapshot for every index pass and plan reconciliation.
+    // Unfinished joiners stay out of the persisted indexed-worker set.
     let rights = matching::FleetRights::new(auth.list_client_permissions().await?);
     let workers = rights.workers(&clients);
     let worker_ids: HashSet<ClientId> = workers.iter().map(|c| c.client_id.clone()).collect();
@@ -251,7 +228,7 @@ pub async fn run(
         .into_iter()
         .filter(|job| indexable.contains(&job.job_id))
         .filter_map(|mut job| {
-            job.body = bodies.remove(&avail_filename(&job.job_id, job.expires_at))?;
+            job.body = bodies.remove(&reindex_entry(&job))?;
             Some(job)
         })
         .collect();
@@ -259,10 +236,10 @@ pub async fn run(
     bodies.extend(
         to_index
             .into_iter()
-            .map(|job| (avail_filename(&job.job_id, job.expires_at), job.body)),
+            .map(|job| (reindex_entry(&job), job.body)),
     );
     let fallback: HashSet<JobId> = flagged_ids.difference(&indexed).cloned().collect();
-    reindex_flagged_clients(
+    let retry_joiners = reindex_flagged_clients(
         todo,
         auth,
         tags,
@@ -272,15 +249,14 @@ pub async fn run(
         &leased_ids,
     )
     .await?;
-    // After every joiner's rebuild, so a failed run sees the same joiners again.
-    if indexed_workers != worker_ids {
-        todo.write_workers(&worker_ids).await?;
+    let indexed_next: HashSet<ClientId> = worker_ids.difference(&retry_joiners).cloned().collect();
+    // Only a successful rebuild consumes a joiner's retry trigger.
+    if indexed_workers != indexed_next {
+        todo.write_workers(&indexed_next).await?;
     }
 
-    // After the index passes, so the sweep never deletes a marker they wrote.
-    let live_clients: HashSet<ClientId> = clients.iter().map(|c| c.client_id.clone()).collect();
-    // The backlog counts a marker only at its job's current deadline. A job
-    // with two `avail/` entries is omitted.
+    // A marker is claimable only at its job's current deadline. A job with
+    // two `avail/` entries is omitted.
     let avail_expiries: HashMap<JobId, ExpiresAt> = all_keys
         .iter()
         .fold(
@@ -304,58 +280,7 @@ pub async fn run(
     }
     eligible.retain(|(_, job_id, _)| !withheld.contains(job_id));
     let denied = todo.list_all_denied().await?;
-    let mut next_candidates = reconcile_orphans(
-        todo,
-        submissions,
-        &eligible,
-        &denied,
-        &live_ids,
-        &live_clients,
-        &terminal_now,
-        &prior_gc_candidates,
-    )
-    .await?;
-    // Written even when an item failed, so a persistent failure cannot freeze
-    // the count. Console-only, so a failed write is just a warning.
     let claimable = claimable_markers(&eligible, &avail_expiries, &denied, now);
-    let backlog = BacklogSnapshot {
-        counted_at: now,
-        jobs: count_backlog(&claimable),
-    };
-    match todo.write_backlog(&backlog).await {
-        Ok(()) => tracing::info!(
-            clients = backlog.jobs.len(),
-            "queue-maintenance: backlog snapshot written"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "queue-maintenance: backlog snapshot write failed"
-        ),
-    }
-    // Its own object, so the fleet listing reads only the totals.
-    let campaign_backlog = CampaignBacklogSnapshot {
-        counted_at: now,
-        devices: count_campaign_backlog(
-            &claimable,
-            &job_campaigns(
-                &job_plan_markers,
-                &manifests,
-                &cancel_markers,
-                &teardown.endings.stranded,
-                now,
-            ),
-        ),
-    };
-    match todo.write_campaign_backlog(&campaign_backlog).await {
-        Ok(()) => tracing::info!(
-            clients = campaign_backlog.devices.len(),
-            "queue-maintenance: campaign backlog snapshot written"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "queue-maintenance: campaign backlog snapshot write failed"
-        ),
-    }
     if let Err(e) = submissions.repair_outcomes().await {
         tracing::warn!(error = %e, "queue-maintenance: submission outcome repair failed");
     }
@@ -405,13 +330,19 @@ pub async fn run(
     )
     .await;
     let after_gc = PhaseMark::now();
-    next_candidates.extend(index_gc.candidates);
-    next_candidates.extend(source_candidates);
-    todo.write_gc_candidates(&next_candidates).await?;
+    let next_candidates: HashSet<String> = index_gc
+        .candidates
+        .into_iter()
+        .chain(source_candidates)
+        .collect();
+    plans.write_gc_candidates(&next_candidates).await?;
 
     let failed_items = failed_items + reconciled.failures + index_gc.failures + source_gc_failures;
 
     cleanup_stale_tmp(todo, settings.tmp_max).await?;
+    // Last: the passes above act on the deadlines they listed. A fresh clock, so
+    // no row moves onto a horizon that passed during the run.
+    let deadlines_restamped = todo.restamp_avail_deadlines(Utc::now()).await?;
 
     [
         ("queue_passes", &at_start, &after_queue_passes),
@@ -423,8 +354,8 @@ pub async fn run(
     let run_cpu = process_cpu_time()
         .zip(at_start.cpu)
         .map(|(now, start)| now.since(start));
-    // The candidate-set write and `tmp/` cleanup are in no phase, so the
-    // phases sum to less than `duration_ms`.
+    // The candidate-set write, `tmp/` cleanup and the re-stamp are in no phase,
+    // so the phases sum to less than `duration_ms`.
     tracing::info!(
         duration_ms = millis(at_start.at.elapsed()),
         queue_passes_ms = millis(after_queue_passes.at - at_start.at),
@@ -448,6 +379,7 @@ pub async fn run(
         slowest_plan_probes = reconciled.slowest.as_ref().map(|slowest| slowest.probes),
         content_keys_read = index_gc.content_keys_read,
         client_records_drained,
+        deadlines_restamped,
         cpu_user_ms = run_cpu.map(|cpu| millis(cpu.user)),
         cpu_system_ms = run_cpu.map(|cpu| millis(cpu.system)),
         failed_items,
@@ -567,13 +499,7 @@ async fn settle_expired_leases(
     let mut recycled = 0usize;
     let mut retired = 0usize;
     let mut failures = 0usize;
-    for key in todo.list_leased().await? {
-        // Foreign cruft or an older key format: left in place, not live, not a
-        // failure. A key format change therefore needs an empty `leased/` tree.
-        let Ok(lease) = parse_leased_key(&key) else {
-            tracing::warn!(key = %key, "skipping unparseable leased key");
-            continue;
-        };
+    for lease in todo.list_leases().await? {
         seen.insert(lease.job_id.clone());
         if lease.lease_expiry >= now {
             continue;
@@ -751,7 +677,7 @@ pub async fn resolve_or_recycle_lease(
 }
 
 /// Settle every job in `all_keys` past the `expires_at` its key encodes:
-/// re-date it onto the latest horizon a member plan still holds, or retire it.
+/// re-date it onto the earliest horizon a member plan still holds, or retire it.
 ///
 /// Only lapsed keys are moved, which the claim gate refuses, so a claim races a
 /// re-date only under clock skew. A `Never` key is never settled, so such a job
@@ -764,9 +690,9 @@ async fn expire_overdue_jobs(
     submissions: &dyn SubmissionStore,
     plans: &dyn PlanStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    all_keys: Vec<AvailKey>,
+    all_keys: Vec<AvailEntry>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, usize)> {
+) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, usize)> {
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
     let mut failures = 0usize;
@@ -785,7 +711,7 @@ async fn expire_overdue_jobs(
             Ok(Overdue::Retired) => {
                 removed.insert(avail.job_id.clone());
             }
-            // Origin ambiguous, so not confirmed terminal; two-sighting GC owns it.
+            // Left the queue by another path, whose delete took its markers.
             Ok(Overdue::Vanished) => {}
             Err(e) => {
                 tracing::warn!(job_id = %avail.job_id, error = %e, "failed to settle overdue job");
@@ -799,14 +725,16 @@ async fn expire_overdue_jobs(
 
 /// What [`settle_overdue_job`] did with one job past its encoded deadline.
 enum Overdue {
-    /// Carries the entry's new key.
-    Redated(AvailKey),
+    /// Carries the entry under its new deadline.
+    Redated(AvailEntry),
     Retired,
     Vanished,
 }
 
-/// Settle one job whose encoded deadline has lapsed: re-date it onto the latest
-/// horizon its member plans still hold, or retire it when none remains.
+/// Settle one job whose encoded deadline has lapsed: re-date it onto the earliest
+/// horizon its member plans still hold, or retire it when none remains. A plan's
+/// horizon is the latest of its markers, as [`TodoStore::restamp_avail_deadlines`]
+/// reads it.
 ///
 /// Needs no record guard of its own: claim and submission contend for one lease
 /// file. An entry a failed expiry left has no unlapsed marker, so it reaches
@@ -817,20 +745,24 @@ async fn settle_overdue_job(
     submissions: &dyn SubmissionStore,
     plans: &dyn PlanStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    avail: &AvailKey,
+    avail: &AvailEntry,
     deadline: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Overdue> {
     // Fresh, since the lapse pass just deleted markers. An error must propagate:
     // read as "no member", it would retire a job another plan still waits on.
-    let latest = plans
+    let horizons: HashMap<PlanId, ExpiresAt> = plans
         .list_job_plan_markers(&avail.job_id)
         .await?
         .into_iter()
-        .map(|(_, expires_at)| expires_at)
-        .filter(|horizon| !horizon.is_expired(now))
-        .max();
-    let Some(to) = latest else {
+        .filter(|(_, horizon)| !horizon.is_expired(now))
+        .fold(HashMap::new(), |mut acc, (plan_id, horizon)| {
+            acc.entry(plan_id)
+                .and_modify(|latest| *latest = (*latest).max(horizon))
+                .or_insert(horizon);
+            acc
+        });
+    let Some(to) = horizons.into_values().min() else {
         return match expire_one_job(todo, submissions, catalog, avail, deadline, now).await? {
             true => Ok(Overdue::Retired),
             false => Ok(Overdue::Vanished),
@@ -846,10 +778,9 @@ async fn settle_overdue_job(
                 job_id = %avail.job_id,
                 from = %avail.expires_at,
                 to = %to,
-                "queue-maintenance: re-dated a job to the latest horizon its member plans hold"
+                "queue-maintenance: re-dated a job to the earliest horizon its member plans hold"
             );
-            Ok(Overdue::Redated(AvailKey {
-                key: avail_filename(&avail.job_id, to),
+            Ok(Overdue::Redated(AvailEntry {
                 job_id: avail.job_id.clone(),
                 expires_at: to,
             }))
@@ -863,7 +794,7 @@ async fn settle_overdue_job(
 /// Record a synthetic `"system"` failure.
 /// Ingestion rejects these jobs. Another writer or an older build created them.
 ///
-/// A job that is already indexed is not checked again. A build that makes
+/// This pass does not check an indexed job again. A build that makes
 /// these rules stricter must ship a migration that flags every available job.
 ///
 /// Not part of [`escalate_all_denied_jobs`]: such a job collects no denials. A
@@ -873,11 +804,11 @@ async fn retire_unmatchable_jobs(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    all_keys: Vec<AvailKey>,
+    all_keys: Vec<AvailEntry>,
     flagged: &HashSet<JobId>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, HashSet<JobId>)> {
+) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, HashSet<JobId>)> {
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
     let mut failures = HashSet::new();
@@ -916,8 +847,8 @@ async fn retire_one_if_unmatchable(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    avail: &AvailKey,
-    bodies: &mut HashMap<String, Value>,
+    avail: &AvailEntry,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let Some(body) = cached_body(todo, avail, bodies).await? else {
@@ -979,11 +910,11 @@ async fn escalate_all_denied_jobs(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    all_keys: Vec<AvailKey>,
+    all_keys: Vec<AvailEntry>,
     flagged: &HashSet<JobId>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(Vec<AvailKey>, HashSet<JobId>, HashSet<JobId>)> {
+) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, HashSet<JobId>)> {
     let denied_by: HashMap<JobId, HashSet<ClientId>> = todo
         .list_all_denied()
         .await?
@@ -1033,16 +964,16 @@ async fn escalate_all_denied_jobs(
 /// the entry left `avail/` since the listing.
 pub(crate) async fn cached_body(
     todo: &dyn TodoStore,
-    avail: &AvailKey,
-    bodies: &mut HashMap<String, Value>,
+    avail: &AvailEntry,
+    bodies: &mut HashMap<AvailEntry, Value>,
 ) -> anyhow::Result<Option<Value>> {
-    if let Some(cached) = bodies.get(&avail.key) {
+    if let Some(cached) = bodies.get(avail) {
         return Ok(Some(cached.clone()));
     }
     let Some(body) = todo.get_avail(&avail.job_id, avail.expires_at).await? else {
         return Ok(None);
     };
-    bodies.insert(avail.key.clone(), body.clone());
+    bodies.insert(avail.clone(), body.clone());
     Ok(Some(body))
 }
 
@@ -1051,9 +982,9 @@ async fn escalate_one_if_all_denied(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    avail: &AvailKey,
+    avail: &AvailEntry,
     denied: &HashSet<ClientId>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let Some(body) = cached_body(todo, avail, bodies).await? else {
@@ -1118,7 +1049,7 @@ async fn denied_client(todo: &dyn TodoStore, job_id: &JobId, client_id: &ClientI
 }
 
 enum QueueEntry<'a> {
-    Avail(&'a AvailKey),
+    Avail(&'a AvailEntry),
     Lease(&'a Lease),
 }
 
@@ -1139,7 +1070,8 @@ impl QueueEntry<'_> {
 
     async fn delete(&self, todo: &dyn TodoStore) -> anyhow::Result<()> {
         match self {
-            Self::Avail(avail) => todo.delete_avail(&avail.job_id, avail.expires_at).await,
+            // By job: a re-stamp may have moved the deadline since the read.
+            Self::Avail(avail) => todo.delete_avail_by_job(&avail.job_id).await,
             Self::Lease(lease) => {
                 todo.delete_lease(
                     &lease.job_id,
@@ -1244,7 +1176,7 @@ async fn expire_one_job(
     todo: &dyn TodoStore,
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
-    avail: &AvailKey,
+    avail: &AvailEntry,
     deadline: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
@@ -1272,34 +1204,47 @@ async fn expire_one_job(
     Ok(true)
 }
 
-/// Every `avail/` key the queue holds, decoded once.
-pub struct AvailListing {
-    pub keys: Vec<AvailKey>,
+/// Fail a queued job unrun because `smaller`, a smaller run of its family that
+/// ran `benchmark_id`, failed with `code`. Returns whether it wrote the
+/// failure. A leased job keeps running: the delete takes only an unleased row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is distinct context the caller already holds"
+)]
+pub async fn fail_larger_run(
+    todo: &dyn TodoStore,
+    submissions: &dyn SubmissionStore,
+    catalog: &HashMap<BenchmarkId, Benchmark>,
+    avail: &AvailEntry,
+    body: &Value,
+    smaller: &JobId,
+    benchmark_id: &BenchmarkId,
+    code: FailureCode,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    resolve_job_terminal(
+        todo,
+        submissions,
+        catalog,
+        &QueueEntry::Avail(avail),
+        body,
+        std::future::ready((
+            format!("not run: {benchmark_id} of this model failed with {code} in {smaller}"),
+            code,
+        )),
+        "smaller_run_failed",
+        FailureSource::SmallerRunFailed,
+        now,
+    )
+    .await
 }
 
-/// List every `avail/` key in key order, decoding each once. An unparseable
-/// filename is logged and dropped as absent.
-pub async fn collect_all_avail(todo: &dyn TodoStore) -> anyhow::Result<AvailListing> {
-    let keys = todo.list_avail().await?;
-    // An unmigrated key would drop below as cruft, taking a live job out of the
-    // GC live set.
-    pipette_store::reject_unmigrated_avail_keys(keys.iter().map(String::as_str))?;
-    Ok(AvailListing {
-        keys: keys
-            .into_iter()
-            .filter_map(|key| match parse_avail_filename(&key) {
-                Ok((job_id, expires_at)) => Some(AvailKey {
-                    key,
-                    job_id,
-                    expires_at,
-                }),
-                Err(_) => {
-                    tracing::warn!(key = %key, "skipping unparseable avail filename");
-                    None
-                }
-            })
-            .collect(),
-    })
+/// The body-cache key of a flagged job: its entry at the read.
+fn reindex_entry(job: &ReindexJob) -> AvailEntry {
+    AvailEntry {
+        job_id: job.job_id.clone(),
+        expires_at: job.expires_at,
+    }
 }
 
 /// Make the eligible index match the workers. Returns the joiners, for a full
@@ -1411,7 +1356,8 @@ async fn index_flagged_jobs(
 ///
 /// The function reads the current record and deletes only the earlier flags. It
 /// preserves newer reindex requests. Leased jobs get their reindex
-/// flag before the wipe, so a crash never loses one.
+/// flag before the wipe, so a crash never loses one. Returns joiners whose
+/// rebuild did not pass its recheck, for the caller to retry next run.
 async fn reindex_flagged_clients(
     todo: &dyn TodoStore,
     auth: &dyn ClientStore,
@@ -1420,18 +1366,21 @@ async fn reindex_flagged_clients(
     joined: &BTreeSet<ClientId>,
     listed: &[JobId],
     leased_ids: &HashSet<JobId>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HashSet<ClientId>> {
     let flags = todo.list_pending_reindex().await?;
-    // One rebuild consumes all of a client's flag keys; a joiner has none.
-    let by_client: BTreeMap<ClientId, Vec<String>> = flags.into_iter().fold(
+    let mut retry_joiners = HashSet::new();
+    // One rebuild consumes all of a client's flags; a joiner has none.
+    let by_client: BTreeMap<ClientId, Vec<ReindexRequest>> = flags.into_iter().fold(
         joined.iter().map(|c| (c.clone(), Vec::new())).collect(),
-        |mut m, (c, key)| {
-            m.entry(c).or_default().push(key);
+        |mut m, request| {
+            m.entry(request.client_id.clone())
+                .or_default()
+                .push(request);
             m
         },
     );
     if by_client.is_empty() {
-        return Ok(());
+        return Ok(retry_joiners);
     }
 
     // Only a rebuild misses the leased jobs; a non-worker's cleanup drops its
@@ -1468,7 +1417,7 @@ async fn reindex_flagged_clients(
         Vec::new()
     };
 
-    for (client_id, keys) in &by_client {
+    for (client_id, requests) in &by_client {
         // `claim` refuses a non-worker, so its markers are dead; a later join
         // rebuilds them.
         let is_worker = workers.contains(client_id);
@@ -1478,10 +1427,13 @@ async fn reindex_flagged_clients(
             None
         };
         let Some(client) = record else {
+            if joined.contains(client_id) {
+                retry_joiners.insert(client_id.clone());
+            }
             // Only the captured flags: a racing re-registration's flag survives.
             todo.delete_eligible_for_client(client_id).await?;
-            for key in keys {
-                todo.delete_pending_reindex(key).await?;
+            for request in requests {
+                todo.delete_pending_reindex(request).await?;
             }
             tracing::info!(
                 client_id = %client_id,
@@ -1510,8 +1462,9 @@ async fn reindex_flagged_clients(
             "queue-maintenance: reindexed client after a matching-input change"
         );
 
-        // Keep the flags if the record changed mid-rebuild: a `PATCH` whose own
-        // flag write failed has no other repair trigger. A failed read keeps them.
+        // Preserve retry state if the record changed mid-rebuild: a `PATCH`
+        // whose flag write failed has no other repair trigger. A failed read
+        // also requires another rebuild.
         let fresh = async {
             let record = auth.get_client(client_id).await?;
             let tags = client_tags(tag_store, client_id).await?;
@@ -1524,259 +1477,43 @@ async fn reindex_flagged_clients(
                 tracing::warn!(
                     client_id = %client_id,
                     error = %e,
-                    "queue-maintenance: recheck read failed; keeping this client's reindex flags"
+                    "queue-maintenance: recheck read failed; retaining this client's retry state"
                 );
                 false
             }
         };
         if !record_unchanged {
+            if joined.contains(client_id) {
+                retry_joiners.insert(client_id.clone());
+            }
             tracing::info!(
                 client_id = %client_id,
-                flags_retained = keys.len(),
-                "queue-maintenance: client's record or tags changed during rebuild; kept its reindex flags for the next run"
+                flags_retained = requests.len(),
+                joiner_retry = joined.contains(client_id),
+                "queue-maintenance: client's rebuild recheck did not pass; retaining retry state for the next run"
             );
             continue;
         }
-        for key in keys {
-            todo.delete_pending_reindex(key).await?;
+        for request in requests {
+            todo.delete_pending_reindex(request).await?;
         }
     }
-    Ok(())
+    Ok(retry_joiners)
 }
 
-/// Whether to act on an orphaned marker now: its `key` was staged last run, or
-/// its `owning_job` was removed this run. A first sighting is staged in `next`.
+/// Whether to delete an orphaned key now: the last run staged it. The function
+/// adds a key to `next` on its first sighting.
 pub(crate) fn confirm_or_stage(
     prior: &HashSet<String>,
-    terminal_jobs: &HashSet<JobId>,
     next: &mut HashSet<String>,
     key: String,
-    owning_job: Option<&JobId>,
 ) -> bool {
-    confirm_or_stage_group(prior, terminal_jobs, next, vec![key], owning_job)
-}
-
-/// [`confirm_or_stage`] for a bulk delete: every key staged last run, or
-/// `owning_job` removed this run.
-fn confirm_or_stage_group(
-    prior: &HashSet<String>,
-    terminal_jobs: &HashSet<JobId>,
-    next: &mut HashSet<String>,
-    keys: Vec<String>,
-    owning_job: Option<&JobId>,
-) -> bool {
-    if owning_job.is_some_and(|job| terminal_jobs.contains(job))
-        || keys.iter().all(|key| prior.contains(key))
-    {
+    if prior.contains(&key) {
         true
     } else {
-        next.extend(keys);
+        next.insert(key);
         false
     }
-}
-
-/// Collect the markers of jobs and clients that no longer exist, gated by
-/// [`confirm_or_stage`]. Returns the next run's candidate set.
-///
-/// Fails fast, unlike the per-item passes: it only reclaims inert detritus, and
-/// its likely failure is an S3 outage that retrying would worsen.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the stores, the listings shared with the backlog count, and the live views \
-              are each context the caller already holds"
-)]
-async fn reconcile_orphans(
-    todo: &dyn TodoStore,
-    submissions: &dyn SubmissionStore,
-    eligible: &[(ClientId, JobId, ExpiresAt)],
-    denied: &[(JobId, ClientId)],
-    live_jobs: &HashSet<JobId>,
-    live_clients: &HashSet<ClientId>,
-    terminal_jobs: &HashSet<JobId>,
-    prior: &HashSet<String>,
-) -> anyhow::Result<HashSet<String>> {
-    let mut next = HashSet::new();
-
-    // ── eligible/clients/{client}/{job}_{exp} ── orphan iff job or client dead.
-    let mut dead_client_eligible: BTreeMap<ClientId, Vec<(String, JobId, ExpiresAt)>> =
-        BTreeMap::new();
-    let mut eligible_removed = 0usize;
-    for (client_id, job_id, expires_at) in eligible {
-        let client_dead = !live_clients.contains(client_id);
-        let job_dead = !live_jobs.contains(job_id);
-        if !client_dead && !job_dead {
-            continue;
-        }
-        let key = format!(
-            "eligible/clients/{}/{}",
-            client_id,
-            eligible_filename(job_id, *expires_at)
-        );
-        if client_dead {
-            dead_client_eligible
-                .entry(client_id.clone())
-                .or_default()
-                .push((key, job_id.clone(), *expires_at));
-        } else if confirm_or_stage(prior, terminal_jobs, &mut next, key, Some(job_id)) {
-            todo.delete_eligible(client_id, job_id, *expires_at).await?;
-            eligible_removed += 1;
-        }
-    }
-    for (client_id, markers) in dead_client_eligible {
-        let count = markers.len();
-        let keys = markers.into_iter().map(|(key, _, _)| key).collect();
-        if confirm_or_stage_group(prior, terminal_jobs, &mut next, keys, None) {
-            todo.delete_eligible_for_client(&client_id).await?;
-            eligible_removed += count;
-            tracing::info!(
-                client_id = %client_id,
-                "queue-maintenance: reconciled eligible markers for a client no longer in the roster"
-            );
-        }
-    }
-
-    // ── denied/{job}.{client} ── orphan iff job or client dead.
-    let mut dead_job_denied: BTreeMap<JobId, Vec<(String, ClientId)>> = BTreeMap::new();
-    let mut denied_removed = 0usize;
-    for (job_id, client_id) in denied {
-        let job_dead = !live_jobs.contains(job_id);
-        let client_dead = !live_clients.contains(client_id);
-        if !job_dead && !client_dead {
-            continue;
-        }
-        let key = format!("denied/{}", denied_marker_filename(job_id, client_id));
-        if job_dead {
-            dead_job_denied
-                .entry(job_id.clone())
-                .or_default()
-                .push((key, client_id.clone()));
-        } else if confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
-            todo.delete_denied(job_id, client_id).await?;
-            denied_removed += 1;
-        }
-    }
-    for (job_id, markers) in dead_job_denied {
-        let count = markers.len();
-        let keys = markers.into_iter().map(|(key, _)| key).collect();
-        if confirm_or_stage_group(prior, terminal_jobs, &mut next, keys, Some(&job_id)) {
-            todo.delete_denied_for_job(&job_id).await?;
-            denied_removed += count;
-        }
-    }
-
-    // ── liveness/{client} ── orphan iff client dead; never collected by age.
-    let mut liveness_removed = 0usize;
-    for (client_id, _seen_at) in todo.list_liveness().await? {
-        if live_clients.contains(&client_id) {
-            continue;
-        }
-        let key = format!("liveness/{}", client_id);
-        if confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
-            todo.delete_liveness(&client_id).await?;
-            liveness_removed += 1;
-            tracing::info!(
-                client_id = %client_id,
-                "queue-maintenance: deleted orphaned liveness marker for deleted client"
-            );
-        }
-    }
-
-    // ── pending-reindex/{client}.{uuid} ── orphan iff client dead.
-    let mut reindex_flags_removed = 0usize;
-    for (client_id, raw_key) in todo.list_pending_reindex().await? {
-        if live_clients.contains(&client_id) {
-            continue;
-        }
-        let key = format!("pending-reindex/{}", raw_key);
-        if confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
-            todo.delete_pending_reindex(&raw_key).await?;
-            reindex_flags_removed += 1;
-        }
-    }
-
-    // ── lost/{job}/ ── orphan iff job dead.
-    let mut lost_lease_jobs_removed = 0usize;
-    for job_id in todo.list_lost_lease_jobs().await? {
-        if live_jobs.contains(&job_id) {
-            continue;
-        }
-        let key = format!("lost/{job_id}/");
-        if confirm_or_stage(prior, terminal_jobs, &mut next, key, Some(&job_id)) {
-            todo.delete_lost_leases_for_job(&job_id).await?;
-            lost_lease_jobs_removed += 1;
-        }
-    }
-
-    // ── leased/{client}/{job}_{exp} ── a deleted client's lease is recycled,
-    // not deleted: it holds the only copy of the job body.
-    let mut leases_recycled = 0usize;
-    for raw_key in todo.list_leased().await? {
-        let Ok(Lease {
-            job_id,
-            expires_at,
-            client_id,
-            lease_expiry,
-        }) = parse_leased_key(&raw_key)
-        else {
-            continue;
-        };
-        if live_clients.contains(&client_id) {
-            continue;
-        }
-        let key = format!("leased/{}", raw_key);
-        if !confirm_or_stage(prior, terminal_jobs, &mut next, key, None) {
-            continue;
-        }
-        match resolve_or_recycle_lease(
-            todo,
-            submissions,
-            &job_id,
-            expires_at,
-            &client_id,
-            lease_expiry,
-        )
-        .await?
-        {
-            LeaseResolution::Recycled => {
-                tracing::info!(
-                    job_id = %job_id,
-                    client_id = %client_id,
-                    "queue-maintenance: recycled lease held by deleted client to avail/"
-                );
-                leases_recycled += 1;
-            }
-            LeaseResolution::ResolvedStale => {
-                tracing::info!(
-                    job_id = %job_id,
-                    client_id = %client_id,
-                    "queue-maintenance: deleted-client lease already had a submission record; deleted stale lease"
-                );
-            }
-            LeaseResolution::Gone => {
-                tracing::debug!(job_id = %job_id, client_id = %client_id, "deleted-client lease already resolved elsewhere");
-            }
-        }
-    }
-
-    if eligible_removed
-        + denied_removed
-        + liveness_removed
-        + reindex_flags_removed
-        + lost_lease_jobs_removed
-        + leases_recycled
-        > 0
-    {
-        tracing::info!(
-            eligible_removed,
-            denied_removed,
-            liveness_removed,
-            reindex_flags_removed,
-            lost_lease_jobs_removed,
-            leases_recycled,
-            "queue-maintenance: reconciled orphaned todo/ markers"
-        );
-    }
-    Ok(next)
 }
 
 /// The `eligible/` markers that a claim at `now` could take, by the claim
@@ -1798,93 +1535,20 @@ fn claimable_markers<'a>(
         .collect()
 }
 
-/// The backlog of each client: the count of its claimable markers.
-fn count_backlog(claimable: &[&(ClientId, JobId, ExpiresAt)]) -> BTreeMap<ClientId, u64> {
-    claimable
-        .iter()
-        .fold(BTreeMap::new(), |mut acc, (client_id, _, _)| {
-            *acc.entry(client_id.clone()).or_default() += 1;
-            acc
-        })
-}
-
-/// The campaigns that hold each job: the campaigns of the plans with a
-/// current membership for the job. A plan holds no job in this map if its
-/// teardown started, if it is outside a campaign, or if it has no manifest.
-fn job_campaigns<'a>(
-    markers: &'a [JobPlanMarker],
-    manifests: &'a [PlanManifest],
-    cancel_markers: &HashSet<PlanId>,
-    stranded: &HashSet<PlanId>,
-    now: DateTime<Utc>,
-) -> HashMap<&'a JobId, BTreeSet<&'a CampaignId>> {
-    let plan_campaigns: HashMap<&PlanId, &CampaignId> = manifests
-        .iter()
-        .filter(|manifest| {
-            !cancel_markers.contains(&manifest.plan_id)
-                && !stranded.contains(&manifest.plan_id)
-                && !matches!(
-                    manifest.status,
-                    PlanStatus::Cancelling | PlanStatus::Cancelled
-                )
-        })
-        .filter_map(|manifest| Some((&manifest.plan_id, manifest.campaign_id.as_ref()?)))
-        .collect();
-    markers
-        .iter()
-        .filter(|marker| !marker.expires_at.is_expired(now))
-        .filter_map(|marker| Some((&marker.job_id, *plan_campaigns.get(&marker.plan_id)?)))
-        .fold(HashMap::new(), |mut acc, (job_id, campaign_id)| {
-            acc.entry(job_id)
-                .or_insert_with(BTreeSet::new)
-                .insert(campaign_id);
-            acc
-        })
-}
-
-/// Count the backlog of each client by campaign. A claimable marker counts
-/// once in each campaign that holds its job. If no campaign holds the job, the
-/// marker counts once in `outside_campaigns`.
-fn count_campaign_backlog(
-    claimable: &[&(ClientId, JobId, ExpiresAt)],
-    job_campaigns: &HashMap<&JobId, BTreeSet<&CampaignId>>,
-) -> BTreeMap<ClientId, CampaignBacklog> {
-    claimable.iter().fold(
-        BTreeMap::new(),
-        |mut acc: BTreeMap<ClientId, CampaignBacklog>, (client_id, job_id, _)| {
-            let backlog = acc.entry(client_id.clone()).or_default();
-            match job_campaigns.get(job_id) {
-                Some(campaigns) => campaigns.iter().for_each(|campaign_id| {
-                    *backlog
-                        .by_campaign
-                        .entry((*campaign_id).clone())
-                        .or_default() += 1;
-                }),
-                None => backlog.outside_campaigns += 1,
-            }
-            acc
-        },
-    )
-}
-
 pub(crate) fn millis(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Delete `tmp/` partial job files older than `max_age`, debris of a crashed
-/// planner.
+/// Delete the staged job bodies older than `max_age`. A crashed planner leaves
+/// them.
 async fn cleanup_stale_tmp(todo: &dyn TodoStore, max_age: Duration) -> anyhow::Result<()> {
-    let stale = todo.list_stale_tmp(max_age).await?;
-    if stale.is_empty() {
-        return Ok(());
+    let deleted = todo.delete_stale_tmp(max_age).await?;
+    if deleted > 0 {
+        tracing::info!(
+            files_deleted = deleted,
+            "queue-maintenance: deleted stale tmp/ files"
+        );
     }
-    for key in &stale {
-        todo.delete_tmp_object(key).await?;
-    }
-    tracing::info!(
-        files_deleted = stale.len(),
-        "queue-maintenance: deleted stale tmp/ files"
-    );
     Ok(())
 }
 
@@ -1965,6 +1629,7 @@ mod tests {
                 auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
                 ..Default::default()
             },
+            pipette_store_testkit::no_queue(),
         )?);
         let worker = settle_test_client("sql-worker", "66", "chip-a")?;
         let client = &worker.client_id;
@@ -1978,8 +1643,7 @@ mod tests {
                 ]),
             )
             .await?;
-        // Mark the worker as indexed. A joining worker gets a rebuild, and the
-        // rebuild deletes the sql-ghost marker before the orphan sweep sees it.
+        // Mark the worker as indexed, so the run does not rebuild its rows.
         stores
             .todo
             .write_workers(&HashSet::from([client.clone()]))
@@ -2011,11 +1675,6 @@ mod tests {
             &body("sql-overdue"),
         )
         .await?;
-        let ghost = JobId::try_new("sql-ghost")?;
-        todo.write_eligible(client, &ghost, ExpiresAt::Never)
-            .await?;
-        todo.write_denied(&ghost, client, &DenialRecord::default())
-            .await?;
         let catalog = HashMap::from([(
             BenchmarkId::try_new("bench-1")?,
             Benchmark::from_toml(
@@ -2023,115 +1682,41 @@ mod tests {
                 "benchmark_type = \"prefill_throughput\"\nparameter_prefill_tokens = 100",
             )?,
         )]);
-        for pass in 1..=2 {
-            run(
-                todo,
-                &*stores.clients,
-                &*stores.tags,
-                &*stores.submissions,
-                &*stores.plans,
-                &catalog,
-                MaintenanceSettings {
-                    tmp_max: Duration::from_secs(86_400),
-                    plan_creating_max: Duration::from_secs(21_600),
-                    lost_lease_limit: 3,
-                },
-            )
-            .await?;
-            assert!(
-                todo.list_eligible_for_client(client)
-                    .await?
-                    .contains(&(available.clone(), ExpiresAt::Never))
-            );
-            assert!(todo.get_avail_by_job(&recycled).await?.is_some());
-            assert_eq!(todo.list_lost_leases(&recycled).await?.len(), 1);
-            assert!(todo.get_avail_by_job(&overdue).await?.is_none());
-            assert_eq!(
-                todo.read_backlog()
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("missing backlog"))?
-                    .jobs
-                    .get(client),
-                Some(&2)
-            );
-            assert_eq!(
-                todo.read_campaign_backlog()
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("missing campaign backlog"))?
-                    .devices
-                    .get(client)
-                    .map(|b| b.outside_campaigns),
-                Some(2)
-            );
-            if pass == 1 {
-                let candidates = todo.read_gc_candidates().await?;
+        stream::iter(0..2)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|_| async {
+                run(
+                    todo,
+                    &*stores.clients,
+                    &*stores.tags,
+                    &*stores.submissions,
+                    &*stores.plans,
+                    &catalog,
+                    MaintenanceSettings {
+                        tmp_max: Duration::from_secs(86_400),
+                        plan_creating_max: Duration::from_secs(21_600),
+                        lost_lease_limit: 3,
+                    },
+                )
+                .await?;
                 assert!(
-                    candidates
-                        .iter()
-                        .any(|k| k.starts_with("eligible/") && k.contains("sql-ghost"))
-                );
-                assert!(
-                    candidates
-                        .iter()
-                        .any(|k| k.starts_with("denied/") && k.contains("sql-ghost"))
-                );
-            } else {
-                assert!(!todo.is_denied(&ghost, client).await?);
-                assert!(
-                    !todo
-                        .list_eligible_for_client(client)
+                    todo.list_eligible_for_client(client)
                         .await?
-                        .iter()
-                        .any(|(j, _)| j == &ghost)
+                        .contains(&(available.clone(), ExpiresAt::Never))
                 );
-            }
-        }
-        Ok(())
-    }
-
-    /// A `list_objects_v2` rule that answers like a bucket holding `keys`.
-    ///
-    /// Duplicated from `pipette-store-s3`: a shared crate would put
-    /// `aws-smithy-mocks` in `THIRD-PARTY-LICENSES.md`.
-    fn bucket_list_rule(keys: &'static [&'static str]) -> aws_smithy_mocks::Rule {
-        aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2).then_compute_output(
-            move |req| {
-                let prefix = req.prefix().unwrap_or_default().to_string();
-                let contents: Vec<aws_sdk_s3::types::Object> = keys
-                    .iter()
-                    .filter(|key| key.starts_with(&prefix))
-                    .map(|key| aws_sdk_s3::types::Object::builder().key(*key).build())
-                    .collect();
-                aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
-                    .set_contents(Some(contents))
-                    .is_truncated(false)
-                    .build()
-            },
-        )
-    }
-
-    /// A directory bucket answers each `list_avail` call with the whole prefix,
-    /// so every extra call re-reads every key.
-    #[tokio::test]
-    async fn a_sweep_lists_the_avail_prefix_once() -> anyhow::Result<()> {
-        const BUCKET: &[&str] = &[
-            "todo/avail/job1/never.json",
-            "todo/avail/job2/never.json",
-            "todo/avail/job3/20260908T000000Z.json",
-        ];
-        let list = bucket_list_rule(BUCKET);
-        let todo = pipette_store_s3::S3TodoStore::new(
-            aws_smithy_mocks::mock_client!(
-                aws_sdk_s3,
-                aws_smithy_mocks::RuleMode::MatchAny,
-                &[&list]
-            ),
-            "test-bucket",
-            "",
-        );
-        let swept = collect_all_avail(&todo).await?;
-        assert_eq!(swept.keys.len(), BUCKET.len(), "the sweep sees every entry");
-        assert_eq!(list.num_calls(), 1, "the sweep lists `avail/` once");
+                assert!(todo.get_avail_by_job(&recycled).await?.is_some());
+                assert_eq!(todo.list_lost_leases(&recycled).await?.len(), 1);
+                assert!(todo.get_avail_by_job(&overdue).await?.is_none());
+                assert_eq!(todo.backlog().await?.get(client), Some(&2));
+                assert_eq!(
+                    todo.campaign_backlog(client, Utc::now())
+                        .await?
+                        .outside_campaigns,
+                    2
+                );
+                anyhow::Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -2189,7 +1774,7 @@ mod tests {
                 .is_some()
         );
         assert!(todo.get_avail_by_job(&recorded).await?.is_none());
-        assert_eq!(todo.list_leased().await?.len(), 1);
+        assert_eq!(todo.list_leases().await?.len(), 1);
         Ok(())
     }
 
@@ -2232,6 +1817,58 @@ mod tests {
         assert_eq!(failures, 0);
         assert_eq!(resolved, HashSet::from([recorded]));
         assert_eq!(S3_DECODE.checkpoint().since(start).bodies, 0);
+        Ok(())
+    }
+
+    /// A re-stamp can move a larger run's deadline between the submit route's
+    /// read and the delete; the failed job still leaves the queue.
+    #[tokio::test]
+    async fn a_larger_run_whose_deadline_moved_after_the_read_leaves_the_queue()
+    -> anyhow::Result<()> {
+        let Some((todo, _db)) = sql_todo().await? else {
+            return Ok(());
+        };
+        let submissions = pipette_store_s3::in_memory_submission_store();
+        let benchmark = BenchmarkId::try_new("bench-1")?;
+        let catalog = HashMap::from([(
+            benchmark.clone(),
+            Benchmark::from_toml(
+                "bench-1",
+                "benchmark_type = \"prefill_throughput\"\nparameter_prefill_tokens = 100",
+            )?,
+        )]);
+        let body = pipette_store_testkit::todo_job_body("job-larger", &["client1"], "bench-1");
+        let job = pipette_store_testkit::seed_avail(&*todo, "job-larger", ExpiresAt::Never, &body)
+            .await?;
+        let read = AvailEntry {
+            job_id: job.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        assert_eq!(
+            todo.redate_avail(&job, ExpiresAt::Never, "20980101T000000Z".parse()?)
+                .await?,
+            RedateResult::Redated
+        );
+
+        let failed = fail_larger_run(
+            &*todo,
+            &*submissions,
+            &catalog,
+            &read,
+            &body,
+            &JobId::try_new("job-smaller")?,
+            &benchmark,
+            FailureCode::AttemptTimeout,
+            Utc::now(),
+        )
+        .await?;
+
+        assert!(failed);
+        assert!(
+            todo.avail_for_jobs(std::slice::from_ref(&job))
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -2303,6 +1940,70 @@ mod tests {
         Ok(())
     }
 
+    struct Starvation {
+        _dir: tempfile::TempDir,
+        _db: TestDb,
+        todo: std::sync::Arc<dyn TodoStore>,
+        plans: std::sync::Arc<dyn PlanStore>,
+        submissions: std::sync::Arc<dyn SubmissionStore>,
+        client: Client,
+        job: JobId,
+        flagged: Vec<ReindexJob>,
+        tags: FleetTags,
+        manifest: PlanManifest,
+    }
+
+    impl Starvation {
+        async fn new() -> anyhow::Result<Option<Self>> {
+            let Some((todo, db)) = sql_todo().await? else {
+                return Ok(None);
+            };
+            let dir = tempfile::tempdir()?;
+            let plans = pipette_store_fs::build_local_fs_plan_store(&StorageConfig::local_fs(
+                dir.path().to_path_buf(),
+            ))?;
+            let job = pipette_store_testkit::seed_avail(
+                &*todo,
+                "job-starvation",
+                ExpiresAt::Never,
+                &serde_json::json!({"requires": ["chip:chip-a"]}),
+            )
+            .await?;
+            let flagged = todo
+                .jobs_needing_reindex(std::slice::from_ref(&job))
+                .await?
+                .jobs;
+            let mut manifest = PlanManifest {
+                campaign_id: None,
+                ..pipette_core::plan::sample_manifest(
+                    PlanId::try_new("plan-00000000-0000-0000-0000-000000000001")?,
+                    PlanStatus::Active,
+                    false,
+                )?
+            };
+            manifest.job_ids = vec![job.clone()];
+            Ok(Some(Self {
+                _dir: dir,
+                _db: db,
+                todo,
+                plans,
+                submissions: pipette_store_s3::in_memory_submission_store(),
+                client: settle_test_client("starvation-client", "11", "chip-a")?,
+                job,
+                flagged,
+                tags: FleetTags::new(Vec::new()),
+                manifest,
+            }))
+        }
+
+        fn avail(&self) -> AvailEntry {
+            AvailEntry {
+                job_id: self.job.clone(),
+                expires_at: ExpiresAt::Never,
+            }
+        }
+    }
+
     #[rstest]
     #[case::withheld(false, false)]
     #[case::revision_race(true, false)]
@@ -2312,67 +2013,46 @@ mod tests {
         #[case] race: bool,
         #[case] denied: bool,
     ) -> anyhow::Result<()> {
-        let Some((todo, _db)) = sql_todo().await? else {
+        let Some(fixture) = Starvation::new().await? else {
             return Ok(());
         };
-        let dir = tempfile::tempdir()?;
-        let plans = pipette_store_fs::build_local_fs_plan_store(&StorageConfig::local_fs(
-            dir.path().to_path_buf(),
-        ))?;
-        let submissions = pipette_store_s3::in_memory_submission_store();
-        let client = settle_test_client("fallback-client", "11", "chip-a")?;
-        let job = pipette_store_testkit::seed_avail(
-            &*todo,
-            "job-fallback",
-            ExpiresAt::Never,
-            &serde_json::json!({"requires": ["chip:chip-a"]}),
-        )
-        .await?;
-        let flagged = todo
-            .jobs_needing_reindex(std::slice::from_ref(&job))
-            .await?
-            .jobs;
-        let mut bodies = flagged
+        let mut bodies = fixture
+            .flagged
             .iter()
-            .map(|job| {
-                (
-                    avail_filename(&job.job_id, job.expires_at),
-                    job.body.clone(),
-                )
-            })
+            .map(|row| (reindex_entry(row), row.body.clone()))
             .collect();
         let denier = if denied {
-            client.client_id.clone()
+            fixture.client.client_id.clone()
         } else {
             ClientId::try_new("other-client")?
         };
         let denied_rows = if race {
-            todo.write_denied(&job, &denier, &DenialRecord::default())
+            fixture
+                .todo
+                .write_denied(&fixture.job, &denier, &DenialRecord::default())
                 .await?;
-            vec![(job.clone(), denier)]
+            vec![(fixture.job.clone(), denier)]
         } else {
             Vec::new()
         };
-        let tags = FleetTags::new(Vec::new());
         let indexed = if race {
-            index_flagged_jobs(&*todo, &[&client], &tags, &flagged).await?
+            index_flagged_jobs(
+                &*fixture.todo,
+                &[&fixture.client],
+                &fixture.tags,
+                &fixture.flagged,
+            )
+            .await?
         } else {
             HashSet::new()
         };
         assert!(indexed.is_empty());
-        let fallback = HashSet::from([job.clone()]);
-        let mut manifest = backlog_manifest(1, None, PlanStatus::Active)?;
-        manifest.job_ids = vec![job.clone()];
-        let entry = AvailKey {
-            key: avail_filename(&job, ExpiresAt::Never),
-            job_id: job.clone(),
-            expires_at: ExpiresAt::Never,
-        };
+        let fallback = HashSet::from([fixture.job.clone()]);
         let report = plan_maintenance::reconcile_plans(
-            &*plans,
-            &*todo,
-            &*submissions,
-            &[manifest.clone()],
+            &*fixture.plans,
+            &*fixture.todo,
+            &*fixture.submissions,
+            std::slice::from_ref(&fixture.manifest),
             &HashSet::new(),
             &plan_maintenance::PlanEndings {
                 released: HashMap::new(),
@@ -2380,11 +2060,11 @@ mod tests {
                 stranded: HashSet::new(),
             },
             &plan_maintenance::Membership::new(Vec::new()),
-            &[entry],
+            &[fixture.avail()],
             &HashSet::new(),
             &fallback,
-            &[&client],
-            &tags,
+            &[&fixture.client],
+            &fixture.tags,
             &indexed,
             &fallback,
             &denied_rows,
@@ -2394,8 +2074,9 @@ mod tests {
         )
         .await?;
         assert_eq!(report.failures, 0);
-        let updated = plans
-            .get_plan(&manifest.plan_id)
+        let updated = fixture
+            .plans
+            .get_plan(&fixture.manifest.plan_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("updated plan"))?;
         assert_eq!(
@@ -2411,7 +2092,14 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("snapshot"))?;
         assert_eq!(snapshot.starved.len(), usize::from(denied));
         assert_eq!(bodies.len(), 1);
-        assert!(todo.jobs_awaiting_index(&[job]).await?.len() == 1);
+        assert!(
+            fixture
+                .todo
+                .jobs_awaiting_index(&[fixture.job])
+                .await?
+                .len()
+                == 1
+        );
         Ok(())
     }
 
@@ -2422,64 +2110,52 @@ mod tests {
     async fn starvation_grouping_confirms_availability_before_plan_status(
         #[case] claimed: bool,
     ) -> anyhow::Result<()> {
-        let Some((todo, _db)) = sql_todo().await? else {
+        let Some(fixture) = Starvation::new().await? else {
             return Ok(());
         };
-        let dir = tempfile::tempdir()?;
-        let plans = pipette_store_fs::build_local_fs_plan_store(&StorageConfig::local_fs(
-            dir.path().to_path_buf(),
-        ))?;
-        let submissions = pipette_store_s3::in_memory_submission_store();
-        let client = settle_test_client("late-claim-client", "11", "chip-a")?;
-        let tags = FleetTags::new(Vec::new());
-        let job = pipette_store_testkit::seed_avail(
-            &*todo,
-            "job-late-claim",
-            ExpiresAt::Never,
-            &serde_json::json!({"requires": ["chip:chip-a"]}),
+        index_flagged_jobs(
+            &*fixture.todo,
+            &[&fixture.client],
+            &fixture.tags,
+            &fixture.flagged,
         )
         .await?;
-        let flagged = todo
-            .jobs_needing_reindex(std::slice::from_ref(&job))
-            .await?
-            .jobs;
-        index_flagged_jobs(&*todo, &[&client], &tags, &flagged).await?;
         assert!(
-            todo.jobs_awaiting_index(std::slice::from_ref(&job))
+            fixture
+                .todo
+                .jobs_awaiting_index(std::slice::from_ref(&fixture.job))
                 .await?
                 .is_empty()
         );
-        let avail = AvailKey {
-            key: avail_filename(&job, ExpiresAt::Never),
-            job_id: job.clone(),
-            expires_at: ExpiresAt::Never,
-        };
         // The run listed an available job and no lease. A claim and a client
         // rebuild can then remove its eligibility before plan reconciliation.
         if claimed {
             assert!(matches!(
-                todo.claim_job(
-                    &job,
-                    ExpiresAt::Never,
-                    &client.client_id,
-                    Utc::now() + chrono::Duration::hours(1)
-                )
-                .await?,
+                fixture
+                    .todo
+                    .claim_job(
+                        &fixture.job,
+                        ExpiresAt::Never,
+                        &fixture.client.client_id,
+                        Utc::now() + chrono::Duration::hours(1)
+                    )
+                    .await?,
                 pipette_store::ClaimResult::Claimed(_)
             ));
         }
-        todo.delete_eligible_for_client(&client.client_id).await?;
-        let observed = pipette_store_testkit::ObservedTodoStore::new(todo.clone());
-        let before = todo.queue_body_reads();
-        let mut manifest = backlog_manifest(1, None, PlanStatus::Active)?;
-        manifest.job_ids = vec![job.clone()];
-        let live = HashSet::from([job.clone()]);
+        fixture
+            .todo
+            .delete_eligible_for_client(&fixture.client.client_id)
+            .await?;
+        let observed = pipette_store_testkit::ObservedTodoStore::new(fixture.todo.clone());
+        let before = fixture.todo.queue_body_reads();
+        let live = HashSet::from([fixture.job.clone()]);
         let mut bodies = HashMap::new();
         let report = plan_maintenance::reconcile_plans(
-            &*plans,
+            &*fixture.plans,
             &observed,
-            &*submissions,
-            &[manifest.clone()],
+            &*fixture.submissions,
+            std::slice::from_ref(&fixture.manifest),
             &HashSet::new(),
             &plan_maintenance::PlanEndings {
                 released: HashMap::new(),
@@ -2487,11 +2163,11 @@ mod tests {
                 stranded: HashSet::new(),
             },
             &plan_maintenance::Membership::new(Vec::new()),
-            &[avail],
+            &[fixture.avail()],
             &HashSet::new(),
             &live,
-            &[&client],
-            &tags,
+            &[&fixture.client],
+            &fixture.tags,
             &HashSet::new(),
             &HashSet::new(),
             &[],
@@ -2501,8 +2177,9 @@ mod tests {
         )
         .await?;
         assert_eq!(report.failures, 0);
-        let updated = plans
-            .get_plan(&manifest.plan_id)
+        let updated = fixture
+            .plans
+            .get_plan(&fixture.manifest.plan_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("updated plan"))?;
         assert_eq!(
@@ -2520,11 +2197,17 @@ mod tests {
             assert!(snapshot.starved.is_empty());
         } else {
             assert_eq!(snapshot.starved.len(), 1);
-            assert_eq!(snapshot.starved[0].job_ids, vec![job.clone()]);
+            assert_eq!(snapshot.starved[0].job_ids, vec![fixture.job.clone()]);
             assert_eq!(snapshot.starved[0].clauses.requires, vec!["chip:chip-a"]);
         }
-        assert_eq!(observed.take_reads(), vec![("get_avail", vec![job])]);
-        assert_eq!(todo.queue_body_reads() - before, u64::from(!claimed));
+        assert_eq!(
+            observed.take_reads(),
+            vec![("get_avail", vec![fixture.job])]
+        );
+        assert_eq!(
+            fixture.todo.queue_body_reads() - before,
+            u64::from(!claimed)
+        );
         assert_eq!(bodies.len(), usize::from(!claimed));
         observed.unexpected.none()?;
         Ok(())
@@ -2675,9 +2358,9 @@ mod tests {
         tags: T,
         workers: HashSet<ClientId>,
         joined: BTreeSet<ClientId>,
-        keys: Vec<AvailKey>,
+        keys: Vec<AvailEntry>,
         leased: HashSet<JobId>,
-        bodies: HashMap<String, Value>,
+        bodies: HashMap<AvailEntry, Value>,
     }
 
     impl Reindex {
@@ -2711,11 +2394,11 @@ mod tests {
             }))
         }
 
-        async fn run(&self, auth: &dyn ClientStore) -> anyhow::Result<()> {
+        async fn run(&self, auth: &dyn ClientStore) -> anyhow::Result<HashSet<ClientId>> {
             stream::iter(
                 self.keys
                     .iter()
-                    .filter_map(|key| self.bodies.get(&key.key).map(|body| (key, body))),
+                    .filter_map(|key| self.bodies.get(key).map(|body| (key, body))),
             )
             .map(Ok::<_, anyhow::Error>)
             .try_for_each(|(key, body)| async move {
@@ -2761,20 +2444,15 @@ mod tests {
         ]);
         let job_a = JobId::try_new("job-batch-a")?;
         let job_b = JobId::try_new("job-batch-b")?;
-        let key_a = avail_filename(&job_a, ExpiresAt::Never);
-        let key_b = avail_filename(&job_b, ExpiresAt::Never);
-        r.keys = vec![
-            AvailKey {
-                key: key_a.clone(),
-                job_id: job_a.clone(),
-                expires_at: ExpiresAt::Never,
-            },
-            AvailKey {
-                key: key_b.clone(),
-                job_id: job_b.clone(),
-                expires_at: ExpiresAt::Never,
-            },
-        ];
+        let key_a = AvailEntry {
+            job_id: job_a.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        let key_b = AvailEntry {
+            job_id: job_b.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        r.keys = vec![key_a.clone(), key_b.clone()];
         r.bodies = HashMap::from([
             (key_a, serde_json::json!({"requires": ["chip:chip-a"]})),
             (key_b, serde_json::json!({"requires": ["chip:chip-b"]})),
@@ -2827,13 +2505,12 @@ mod tests {
         r.todo.write_pending_reindex(&evaluated.client_id).await?;
 
         let job = JobId::new_unchecked("job-recheck");
-        let avail = AvailKey {
-            key: "avail/job-recheck".into(),
+        let avail = AvailEntry {
             job_id: job.clone(),
             expires_at: ExpiresAt::Never,
         };
         r.bodies.insert(
-            avail.key.clone(),
+            avail.clone(),
             serde_json::json!({
                 "job_id": "job-recheck",
                 "requires": ["chip:chip-a"],
@@ -2965,25 +2642,22 @@ mod tests {
         r.todo.write_pending_reindex(&client.client_id).await?;
 
         let tagged_job = JobId::new_unchecked("job-tagged");
-        r.keys = vec![
-            AvailKey {
-                key: "avail/job-tagged".into(),
-                job_id: tagged_job.clone(),
-                expires_at: ExpiresAt::Never,
-            },
-            AvailKey {
-                key: "avail/job-other-tag".into(),
-                job_id: JobId::new_unchecked("job-other-tag"),
-                expires_at: ExpiresAt::Never,
-            },
-        ];
+        let tagged = AvailEntry {
+            job_id: tagged_job.clone(),
+            expires_at: ExpiresAt::Never,
+        };
+        let other = AvailEntry {
+            job_id: JobId::new_unchecked("job-other-tag"),
+            expires_at: ExpiresAt::Never,
+        };
+        r.keys = vec![tagged.clone(), other.clone()];
         r.bodies = HashMap::from([
             (
-                "avail/job-tagged".to_string(),
+                tagged,
                 serde_json::json!({"job_id": "job-tagged", "requires": ["tag:lab"]}),
             ),
             (
-                "avail/job-other-tag".to_string(),
+                other,
                 serde_json::json!({"job_id": "job-other-tag", "requires": ["tag:other"]}),
             ),
         ]);
@@ -3010,8 +2684,7 @@ mod tests {
         let auth = ScriptedClientStore::new([Ok(Some(client.clone())), Ok(Some(client.clone()))]);
         r.todo.write_pending_reindex(&client.client_id).await?;
         // The availability listing saw it, but the lease listing did not.
-        r.keys.push(AvailKey {
-            key: avail_filename(&job, ExpiresAt::Never),
+        r.keys.push(AvailEntry {
             job_id: job.clone(),
             expires_at: ExpiresAt::Never,
         });
@@ -3069,7 +2742,13 @@ mod tests {
         };
         let auth = ScriptedClientStore::new([Ok(None)]);
         let client = ClientId::try_new("ev1_deleted")?;
-        let job = JobId::new_unchecked("job-held");
+        let job = pipette_store_testkit::seed_avail(
+            &*r.todo,
+            "job-held",
+            ExpiresAt::Never,
+            &serde_json::json!({"job_id": "job-held"}),
+        )
+        .await?;
         let leased = seed_indexed_lease(&*r.todo, "job-leased").await?;
         r.todo
             .write_eligible(&client, &job, ExpiresAt::Never)
@@ -3101,7 +2780,13 @@ mod tests {
         let stays = ClientId::try_new("ev1_stays")?;
         let leaves = ClientId::try_new("ev1_leaves")?;
         let joins = ClientId::try_new("ev1_joins")?;
-        let job = JobId::new_unchecked("job-held");
+        let job = pipette_store_testkit::seed_avail(
+            &*todo,
+            "job-held",
+            ExpiresAt::Never,
+            &serde_json::json!({"job_id": "job-held"}),
+        )
+        .await?;
         let indexed = HashSet::from([stays.clone(), leaves.clone()]);
         todo.write_eligible(&stays, &job, ExpiresAt::Never).await?;
         todo.write_eligible(&leaves, &job, ExpiresAt::Never).await?;
@@ -3154,6 +2839,46 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum JoinerRecheck {
+        Unchanged,
+        Changed,
+        Unavailable,
+        Deleted,
+    }
+
+    #[rstest]
+    #[case::unchanged(JoinerRecheck::Unchanged, false)]
+    #[case::changed(JoinerRecheck::Changed, true)]
+    #[case::unavailable(JoinerRecheck::Unavailable, true)]
+    #[case::deleted(JoinerRecheck::Deleted, true)]
+    #[tokio::test]
+    async fn an_unfinished_joiner_keeps_its_retry_trigger(
+        #[case] recheck: JoinerRecheck,
+        #[case] retry: bool,
+    ) -> anyhow::Result<()> {
+        let Some(mut r) = Reindex::new().await? else {
+            return Ok(());
+        };
+        let client = settle_test_client("retry-joiner", "55", "chip-a")?;
+        let fresh = match recheck {
+            JoinerRecheck::Unchanged => Ok(Some(client.clone())),
+            JoinerRecheck::Changed => Ok(Some(settle_test_client("retry-joiner", "55", "chip-b")?)),
+            JoinerRecheck::Unavailable => Err("auth store unavailable".to_owned()),
+            JoinerRecheck::Deleted => Ok(None),
+        };
+        let auth = ScriptedClientStore::new([Ok(Some(client.clone())), fresh]);
+        r.workers.insert(client.client_id.clone());
+        r.joined.insert(client.client_id.clone());
+
+        let retry_joiners = r.run(&auth).await?;
+
+        assert_eq!(retry_joiners.contains(&client.client_id), retry);
+        assert!(r.todo.list_pending_reindex().await?.is_empty());
+        auth.unexpected.none()?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reindex_keeps_captured_flags_when_tags_change_mid_rebuild() -> anyhow::Result<()> {
         let client = settle_test_client("retagged-client", "55", "chip-a")?;
@@ -3182,28 +2907,28 @@ mod tests {
         Ok(())
     }
 
-    // ── backlog count ──────────────────────────────────────────────────────
+    // ── claimable markers ──────────────────────────────────────────────────
 
-    fn backlog_now() -> DateTime<Utc> {
+    fn claim_now() -> DateTime<Utc> {
         DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(1_800_000_000)
     }
 
     fn deadline(offset: i64) -> ExpiresAt {
-        ExpiresAt::At(backlog_now() + chrono::Duration::seconds(offset))
+        ExpiresAt::At(claim_now() + chrono::Duration::seconds(offset))
     }
 
-    /// The backlog that the claim filters leave, counted at [`backlog_now`].
+    /// The claimable markers of each client at [`claim_now`].
     fn backlog_of(
         eligible: &[(ClientId, JobId, ExpiresAt)],
         avail_expiries: &HashMap<JobId, ExpiresAt>,
         denied: &[(JobId, ClientId)],
     ) -> BTreeMap<ClientId, u64> {
-        count_backlog(&claimable_markers(
-            eligible,
-            avail_expiries,
-            denied,
-            backlog_now(),
-        ))
+        claimable_markers(eligible, avail_expiries, denied, claim_now())
+            .into_iter()
+            .fold(BTreeMap::new(), |mut acc, (client_id, _, _)| {
+                *acc.entry(client_id.clone()).or_default() += 1;
+                acc
+            })
     }
 
     #[rstest]
@@ -3216,7 +2941,7 @@ mod tests {
     #[case::denied_pair("ev1_a", deadline(60), Some(deadline(60)), Some("ev1_a"), &[])]
     #[case::another_clients_denial("ev1_a", deadline(60), Some(deadline(60)), Some("ev1_b"), &[("ev1_a", 1)])]
     #[case::another_clients_marker("ev1_b", deadline(60), Some(deadline(60)), None, &[("ev1_b", 1)])]
-    fn count_backlog_applies_the_claim_filters(
+    fn claimable_markers_apply_the_claim_filters(
         #[case] holder: &str,
         #[case] marker: ExpiresAt,
         #[case] avail: Option<ExpiresAt>,
@@ -3240,220 +2965,6 @@ mod tests {
         Ok(())
     }
 
-    /// A client with no counting marker has no entry.
-    #[test]
-    fn count_backlog_sums_each_clients_markers() -> anyhow::Result<()> {
-        let (a, b) = (ClientId::try_new("ev1_a")?, ClientId::try_new("ev1_b")?);
-        let (j1, j2) = (JobId::new_unchecked("job-1"), JobId::new_unchecked("job-2"));
-        let eligible = vec![
-            (a.clone(), j1.clone(), deadline(60)),
-            (a.clone(), j2.clone(), deadline(60)),
-            (b.clone(), j1.clone(), deadline(60)),
-        ];
-        let avail_expiries =
-            HashMap::from([(j1.clone(), deadline(60)), (j2.clone(), deadline(60))]);
-        let denied = vec![(j1, b)];
-        assert_eq!(
-            backlog_of(&eligible, &avail_expiries, &denied),
-            BTreeMap::from([(a, 2)])
-        );
-        Ok(())
-    }
-
-    fn backlog_plan(n: u8) -> anyhow::Result<PlanId> {
-        Ok(PlanId::try_new(format!(
-            "plan-00000000-0000-0000-0000-00000000000{n}"
-        ))?)
-    }
-
-    fn backlog_campaign(n: u8) -> anyhow::Result<CampaignId> {
-        Ok(CampaignId::try_new(format!(
-            "campaign_00000000-0000-0000-0000-00000000000{n}"
-        ))?)
-    }
-
-    /// The manifest of plan `plan`, in campaign `campaign` if one is given.
-    fn backlog_manifest(
-        plan: u8,
-        campaign: Option<u8>,
-        status: PlanStatus,
-    ) -> anyhow::Result<PlanManifest> {
-        Ok(PlanManifest {
-            campaign_id: campaign.map(backlog_campaign).transpose()?,
-            ..pipette_core::plan::sample_manifest(backlog_plan(plan)?, status, false)?
-        })
-    }
-
-    /// The `job-plans/` marker of plan `plan` for `job`.
-    fn backlog_marker(
-        job: &JobId,
-        plan: u8,
-        expires_at: ExpiresAt,
-    ) -> anyhow::Result<JobPlanMarker> {
-        Ok(JobPlanMarker {
-            job_id: job.clone(),
-            plan_id: backlog_plan(plan)?,
-            expires_at,
-            written_at: backlog_now(),
-        })
-    }
-
-    /// One claimable marker of `ev1_a` for `job-1`. The cases give:
-    /// - `memberships`: the `job-plans/` markers of the job.
-    /// - `plans`: the manifests, each with a plan, a campaign and a status.
-    /// - `cancelled`: the plans that have a cancel marker.
-    /// - `stranded`: the plans that teardown ended in `creating`.
-    #[rstest]
-    #[case::no_membership(&[], &[], &[], &[], &[], 1)]
-    #[case::one_campaign(&[(1, deadline(60))], &[(1, Some(1), PlanStatus::Active)], &[], &[], &[(1, 1)], 0)]
-    #[case::two_plans_of_one_campaign_count_once(
-        &[(1, deadline(60)), (2, ExpiresAt::Never)],
-        &[(1, Some(1), PlanStatus::Active), (2, Some(1), PlanStatus::Active)],
-        &[],
-        &[],
-        &[(1, 1)],
-        0
-    )]
-    #[case::two_campaigns_count_once_each(
-        &[(1, deadline(60)), (2, deadline(60))],
-        &[(1, Some(1), PlanStatus::Active), (2, Some(2), PlanStatus::PendingClients)],
-        &[],
-        &[],
-        &[(1, 1), (2, 1)],
-        0
-    )]
-    #[case::plan_outside_campaigns(&[(1, deadline(60))], &[(1, None, PlanStatus::Active)], &[], &[], &[], 1)]
-    #[case::campaign_beside_an_outside_plan(
-        &[(1, deadline(60)), (2, deadline(60))],
-        &[(1, Some(1), PlanStatus::Active), (2, None, PlanStatus::Active)],
-        &[],
-        &[],
-        &[(1, 1)],
-        0
-    )]
-    #[case::lapsed_membership(&[(1, deadline(-60))], &[(1, Some(1), PlanStatus::Active)], &[], &[], &[], 1)]
-    #[case::membership_without_manifest(&[(1, deadline(60))], &[], &[], &[], &[], 1)]
-    #[case::cancelling_plan(&[(1, deadline(60))], &[(1, Some(1), PlanStatus::Cancelling)], &[], &[], &[], 1)]
-    #[case::cancel_marker(&[(1, deadline(60))], &[(1, Some(1), PlanStatus::Active)], &[1], &[], &[], 1)]
-    #[case::stranded_plan(&[(1, deadline(60))], &[(1, Some(1), PlanStatus::Creating)], &[], &[1], &[], 1)]
-    fn count_campaign_backlog_counts_each_campaign_once(
-        #[case] memberships: &[(u8, ExpiresAt)],
-        #[case] plans: &[(u8, Option<u8>, PlanStatus)],
-        #[case] cancelled: &[u8],
-        #[case] stranded: &[u8],
-        #[case] by_campaign: &[(u8, u64)],
-        #[case] outside_campaigns: u64,
-    ) -> anyhow::Result<()> {
-        let client = ClientId::try_new("ev1_a")?;
-        let job = JobId::new_unchecked("job-1");
-        let markers = memberships
-            .iter()
-            .map(|(plan, expires_at)| backlog_marker(&job, *plan, *expires_at))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let manifests = plans
-            .iter()
-            .map(|(plan, campaign, status)| backlog_manifest(*plan, *campaign, *status))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let cancel_markers = cancelled
-            .iter()
-            .map(|plan| backlog_plan(*plan))
-            .collect::<anyhow::Result<HashSet<_>>>()?;
-        let stranded = stranded
-            .iter()
-            .map(|plan| backlog_plan(*plan))
-            .collect::<anyhow::Result<HashSet<_>>>()?;
-        let marker = (client.clone(), job, deadline(60));
-        let expected = CampaignBacklog {
-            by_campaign: by_campaign
-                .iter()
-                .map(|(campaign, jobs)| Ok((backlog_campaign(*campaign)?, *jobs)))
-                .collect::<anyhow::Result<_>>()?,
-            outside_campaigns,
-        };
-        assert_eq!(
-            count_campaign_backlog(
-                &[&marker],
-                &job_campaigns(
-                    &markers,
-                    &manifests,
-                    &cancel_markers,
-                    &stranded,
-                    backlog_now(),
-                ),
-            ),
-            BTreeMap::from([(client, expected)])
-        );
-        Ok(())
-    }
-
-    /// The count of each client uses only the markers of that client. A
-    /// client with no marker has no entry.
-    #[test]
-    fn count_campaign_backlog_sums_each_clients_markers() -> anyhow::Result<()> {
-        let (a, b) = (ClientId::try_new("ev1_a")?, ClientId::try_new("ev1_b")?);
-        let (j1, j2) = (JobId::new_unchecked("job-1"), JobId::new_unchecked("job-2"));
-        let markers = [&j1, &j2]
-            .into_iter()
-            .map(|job_id| backlog_marker(job_id, 1, ExpiresAt::Never))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let manifests = vec![backlog_manifest(1, Some(1), PlanStatus::Active)?];
-        let claimable = [
-            (a.clone(), j1, deadline(60)),
-            (a.clone(), j2, deadline(60)),
-            (b.clone(), JobId::new_unchecked("job-3"), deadline(60)),
-        ];
-        let claimable: Vec<_> = claimable.iter().collect();
-        assert_eq!(
-            count_campaign_backlog(
-                &claimable,
-                &job_campaigns(
-                    &markers,
-                    &manifests,
-                    &HashSet::new(),
-                    &HashSet::new(),
-                    backlog_now(),
-                ),
-            ),
-            BTreeMap::from([
-                (
-                    a,
-                    CampaignBacklog {
-                        by_campaign: BTreeMap::from([(backlog_campaign(1)?, 2)]),
-                        outside_campaigns: 0,
-                    }
-                ),
-                (
-                    b,
-                    CampaignBacklog {
-                        by_campaign: BTreeMap::new(),
-                        outside_campaigns: 1,
-                    }
-                ),
-            ])
-        );
-        Ok(())
-    }
-
-    // ── orphan reconciliation ──────────────────────────────────────────────
-
-    /// A database `TodoStore` and a `SubmissionStore` in a tempdir. `None`
-    /// skips the test without `TEST_DATABASE_URL`.
-    async fn recon_stores() -> anyhow::Result<
-        Option<(
-            std::sync::Arc<dyn TodoStore>,
-            LocalFsSubmissionStore,
-            tempfile::TempDir,
-            TestDb,
-        )>,
-    > {
-        let Some((todo, db)) = sql_todo().await? else {
-            return Ok(None);
-        };
-        let dir = tempfile::tempdir()?;
-        let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
-        Ok(Some((todo, submissions, dir, db)))
-    }
-
     /// Seed one lease of `job` under `ExpiresAt::Never`. Set the job ID in its body.
     async fn seed_lease(
         todo: &dyn TodoStore,
@@ -3473,279 +2984,6 @@ mod tests {
         Ok(())
     }
 
-    async fn sweep(
-        todo: &dyn TodoStore,
-        submissions: &dyn SubmissionStore,
-        live_jobs: &HashSet<JobId>,
-        live_clients: &HashSet<ClientId>,
-        terminal_jobs: &HashSet<JobId>,
-        prior: &HashSet<String>,
-    ) -> anyhow::Result<HashSet<String>> {
-        reconcile_orphans(
-            todo,
-            submissions,
-            &todo.list_all_eligible().await?,
-            &todo.list_all_denied().await?,
-            live_jobs,
-            live_clients,
-            terminal_jobs,
-            prior,
-        )
-        .await
-    }
-
-    /// A dead client's markers go on the second sweep, its lease recycled; a
-    /// live client's stay. Every job is live, so only the roster matters.
-    #[rstest]
-    #[case::deleted_client_collected(false)]
-    #[case::live_client_untouched(true)]
-    #[tokio::test]
-    async fn reconcile_client_owned_markers_across_subtrees(
-        #[case] client_live: bool,
-    ) -> anyhow::Result<()> {
-        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
-            return Ok(());
-        };
-        let client = ClientId::try_new(if client_live { "live-client" } else { "ghost" })?;
-        let job = JobId::new_unchecked("job-live");
-        let job_leased = JobId::new_unchecked("job-leased");
-
-        todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
-        todo.write_denied(&job, &client, &DenialRecord::default())
-            .await?;
-        todo.stamp_liveness(&client).await?;
-        todo.write_pending_reindex(&client).await?;
-        seed_lease(
-            &*todo,
-            &job_leased,
-            &client,
-            "2026-12-31T00:00:00Z".parse()?,
-        )
-        .await?;
-
-        let live_jobs = HashSet::from([job.clone(), job_leased.clone()]);
-        let live_clients = if client_live {
-            HashSet::from([client.clone()])
-        } else {
-            HashSet::new()
-        };
-        let terminal: HashSet<JobId> = HashSet::new();
-
-        // First sweep never removes anything.
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        assert_eq!(todo.list_all_eligible().await?.len(), 1);
-        assert_eq!(todo.list_all_denied().await?.len(), 1);
-        assert_eq!(todo.list_liveness().await?.len(), 1);
-        assert_eq!(todo.list_pending_reindex().await?.len(), 1);
-        assert_eq!(todo.list_leased().await?.len(), 1);
-        assert_eq!(candidates.len(), if client_live { 0 } else { 5 });
-
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &candidates,
-        )
-        .await?;
-        let remaining = usize::from(client_live);
-        assert_eq!(todo.list_all_eligible().await?.len(), remaining);
-        assert_eq!(todo.list_all_denied().await?.len(), remaining);
-        assert_eq!(todo.list_liveness().await?.len(), remaining);
-        assert_eq!(todo.list_pending_reindex().await?.len(), remaining);
-        assert_eq!(todo.list_leased().await?.len(), remaining);
-        // The lease is recycled to avail/ (body preserved) only for a dead client.
-        assert_eq!(
-            todo.get_avail_by_job(&job_leased).await?.is_some(),
-            !client_live
-        );
-        assert!(candidates.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_deletes_deleted_client_lease_when_job_recorded() -> anyhow::Result<()> {
-        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
-            return Ok(());
-        };
-        let ghost = ClientId::try_new("ghost")?;
-        let job = JobId::new_unchecked("job-recorded");
-
-        seed_lease(&*todo, &job, &ghost, "2026-12-31T00:00:00Z".parse()?).await?;
-        submissions
-            .write_processed(
-                &job,
-                &serde_json::json!({ "job_id": "job-recorded", "message_type": "success" }),
-            )
-            .await?;
-
-        let live_jobs: HashSet<JobId> = HashSet::new();
-        let live_clients: HashSet<ClientId> = HashSet::new();
-        let terminal: HashSet<JobId> = HashSet::new();
-
-        // First sweep stages the lease but removes nothing.
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        assert_eq!(todo.list_leased().await?.len(), 1);
-        assert_eq!(candidates.len(), 1);
-
-        // Second sweep deletes the stale lease; the recorded job is not recycled.
-        sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &candidates,
-        )
-        .await?;
-        assert!(todo.list_leased().await?.is_empty());
-        assert!(todo.get_avail_by_job(&job).await?.is_none());
-        Ok(())
-    }
-
-    /// The per-marker denied delete spares a live job's denials from live
-    /// clients.
-    #[tokio::test]
-    async fn reconcile_collects_both_orphan_directions() -> anyhow::Result<()> {
-        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
-            return Ok(());
-        };
-        let live_client = ClientId::try_new("live-client")?;
-        let dead_client = ClientId::try_new("dead-client")?;
-        let live_job = JobId::new_unchecked("job-live");
-        let dead_job = JobId::new_unchecked("job-dead");
-
-        todo.write_eligible(&live_client, &dead_job, ExpiresAt::Never)
-            .await?;
-        todo.write_eligible(&dead_client, &live_job, ExpiresAt::Never)
-            .await?;
-        todo.write_denied(&live_job, &dead_client, &DenialRecord::default())
-            .await?;
-        todo.write_denied(&live_job, &live_client, &DenialRecord::default())
-            .await?;
-
-        let live_jobs = HashSet::from([live_job.clone()]);
-        let live_clients = HashSet::from([live_client.clone()]);
-        let terminal: HashSet<JobId> = HashSet::new();
-
-        // Two sweeps to clear the two-sighting gate.
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &candidates,
-        )
-        .await?;
-
-        assert!(todo.list_all_eligible().await?.is_empty());
-        assert_eq!(
-            todo.list_all_denied().await?,
-            vec![(live_job.clone(), live_client.clone())]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reconcile_sweeps_terminal_job_markers_same_run() -> anyhow::Result<()> {
-        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
-            return Ok(());
-        };
-        let client = ClientId::try_new("live-client")?;
-        let job = JobId::new_unchecked("job-terminal");
-
-        todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
-        todo.write_denied(&job, &client, &DenialRecord::default())
-            .await?;
-
-        let live_jobs: HashSet<JobId> = HashSet::new();
-        let live_clients = HashSet::from([client.clone()]);
-        let terminal = HashSet::from([job.clone()]);
-
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        assert!(todo.list_all_eligible().await?.is_empty());
-        assert!(todo.list_all_denied().await?.is_empty());
-        assert!(candidates.is_empty());
-        Ok(())
-    }
-
-    /// Its marker is neither deleted nor re-staged.
-    #[tokio::test]
-    async fn reconcile_spares_reappearing_client() -> anyhow::Result<()> {
-        let Some((todo, submissions, _dir, _db)) = recon_stores().await? else {
-            return Ok(());
-        };
-        let client = ClientId::try_new("flapper")?;
-        let job = JobId::new_unchecked("job-x");
-        todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
-
-        let live_jobs = HashSet::from([job.clone()]);
-        let terminal: HashSet<JobId> = HashSet::new();
-
-        // First sweep: client absent → the marker is staged.
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &HashSet::new(),
-            &terminal,
-            &HashSet::new(),
-        )
-        .await?;
-        assert_eq!(todo.list_all_eligible().await?.len(), 1);
-        assert_eq!(candidates.len(), 1);
-
-        // Second sweep: the client reappeared → spared, candidate cleared.
-        let live_clients = HashSet::from([client.clone()]);
-        let candidates = sweep(
-            &*todo,
-            &submissions,
-            &live_jobs,
-            &live_clients,
-            &terminal,
-            &candidates,
-        )
-        .await?;
-        assert_eq!(todo.list_all_eligible().await?.len(), 1);
-        assert!(candidates.is_empty());
-        Ok(())
-    }
-
     // ── run order ──────────────────────────────────────────────────────────
 
     /// A [`PlanStore`] whose first manifest listing lets a staging ingest finish
@@ -3759,6 +2997,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PlanStore for IngestFinishesAtManifestListing {
+        async fn join_job(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+            expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            self.inner.join_job(job_id, plan_id, expires_at).await
+        }
+
         async fn list_matching_plans(
             &self,
             filter: &pipette_store::PlanFilter,
@@ -3773,7 +3020,7 @@ mod tests {
                     self.manifest
                         .job_ids
                         .iter()
-                        .map(|job_id| self.todo.promote_avail(job_id, ExpiresAt::Never)),
+                        .map(|job_id| self.todo.promote_avail(job_id, ExpiresAt::Never, None)),
                 )
                 .await?;
                 self.inner.put_plan(&self.manifest).await?;
@@ -3873,6 +3120,19 @@ mod tests {
                 .delete_job_plan_marker(job_id, plan_id, expires_at)
                 .await
         }
+        async fn end_membership(
+            &self,
+            job_id: &JobId,
+            plan_id: &PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            self.inner.end_membership(job_id, plan_id).await
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
+            self.inner.read_gc_candidates().await
+        }
+        async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
+            self.inner.write_gc_candidates(candidates).await
+        }
         async fn put_plan_source(
             &self,
             plan_id: &PlanId,
@@ -3937,6 +3197,7 @@ mod tests {
                 auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
                 ..pipette_core::config::Config::default()
             },
+            pipette_store_testkit::no_queue(),
         )?);
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(1));
         let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(2));

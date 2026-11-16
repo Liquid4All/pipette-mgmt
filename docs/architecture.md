@@ -19,14 +19,15 @@ One binary, `pipette-mgmt`, runs as these processes:
 
 ## 2. Backends
 
+- `[database]` (required): PostgreSQL for the records (plans, campaigns,
+  identities, organizations, vault records) and the job queue.
 - `[storage]`: the object store (local filesystem or S3) for the catalog,
   submissions, the warehouse, vault blobs and the dataset cache.
-- `[auth_storage]`: without `[database]`, the identity records.
-- `[todo_storage]`: the job queue; an S3 Express One Zone bucket in production.
+- `[auth_storage]`: the object-store identity records that `db import` and
+  `db export` copy.
 - `[eval_packages_storage]`: the eval corpora the scores service packs, read
   only; `[storage]` without it.
-- `[database]`: PostgreSQL for the records (plans, campaigns, identities,
-  organizations, vault records). Production runs it.
+- `[vault_storage]`: vault blobs and staged uploads; `[storage]` without it.
 
 [storage.md](storage.md) is the layout and the contract of each.
 
@@ -35,11 +36,11 @@ One binary, `pipette-mgmt`, runs as these processes:
 1. **Plan.** A campaign write files a plan; ingestion expands it into jobs,
    merges duplicates, and records the plan
    ([plan-ingestion.md](plan-ingestion.md)).
-2. **Queue.** The jobs are promoted into `todo/avail/`, and
-   `queue-maintenance` writes the eligibility markers that say which device may
+2. **Queue.** The jobs are promoted into the job queue in `[database]`, and
+   `queue-maintenance` writes the eligibility rows that say which device may
    take each ([queue.md](queue.md)).
-3. **Claim.** A device claims a job by an atomic rename into `todo/leased/`,
-   heartbeats while it runs, and submits the result.
+3. **Claim.** A device claims a job in a database transaction that leases the
+   job row, heartbeats while it runs, and submits the result.
 4. **Submit.** The body lands in `submissions/incoming/`, success and failure
    alike ([storage.md §4](storage.md#4-submission-contract)).
 5. **Score.** `process-submissions` scores non-eval bodies at once. An eval

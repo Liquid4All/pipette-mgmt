@@ -20,9 +20,9 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientId, ClientPermission, RuntimeOutput};
 use pipette_store_testkit::TEST_LIST_LIMIT;
 use pipette_web_testkit::{
-    QueueBackend, authed_get, authed_post, body_json, denied_clients, job, make_state,
-    register_and_approve, seed_leased, seeded_queue_state, setup_benchmarks, submit_benchmark,
-    unauthed_post, valid_submission,
+    authed_get, authed_post, body_json, denied_clients, job, make_state, register_and_approve,
+    seed_leased, seeded_queue_state, setup_benchmarks, submit_benchmark, unauthed_post,
+    valid_submission,
 };
 
 /// A claimed `job_id` in the server-minted shape (`job-{uuid}`).
@@ -552,7 +552,7 @@ async fn test_submit_gated_while_pending_reindex() -> anyhow::Result<()> {
 
     seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
     state.todo_store.write_pending_reindex(&client_id).await?;
-    let leases_before = state.todo_store.list_leased().await?;
+    let leases_before = state.todo_store.list_leases().await?;
 
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(CLAIMED_JOB_ID);
@@ -571,7 +571,7 @@ async fn test_submit_gated_while_pending_reindex() -> anyhow::Result<()> {
         "the refused submission must not be written"
     );
     assert_eq!(
-        state.todo_store.list_leased().await?,
+        state.todo_store.list_leases().await?,
         leases_before,
         "the voided lease must not be renamed"
     );
@@ -594,7 +594,7 @@ async fn test_submit_job_id_leased_to_other_client_returns_409() -> anyhow::Resu
 
     let other = ClientId::try_new("ev1_other")?;
     seed_lease(&state, CLAIMED_JOB_ID, &other).await?;
-    let leases_before = state.todo_store.list_leased().await?;
+    let leases_before = state.todo_store.list_leases().await?;
 
     let mut body = valid_submission("prefill_throughput_256");
     body["job_id"] = json!(CLAIMED_JOB_ID);
@@ -612,7 +612,7 @@ async fn test_submit_job_id_leased_to_other_client_returns_409() -> anyhow::Resu
             .is_none(),
         "the zombie's submission must not be written"
     );
-    assert_eq!(state.todo_store.list_leased().await?, leases_before);
+    assert_eq!(state.todo_store.list_leases().await?, leases_before);
     Ok(())
 }
 
@@ -1071,7 +1071,7 @@ async fn test_failure_with_a_narrow_pair_is_recorded() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `todo/` job body to plant in a `leased/` entry: `recycle_lease` reads its
+/// A queued job body to plant in a `leased/` entry: `recycle_lease` reads its
 /// `expires_at` and escalation its `clients`.
 fn leased_job_body(job_id: &str, clients: &[&str]) -> serde_json::Value {
     json!({
@@ -1322,7 +1322,7 @@ async fn test_submit_retriable_failure_denies_and_recycles() -> anyhow::Result<(
     assert!(
         state
             .todo_store
-            .list_leased_for_client(&client_id)
+            .leases_for_client(&client_id)
             .await?
             .is_empty()
     );
@@ -1400,9 +1400,16 @@ fn retriable_failure_logs_the_reason_at_warn(#[case] route: &str) -> anyhow::Res
 }
 
 /// A non-retriable failure is the job's terminal result: recorded as `failed`
-/// and the job's `todo/` state torn down (no lease, no avail entry).
+/// with its code, `unspecified` when it sends none, and the job's queue state
+/// torn down (no lease, no avail entry).
+#[rstest]
+#[case::uncoded(None, "unspecified")]
+#[case::device_not_ready(Some("device_not_ready"), "device_not_ready")]
 #[tokio::test]
-async fn test_submit_non_retriable_failure_is_terminal() -> anyhow::Result<()> {
+async fn test_submit_non_retriable_failure_is_terminal(
+    #[case] code: Option<&str>,
+    #[case] recorded: &str,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
@@ -1412,7 +1419,10 @@ async fn test_submit_non_retriable_failure_is_terminal() -> anyhow::Result<()> {
     let body = leased_job_body(claimed, &[client_id.as_str()]);
     seed_leased(state.todo_store.as_ref(), claimed, &client_id, &body).await?;
 
-    let failure = valid_failure("prefill_throughput_256", claimed, false);
+    let mut failure = valid_failure("prefill_throughput_256", claimed, false);
+    if let Some(code) = code {
+        failure["failure_code"] = json!(code);
+    }
     let resp = authed_post(&state, &sk, &client_id, "/benchmarks", &failure).await?;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
@@ -1422,13 +1432,20 @@ async fn test_submit_non_retriable_failure_is_terminal() -> anyhow::Result<()> {
     let b = body_json(resp).await?;
     assert_eq!(b["status"], "failed");
     assert_eq!(b["failure_reason"], "runtime OOM");
+    assert_eq!(b["failure_code"], recorded);
+    let job = job(claimed)?;
+    let stored = state
+        .submission_store
+        .find_job(&job)
+        .await?
+        .context("expected a stored failure record")?;
+    assert_eq!(stored.body["failure_code"], recorded);
 
     // Torn down: no lease, no avail entry.
-    let job = job(claimed)?;
     assert!(
         state
             .todo_store
-            .list_leased_for_client(&client_id)
+            .leases_for_client(&client_id)
             .await?
             .is_empty()
     );
@@ -1507,7 +1524,7 @@ async fn test_submit_retriable_failure_all_denied_escalates_via_queue_maintenanc
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3211,7 +3228,7 @@ async fn test_submit_malformed_failure_body_returns_400(
     let (sk, client_id) = register_and_approve(&state).await?;
     // A live lease, so the refusal cannot be the claim check's `404`.
     seed_lease(&state, CLAIMED_JOB_ID, &client_id).await?;
-    let leases = state.todo_store.list_leased_for_client(&client_id).await?;
+    let leases = state.todo_store.leases_for_client(&client_id).await?;
 
     let mut body = valid_failure("prefill_throughput_256", CLAIMED_JOB_ID, false);
     let fields = body
@@ -3234,7 +3251,7 @@ async fn test_submit_malformed_failure_body_returns_400(
             .is_none()
     );
     assert_eq!(
-        state.todo_store.list_leased_for_client(&client_id).await?,
+        state.todo_store.leases_for_client(&client_id).await?,
         leases,
         "the refused failure must not touch the lease"
     );

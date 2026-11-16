@@ -190,6 +190,32 @@ pub fn run_answers(before: &Value, after: &Value, run: &BTreeSet<String>) -> boo
     known && now.met_by(&run.union(&held).cloned().collect())
 }
 
+/// Whether a finished run under `before`'s attempt limit is known to have
+/// passed `after`'s: the two set the same limit or none, or both set one and
+/// `before`'s is not above `after`'s. A body with no limit runs under the
+/// client's default, which the server does not know.
+pub fn limit_answers(before: &Value, after: &Value) -> bool {
+    let (was, now) = (attempt_limit(before), attempt_limit(after));
+    was == now
+        || matches!(
+            (was.and_then(Value::as_u64), now.and_then(Value::as_u64)),
+            (Some(was), Some(now)) if was <= now
+        )
+}
+
+/// Whether `before` and `after` set the same attempt limit, or neither sets
+/// one.
+pub fn same_limit(before: &Value, after: &Value) -> bool {
+    attempt_limit(before) == attempt_limit(after)
+}
+
+/// A body's `spec.benchmark_flags.attempt_timeout_seconds`, `None` when it
+/// sets none.
+fn attempt_limit(body: &Value) -> Option<&Value> {
+    body.pointer("/spec/benchmark_flags/attempt_timeout_seconds")
+        .filter(|limit| !limit.is_null())
+}
+
 /// A body's [`REQUIRED_FLAGS`]: empty when absent, `None` when malformed.
 fn required_flags(body: &Value) -> Option<BTreeSet<String>> {
     match body.get(REQUIRED_FLAGS) {
@@ -1701,5 +1727,42 @@ mod tests {
         let after =
             json!({"requires": ["tag:lab-east", "os:ios"], "any_of": [["device:iphone17pro"]]});
         assert!(run_answers(&before, &after, &BTreeSet::new()));
+    }
+
+    /// A run under `before` seconds, `null` for none, against a body that sets
+    /// `after`.
+    #[rstest]
+    #[case::the_same_limit(json!(180), json!(180), true)]
+    #[case::neither_sets_one(json!(null), json!(null), true)]
+    #[case::raised(json!(180), json!(300), true)]
+    #[case::lowered(json!(300), json!(180), false)]
+    #[case::set_on_a_run_with_none(json!(null), json!(180), false)]
+    #[case::taken_off(json!(180), json!(null), false)]
+    // Not a whole number of seconds: only the same value answers.
+    #[case::malformed(json!("180"), json!("300"), false)]
+    #[case::the_same_malformed(json!("180"), json!("180"), true)]
+    fn a_run_answers_a_limit_it_ran_within(
+        #[case] before: Value,
+        #[case] after: Value,
+        #[case] answers: bool,
+    ) {
+        let body = |limit: &Value| json!({"spec": {"benchmark_flags": {"attempt_timeout_seconds": limit}}});
+        assert_eq!(limit_answers(&body(&before), &body(&after)), answers);
+        assert_eq!(same_limit(&body(&before), &body(&after)), before == after);
+    }
+
+    /// A body with no flags, or flags with no limit, sets none.
+    #[rstest]
+    #[case::no_flags(json!({"spec": {"benchmark_flags": null}}))]
+    #[case::no_flags_key(json!({"spec": {}}))]
+    #[case::flags_without_a_limit(json!({"spec": {"benchmark_flags": {"http_timeout_seconds": 60}}}))]
+    fn a_body_without_a_limit_sets_none(#[case] unlimited: Value) {
+        let limited = json!({"spec": {"benchmark_flags": {"attempt_timeout_seconds": 180}}});
+        assert!(limit_answers(
+            &unlimited,
+            &json!({"spec": {"benchmark_flags": null}})
+        ));
+        assert!(!limit_answers(&unlimited, &limited));
+        assert!(!limit_answers(&limited, &unlimited));
     }
 }

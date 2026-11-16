@@ -19,8 +19,8 @@ use futures::stream::{self, StreamExt};
 use pipette_core::audit::{new_event, outcome_of_status};
 use pipette_pipeline::audit::AuditReach;
 use pipette_plan_types::{
-    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget, CampaignId, ClientId, JobId,
-    OrgId, PlanId, UserId, VaultPrincipalId, VaultResourceId,
+    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget, CampaignGroupId, CampaignId,
+    ClientId, JobId, OrgId, PlanId, PrincipalOwner, UserId, VaultPrincipalId, VaultResourceId,
 };
 
 use crate::state::AppState;
@@ -263,6 +263,7 @@ impl AppState {
         AuditReach {
             orgs: self.org_store.as_ref(),
             campaigns: self.campaign_store.as_ref(),
+            campaign_groups: self.campaign_group_store.as_deref(),
             plans: self.plan_store.as_ref(),
             vault: &self.vault_store,
         }
@@ -461,6 +462,9 @@ async fn path_targets(reach: &AuditReach<'_>, params: &[(String, String)]) -> Ve
                 "campaign_id" => CampaignId::try_new(value)
                     .ok()
                     .map(|campaign_id| AuditTarget::Campaign { campaign_id }),
+                "group_id" => CampaignGroupId::try_new(value)
+                    .ok()
+                    .map(|group_id| AuditTarget::CampaignGroup { group_id }),
                 "plan_id" => PlanId::try_new(value)
                     .ok()
                     .map(|plan_id| AuditTarget::Plan { plan_id }),
@@ -471,10 +475,10 @@ async fn path_targets(reach: &AuditReach<'_>, params: &[(String, String)]) -> Ve
                 "resource_id" | "model_key" => VaultResourceId::try_new(value)
                     .ok()
                     .map(|resource_id| AuditTarget::VaultResource { resource_id }),
-                "principal_id" => value.parse().ok().map(|principal| match principal {
-                    VaultPrincipalId::Org(org_id) => AuditTarget::Org { org_id },
-                    VaultPrincipalId::User(user_id) => AuditTarget::User { user_id },
-                }),
+                "principal_id" => value
+                    .parse::<VaultPrincipalId>()
+                    .ok()
+                    .map(|principal| PrincipalOwner::from(principal).into()),
                 _ => None,
             }
         })
@@ -514,7 +518,7 @@ mod tests {
         let stores = Stores {
             audit: Some(log.clone()),
             descriptor_catalog: None,
-            ..build_local_fs_stores(&config)?
+            ..build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
         };
         let state = AppState::new(config, stores, pipette_web_testkit::test_http_client()?).await?;
         let event = new_event(
@@ -550,7 +554,8 @@ mod tests {
                 AuditAction::Cli { .. }
                 | AuditAction::FirstClerkSignIn { .. }
                 | AuditAction::CatalogRename { .. }
-                | AuditAction::CatalogMerge { .. } => (event.outcome, 0),
+                | AuditAction::CatalogMerge { .. }
+                | AuditAction::GroupPolicy { .. } => (event.outcome, 0),
             })
             .collect();
         assert_eq!(written, Vec::from_iter(expected));

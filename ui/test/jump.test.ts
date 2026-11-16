@@ -29,6 +29,7 @@ const lookups = (plans: Record<string, PlanSummary[]>, readable: string[] = []):
 describe("the jump box", () => {
   test.each([
     [CAMPAIGN, `/app/campaigns/${CAMPAIGN}`],
+    ["group_0199a1b2", "/app/campaign-groups/group_0199a1b2"],
     [PLAN, `/app/plans/${PLAN}`],
     [CLIENT, `/app/clients/${CLIENT}`],
     ["vault_0199a1b2", "/app/vault/vault_0199a1b2"],

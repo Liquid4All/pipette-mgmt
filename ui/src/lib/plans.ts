@@ -15,10 +15,16 @@ const counted = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`
 /** A revision's change in a sentence, as `pipette-mgmt plans status` prints it. */
 export function changeText(change: RevisionChange): string {
   switch (change.type) {
-    case "rerun":
-      if (change.answered === "failed") return `Re-run of all failed jobs (${change.job_count}).`;
-      if (change.answered === "all") return `Re-run of all finished or failed jobs (${change.job_count}).`;
-      return `Re-run of ${counted(change.job_count, "job")}.`;
+    case "rerun": {
+      const marked = change.marked_job_count ?? 0;
+      const group = change.group_id
+        ? ` Campaign group ${change.group_id} policies: ${(change.policies ?? []).join(", ")}.` : "";
+      if (!change.answered && !change.job_count && marked) return `Marked ${counted(marked, "job")} failed.${group}`;
+      const rerun = change.answered === "failed" ? `Re-run of all failed jobs (${change.job_count})`
+        : change.answered === "all" ? `Re-run of all finished or failed jobs (${change.job_count})`
+        : `Re-run of ${counted(change.job_count, "job")}`;
+      return (marked ? `${rerun}; ${marked} marked failed.` : `${rerun}.`) + group;
+    }
     case "revert":
       return `Reverted to ${change.to_plan_id}.`;
     case "recalculate":
@@ -32,28 +38,15 @@ export function changeText(change: RevisionChange): string {
           + (change.restored ?? []).map((variant) => ` Restored variant ${variant.variant_index} of ${variant.plan_id}.`).join("")
         : "Document revised.";
       const earlier = change.carry_earlier ? " Carries runs of earlier plans." : "";
+      const acrossLimit = change.carry_across_limit ? " Carries runs across a changed attempt limit." : "";
       const named = change.inherit_from?.length ? ` Inherits runs of ${change.inherit_from.join(", ")}.` : "";
-      return head + earlier + named;
+      return head + earlier + acrossLimit + named;
     }
   }
 }
 
-/** A plan's status as the app draws it: a complete plan says where any of its jobs failed. */
-export type ShownStatus = PlanStatus | "complete_with_failures";
-
-/** Every status a listing filters on, in `PlanStatus::iter` order, the drawn one after the status it is read off. */
-export const PLAN_STATUSES: ShownStatus[] =
-  ["creating", "active", "pending_clients", "cancelling", "complete", "complete_with_failures", "cancelled"];
-
-export const shownStatus = (status: PlanStatus, counts: Pick<Counts, "failed"> | null | undefined): ShownStatus =>
-  (status === "complete" && counts?.failed ? "complete_with_failures" : status);
-
-/** The status filter's choices a plan is kept under: its drawn status, and `complete` too where that has failures. */
-export const statusChoices = (status: PlanStatus, counts: Pick<Counts, "failed"> | null | undefined): ShownStatus[] => {
-  // The stored status and the server's `status` filter stay `complete`, so that choice keeps these plans too.
-  const shown = shownStatus(status, counts);
-  return shown === "complete_with_failures" ? ["complete", shown] : [shown];
-};
+/** Every status a listing filters on, in `PlanStatus::iter` order. */
+export const PLAN_STATUSES: PlanStatus[] = ["creating", "active", "pending_clients", "cancelling", "complete", "cancelled"];
 
 /** The share of its jobs a plan is done with, which a listing sorts by; null where none is counted. */
 export const doneShare = (counts: Counts | null | undefined): number | null =>
@@ -131,6 +124,8 @@ const FAILED_BY: Record<FailureSource, string> = {
   all_clients_denied: "every client denied it",
   unmatchable: "no client can run it",
   lease_lost: "retired for losing its leases",
+  marked: "marked failed",
+  smaller_run_failed: "a smaller run failed",
 };
 
 /** A source withheld below read_clients arrives as null, so it reads plain `failed`. */
@@ -300,7 +295,7 @@ export function planTable(names: Record<string, string>, submitters: boolean): T
     columns: [
       { key: "plan_id", label: "plan_id", raw: (plan) => plan.plan_id, href: (plan) => planLink(plan.plan_id) },
       { key: "note", label: "note", raw: (plan) => plan.note ?? null },
-      { key: "status", label: "status", raw: (plan) => shownStatus(plan.status, counts(plan)) },
+      { key: "status", label: "status", raw: (plan) => plan.status },
       { key: "created_at", label: "created_at", raw: (plan) => plan.created_at, as: "time" },
       ...(submitters ? [{ key: "submitted_by", label: "submitted_by", raw: submitter }] : []),
       { key: "progress", label: "progress", raw: (plan) => doneShare(counts(plan)) },
@@ -315,7 +310,7 @@ export function planTable(names: Record<string, string>, submitters: boolean): T
       { key: "q", label: "note", texts: (plan) => [plan.note] },
     ],
     choices: [
-      { key: "status", label: "status", values: (plan) => statusChoices(plan.status, counts(plan)),
+      { key: "status", label: "status", values: (plan) => [plan.status],
         name: (value) => value.replaceAll("_", " "),
         order: PLAN_STATUSES },
       ...(submitters ? [{ key: "by", label: "submitted_by", values: (plan: PlanView) => [submitter(plan)] }] : []),

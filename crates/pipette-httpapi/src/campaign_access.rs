@@ -13,6 +13,8 @@ use crate::error::AppError;
 use crate::owner::HandOffScope;
 use crate::state::AppState;
 
+const ANOTHER_OWNER: &str = "this campaign belongs to another owner";
+
 /// Which campaigns a caller may **read**: opened by `read_plans` or
 /// `manage_orgs`, so an org admin can read back a campaign it may repoint.
 pub enum CampaignReach {
@@ -129,12 +131,24 @@ impl CampaignReach {
     }
 
     pub fn admits(&self, campaign: &Campaign) -> bool {
-        match (self, &campaign.owner) {
-            (Self::Any, _) => true,
-            (Self::Listed { org, campaigns }, CampaignOwner::Org { org_id }) => {
-                org.as_ref() == Some(org_id) && campaigns.contains(&campaign.campaign_id)
+        match self {
+            Self::Listed { org, campaigns } => {
+                campaign
+                    .owner
+                    .org_id()
+                    .is_some_and(|owner| org.as_ref() == Some(owner))
+                    && campaigns.contains(&campaign.campaign_id)
             }
-            (Self::Listed { .. }, CampaignOwner::User { .. }) => false,
+            Self::Any | Self::Own { .. } => self.admits_owner(&campaign.owner),
+        }
+    }
+
+    /// Whether the campaigns of `owner` are in reach, for a record they share,
+    /// such as a campaign group. A campaign reader reaches listed campaigns alone.
+    pub fn admits_owner(&self, owner: &CampaignOwner) -> bool {
+        match (self, owner) {
+            (Self::Any, _) => true,
+            (Self::Listed { .. }, _) => false,
             (
                 Self::Own {
                     user, offboarded, ..
@@ -255,25 +269,54 @@ impl CampaignAuthority {
     /// A `403`, not a `404`: a campaign id is a minted UUIDv7, so a caller that
     /// names one was given it and the true answer discloses nothing.
     pub fn require(&self, campaign: &Campaign) -> Result<(), AppError> {
-        self.require_if(self.may_administer(&campaign.owner), campaign)
+        let admitted = self.may_administer(&campaign.owner);
+        self.require_if(
+            admitted,
+            &campaign.owner,
+            campaign.campaign_id.as_str(),
+            ANOTHER_OWNER,
+        )
     }
 
     /// Refuse unless this caller may file into `campaign`, with
     /// [`Self::require`]'s answer.
     pub fn require_run(&self, campaign: &Campaign) -> Result<(), AppError> {
-        self.require_if(self.may_run(&campaign.owner), campaign)
+        self.require_run_owner(
+            &campaign.owner,
+            campaign.campaign_id.as_str(),
+            ANOTHER_OWNER,
+        )
     }
 
-    fn require_if(&self, admitted: bool, campaign: &Campaign) -> Result<(), AppError> {
+    /// [`Self::require_run`] for `record`, a record of `owner`'s other than a
+    /// campaign: `another_owner` replaces the campaign wording.
+    pub fn require_run_owner(
+        &self,
+        owner: &CampaignOwner,
+        record: &str,
+        another_owner: &'static str,
+    ) -> Result<(), AppError> {
+        self.require_if(self.may_run(owner), owner, record, another_owner)
+    }
+
+    fn require_if(
+        &self,
+        admitted: bool,
+        owner: &CampaignOwner,
+        record: &str,
+        another_owner: &'static str,
+    ) -> Result<(), AppError> {
         if admitted {
             return Ok(());
         }
         tracing::warn!(
-            campaign_id = %campaign.campaign_id,
-            owner = %campaign.owner.label(),
-            "refused: the campaign is outside the caller's scope"
+            record,
+            owner = %owner.label(),
+            "refused: the record is outside the caller's scope"
         );
-        Err(AppError::Forbidden(self.refusal(&campaign.owner).into()))
+        Err(AppError::Forbidden(
+            self.refusal(owner, another_owner).into(),
+        ))
     }
 
     /// Whether `owner` is a disabled member of the organization this caller
@@ -309,17 +352,28 @@ impl CampaignAuthority {
         rights: &UserRights,
         campaign: &Campaign,
     ) -> Result<(), AppError> {
-        if self.may_administer(&campaign.owner)
-            || self.offboards(state, rights, &campaign.owner).await?
-        {
-            return Ok(());
-        }
-        self.require(campaign)
+        let record = campaign.campaign_id.as_str();
+        self.require_record_owner(state, rights, &campaign.owner, record, ANOTHER_OWNER)
+            .await
+    }
+
+    /// [`Self::require_record`] for a record of `owner`'s other than a
+    /// campaign, as [`Self::require_run_owner`] takes one.
+    pub async fn require_record_owner(
+        &self,
+        state: &AppState,
+        rights: &UserRights,
+        owner: &CampaignOwner,
+        record: &str,
+        another_owner: &'static str,
+    ) -> Result<(), AppError> {
+        let admitted = self.may_administer(owner) || self.offboards(state, rights, owner).await?;
+        self.require_if(admitted, owner, record, another_owner)
     }
 
     /// Why a check refused `owner`: for its own or its organization's campaign,
-    /// the caller is told the grant it lacks, not "another owner".
-    fn refusal(&self, owner: &CampaignOwner) -> &'static str {
+    /// the caller is told the grant it lacks, not `another_owner`.
+    fn refusal(&self, owner: &CampaignOwner, another_owner: &'static str) -> &'static str {
         match owner {
             CampaignOwner::User { user_id } if *user_id == self.user_id => {
                 "administering your own campaigns needs submit_plans"
@@ -327,9 +381,7 @@ impl CampaignAuthority {
             CampaignOwner::Org { org_id } if self.member_of.as_ref() == Some(org_id) => {
                 "administering your organization's campaigns needs manage_orgs"
             }
-            CampaignOwner::Org { .. } | CampaignOwner::User { .. } => {
-                "this campaign belongs to another owner"
-            }
+            CampaignOwner::Org { .. } | CampaignOwner::User { .. } => another_owner,
         }
     }
 }
@@ -453,15 +505,19 @@ mod tests {
             admin_of: None,
             member_of: Some(my_org.clone()),
         };
-        assert!(authority.refusal(&user(&me)).contains("needs submit_plans"));
         assert!(
             authority
-                .refusal(&org(&my_org))
+                .refusal(&user(&me), ANOTHER_OWNER)
+                .contains("needs submit_plans")
+        );
+        assert!(
+            authority
+                .refusal(&org(&my_org), ANOTHER_OWNER)
                 .contains("needs manage_orgs")
         );
         for stranger in [org(&OrgId::mint()), user(&UserId::mint())] {
             assert_eq!(
-                authority.refusal(&stranger),
+                authority.refusal(&stranger, ANOTHER_OWNER),
                 "this campaign belongs to another owner"
             );
         }
@@ -549,6 +605,10 @@ mod tests {
             "an unlisted team campaign"
         );
         assert!(!reach.admits(&campaign(user(&reader.user_id))?));
+        assert!(
+            !reach.admits_owner(&org(&my_org)),
+            "its organization's campaign groups"
+        );
         assert_eq!(reach.filer(), None);
 
         reader.campaign_scope = None;

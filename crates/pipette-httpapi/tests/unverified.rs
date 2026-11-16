@@ -172,9 +172,9 @@ fn retriable_failure_body(job_id: &str) -> Value {
     })
 }
 
-/// Where the echoed job sits in `todo/` when the held body arrives.
+/// Where the echoed job sits in the queue when the held body arrives.
 enum Queued {
-    /// No `todo/` entry names the job.
+    /// The queue does not hold the job.
     Nowhere,
     Avail,
     /// Leased to another, approved client.
@@ -244,7 +244,7 @@ async fn test_held_echoed_job_id_binds_no_claim() -> anyhow::Result<()> {
             }
         }
         let avail = state.todo_store.get_avail_by_job(&job_id).await?;
-        let other_leases = state.todo_store.list_leased_for_client(&other).await?;
+        let other_leases = state.todo_store.leases_for_client(&other).await?;
         assert_eq!(
             (avail.is_some(), other_leases.len()),
             match case.queued {
@@ -286,7 +286,7 @@ async fn test_held_echoed_job_id_binds_no_claim() -> anyhow::Result<()> {
             case.name
         );
         assert_eq!(
-            state.todo_store.list_leased_for_client(&other).await?,
+            state.todo_store.leases_for_client(&other).await?,
             other_leases,
             "{}: the other client's lease is untouched",
             case.name

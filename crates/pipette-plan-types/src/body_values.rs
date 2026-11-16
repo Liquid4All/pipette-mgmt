@@ -1,6 +1,7 @@
 //! Values every operator body is written in: the fleet tier, list order, the
 //! query readers and the refusal body.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -93,6 +94,20 @@ where
         .map(|raw| raw.iter().map(|s| s.parse()).collect::<Result<Vec<T>, _>>())
         .transpose()
         .map_err(serde::de::Error::custom)
+}
+
+/// [`parsed`] over each key of a map.
+pub fn parsed_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: FromStr + Ord,
+    K::Err: std::fmt::Display,
+    V: Deserialize<'de>,
+{
+    BTreeMap::<String, V>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, value)| Ok((key.parse().map_err(serde::de::Error::custom)?, value)))
+        .collect()
 }
 
 /// A comma-separated query list read through `T`'s `FromStr`. Present but empty

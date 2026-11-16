@@ -20,7 +20,7 @@ revisions differ:
 - [`PUT /api/v1/campaigns/{id}/document`](campaigns/revise_document.md): a
   whole new document in place of that plan's document.
 - [`POST /api/v1/campaigns/{id}/rerun`](campaigns/rerun_jobs.md): that plan's
-  document, filed again to run some of its jobs again.
+  document, filed again to run some of its jobs again or mark them failed.
 - [`POST /api/v1/campaigns/{id}/recalculate`](campaigns/recalculate_jobs.md):
   that plan's document, filed again to score some of its evals again.
 - [`POST /api/v1/campaigns/{id}/revert`](campaigns/revert_campaign.md): a copy
@@ -70,12 +70,17 @@ carries `campaign_id`, `name`, `owner`, `created_at`, `updated_at` and:
 - `state`: `"archived"` on a campaign taken out of use, which takes no new
   plan ([archiving](campaigns/update_campaign.md)). Absent while active.
 
-A write replaces the whole record with no version check, so two administrators
-changing one campaign at once is last-writer-wins. A write that asks for the
-state the record already holds writes nothing and leaves `updated_at`, so it is
-safe to retry. A revision moves the campaign only if it still runs the plan
-the revision replaced and still has the same owner; otherwise the server
-cancels the revision and answers `409`.
+A write replaces the whole record, and only if the record is still the one the
+server read, so a write never reverts a field it does not set, such as the plan
+a filing moved to. A [rename, relabel or archive](campaigns/update_campaign.md)
+or a [hand-off](campaigns/set_campaign_owner.md) that meets another write
+answers `409` and writes nothing: send it again. A write that asks for the
+state the record already holds writes nothing to it and leaves `updated_at`, so
+it is safe to retry; a hand-off still takes the campaign out of a
+[group](campaign-groups.md) of another owner. A filing moves the campaign only if it still runs the plan the
+filing replaces and still has the same owner; otherwise the server answers `409`
+and cancels the filed plan; the message says if that cancel failed. An archive
+that lands while a plan is filed does not stop the filing.
 
 ## Who may do what
 
@@ -303,8 +308,8 @@ What the schema cannot say:
   does an `any_of` group that marks some members and not others. On any other
   flag the suffix is part of the flag.
 - **`expires_at`** is an RFC 3339 timestamp or `never`. Without one, each job
-  expires 30 days after the filing. A job a plan shares keeps the deadline it
-  has ([shared jobs](#shared-jobs)).
+  expires 30 days after the filing. A shared job takes the earliest
+  `expires_at` of the plans waiting on it ([shared jobs](#shared-jobs)).
 - **`merge_duplicates`** is a boolean, `true` by default. `false` gives this
   plan its own run of every cell, for a plan whose point is a second,
   independent run, such as one that measures variance. A later plan can still
@@ -353,11 +358,12 @@ ignores its `client_versions`.
   of reach is refused as an unknown one is, and an id two organizations hold
   is refused for everyone. The message suggests the nearest id.
 - Be runnable where this build can parse the spec: the runtime loads the
-  model, the `runtime_flags` fit the runtime and the model, and an eval
-  cell's engine honors the context bound its catalog entry sets. On a
-  free-text entry with no bound, a vLLM cell must not pin `max_model_len` at
-  or under `parameter_max_tokens`, where every request would get vLLM's
-  HTTP 400.
+  model, the `runtime_flags` fit the runtime and the model, a decision entry's
+  `runtime_flags` are a decision cell's with `parallel` set and its images run
+  on a `gguf_vision` model, and an eval cell's engine honors the
+  context bound its catalog entry sets. On a free-text entry with no bound, a
+  vLLM cell must not pin `max_model_len` at or under `parameter_max_tokens`,
+  where every request would get vLLM's HTTP 400.
 - On a vlm_eval benchmark whose entry has a recipe, name a model, projector
   and `enable_thinking` that the recipe covers, judged by the model's
   HuggingFace origin. No other entry for the same task and dataset version (a
@@ -490,6 +496,7 @@ errors of its campaign checks.
 | 401 | Missing or invalid auth headers. A device (`ev1_…` in `X-Client-Id`) gets `401`, because only a user signs these routes |
 | 403 | A user is pending an operator's approval, or is disabled |
 | 403 | A user holds no `submit_plans`: `user lacks the submit_plans permission` |
+| 409 | A filing into an existing campaign met other edits to the campaign on each of three tries to advance it. The plan does not become the head, and the server cancels it. File it again |
 | 413 | The body is over `plan_body_limit_bytes` (see [request size limits](../httpapi.md#12-request-size-limits)). Nothing is staged: the body is never parsed |
 | 415 | The `Content-Type` is missing, or is not `application/toml` |
 | 429 | The plan must download a gated model, and every one of the `hf_import_max_concurrent` import permits is held. Nothing is staged or downloaded. Retry later |
@@ -526,10 +533,10 @@ if its owner or its current plan changed, `403` if the caller may no longer
 file into it. From then
 on the filing runs to completion, disconnect or not. The plan is written
 before the campaign moves onto it, so a failure between the two leaves a plan
-that names the campaign and never took effect. Queue maintenance writes no eligible marker
+that names the campaign and never took effect. Queue maintenance writes no eligibility row
 for a job that only a `creating` plan holds
 ([queue.md: Committed filings](../queue.md#committed-filings)). A `500` during
-staging leaves earlier promoted jobs in `avail/`, unclaimable, until
+staging leaves earlier promoted jobs in the job queue, unclaimable, until
 `queue-maintenance` cancels the `creating` plan and retires its jobs, after
 `plan_creating_max_age_secs`. A promoted job of a committed plan is claimable
 from the next `queue-maintenance` run.
@@ -555,10 +562,12 @@ id, `expires_at`, `merge_duplicates`, a model's token and a vault source's
 `custom_label` take no part. Two spellings of one number (`1` and `1.0`)
 differ, so both run: a missed merge, never a wrong one.
 
-A plan that joins accepts the job's deadline. Each plan stops waiting at its
-own `expires_at`: once that passes with no result, the plan lists the job in
-`expired_jobs` and counts it `failed`, and the job stays queued for the plans
-still waiting on it.
+A waiting job's deadline is the earliest `expires_at` of the plans waiting on
+it, so devices take it in the order of the most urgent of them. A joining
+plan's `expires_at` counts from the next `queue-maintenance` run. Each plan
+stops waiting at its own `expires_at`: once that passes with no result, the
+plan lists the job in `expired_jobs` and counts it `failed`, and the job stays
+queued under the earliest `expires_at` of the plans still waiting on it.
 
 A cell the fleet already measured need not run again. On a server with a
 `[database]`, a cell takes the newest successful run of the same
@@ -566,8 +575,8 @@ cell whose recorded device meets its clauses, from a campaign of the same
 scope: the owner's organization and its users, or, for a user in no
 organization, that user's own campaigns. The plan lists that job, which
 counts `finished`, and `merged_job_count` counts it. A job a later plan
-re-ran answers nothing. `merge_duplicates = false` skips both this and the
-merge.
+re-ran or marked failed answers nothing. `merge_duplicates = false` skips both
+this and the merge.
 
 ### Carrying jobs into a revision
 
@@ -581,9 +590,11 @@ that plan whose body it still describes:
 - A **finished** job, failed or not, is listed and counted as the superseded
   plan counted it. Nothing runs it again.
 - A **queued or running** job is joined, so cancelling the superseded plan
-  does not stop it, unless a finished run of the same cell answers it
-  ([shared jobs](#shared-jobs)): the revision then lists that run, and leaves
-  the queued job to the superseded plan.
+  does not stop it. A queued job gives way to a finished run of the same cell
+  that answers it ([shared jobs](#shared-jobs)): the revision then lists that
+  run, and leaves the queued job to the superseded plan. A job a client is
+  running stays, unless its deadline has passed, and the revision takes its
+  result.
 - A job past its deadline, gone with no record, or one the superseded plan
   lost to a lapse is not carried. The cell is placed afresh.
 
@@ -597,19 +608,53 @@ recorded device is known to hold each flag they require. Anything else runs
 again. So moving a build pin keeps the runs on other builds, and a `:required`
 pin keeps only runs on the builds it names.
 
+**A change of the attempt limit keeps the runs known to have passed it.** For
+the rule above, bodies that differ only in
+`benchmark_flags.attempt_timeout_seconds` are the same body, so a cell whose
+limit changed finds the superseded plan's successful run too. The cell takes
+the run when the run is known to have passed the cell's limit. Two bodies
+vouch for a run: the one it was requested with, and the one the superseded
+plan lists its job under, which is another body once a revision took the run
+for a changed cell. The run is kept when one of the two sets the cell's limit,
+or sets none where the cell sets none, or sets a limit that is not above the
+cell's. So raising a limit keeps each run whose requested limit, or the limit
+its plan holds it under, is not above the new one. With `carry_across_limit`,
+on the routes that take it, the cell takes the superseded plan's successful
+run, or one a plan on offer brings (below), whatever limit that run had. The
+new plan lists the job under the cell's
+body, so a later revision needs the option again only for a limit that neither
+body covers: each of the two sets no limit where the cell sets one, a limit
+above the cell's, or a limit where the cell sets none. A run also answers when
+a plan on offer (below) lists its job for the very body of the cell, which is
+how a revert brings back the runs that its target held. Where several runs
+could answer a cell, the cell first takes one that its plan holds under
+exactly the cell's limit, or one that a plan on offer lists for its body. A cell that
+takes no run runs again, and a failed run answers in no case. The dry run
+counts the cells that run again in `requirements_rerun_job_count` and lists
+their jobs in `dropped_job_ids`.
+
 `carry_earlier` and `inherit_from`, on the routes that take them, let a cell
 that the superseded plan has not answered take a successful run of the
 campaign's earlier plans, newest first, then of the named plans in the order
-named, by the same rule. A job that lapsed, or that a later plan of its
-campaign re-ran, is not on offer, and a named plan's live job is joined as a
-shared job instead. Carrying ignores `merge_duplicates`.
+named, by the same rules. A job that lapsed, or that a later plan of its
+campaign re-ran or marked failed, is not on offer, and a named plan's live job
+is joined as a shared job instead. A queued job of the superseded plan gives
+way to such a run unless a client is running it. Carrying ignores
+`merge_duplicates`. With
+`carry_across_limit`, these plans' runs also answer whatever limit each had,
+which is how a campaign under a limit takes runs filed without one.
 
 A re-run withholds the jobs it names: each cell is a fresh job that joins
 nothing, and `rerun_of` maps it to the job it runs again. A recalculation
 withholds them too, and scores a copy of each named job's record under a fresh
-job that never queues. Both file the superseded plan's own document, so each
-must place every cell again. A document that now expands differently is
-refused with `400`, and nothing is filed.
+job that never queues. A re-run's `fail` withholds its jobs as well, and
+answers each cell with a failure under a fresh job that never queues, which
+`rerun_of` maps to the job it marks failed. Each files the superseded plan's
+own document, so each must place every cell again. A document that now
+expands to other cells is refused with `400`, and nothing is filed. A job `fail`
+names may still be queued or running: it is not joined, and stops with the
+superseded plan
+([marking a job failed](campaigns/rerun_jobs.md#marking-a-job-failed)).
 
 ### Catalog names
 

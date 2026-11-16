@@ -19,6 +19,7 @@
   import Benchmarks from "./routes/Benchmarks.svelte";
   import Campaign from "./routes/Campaign.svelte";
   import CampaignDocument from "./routes/CampaignDocument.svelte";
+  import CampaignGroup from "./routes/CampaignGroup.svelte";
   import CampaignNew from "./routes/CampaignNew.svelte";
   import Campaigns from "./routes/Campaigns.svelte";
   import CliLogin from "./routes/CliLogin.svelte";
@@ -118,7 +119,13 @@
     "campaign-plan-settings": { component: Campaign, title: "Campaign settings" },
     "campaign-document": { component: CampaignDocument, title: "Campaign document" },
     "me-campaigns": { component: MyCampaigns, title: "Campaigns" },
+    "me-campaign-groups": { component: MyCampaigns, title: "Campaign groups" },
     "org-campaigns": { component: OrgCampaigns, title: "Campaigns" },
+    "org-campaign-groups": { component: OrgCampaigns, title: "Campaign groups" },
+    "campaign-group": { component: CampaignGroup, title: "Campaign group" },
+    "campaign-group-policies": { component: CampaignGroup, title: "Campaign group policies" },
+    "campaign-group-activity": { component: CampaignGroup, title: "Campaign group activity" },
+    "campaign-group-settings": { component: CampaignGroup, title: "Campaign group settings" },
     missing: { component: NotFound, title: "Not found" },
   };
 

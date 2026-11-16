@@ -16,7 +16,7 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientId, ClientOwner, ClientPermission, OrgId};
 
 use crate::app::{
-    QueueBackend, QueueState, make_state, seeded_queue_state, setup_benchmarks, test_app,
+    QueueState, make_state, seeded_object_state, seeded_queue_state, setup_benchmarks, test_app,
 };
 use crate::request::body_json;
 use crate::user_auth::TEST_AUTHORITY;
@@ -253,13 +253,22 @@ pub async fn approved_client(
     Ok((state, key, client_id))
 }
 
-/// An [`approved_client`] on the queue `backend`. It returns `None` if
+/// An [`approved_client`] whose records stay on the local_fs object stores,
+/// as [`crate::make_object_state`] builds them.
+pub async fn approved_object_client(
+    dir: &std::path::Path,
+) -> anyhow::Result<(AppState, SigningKey, ClientId)> {
+    let state = seeded_object_state(dir).await?;
+    let (key, client_id) = register_and_approve(&state).await?;
+    Ok((state, key, client_id))
+}
+
+/// An [`approved_client`] on the database queue. It returns `None` if
 /// [`seeded_queue_state`] returns `None`, and the test then skips.
 pub async fn approved_queue_client(
     dir: &std::path::Path,
-    backend: QueueBackend,
 ) -> anyhow::Result<Option<(QueueState, SigningKey, ClientId)>> {
-    let Some(queue) = seeded_queue_state(dir, backend).await? else {
+    let Some(queue) = seeded_queue_state(dir).await? else {
         return Ok(None);
     };
     let (key, client_id) = register_and_approve(&queue.state).await?;

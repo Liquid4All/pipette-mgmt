@@ -10,19 +10,20 @@ use serde_json::{Value, json};
 use pipette_core::client::{Client, ClientStatus};
 use pipette_core::denial::DenialRecord;
 use pipette_core::plan::PlanManifest;
-use pipette_core::todo_filename::avail_filename;
 use pipette_httpapi::state::AppState;
 use pipette_pipeline::client_admin;
 use pipette_plan_types::{
     ClientId, ClientPermission, DeviceProfile, ExpiresAt, JobId, NonEmptyTrimmedString, PlanId,
     PlanStatus, Tag, UserPermission,
 };
-use pipette_store::{ClaimResult, JobState, RecycleResult, RenewLeaseResult, ScoreQueueStage};
+use pipette_store::{
+    AvailEntry, ClaimResult, JobJoin, JobState, RecycleResult, RenewLeaseResult, ScoreQueueStage,
+};
 use pipette_store_testkit::todo_job_body;
 use pipette_web_testkit::{
-    QueueBackend, QueueState, approved_queue_client, authed_post, denied_clients, grant, job,
-    register_and_approve, registered_user, run_qm, run_qm_full, run_qm_with_tmp_age, seed_avail,
-    seeded_queue_state, setup_benchmarks, submit_plan_as, valid_submission,
+    approved_queue_client, authed_post, body_json, denied_clients, grant, register_and_approve,
+    registered_user, run_qm, run_qm_full, run_qm_with_tmp_age, seed_avail, seeded_queue_state,
+    setup_benchmarks, submit_plan_as, valid_submission,
 };
 
 /// Runs once so the client is already a worker: the run that sees a client join
@@ -118,7 +119,7 @@ async fn test_new_job_indexed_only_for_matching_clients(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -188,7 +189,7 @@ impl Gate {
 async fn test_eligible_index_follows_the_workers(#[case] gate: Gate) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -223,7 +224,7 @@ async fn test_eligible_index_follows_the_workers(#[case] gate: Gate) -> anyhow::
 async fn test_any_of_job_indexed_only_for_group_matching_clients() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -257,7 +258,7 @@ async fn test_any_of_job_indexed_only_for_group_matching_clients() -> anyhow::Re
 async fn test_clients_array_job_indexed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -281,47 +282,13 @@ async fn test_clients_array_job_indexed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The backlog snapshot serves the console only, so a failed write must not fail
-/// the run. A trigger makes the write fail.
-#[tokio::test]
-async fn test_a_failed_backlog_write_does_not_fail_the_run() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    let state = &queue.state;
-    let (_, client) = register_and_approve(state).await?;
-    queue
-        .execute_sql(
-            "CREATE FUNCTION refuse_backlog() RETURNS trigger LANGUAGE plpgsql AS \
-         $$ BEGIN RAISE EXCEPTION 'backlog write refused'; END $$; \
-         CREATE TRIGGER refuse_backlog BEFORE INSERT OR UPDATE ON queue_maintenance_state \
-         FOR EACH ROW WHEN (NEW.name = 'backlog') EXECUTE FUNCTION refuse_backlog();",
-        )
-        .await?;
-    let job = seed_avail(
-        state.todo_store.as_ref(),
-        "job-1",
-        ExpiresAt::Never,
-        &json!({"clients": [client.as_str()]}),
-    )
-    .await?;
-
-    run_qm(state).await?;
-
-    assert_eq!(eligible_jobs(state, &client).await?, vec![job]);
-    assert_eq!(state.todo_store.read_backlog().await?, None);
-    Ok(())
-}
-
 /// A key sorting below an already-indexed one is still indexed: `Uuid::now_v7`
 /// orders ids per process only, so "new" comes from the reindex flag, not order.
 #[tokio::test]
 async fn test_out_of_order_promotion_is_indexed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -347,7 +314,7 @@ async fn test_out_of_order_promotion_is_indexed() -> anyhow::Result<()> {
 async fn test_already_indexed_jobs_are_skipped() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -380,7 +347,7 @@ async fn test_already_indexed_jobs_are_skipped() -> anyhow::Result<()> {
 async fn test_creating_jobs_wait_for_a_committed_plan_before_indexing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -454,7 +421,7 @@ async fn test_creating_jobs_wait_for_a_committed_plan_before_indexing() -> anyho
 async fn test_a_corrupt_flagged_job_does_not_block_healthy_indexing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(mut queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let observed = std::sync::Arc::new(
@@ -526,7 +493,7 @@ async fn test_a_corrupt_flagged_job_does_not_block_healthy_indexing() -> anyhow:
 async fn test_a_run_indexes_only_the_jobs_added_since_the_last() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(mut queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let observed = std::sync::Arc::new(
@@ -613,7 +580,7 @@ async fn test_starvation_follows_claimable_index_rows(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(mut queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let observed = std::sync::Arc::new(
@@ -701,7 +668,7 @@ async fn test_starvation_follows_claimable_index_rows(
 async fn test_escalation_reads_only_after_a_new_denial() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(mut queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(mut queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let observed = std::sync::Arc::new(
@@ -760,7 +727,7 @@ async fn test_failed_terminal_checks_keep_the_reindex_flag(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -817,7 +784,7 @@ async fn seed_clients_jobs(
 async fn test_worker_changes_follow_the_perform_work_grant() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -858,7 +825,7 @@ async fn awaits_index(state: &AppState, job: &JobId) -> anyhow::Result<bool> {
 async fn test_recycled_lease_is_reindexed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -911,7 +878,7 @@ async fn test_pending_reindex_reevaluates_after_a_profile_or_tag_change(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -947,13 +914,91 @@ async fn test_pending_reindex_reevaluates_after_a_profile_or_tag_change(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_a_joiner_changed_during_rebuild_is_retried_next_run() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((queue, _, client)) = approved_queue_client(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (_, stable) = register_and_approve(state).await?;
+    set_profile(state, &client, os_profile("macOS")?).await?;
+    pipette_web_testkit::clear_pending_reindex(state.todo_store.as_ref(), &client).await?;
+    pipette_web_testkit::clear_pending_reindex(state.todo_store.as_ref(), &stable).await?;
+    assert!(state.todo_store.read_workers().await?.is_empty());
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-joiner-retry",
+        ExpiresAt::Never,
+        &json!({"requires": ["os:macos"]}),
+    )
+    .await?;
+    let flagged = state
+        .todo_store
+        .jobs_needing_reindex(std::slice::from_ref(&job))
+        .await?
+        .jobs
+        .into_iter()
+        .next()
+        .context("the seeded job needs indexing")?;
+    assert!(
+        state
+            .todo_store
+            .replace_eligibility(&job, flagged.revision, &[])
+            .await?
+    );
+
+    // Change the profile after eligibility is written, without a reindex flag,
+    // as a concurrent PATCH with a failed flag write can do.
+    queue
+        .execute_sql(
+            r#"
+        CREATE FUNCTION change_profile_during_join() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            UPDATE clients
+            SET body = jsonb_set(body::jsonb, '{device_os_name}', '"Linux"'::jsonb)::text,
+                revision = revision + 1
+            WHERE client_id = NEW.client_id AND body::jsonb ->> 'device_os_name' = 'macOS';
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER change_profile_during_join AFTER INSERT ON queue_eligibility
+        FOR EACH ROW EXECUTE FUNCTION change_profile_during_join();
+    "#,
+        )
+        .await?;
+    run_qm(state).await?;
+    assert_eq!(eligible_jobs(state, &client).await?, vec![job.clone()]);
+    assert_eq!(
+        state.todo_store.read_workers().await?,
+        std::collections::HashSet::from([stable.clone()])
+    );
+    assert!(state.todo_store.list_pending_reindex().await?.is_empty());
+    assert!(
+        state
+            .todo_store
+            .jobs_awaiting_index(std::slice::from_ref(&job))
+            .await?
+            .is_empty()
+    );
+
+    run_qm(state).await?;
+    assert!(eligible_jobs(state, &client).await?.is_empty());
+    assert_eq!(
+        state.todo_store.read_workers().await?,
+        std::collections::HashSet::from([client, stable])
+    );
+    assert!(state.todo_store.list_pending_reindex().await?.is_empty());
+    Ok(())
+}
+
 /// A profile-changing `PATCH /clients/me` writes two flag keys; one rebuild must
 /// consume both, or a leftover triggers a redundant one.
 #[tokio::test]
 async fn test_reindex_consumes_all_flag_keys_in_one_rebuild() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -981,7 +1026,7 @@ async fn test_reindex_consumes_all_flag_keys_in_one_rebuild() -> anyhow::Result<
 async fn test_reindex_cleans_up_deleted_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1026,7 +1071,7 @@ async fn test_deferred_reindex_settles_when_leased_job_recycles(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1083,149 +1128,6 @@ async fn test_deferred_reindex_settles_when_leased_job_recycles(
     Ok(())
 }
 
-#[tokio::test]
-async fn test_gc_removes_orphan_markers_but_keeps_live_ones() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    let state = &queue.state;
-
-    let client = register_indexed_worker(state).await?;
-
-    let live = seed_avail(
-        state.todo_store.as_ref(),
-        "job-live",
-        ExpiresAt::Never,
-        &json!({"clients": [client.as_str()]}),
-    )
-    .await?;
-    let orphan = job("job-orphan")?;
-    state
-        .todo_store
-        .write_eligible(&client, &orphan, ExpiresAt::Never)
-        .await?;
-
-    // Deletion needs two consecutive orphaned sightings, so one stale listing
-    // cannot cost a live job its markers.
-    run_qm(state).await?;
-    let eligible = eligible_jobs(state, &client).await?;
-    assert!(eligible.contains(&live), "live job marker should be kept");
-    assert!(
-        eligible.contains(&orphan),
-        "first sighting should not delete the orphan marker"
-    );
-
-    run_qm(state).await?;
-    let eligible = eligible_jobs(state, &client).await?;
-    assert!(eligible.contains(&live), "live job marker should be kept");
-    assert!(!eligible.contains(&orphan), "orphan marker should be GC'd");
-    Ok(())
-}
-
-/// How run 2 clears the candidacy. `FailsFatally` fails after the live-set
-/// listings but before the GC sweeps because the test renames the
-/// reindex-request table.
-enum Run2 {
-    Succeeds,
-    FailsFatally,
-}
-
-/// Job absent, present, absent, absent: run 3 must be a fresh first sighting
-/// (marker kept), and run 4 completes the pair and sweeps the marker.
-async fn assert_candidate_resets(
-    queue: &QueueState,
-    job_name: &str,
-    run2: Run2,
-) -> anyhow::Result<()> {
-    let state = &queue.state;
-    let client = register_indexed_worker(state).await?;
-    let job = job(job_name)?;
-    // No denied marker: a fully-denied clients-only job would be escalated by
-    // another pass.
-    state
-        .todo_store
-        .write_eligible(&client, &job, ExpiresAt::Never)
-        .await?;
-
-    run_qm(state).await?;
-    assert!(
-        eligible_jobs(state, &client).await?.contains(&job),
-        "first sighting must not delete the marker"
-    );
-
-    seed_avail(
-        state.todo_store.as_ref(),
-        job_name,
-        ExpiresAt::Never,
-        &json!({"clients": [client.as_str()]}),
-    )
-    .await?;
-    match run2 {
-        Run2::Succeeds => run_qm(state).await?,
-        Run2::FailsFatally => {
-            // Dies before the end-of-run candidate rewrite; the start-of-run consume
-            // must already have cleared the candidacy.
-            queue
-                .execute_sql("ALTER TABLE queue_reindex_requests RENAME TO hidden_requests")
-                .await?;
-            assert!(
-                run_qm(state).await.is_err(),
-                "run 2 should fail fatally at the reindex pass"
-            );
-            queue
-                .execute_sql("ALTER TABLE hidden_requests RENAME TO queue_reindex_requests")
-                .await?;
-        }
-    }
-    assert!(
-        eligible_jobs(state, &client).await?.contains(&job),
-        "live job's marker must be kept"
-    );
-
-    state
-        .todo_store
-        .delete_avail(&job, ExpiresAt::Never)
-        .await?;
-    run_qm(state).await?;
-    assert!(
-        eligible_jobs(state, &client).await?.contains(&job),
-        "marker must survive run 3: run 2 cleared the candidacy, so this is a fresh first sighting"
-    );
-
-    run_qm(state).await?;
-    assert!(
-        !eligible_jobs(state, &client).await?.contains(&job),
-        "marker should be GC'd on the second consecutive orphaned sighting"
-    );
-    Ok(())
-}
-
-/// A transient listing miss must not leave a "strike one" that a later,
-/// unrelated miss completes.
-#[tokio::test]
-async fn test_gc_candidate_resets_when_job_reappears() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    assert_candidate_resets(&queue, "job-flapping", Run2::Succeeds).await
-}
-
-/// The candidate set is consumed at the start of each run, so a run that dies
-/// partway leaves no sightings for the next run to pair with.
-#[tokio::test]
-async fn test_gc_candidate_cleared_by_failed_run() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    assert_candidate_resets(&queue, "job-strike", Run2::FailsFatally).await
-}
-
 /// A live lease is left alone and an expired one recycled; either way the job
 /// is live, so its eligible marker survives the GC sweep.
 #[rstest]
@@ -1238,7 +1140,7 @@ async fn test_leased_job_survives_sweep_and_recycles_on_expiry(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1263,13 +1165,13 @@ async fn test_leased_job_survives_sweep_and_recycles_on_expiry(
     run_qm(state).await?;
 
     if expect_recycled {
-        assert!(state.todo_store.list_leased().await?.is_empty());
+        assert!(state.todo_store.list_leases().await?.is_empty());
         assert!(
             state.todo_store.get_avail_by_job(&job).await?.is_some(),
             "recycled job should be back in avail/"
         );
     } else {
-        assert_eq!(state.todo_store.list_leased().await?.len(), 1);
+        assert_eq!(state.todo_store.list_leases().await?.len(), 1);
     }
     assert_eq!(eligible_jobs(state, &client).await?, vec![job]);
     Ok(())
@@ -1288,7 +1190,7 @@ async fn test_expired_job_with_unrecordable_body_is_deleted(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1321,7 +1223,7 @@ async fn test_expired_job_with_unrecordable_body_is_deleted(
     assert!(state.todo_store.get_avail_by_job(&job).await?.is_none());
     assert!(state.submission_store.get_submission(&job).await?.is_none());
 
-    // Positively removed, so swept in this run, not by the two-sighting orphan path.
+    // The delete of the job takes its markers in the same run.
     assert!(denied_clients(state, &job).await?.is_empty());
     assert!(eligible_jobs(state, &client).await?.is_empty());
 
@@ -1342,7 +1244,7 @@ async fn test_expired_job_teardown(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1414,7 +1316,7 @@ async fn test_expired_job_teardown(
 async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1456,7 +1358,7 @@ async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Resu
 
     run_qm(state).await?;
 
-    assert!(state.todo_store.list_leased().await?.is_empty());
+    assert!(state.todo_store.list_leases().await?.is_empty());
     assert!(state.todo_store.get_avail_by_job(&job).await?.is_none());
     let record = state
         .submission_store
@@ -1484,7 +1386,7 @@ async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Resu
 async fn test_stale_lease_for_recorded_job_deleted_not_recycled() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1532,7 +1434,7 @@ async fn test_stale_lease_for_recorded_job_deleted_not_recycled() -> anyhow::Res
 
     run_qm(state).await?;
 
-    assert!(state.todo_store.list_leased().await?.is_empty());
+    assert!(state.todo_store.list_leases().await?.is_empty());
     assert!(state.todo_store.get_avail_by_job(&job).await?.is_none());
     // The existing record survives byte-for-byte — no synthetic write.
     let record = state
@@ -1573,7 +1475,7 @@ async fn lose_lease(
 async fn test_job_retired_once_its_lost_leases_reach_the_limit() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1613,7 +1515,7 @@ async fn test_job_retired_once_its_lost_leases_reach_the_limit() -> anyhow::Resu
         record.body["failure_reason"],
         format!("Lease lost without a result 3 times (clients: {client})")
     );
-    assert!(state.todo_store.list_leased().await?.is_empty());
+    assert!(state.todo_store.list_leases().await?.is_empty());
     assert!(state.todo_store.get_avail_by_job(&job).await?.is_none());
     assert!(state.todo_store.list_lost_lease_jobs().await?.is_empty());
     assert!(eligible_jobs(state, &client).await?.is_empty());
@@ -1654,49 +1556,6 @@ async fn test_lost_lease_limit_zero_always_recycles() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A job's `lost/` markers go once it leaves the queue (here, by a result), on
-/// the second orphaned sighting; a live job keeps them.
-#[tokio::test]
-async fn test_lost_lease_markers_swept_with_their_job() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    let state = &queue.state;
-    let (_, client) = register_and_approve(state).await?;
-    let live = seed_avail(
-        state.todo_store.as_ref(),
-        "job-live",
-        ExpiresAt::Never,
-        &expirable_body("job-live", &[&client]),
-    )
-    .await?;
-    let done = job("job-done")?;
-    let lapsed = Utc::now() - chrono::Duration::hours(1);
-    for job_id in [&live, &done] {
-        state
-            .todo_store
-            .write_lost_lease(job_id, &client, lapsed)
-            .await?;
-    }
-
-    let lost_jobs = || async {
-        let mut jobs = state.todo_store.list_lost_lease_jobs().await?;
-        jobs.sort();
-        anyhow::Ok(jobs)
-    };
-    run_qm(state).await?;
-    assert_eq!(
-        lost_jobs().await?,
-        vec![done.clone(), live.clone()],
-        "the first orphaned sighting only stages the dead job's markers"
-    );
-    run_qm(state).await?;
-    assert_eq!(lost_jobs().await?, vec![live]);
-    Ok(())
-}
-
 /// Best-effort teardown can leave the `avail/` entry of a recorded job behind;
 /// expiry removes it and keeps the record, in `processed/` or mid-scoring.
 #[rstest]
@@ -1708,7 +1567,7 @@ async fn test_expired_job_with_existing_record_not_overwritten(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1767,7 +1626,7 @@ async fn test_expired_job_with_existing_record_not_overwritten(
 async fn test_qm_escalates_all_denied_clients_only_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1846,7 +1705,7 @@ async fn test_qm_all_denied_escalation_skips(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1883,7 +1742,7 @@ async fn test_qm_all_denied_escalation_skips(
 async fn test_qm_escalates_when_an_exclusion_closes_the_roster() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1921,7 +1780,7 @@ async fn test_qm_escalates_when_an_exclusion_closes_the_roster() -> anyhow::Resu
 async fn test_qm_capability_exclusion_does_not_close_the_roster() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -1974,7 +1833,7 @@ async fn test_qm_retires_a_job_no_client_can_match(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2020,7 +1879,7 @@ async fn test_qm_retires_a_job_no_client_can_match(
 async fn test_qm_keeps_a_job_only_the_fleet_cannot_match() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2050,7 +1909,7 @@ async fn test_qm_keeps_a_job_only_the_fleet_cannot_match() -> anyhow::Result<()>
 async fn test_qm_keeps_a_job_whose_exclusion_group_is_vacuous() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2080,7 +1939,7 @@ async fn test_qm_keeps_a_job_whose_exclusion_group_is_vacuous() -> anyhow::Resul
 async fn test_qm_excluded_client_is_indexed_out_and_claims_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2113,7 +1972,7 @@ async fn test_qm_excluded_client_is_indexed_out_and_claims_nothing() -> anyhow::
 async fn test_qm_all_denied_escalation_preserves_existing_record() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2151,70 +2010,27 @@ async fn test_qm_all_denied_escalation_preserves_existing_record() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn test_denied_gc_sweeps_terminal_jobs_only() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
-        return Ok(());
-    };
-    let state = &queue.state;
-
-    let (_, client) = register_and_approve(state).await?;
-    // A second roster member keeps the job short of all-denied, which the
-    // reconciliation pass would escalate.
-    let live = seed_avail(
-        state.todo_store.as_ref(),
-        "job-live",
-        ExpiresAt::Never,
-        &json!({"clients": [client.as_str(), "ev1_other"]}),
-    )
-    .await?;
-    let terminal = job("job-terminal")?;
-    state
-        .todo_store
-        .write_denied(&live, &client, &DenialRecord::default())
-        .await?;
-    state
-        .todo_store
-        .write_denied(&terminal, &client, &DenialRecord::default())
-        .await?;
-
-    // The two-sighting rule: the first run only records the candidate.
-    run_qm(state).await?;
-    assert_eq!(
-        denied_clients(state, &terminal).await?,
-        vec![client.clone()],
-        "first sighting should not delete the orphan marker"
-    );
-    run_qm(state).await?;
-
-    assert_eq!(denied_clients(state, &live).await?, vec![client.clone()]);
-    assert!(denied_clients(state, &terminal).await?.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_stale_tmp_deleted_only_past_max_age() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
 
     // A crash can leave a body that no TodoStore call can write.
-    queue
-        .execute_sql("INSERT INTO queue_tmp (job_id, body) VALUES ('partial', '{')")
-        .await?;
-    let staged = || state.todo_store.list_stale_tmp(Duration::ZERO);
+    let stage_partial =
+        || queue.execute_sql("INSERT INTO queue_tmp (job_id, body) VALUES ('partial', '{')");
 
-    // Far above the row's age → kept.
+    // Far above the row's age → kept, so the direct delete finds it.
+    stage_partial().await?;
     run_qm(state).await?;
-    assert_eq!(staged().await?, vec!["partial.json".to_owned()]);
+    assert_eq!(state.todo_store.delete_stale_tmp(Duration::ZERO).await?, 1);
 
-    // Zero age → everything is stale → deleted.
+    // Zero age → everything is stale → deleted, so the direct delete finds nothing.
+    stage_partial().await?;
     run_qm_with_tmp_age(state, Duration::ZERO).await?;
-    assert!(staged().await?.is_empty());
+    assert_eq!(state.todo_store.delete_stale_tmp(Duration::ZERO).await?, 0);
     Ok(())
 }
 
@@ -2283,7 +2099,7 @@ async fn seed_plan(
 async fn test_cancel_marker_tears_down_avail_and_leased_jobs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2328,7 +2144,7 @@ async fn test_cancel_marker_tears_down_avail_and_leased_jobs() -> anyhow::Result
         "the queued job is deleted from avail/"
     );
     assert!(
-        state.todo_store.list_leased().await?.is_empty(),
+        state.todo_store.list_leases().await?.is_empty(),
         "the running job's lease is deleted"
     );
     assert!(
@@ -2379,7 +2195,7 @@ async fn test_cancel_marker_tears_down_avail_and_leased_jobs() -> anyhow::Result
 async fn test_teardown_makes_the_holders_next_heartbeat_404() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2434,7 +2250,7 @@ async fn test_teardown_makes_the_holders_next_heartbeat_404() -> anyhow::Result<
 async fn test_a_result_submitted_before_teardown_lands() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2500,7 +2316,7 @@ async fn test_a_result_submitted_before_teardown_lands() -> anyhow::Result<()> {
 async fn test_a_result_submitted_after_teardown_404s_and_writes_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2569,7 +2385,7 @@ async fn test_a_result_submitted_after_teardown_404s_and_writes_nothing() -> any
 async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2623,7 +2439,7 @@ async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
 async fn test_plan_stays_cancelling_until_teardown_finishes() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2716,7 +2532,7 @@ async fn test_plan_stays_cancelling_until_teardown_finishes() -> anyhow::Result<
 async fn test_the_settle_is_decided_per_plan() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2788,7 +2604,7 @@ async fn test_marker_for_terminal_plan_is_collected_without_touching_status(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2819,7 +2635,7 @@ async fn test_marker_for_terminal_plan_is_collected_without_touching_status(
 async fn test_marker_without_manifest_is_collected() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2837,9 +2653,7 @@ async fn test_marker_without_manifest_is_collected() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_a_cancelled_plan_keeps_its_links_and_sources() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2873,7 +2687,7 @@ async fn test_a_cancelled_plan_keeps_its_links_and_sources() -> anyhow::Result<(
 async fn test_a_stranded_ingest_keeps_its_link_and_source() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2923,7 +2737,7 @@ async fn test_terminal_plan_is_kept_however_old(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2980,7 +2794,7 @@ async fn test_terminal_plan_is_kept_however_old(
 async fn test_an_old_live_plan_is_kept() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3055,7 +2869,7 @@ async fn test_plan_status_follows_the_fleet(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3106,7 +2920,7 @@ async fn test_plan_status_follows_the_fleet(
 async fn test_complete_latch_counts_finished_and_failed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3167,7 +2981,7 @@ async fn test_complete_latch_counts_finished_and_failed() -> anyhow::Result<()> 
 async fn test_creating_plan_is_not_latched_complete() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3199,7 +3013,7 @@ async fn test_creating_plan_is_not_latched_complete() -> anyhow::Result<()> {
 async fn test_stranded_creating_plan_is_torn_down() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3254,7 +3068,7 @@ async fn test_stranded_creating_plan_is_torn_down() -> anyhow::Result<()> {
 async fn test_young_creating_plan_is_left_alone() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3296,7 +3110,7 @@ async fn test_cancelling_a_creating_plan_keeps_its_marker_while_its_ingest_could
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3362,7 +3176,7 @@ async fn test_cancelling_a_creating_plan_keeps_its_marker_while_its_ingest_could
 async fn test_partial_starvation_stays_active_and_reports_starved() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3468,7 +3282,7 @@ async fn test_starved_jobs_group_by_shared_eligibility(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3515,7 +3329,7 @@ async fn test_starved_jobs_group_by_shared_eligibility(
 async fn test_leased_job_keeps_plan_active_without_a_matching_client() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3573,7 +3387,7 @@ async fn test_leased_job_keeps_plan_active_without_a_matching_client() -> anyhow
 async fn test_incoming_record_counts_as_finished() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3673,7 +3487,7 @@ async fn members(state: &AppState, job_id: &JobId) -> anyhow::Result<Vec<PlanId>
 async fn test_cancel_of_one_member_releases_a_shared_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3738,7 +3552,7 @@ async fn test_cancel_of_one_member_releases_a_shared_job() -> anyhow::Result<()>
 async fn test_active_plan_keeps_a_job_whose_membership_marker_is_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3790,7 +3604,7 @@ async fn test_active_plan_keeps_a_job_whose_membership_marker_is_missing() -> an
 async fn test_cancel_of_the_last_member_retires_the_shared_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3835,7 +3649,7 @@ async fn test_cancel_of_the_last_member_retires_the_shared_job() -> anyhow::Resu
 async fn test_a_job_with_no_membership_marker_still_retires() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3882,7 +3696,7 @@ async fn test_a_job_with_no_membership_marker_still_retires() -> anyhow::Result<
 async fn test_plan_index_gc_waits_for_the_age_gate_and_a_second_sighting() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3945,7 +3759,7 @@ async fn test_plan_index_gc_waits_for_the_age_gate_and_a_second_sighting() -> an
 async fn test_plan_index_gc_collects_a_marker_whose_manifest_is_gone() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -3991,7 +3805,7 @@ async fn test_plan_index_gc_collects_a_marker_whose_manifest_is_gone() -> anyhow
 async fn test_plan_index_gc_collects_a_marker_whose_plan_omits_the_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4055,7 +3869,7 @@ async fn test_plan_index_gc_collects_a_marker_whose_plan_omits_the_job() -> anyh
 async fn test_one_result_advances_both_plans_holding_the_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4144,7 +3958,7 @@ async fn lapse_of(
 async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4212,15 +4026,13 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
         (1, 1, 0)
     );
 
-    let mut avail = state.todo_store.list_avail().await?;
-    avail.sort();
-    assert_eq!(
-        avail,
-        vec![
-            avail_filename(&shared, distant()),
-            avail_filename(&solo, distant()),
-        ]
-    );
+    let entry = |job_id: &JobId| AvailEntry {
+        job_id: job_id.clone(),
+        expires_at: distant(),
+    };
+    let mut want = vec![entry(&shared), entry(&solo)];
+    want.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    assert_eq!(state.todo_store.list_avail_entries().await?, want);
     let mut markers = state.todo_store.list_eligible_for_client(&client).await?;
     markers.sort();
     assert_eq!(
@@ -4237,7 +4049,7 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
 async fn test_the_last_member_horizon_lapsing_retires_the_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4295,7 +4107,7 @@ async fn test_the_last_member_horizon_lapsing_retires_the_job() -> anyhow::Resul
 async fn test_a_plan_completes_when_its_last_job_lapses() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4348,7 +4160,7 @@ async fn test_a_plan_completes_when_its_last_job_lapses() -> anyhow::Result<()> 
 async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4397,7 +4209,7 @@ async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
         (0, 1),
         "the plan whose horizon stands still sees the job running"
     );
-    assert_eq!(state.todo_store.list_leased().await?.len(), 1);
+    assert_eq!(state.todo_store.list_leases().await?.len(), 1);
     Ok(())
 }
 
@@ -4406,7 +4218,7 @@ async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
 async fn test_a_recorded_job_is_never_recorded_as_lapsed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4449,13 +4261,150 @@ async fn test_a_recorded_job_is_never_recorded_as_lapsed() -> anyhow::Result<()>
     Ok(())
 }
 
+/// A revision dated earlier joins the waiting job and the plan it replaces
+/// leaves: in that run the job takes the revision's horizon, so a claim takes
+/// it ahead of a job due between the two horizons.
+#[tokio::test]
+async fn test_a_replaced_plan_leaving_moves_the_job_to_the_revisions_horizon() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (key, client) = register_and_approve(state).await?;
+    let revised: ExpiresAt = "20980101T000000Z".parse()?;
+    let between: ExpiresAt = "20980601T000000Z".parse()?;
+
+    // The replaced plan minted the job, so the queue carries its horizon.
+    let carried = seed_avail(
+        state.todo_store.as_ref(),
+        "job-carried",
+        distant(),
+        &expirable_body("job-carried", &[&client]),
+    )
+    .await?;
+    let due_between = seed_avail(
+        state.todo_store.as_ref(),
+        "job-between",
+        between,
+        &expirable_body("job-between", &[&client]),
+    )
+    .await?;
+    let replaced = test_plan_id();
+    let revision = other_plan_id();
+    seed_membership(state, &carried, &replaced, distant()).await?;
+    seed_membership(state, &carried, &revision, revised).await?;
+    seed_membership(state, &due_between, &revision, between).await?;
+    seed_plan(
+        state,
+        &plan_manifest(&replaced, PlanStatus::Active, &[&carried]),
+        true,
+    )
+    .await?;
+    seed_plan(
+        state,
+        &plan_manifest(&revision, PlanStatus::Active, &[&carried, &due_between]),
+        false,
+    )
+    .await?;
+
+    run_qm(state).await?;
+
+    assert_eq!(members(state, &carried).await?, vec![revision]);
+    assert_eq!(
+        state
+            .todo_store
+            .avail_for_jobs(std::slice::from_ref(&carried))
+            .await?,
+        vec![AvailEntry {
+            job_id: carried.clone(),
+            expires_at: revised
+        }]
+    );
+    let response = authed_post(state, &key, &client, "/plans/claim", &json!({})).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed = body_json(response).await?;
+    assert_eq!(claimed["job_id"], carried.as_str());
+    assert_eq!(claimed["expires_at"], revised.to_string());
+    Ok(())
+}
+
+/// A joiner accepts the row's deadline; the next run brings the row down to
+/// the joiner's earlier horizon.
+#[tokio::test]
+async fn test_a_joiner_with_an_earlier_horizon_lowers_the_row_next_run() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (_, client) = register_and_approve(state).await?;
+    let sooner: ExpiresAt = "20980101T000000Z".parse()?;
+
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-joined",
+        distant(),
+        &expirable_body("job-joined", &[&client]),
+    )
+    .await?;
+    let minter = test_plan_id();
+    let joiner = other_plan_id();
+    seed_membership(state, &job, &minter, distant()).await?;
+    seed_plan(
+        state,
+        &plan_manifest(&minter, PlanStatus::Active, &[&job]),
+        false,
+    )
+    .await?;
+    run_qm(state).await?;
+
+    assert_eq!(
+        state.plan_store.join_job(&job, &joiner, sooner).await?,
+        JobJoin::Joined
+    );
+    seed_plan(
+        state,
+        &plan_manifest(&joiner, PlanStatus::Active, &[&job]),
+        false,
+    )
+    .await?;
+    assert_eq!(
+        state
+            .todo_store
+            .avail_for_jobs(std::slice::from_ref(&job))
+            .await?,
+        vec![AvailEntry {
+            job_id: job.clone(),
+            expires_at: distant()
+        }]
+    );
+
+    run_qm(state).await?;
+
+    assert_eq!(
+        state
+            .todo_store
+            .avail_for_jobs(std::slice::from_ref(&job))
+            .await?,
+        vec![AvailEntry {
+            job_id: job.clone(),
+            expires_at: sooner
+        }]
+    );
+    Ok(())
+}
+
 /// The two-sighting rule guards against listing races; a key naming a
 /// superseded deadline is dead regardless.
 #[tokio::test]
 async fn test_a_marker_naming_a_superseded_deadline_is_collected_at_once() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4487,9 +4436,7 @@ async fn test_a_marker_naming_a_superseded_deadline_is_collected_at_once() -> an
 #[tokio::test]
 async fn queue_register_claim_and_recycle() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, key, client)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, key, client)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;

@@ -1058,7 +1058,15 @@ formats and quantizations.
 - **The quantization** is a label that the operator gives in the `create` file,
   for example `q4_0`, `q4_k_m`, `4bit`, `int4` or `bf16`. A model descriptor
   usually does not hold its quantization in a field: the quantization is part of
-  a file name or a repository name. A label matches `[a-z0-9_]+`.
+  a file name or a repository name. A label matches `[a-z0-9_]+(@[a-z0-9_]+)?`.
+  The part after the `@` names the source of the quantization, for example
+  `q4_k_m@unsloth`. This lets an entry distinguish members with the same format
+  and quantization scheme but different sources. The source is part of the
+  label and thus part of the member key.
+
+  Labels without a source keep their existing meaning. Older clients whose
+  validators accept only `[a-z0-9_]+` reject source-qualified labels; they need
+  the updated grammar to use these members.
 
 An entry has at most one member for each format and quantization.
 

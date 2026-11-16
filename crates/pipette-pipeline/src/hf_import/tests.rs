@@ -189,7 +189,9 @@ impl Fixture {
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let vault = pipette_store_fs::build_local_fs_stores(&config)?.vault;
+        let vault =
+            pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
+                .vault;
         let hub = MockHub::start(repos()).await?;
         let client = HubClient::new(hub.endpoint.clone(), max_requests)?;
         let owner = VaultOwner::Org {

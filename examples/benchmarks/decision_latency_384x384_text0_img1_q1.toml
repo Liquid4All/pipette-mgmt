@@ -1,0 +1,7 @@
+# One question with a 384 px image as the whole state.
+benchmark_type         = "decision_latency"
+parameter_image_width  = 384
+parameter_image_height = 384
+parameter_text_tokens  = 0
+parameter_num_images   = 1
+parameter_questions    = 1

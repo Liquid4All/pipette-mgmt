@@ -5,7 +5,7 @@
   // offers a revert if the reader may read that plan and may revise the campaign.
   import { revertOffered } from "../campaigns";
   import { progressOf } from "../format";
-  import { PLAN_STATUSES, changeText, doneShare, shownStatus, statusChoices } from "../plans";
+  import { PLAN_STATUSES, changeText, doneShare } from "../plans";
   import type { TableSpec } from "../table";
   import type { CampaignPlanRow, NamedCampaignOverview } from "../api-types";
   import Clamped from "./Clamped.svelte";
@@ -24,19 +24,18 @@
   let reverter = $state<ReturnType<typeof RevertAction>>();
 
   const counts = (row: CampaignPlanRow) => row.plan?.counts;
-  const status = (row: CampaignPlanRow) => (row.plan ? shownStatus(row.plan.status, counts(row)) : null);
   // A plan the reader may not read is its id alone.
   const spec: TableSpec<CampaignPlanRow> = $derived({
     columns: [
       { key: "plan_id", label: "plan_id", raw: (row) => row.plan_id },
       { key: "note", label: "note", raw: (row) => row.plan?.note ?? null },
       { key: "change", label: "change", as: "json", raw: (row) => (row.plan?.change ? JSON.stringify(row.plan.change) : null) },
-      { key: "status", label: "status", raw: status, as: "state" },
+      { key: "status", label: "status", raw: (row) => row.plan?.status ?? null, as: "state" },
       { key: "created_at", label: "created_at", raw: (row) => row.plan?.created_at ?? null, as: "time" },
       { key: "progress", label: "progress", raw: (row) => doneShare(counts(row)) },
     ],
     texts: [{ key: "q", label: "plan_id, note or change", texts: (row) => [row.plan_id, row.plan?.note, row.plan?.change && changeText(row.plan.change)] }],
-    choices: [{ key: "status", label: "status", values: (row) => (row.plan ? statusChoices(row.plan.status, counts(row)) : [""]),
+    choices: [{ key: "status", label: "status", values: (row) => [row.plan?.status ?? ""],
                 name: (value) => value.replaceAll("_", " "), order: PLAN_STATUSES }],
   });
   const current = $derived(detail.history[0]?.plan_id);

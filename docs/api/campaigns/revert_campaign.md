@@ -19,7 +19,9 @@ plan supersedes the plan that the campaign runs. The route runs these steps:
    replaced plan does not answer. A [variant edit](edit_variants.md) with
    `carry_earlier` makes the same offer. The results of the named plan then
    come back, and the revision does not run them again. A revert always makes
-   this offer.
+   this offer. A run that one of those plans lists for the very body of a cell
+   answers the cell whatever attempt limit the run had, so a plan that kept
+   runs with `carry_across_limit` gets them back.
 4. Moves the campaign onto the revision.
 5. Cancels the replaced plan. Its teardown retires the jobs that the document
    does not describe.

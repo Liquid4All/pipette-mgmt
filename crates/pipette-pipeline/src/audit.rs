@@ -7,10 +7,12 @@ use futures::stream::{self, StreamExt};
 
 use pipette_core::audit::new_event;
 use pipette_plan_types::{
-    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget, CampaignId, ClientId, JobId,
-    OrgId, PlanId, PrincipalOwner, UserId, VaultResourceId,
+    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget, CampaignGroupId, CampaignId,
+    ClientId, JobId, OrgId, PlanId, PrincipalOwner, UserId, VaultResourceId,
 };
-use pipette_store::{AuditFilter, AuditStores, CampaignStore, OrgStore, PlanStore, VaultRecords};
+use pipette_store::{
+    AuditFilter, AuditStores, CampaignGroupStore, CampaignStore, OrgStore, PlanStore, VaultRecords,
+};
 
 use crate::org::OrgRef;
 
@@ -78,6 +80,7 @@ pub fn audit_filter(
 pub struct AuditReach<'a> {
     pub orgs: &'a dyn OrgStore,
     pub campaigns: &'a dyn CampaignStore,
+    pub campaign_groups: Option<&'a dyn CampaignGroupStore>,
     pub plans: &'a dyn PlanStore,
     pub vault: &'a dyn VaultRecords,
 }
@@ -87,6 +90,7 @@ impl<'a> AuditReach<'a> {
         Self {
             orgs: stores.orgs.as_ref(),
             campaigns: stores.campaigns.as_ref(),
+            campaign_groups: stores.campaign_groups.as_deref(),
             plans: stores.plans.as_ref(),
             vault: stores.vault.as_ref(),
         }
@@ -126,6 +130,7 @@ impl<'a> AuditReach<'a> {
             AuditTarget::User { user_id } => self.orgs.get_membership(user_id).await,
             AuditTarget::Client { client_id } => crate::org::owning_org(self.orgs, client_id).await,
             AuditTarget::Campaign { campaign_id } => self.campaign_org(campaign_id).await,
+            AuditTarget::CampaignGroup { group_id } => self.group_org(group_id).await,
             AuditTarget::Plan { plan_id } => self.plan_org(plan_id).await,
             AuditTarget::VaultResource { resource_id } => self.vault_org(resource_id).await,
             // A job reaches its plans only through a scan of the queue.
@@ -143,6 +148,16 @@ impl<'a> AuditReach<'a> {
     async fn campaign_org(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<OrgId>> {
         match self.campaigns.get_campaign(campaign_id).await? {
             Some(campaign) => self.owner_org(&campaign.owner).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn group_org(&self, group_id: &CampaignGroupId) -> anyhow::Result<Option<OrgId>> {
+        let Some(groups) = self.campaign_groups else {
+            return Ok(None);
+        };
+        match groups.get_group(group_id).await? {
+            Some(group) => self.owner_org(&group.owner).await,
             None => Ok(None),
         }
     }
@@ -294,6 +309,10 @@ pub fn target_of_id(raw: &str) -> Option<AuditTarget> {
         AuditTarget::Campaign {
             campaign_id: CampaignId::try_new(raw).ok()?,
         }
+    } else if raw.starts_with(CampaignGroupId::PREFIX) {
+        AuditTarget::CampaignGroup {
+            group_id: CampaignGroupId::try_new(raw).ok()?,
+        }
     } else if raw.starts_with(VaultResourceId::PREFIX) {
         AuditTarget::VaultResource {
             resource_id: VaultResourceId::try_new(raw).ok()?,
@@ -323,10 +342,12 @@ mod tests {
     use anyhow::Context;
     use rstest::{fixture, rstest};
 
+    use pipette_core::campaign::CampaignGroup;
     use pipette_core::organization::Organization;
     use pipette_plan_types::{NonEmptyTrimmedString, OrgSlug};
     use pipette_store::Stores;
     use pipette_store_fs::build_local_fs_stores;
+    use pipette_store_sql::scratch::TestDb;
     use pipette_store_testkit::CapturingAuditStore;
 
     use super::*;
@@ -343,6 +364,7 @@ mod tests {
             Ok(AuditStores {
                 orgs: Arc::clone(&self.stores.orgs),
                 campaigns: Arc::clone(&self.stores.campaigns),
+                campaign_groups: self.stores.campaign_groups.clone(),
                 plans: Arc::clone(&self.stores.plans),
                 vault: Arc::new(Arc::clone(&self.stores.vault)),
                 log: Arc::clone(self.stores.audit.as_ref().context("an audit log")?),
@@ -362,7 +384,7 @@ mod tests {
         let stores = Stores {
             audit: Some(log.clone()),
             descriptor_catalog: None,
-            ..build_local_fs_stores(&config)?
+            ..build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
         };
         Ok(Local {
             _dir: dir,
@@ -460,6 +482,40 @@ mod tests {
         Ok(())
     }
 
+    /// A group id names its owner's organization, so a command that names only
+    /// a group, as `db backfill-rerun-results` does, is in that log.
+    #[tokio::test]
+    async fn a_group_id_names_its_owner_s_organization() -> anyhow::Result<()> {
+        let Some(db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let stores = pipette_store_sql::audit_stores(db.db());
+        let org_id = OrgId::try_new("org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?;
+        let group = CampaignGroup::new(
+            NonEmptyTrimmedString::try_new("aa-perf")?,
+            PrincipalOwner::Org {
+                org_id: org_id.clone(),
+            },
+            chrono::Utc::now(),
+        );
+        stores
+            .campaign_groups
+            .as_deref()
+            .context("a [database] keeps campaign groups")?
+            .create_group(&group)
+            .await?;
+        let args = ["db", "backfill-rerun-results", group.group_id.as_str()].map(str::to_owned);
+        let audit = CommandAudit::start(
+            &stores,
+            "db backfill-rerun-results".into(),
+            args.to_vec(),
+            vec![],
+        )
+        .await;
+        assert_eq!(audit.orgs, BTreeSet::from([org_id]));
+        Ok(())
+    }
+
     /// The kernel names the host where no `$HOSTNAME` is exported, as on macOS
     /// and under cron.
     #[test]
@@ -523,6 +579,7 @@ mod tests {
     #[case("org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", Some("org"))]
     #[case("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", Some("user"))]
     #[case("campaign_0195c3e2", Some("campaign"))]
+    #[case("group_0195c3e2", Some("campaign_group"))]
     #[case("vault_0195c3e2", Some("vault_resource"))]
     #[case("plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", Some("plan"))]
     #[case("job-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", Some("job"))]

@@ -13,12 +13,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
-use getrandom::SysRng;
-use getrandom::rand_core::TryRng;
 use serde::{Deserialize, Serialize};
 
 use pipette_core::benchmark::{Benchmark, CatalogLoad};
-use pipette_core::campaign::Campaign;
+use pipette_core::campaign::{Campaign, CampaignGroup, GroupPolicyState};
 use pipette_core::client::{Client, MigrationRecord, SignatureMigration, recorded_run_flags};
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_core::client_preauth::{
@@ -33,7 +31,7 @@ use pipette_core::organization::{Membership, Organization, Ownership};
 use pipette_core::plan::{
     PlanHeader, PlanManifest, PlanNotes, PlanSource, PlanSummary, SettledOutcome,
 };
-use pipette_core::todo_filename::{Lease, parse_avail_filename, parse_leased_key};
+use pipette_core::todo_filename::Lease;
 use pipette_core::types::id_from_key;
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_permission::UserPermissionSet;
@@ -41,9 +39,10 @@ use pipette_core::user_preauth::{UserPreauthConsumeOutcome, UserPreauthKey, User
 use pipette_core::vault::{VaultImport, VaultObjectKey, VaultOwner, VaultResource};
 use pipette_core::warehouse::{JobMetrics, MetricRow};
 use pipette_plan_types::{
-    AuditActorKind, AuditEventId, AuditOutcome, AuditTarget, BenchmarkId, CampaignId, ClientId,
-    ClientOwner, ClientPreauthKeyId, ExpiresAt, FirstClerkSignIn, IdError, JobId, ModelKey, OrgId,
-    PlanId, PlanStatus, PublicKeyHex, RuntimeOutput, Sha256, Tag, UserId, UserKeyId,
+    AuditActorKind, AuditEventId, AuditOutcome, AuditTarget, BenchmarkId, CachedArtifacts,
+    CampaignGroupId, CampaignGroupPolicy, CampaignId, ClientId, ClientOwner, ClientPreauthKeyId,
+    ExpiresAt, FirstClerkSignIn, IdError, JobId, ModelKey, OrgId, PlanId, PlanStatus, PolicyRerun,
+    PolicyRerunSummary, PublicKeyHex, RuntimeOutput, Sha256, Tag, UserId, UserKeyId,
     UserPreauthKeyId, VaultResourceId,
 };
 use pipette_plan_types::{
@@ -51,29 +50,6 @@ use pipette_plan_types::{
     DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberKey, EntryError,
     ModelFormat, ModelType, NonEmptyVec, QuantizationLabel, RunMark, RuntimeType,
 };
-
-/// Parse a persisted `queue-maintenance` key set; corrupt state reads as empty.
-/// Empty is safe: each run rewrites the set wholesale, so corruption self-heals.
-pub fn parse_key_set<T>(bytes: &[u8], what: &str) -> HashSet<T>
-where
-    T: serde::de::DeserializeOwned + Eq + std::hash::Hash,
-{
-    serde_json::from_slice(bytes).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, what = %what, "corrupt key-set state; treating as empty");
-        HashSet::new()
-    })
-}
-
-/// Parse a stored `queue-maintenance` snapshot, such as [`BacklogSnapshot`]
-/// or [`CampaignBacklogSnapshot`]. Corrupt data reads as `None` until the next
-/// run overwrites it.
-pub fn parse_snapshot<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Option<T> {
-    serde_json::from_slice(bytes)
-        .inspect_err(|e| {
-            tracing::warn!(error = %e, what = %what, "corrupt snapshot; treating as absent");
-        })
-        .ok()
-}
 
 /// Where a job sits in the pipeline. The variant names are the wire strings
 /// clients read.
@@ -1110,6 +1086,7 @@ pub struct VaultBlob {
     pub modified: DateTime<Utc>,
 }
 pub type CampaignPage = Page<Campaign, CampaignId>;
+pub type CampaignGroupPage = Page<CampaignGroup, CampaignGroupId>;
 pub type ModelParamsPage = Page<ModelParams, ModelKey>;
 /// Newest first: `resume_after` is the next page's exclusive upper bound.
 pub type AuditPage = Page<AuditEvent, AuditEventId>;
@@ -1223,9 +1200,19 @@ fn a_flat_keyspace_leaf_names_an_id_only_verbatim() {
 pub trait CampaignStore: Send + Sync {
     async fn get_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<Campaign>>;
 
-    /// No compare-and-swap: operators are the only writers, so a race is
-    /// last-writer-wins, never a corrupt record.
+    /// Last writer wins: for a new record or a copy. An edit of a stored record
+    /// goes through [`CampaignStore::replace_campaign`].
     async fn put_campaign(&self, campaign: &Campaign) -> anyhow::Result<()>;
+
+    /// Write `updated` only if the stored record still equals `read`, else `false`.
+    /// Not atomic by default: a backend with a conditional write overrides it.
+    async fn replace_campaign(&self, read: &Campaign, updated: &Campaign) -> anyhow::Result<bool> {
+        if self.get_campaign(&read.campaign_id).await?.as_ref() != Some(read) {
+            return Ok(false);
+        }
+        self.put_campaign(updated).await?;
+        Ok(true)
+    }
 
     /// In creation order (UUIDv7 ids), with [`PlanStore::list_plans`]'s paging
     /// and invalid-object contract.
@@ -1238,6 +1225,152 @@ pub trait CampaignStore: Send + Sync {
     /// Idempotent. Deletes the pointer only: tearing down the plan too would
     /// let a bookkeeping change destroy running benchmarks.
     async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()>;
+}
+
+/// Campaign groups, their members, their policies and the re-runs those filed.
+/// A campaign is in at most one group, and deleting a campaign removes its
+/// membership. SQL keeps them; no object store does.
+#[async_trait]
+pub trait CampaignGroupStore: Send + Sync {
+    /// Fails when the id is already stored, so a create never overwrites.
+    async fn create_group(&self, group: &CampaignGroup) -> anyhow::Result<()>;
+
+    /// `false`, writing nothing, when the group is gone, so an edit racing a
+    /// delete cannot bring it back. A racing update is last-writer-wins.
+    async fn update_group(&self, group: &CampaignGroup) -> anyhow::Result<bool>;
+
+    async fn get_group(&self, group_id: &CampaignGroupId) -> anyhow::Result<Option<CampaignGroup>>;
+
+    /// With [`CampaignStore::list_campaigns`]'s order, paging and
+    /// invalid-object contract.
+    async fn list_groups(
+        &self,
+        after: Option<&CampaignGroupId>,
+        limit: NonZeroUsize,
+    ) -> anyhow::Result<CampaignGroupPage>;
+
+    /// Idempotent. Deletes the memberships and the policies, never the campaigns.
+    async fn delete_group(&self, group_id: &CampaignGroupId) -> anyhow::Result<()>;
+
+    /// All or nothing: a campaign in another group refuses the call with
+    /// [`CampaignInAnotherGroupError`]; one already in this group is skipped.
+    /// A missing group or campaign fails untyped (an empty list checks neither)
+    /// and owners are not compared, so the caller checks both first.
+    async fn add_members(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_ids: &[CampaignId],
+    ) -> anyhow::Result<()>;
+
+    /// Idempotent.
+    async fn remove_member(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<()>;
+
+    /// In campaign id order, which is creation order.
+    async fn members(&self, group_id: &CampaignGroupId) -> anyhow::Result<Vec<CampaignId>>;
+
+    async fn group_of(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<CampaignGroupId>>;
+
+    /// The group's stored policies, at most one per kind, by kind name.
+    async fn list_policies(
+        &self,
+        group_id: &CampaignGroupId,
+    ) -> anyhow::Result<Vec<CampaignGroupPolicy>>;
+
+    /// Write `updated`, of `read`'s group and kind, only if the stored policy
+    /// still equals `read`, or none is stored and `read` is the kind's
+    /// defaults; else `false`. Compared decoded, so a field this build drops
+    /// does not count, and the write leaves it out. A missing group fails
+    /// untyped when `read` is the defaults and answers `false` otherwise, so
+    /// the caller reads it first.
+    async fn replace_policy(
+        &self,
+        read: &CampaignGroupPolicy,
+        updated: &CampaignGroupPolicy,
+    ) -> anyhow::Result<bool>;
+
+    /// Every group's stored policies that are on.
+    async fn enabled_policies(&self) -> anyhow::Result<EnabledPolicies>;
+
+    /// Each member of the group, in campaign id order, with its policy state.
+    async fn policy_states(&self, group_id: &CampaignGroupId) -> anyhow::Result<Vec<GroupMember>>;
+
+    /// `false`, writing nothing, when the campaign is not a member of the
+    /// group, as after a move to another group.
+    async fn set_policy_state(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+        state: &GroupPolicyState,
+    ) -> anyhow::Result<bool>;
+
+    /// Record `reruns`, re-runs the group's policies filed, keeping a row
+    /// already recorded for a re-run job and kind as it is. The rows written.
+    async fn record_reruns(
+        &self,
+        group_id: &CampaignGroupId,
+        reruns: &[PolicyRerun],
+    ) -> anyhow::Result<usize>;
+
+    /// The member's recorded re-runs that have no outcome yet.
+    async fn waiting_reruns(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<Vec<PolicyRerun>>;
+
+    /// Write each of `judged`'s `after`, `after_code`, `outcome` and
+    /// `judged_at` on its row, by re-run job and kind, while that row has no
+    /// outcome. The rows written.
+    async fn judge_reruns(
+        &self,
+        group_id: &CampaignGroupId,
+        judged: &[PolicyRerun],
+    ) -> anyhow::Result<usize>;
+
+    /// The rows of `campaigns` summed up per kind, in kind order, and those
+    /// rows newest filing first from `offset`, `limit` of them or, for
+    /// `None`, all.
+    async fn rerun_results(
+        &self,
+        group_id: &CampaignGroupId,
+        campaigns: &[CampaignId],
+        offset: usize,
+        limit: Option<usize>,
+    ) -> anyhow::Result<(Vec<PolicyRerunSummary>, Vec<PolicyRerun>)>;
+}
+
+/// [`CampaignGroupStore::enabled_policies`]'s answer.
+#[derive(Debug, Default)]
+pub struct EnabledPolicies {
+    /// Grouped by group id, which the policy pass chunks on; each group's rows
+    /// by kind name.
+    pub policies: Vec<CampaignGroupPolicy>,
+    /// Each stored policy that does not decode, on or off, and each one on
+    /// whose settings its kind refuses, with its group, so the caller can skip
+    /// that group. Keyed as [`CampaignGroupStore::list_policies`] names the
+    /// row.
+    pub unreadable: Vec<(CampaignGroupId, UnreadableObjectError)>,
+}
+
+/// A member campaign of a group, as [`CampaignGroupStore::policy_states`]
+/// reads it.
+#[derive(Debug)]
+pub struct GroupMember {
+    pub campaign_id: CampaignId,
+    /// `None` until the policy pass writes one.
+    pub policy_state: Result<Option<GroupPolicyState>, UnreadableObjectError>,
+}
+
+/// [`CampaignGroupStore::add_members`]'s refusal.
+#[derive(Debug, thiserror::Error)]
+#[error("campaign {campaign_id} is in campaign group {group_id}")]
+pub struct CampaignInAnotherGroupError {
+    pub campaign_id: CampaignId,
+    pub group_id: CampaignGroupId,
 }
 
 /// The model parameter table: parameter counts, one record per model key.
@@ -2086,6 +2219,28 @@ pub enum BlobWrite {
     },
 }
 
+/// What [`PlanStore::end_membership`] did with a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipEnd {
+    /// Other plans still hold the job, so it stays in the queue.
+    Released { surviving_plans: usize },
+    /// The plan held the last membership, and the job left the queue.
+    Retired,
+    /// The plan held the last membership, and the queue no longer held the job.
+    Absent,
+}
+
+/// What [`PlanStore::join_job`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobJoin {
+    /// The store wrote the marker, and the queue holds the job.
+    Joined,
+    /// The queue does not hold the job, and no marker is written.
+    Gone,
+    /// The store wrote the marker. The store did not check the queue.
+    Unchecked,
+}
+
 /// Plan manifests, which outlive their jobs so a finished plan stays queryable.
 #[async_trait]
 pub trait PlanStore: Send + Sync {
@@ -2306,6 +2461,41 @@ pub trait PlanStore: Send + Sync {
         plan_id: &PlanId,
         expires_at: ExpiresAt,
     ) -> anyhow::Result<()>;
+
+    /// Delete every membership marker of `plan_id` on `job_id`. If no marker
+    /// is left, delete the job from the queue in the same transaction, lease
+    /// included. Only the database store keeps the markers next to the queue;
+    /// the object stores reject this operation.
+    async fn end_membership(
+        &self,
+        job_id: &JobId,
+        plan_id: &PlanId,
+    ) -> anyhow::Result<MembershipEnd>;
+
+    /// Write the membership marker of `plan_id` on a job that a merge joins.
+    /// The database store also writes the job's queue row in this transaction.
+    /// A concurrent [`end_membership`](Self::end_membership) conflicts with
+    /// this write, so one transaction retries. The method returns
+    /// [`JobJoin::Gone`] without a marker if the queue does not hold
+    /// the job. The object stores reject this operation.
+    async fn join_job(
+        &self,
+        job_id: &JobId,
+        plan_id: &PlanId,
+        expires_at: ExpiresAt,
+    ) -> anyhow::Result<JobJoin>;
+
+    // ── plan-index GC candidates ────────────────────────────────────────────
+    //
+    // The plan-index keys that the last `queue-maintenance` run found
+    // orphaned. The run deletes a key only when it finds the key orphaned a
+    // second time. Only the database store keeps the set; the object stores
+    // reject these operations.
+
+    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>>;
+
+    /// Replace the set with `candidates`.
+    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()>;
 
     // ── plan-sources/{plan_id}.toml ─────────────────────────────────────────
     //
@@ -2662,9 +2852,41 @@ pub enum ClaimOutcome {
     Granted {
         lease: Lease,
         body: serde_json::Value,
+        affinity: ClaimAffinity,
     },
     /// The client holds no live lease and no eligible job is free.
     Empty,
+}
+
+/// Which artifacts of a granted job the client already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAffinity {
+    /// The client held the model and the runtime.
+    Both,
+    Model,
+    Runtime,
+    /// The client held neither, or the backend does not track affinity.
+    None,
+}
+
+impl ClaimAffinity {
+    pub fn new(model: bool, runtime: bool) -> Self {
+        match (model, runtime) {
+            (true, true) => Self::Both,
+            (true, false) => Self::Model,
+            (false, true) => Self::Runtime,
+            (false, false) => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Model => "model",
+            Self::Runtime => "runtime",
+            Self::None => "none",
+        }
+    }
 }
 
 /// The result of [`TodoStore::reclaim_for_client`].
@@ -2685,65 +2907,19 @@ pub enum ReclaimOutcome {
     Refused,
 }
 
-/// Claims the job under `marker_expires_at`. A re-date ([`TodoStore::redate_avail`])
-/// between the eligibility read and the claim can invalidate the marker's key. After a
-/// miss, retry once with the job's current key.
-async fn claim_at_current_key<S: TodoStore + ?Sized>(
-    todo: &S,
-    client_id: &ClientId,
-    job_id: &JobId,
-    marker_expires_at: ExpiresAt,
-    lease_expiry: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<Option<(ExpiresAt, serde_json::Value)>> {
-    if let ClaimResult::Claimed(body) = todo
-        .claim_job(job_id, marker_expires_at, client_id, lease_expiry)
-        .await?
-    {
-        return Ok(Some((marker_expires_at, body)));
-    }
-    let Some(current) = todo
-        .avail_key_for_job(job_id)
-        .await?
-        .and_then(|name| parse_avail_filename(&name).ok())
-        .map(|(_, expires_at)| expires_at)
-    else {
-        return Ok(None);
-    };
-    // The same key, or one already past: nothing a retry can win.
-    if current == marker_expires_at || current.is_expired(now) {
-        return Ok(None);
-    }
-    let ClaimResult::Claimed(body) = todo
-        .claim_job(job_id, current, client_id, lease_expiry)
-        .await?
-    else {
-        return Ok(None);
-    };
-    tracing::warn!(
-        client_id = %client_id,
-        job_id = %job_id,
-        marker_expires_at = %marker_expires_at,
-        key_expires_at = %current,
-        "claimed a job under the deadline its avail/ key carries; the client's eligible marker \
-         names an older one, which the next queue-maintenance run collects"
-    );
-    Ok(Some((current, body)))
-}
-
-fn parse_queue_lease(key: &str) -> Option<Lease> {
-    parse_leased_key(key)
-        .inspect_err(|error| {
-            tracing::warn!(%key, %error, "skipping unparseable lease key");
-        })
-        .ok()
-}
-
 /// An available queue entry, without its body. Expired entries are included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AvailEntry {
     pub job_id: JobId,
     pub expires_at: ExpiresAt,
+}
+
+/// One pending-reindex flag on a client. The store assigns `request_id`, and
+/// each request has its own ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReindexRequest {
+    pub client_id: ClientId,
+    pub request_id: String,
 }
 
 /// An available job that carries the reindex flag, as
@@ -2767,21 +2943,6 @@ pub struct ReindexBatch {
     pub unreadable: Vec<JobId>,
 }
 
-/// A queue operation that only the database queue supports.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{operation} needs the database queue: set `backend = \"database\"` under `[todo_storage]`"
-)]
-pub struct QueueNeedsDatabaseError {
-    pub operation: &'static str,
-}
-
-impl QueueNeedsDatabaseError {
-    pub fn new(operation: &'static str) -> Self {
-        Self { operation }
-    }
-}
-
 #[async_trait]
 pub trait TodoStore: Send + Sync {
     /// The count of full job bodies that this store fetches from the queue.
@@ -2795,75 +2956,26 @@ pub trait TodoStore: Send + Sync {
     /// Returns the availability entries for these jobs. The entries include
     /// expired deadlines, in an unspecified order. An empty list of jobs returns
     /// no rows. A repeated job ID returns one row.
-    async fn avail_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<AvailEntry>> {
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let jobs: HashSet<_> = jobs.iter().collect();
-        let keys = self.list_avail().await?;
-        reject_unmigrated_avail_keys(keys.iter().map(String::as_str))?;
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| match parse_avail_filename(&key) {
-                Ok((job_id, expires_at)) if jobs.contains(&job_id) => {
-                    Some(AvailEntry { job_id, expires_at })
-                }
-                Ok(_) => None,
-                Err(error) => {
-                    tracing::warn!(%key, %error, "skipping unparseable avail filename");
-                    None
-                }
-            })
-            .collect())
-    }
+    async fn avail_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<AvailEntry>>;
 
     /// Returns every lease that this client holds. The result includes lapsed
     /// leases, in an unspecified order.
-    async fn leases_for_client(&self, client: &ClientId) -> anyhow::Result<Vec<Lease>> {
-        Ok(self
-            .list_leased_for_client(client)
-            .await?
-            .into_iter()
-            .filter_map(|key| parse_queue_lease(&key))
-            .collect())
-    }
+    async fn leases_for_client(&self, client: &ClientId) -> anyhow::Result<Vec<Lease>>;
 
     /// Returns every lease on these jobs. The result includes lapsed leases, in
     /// an unspecified order. An empty list of jobs returns no rows. A repeated
     /// job ID returns its leases once.
-    async fn leases_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<Lease>> {
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let jobs: HashSet<_> = jobs.iter().collect();
-        Ok(self
-            .list_leased()
-            .await?
-            .into_iter()
-            .filter_map(|key| parse_queue_lease(&key))
-            .filter(|lease| jobs.contains(&lease.job_id))
-            .collect())
-    }
+    async fn leases_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<Lease>>;
 
     /// Returns each pair of a job and a client that the job denies, for these
     /// jobs, in an unspecified order. An empty list of jobs returns no rows. A
     /// repeated job ID returns its pairs once.
-    async fn denials_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<(JobId, ClientId)>> {
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let jobs: HashSet<_> = jobs.iter().collect();
-        Ok(self
-            .list_all_denied()
-            .await?
-            .into_iter()
-            .filter(|(job, _)| jobs.contains(job))
-            .collect())
-    }
+    async fn denials_for_jobs(&self, jobs: &[JobId]) -> anyhow::Result<Vec<(JobId, ClientId)>>;
 
     // ── avail/ ──────────────────────────────────────────────────────────────
-    /// Every `{job_id}/{expires_at}.json` key, in key order.
-    async fn list_avail(&self) -> anyhow::Result<Vec<String>>;
+    /// Every available entry, in byte order of the job ID. The result includes
+    /// expired entries.
+    async fn list_avail_entries(&self) -> anyhow::Result<Vec<AvailEntry>>;
 
     async fn get_avail(
         &self,
@@ -2883,11 +2995,9 @@ pub trait TodoStore: Send + Sync {
     async fn get_avail_by_job(&self, job_id: &JobId) -> anyhow::Result<Option<serde_json::Value>>;
 
     // ── leased/ ─────────────────────────────────────────────────────────────
-    /// Every `{client_id}/{job_id}.{expires_at}.{lease_expiry}.json` key.
-    /// Prefer `list_leased_for_client` when the client is known.
-    async fn list_leased(&self) -> anyhow::Result<Vec<String>>;
-
-    async fn list_leased_for_client(&self, client_id: &ClientId) -> anyhow::Result<Vec<String>>;
+    /// Every lease, lapsed leases included, in an unspecified order. Prefer
+    /// [`Self::leases_for_client`] when the client is known.
+    async fn list_leases(&self) -> anyhow::Result<Vec<Lease>>;
 
     /// For the idempotent `claim` path: hands a re-polling client back its job
     /// without renewing the lease.
@@ -2940,6 +3050,21 @@ pub trait TodoStore: Send + Sync {
     /// concurrent claims can give the client two leases. A backend with transactions runs
     /// them as one. A terminal job or pending record repair returns
     /// [`ClaimOutcome::SettlementRequired`]; settle its lapsed leases before retrying.
+    ///
+    /// A backend that keeps the family of [`Self::promote_avail`] hands out,
+    /// within one deadline, a job with fewer smaller runs of its family queued,
+    /// leased or not, first: runs no larger in any size and smaller in one.
+    ///
+    /// `cached` is what the client says it holds. A backend that tracks cache
+    /// affinity then prefers the model that the fewest other clients lease among
+    /// the client's eligible jobs, then a job whose model or runtime the client
+    /// holds. Without `cached`, it uses the artifacts of the last job it granted
+    /// to the client, unless [`Self::forget_last_grant`] cleared them. The
+    /// default ignores `cached`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is one input of the claim transaction; a bundle type would be single-use"
+    )]
     async fn claim_for_client(
         &self,
         client_id: &ClientId,
@@ -2947,88 +3072,9 @@ pub trait TodoStore: Send + Sync {
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&Lease>,
+        cached: Option<&CachedArtifacts>,
         now: DateTime<Utc>,
-    ) -> anyhow::Result<ClaimOutcome> {
-        // A listing can surface both keys of a renewal rename; the later one is live.
-        let leases = self.leases_for_client(client_id).await?;
-        if leases.iter().any(|lease| {
-            lease.lease_expiry <= now
-                && !leases
-                    .iter()
-                    .any(|live| live.job_id == lease.job_id && live.lease_expiry > now)
-        }) {
-            return Ok(ClaimOutcome::SettlementRequired);
-        }
-        let held = leases
-            .into_iter()
-            .filter(|lease| lease.lease_expiry > now)
-            .max_by_key(|lease| lease.lease_expiry);
-        if let Some(lease) = held
-            && let Some(body) = self
-                .get_leased(
-                    &lease.job_id,
-                    lease.expires_at,
-                    client_id,
-                    lease.lease_expiry,
-                )
-                .await?
-        {
-            if checked_lease != Some(&lease) {
-                return Ok(ClaimOutcome::CheckHeldLease { lease, body });
-            }
-            if lost_lease_limit > 0 {
-                self.write_lost_lease(&lease.job_id, client_id, lease.lease_expiry)
-                    .await?;
-                if self.list_lost_leases(&lease.job_id).await?.len() >= lost_lease_limit {
-                    return Ok(ClaimOutcome::Withheld(lease));
-                }
-            }
-            return Ok(ClaimOutcome::HandedBack { lease, body });
-        }
-
-        // The random tiebreak keeps clients from stampeding one job in a tier
-        // that a planner run stamped with a single expiry.
-        let mut ranked = self
-            .list_eligible_for_client(client_id)
-            .await?
-            .into_iter()
-            // Without the expiry filter the sort would prefer an unswept expired job.
-            .filter(|(job_id, exp)| !exp.is_expired(now) && !passed_over.contains(job_id))
-            .map(|(job_id, exp)| {
-                SysRng
-                    .try_next_u64()
-                    .map(|tiebreak| (job_id, exp, tiebreak))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
-        for (job_id, marker_expires_at, _) in ranked {
-            // A point read per candidate, not a listing of all of `denied/`.
-            if self.is_denied(&job_id, client_id).await? {
-                continue;
-            }
-            // A miss falls through to the next candidate: another claimer took
-            // the job between the listing and the rename, or it left the queue.
-            if let Some((expires_at, body)) = claim_at_current_key(
-                self,
-                client_id,
-                &job_id,
-                marker_expires_at,
-                lease_expiry,
-                now,
-            )
-            .await?
-            {
-                let lease = Lease {
-                    job_id,
-                    expires_at,
-                    client_id: client_id.clone(),
-                    lease_expiry,
-                };
-                return Ok(ClaimOutcome::Granted { lease, body });
-            }
-        }
-        Ok(ClaimOutcome::Empty)
-    }
+    ) -> anyhow::Result<ClaimOutcome>;
 
     /// Renews the client's lease on `job_id` to `lease_expiry`. If the client
     /// does not hold the job, leases the job to it on the conditions of
@@ -3044,67 +3090,11 @@ pub trait TodoStore: Send + Sync {
         job_id: &JobId,
         client_id: &ClientId,
         lease_expiry: DateTime<Utc>,
-        _lost_lease_limit: usize,
+        lost_lease_limit: usize,
         now: DateTime<Utc>,
-    ) -> anyhow::Result<ReclaimOutcome> {
-        let leases = self.leases_for_client(client_id).await?;
-        if leases.iter().any(|lease| {
-            &lease.job_id != job_id
-                && lease.lease_expiry <= now
-                && !leases
-                    .iter()
-                    .any(|live| live.job_id == lease.job_id && live.lease_expiry > now)
-        }) {
-            return Ok(ReclaimOutcome::SettlementRequired);
-        }
-        match self.renew_lease(job_id, client_id, lease_expiry).await? {
-            RenewLeaseResult::Renewed(_) => return Ok(ReclaimOutcome::Renewed),
-            RenewLeaseResult::WrongClient => return Ok(ReclaimOutcome::LeasedElsewhere),
-            RenewLeaseResult::NotFound => {}
-        }
-        let holds_another = self
-            .leases_for_client(client_id)
-            .await?
-            .iter()
-            .any(|lease| lease.lease_expiry > now);
-        if holds_another {
-            return Ok(ReclaimOutcome::Refused);
-        }
-        let Some((_, expires_at)) = self
-            .list_eligible_for_client(client_id)
-            .await?
-            .into_iter()
-            .find(|(candidate, _)| candidate == job_id)
-        else {
-            return Ok(ReclaimOutcome::Refused);
-        };
-        if expires_at.is_expired(now) || self.is_denied(job_id, client_id).await? {
-            return Ok(ReclaimOutcome::Refused);
-        }
-        Ok(
-            match self
-                .claim_job(job_id, expires_at, client_id, lease_expiry)
-                .await?
-            {
-                ClaimResult::Claimed(body) => ReclaimOutcome::Granted {
-                    lease: Lease {
-                        job_id: job_id.clone(),
-                        expires_at,
-                        client_id: client_id.clone(),
-                        lease_expiry,
-                    },
-                    body,
-                },
-                ClaimResult::Gone => ReclaimOutcome::Refused,
-            },
-        )
-    }
+    ) -> anyhow::Result<ReclaimOutcome>;
 
     // ── avail/ → avail/ (re-date) ───────────────────────────────────────────
-    /// The job's `avail/` key, which carries its live deadline. A read failure
-    /// propagates: a swallowed one would read a live job as gone.
-    async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>>;
-
     /// Atomic rename to a new deadline; the body is untouched, so the key is
     /// authoritative. Only the serialized expiry pass calls it, and a claim
     /// that moved the entry first makes it [`RedateResult::Gone`].
@@ -3114,6 +3104,12 @@ pub trait TodoStore: Send + Sync {
         from: ExpiresAt,
         to: ExpiresAt,
     ) -> anyhow::Result<RedateResult>;
+
+    /// In one statement, set each available job's deadline to the earliest
+    /// horizon among its member plans that has not passed at `now`, `never`
+    /// after every date. A plan's horizon is the latest of its markers. A leased
+    /// job and a job with no such member keep theirs. Returns the jobs changed.
+    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64>;
 
     // ── leased/ → avail/ (lease recycle) ────────────────────────────────────
     /// Atomic rename back to the exact key the job was claimed from; a pure
@@ -3126,8 +3122,15 @@ pub trait TodoStore: Send + Sync {
         lease_expiry: DateTime<Utc>,
     ) -> anyhow::Result<RecycleResult>;
 
+    /// Forgets the artifacts of the last job granted to `client_id` if that job
+    /// is `job_id`. The server calls it after a failure report or before
+    /// reverting a grant that post-grant checks reject. The client may not hold
+    /// the job's artifacts. The default tracks no grants and does nothing.
+    async fn forget_last_grant(&self, job_id: &JobId, client_id: &ClientId) -> anyhow::Result<()>;
+
     // ── denied/ ─────────────────────────────────────────────────────────────
-    /// A second write for the same pair replaces the body.
+    /// A second write for the same pair replaces the body. The database queue
+    /// writes nothing for a job that it does not hold.
     async fn write_denied(
         &self,
         job_id: &JobId,
@@ -3157,7 +3160,7 @@ pub trait TodoStore: Send + Sync {
     ) -> anyhow::Result<Vec<(JobId, ExpiresAt)>>;
     /// An object store names the marker with `expires_at`, which must match
     /// the job's `avail/` entry. The database queue reads the deadline from
-    /// the job.
+    /// the job, and writes nothing for a job that it does not hold.
     async fn write_eligible(
         &self,
         client_id: &ClientId,
@@ -3175,13 +3178,13 @@ pub trait TodoStore: Send + Sync {
     async fn list_all_eligible(&self) -> anyhow::Result<Vec<(ClientId, JobId, ExpiresAt)>>;
 
     // ── pending-reindex/ ────────────────────────────────────────────────────
-    // One fresh `{client_id}.{uuid}` key per request, never overwritten: the
-    // pass deletes only the keys it captured, so a flag raised mid-rebuild survives.
+    // Each write adds a new request with its own ID. The pass deletes only the
+    // requests it captured, so a flag raised mid-rebuild survives.
     async fn write_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<()>;
-    /// `(client_id, key)` per flag; unparseable names are warned and skipped.
-    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<(ClientId, String)>>;
-    /// Idempotent.
-    async fn delete_pending_reindex(&self, key: &str) -> anyhow::Result<()>;
+    /// Every pending request, ordered by client and then by request ID.
+    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<ReindexRequest>>;
+    /// Deletes this one request. Idempotent.
+    async fn delete_pending_reindex(&self, request: &ReindexRequest) -> anyhow::Result<()>;
     /// The claim gate. An unreadable listing is an error: "couldn't check" must
     /// not read as "not flagged".
     async fn has_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<bool>;
@@ -3190,62 +3193,48 @@ pub trait TodoStore: Send + Sync {
     // Each job carries a reindex flag. An insert, a recycle and a re-date set
     // it, as does a denial. `queue-maintenance` rebuilds the job's
     // eligibility and clears the flag.
-    // Only the database queue keeps the flag; the object stores return
-    // [`QueueNeedsDatabaseError`].
     /// The flagged available jobs among `jobs`, with their bodies. Excluded
     /// jobs' bodies are not decoded. A leased job keeps its flag until it returns.
     /// An empty list returns no jobs. Repeated IDs return each job once.
     /// A body that does not parse puts its job in
     /// [`ReindexBatch::unreadable`]; the other jobs still return.
-    async fn jobs_needing_reindex(&self, _jobs: &[JobId]) -> anyhow::Result<ReindexBatch> {
-        Err(QueueNeedsDatabaseError::new("jobs_needing_reindex").into())
-    }
+    async fn jobs_needing_reindex(&self, jobs: &[JobId]) -> anyhow::Result<ReindexBatch>;
     /// Distinct matcher inputs and their available job IDs among `jobs`.
     /// The method omits jobs on lease and jobs that do not exist.
     /// The method reads no job bodies.
     async fn avail_clause_groups(
         &self,
-        _jobs: &[JobId],
-    ) -> anyhow::Result<Vec<(serde_json::Value, Vec<JobId>)>> {
-        Err(QueueNeedsDatabaseError::new("avail_clause_groups").into())
-    }
+        jobs: &[JobId],
+    ) -> anyhow::Result<Vec<(serde_json::Value, Vec<JobId>)>>;
     /// Insert a client's eligibility rows in one batch. The method is idempotent.
-    async fn write_eligible_rows(&self, _client: &ClientId, _jobs: &[JobId]) -> anyhow::Result<()> {
-        Err(QueueNeedsDatabaseError::new("write_eligible_rows").into())
-    }
+    /// It skips each job that the queue does not hold.
+    async fn write_eligible_rows(&self, client: &ClientId, jobs: &[JobId]) -> anyhow::Result<()>;
     /// Replace the job's eligibility with `clients`. Clear its flag in the same
     /// transaction. The method returns `false` without changes if the revision
     /// differs. A concurrent claim, re-date, or deletion preserves the flag for
     /// a later pass.
     async fn replace_eligibility(
         &self,
-        _job_id: &JobId,
-        _revision: i64,
-        _clients: &[ClientId],
-    ) -> anyhow::Result<bool> {
-        Err(QueueNeedsDatabaseError::new("replace_eligibility").into())
-    }
+        job_id: &JobId,
+        revision: i64,
+        clients: &[ClientId],
+    ) -> anyhow::Result<bool>;
     /// Set the flag on each job that exists, leased or available.
-    async fn flag_for_reindex(&self, _jobs: &[JobId]) -> anyhow::Result<()> {
-        Err(QueueNeedsDatabaseError::new("flag_for_reindex").into())
-    }
+    async fn flag_for_reindex(&self, jobs: &[JobId]) -> anyhow::Result<()>;
     /// The jobs among `jobs` that carry the flag.
-    async fn jobs_awaiting_index(&self, _jobs: &[JobId]) -> anyhow::Result<HashSet<JobId>> {
-        Err(QueueNeedsDatabaseError::new("jobs_awaiting_index").into())
-    }
+    async fn jobs_awaiting_index(&self, jobs: &[JobId]) -> anyhow::Result<HashSet<JobId>>;
     /// The workers that the last index pass matched against, to find who
     /// joined or left.
-    async fn read_workers(&self) -> anyhow::Result<HashSet<ClientId>> {
-        Err(QueueNeedsDatabaseError::new("read_workers").into())
-    }
-    async fn write_workers(&self, _workers: &HashSet<ClientId>) -> anyhow::Result<()> {
-        Err(QueueNeedsDatabaseError::new("write_workers").into())
-    }
+    async fn read_workers(&self) -> anyhow::Result<HashSet<ClientId>>;
+    async fn write_workers(&self, workers: &HashSet<ClientId>) -> anyhow::Result<()>;
+    /// Remove one client from the worker set. The method is idempotent.
+    async fn delete_worker(&self, client_id: &ClientId) -> anyhow::Result<()>;
 
     // ── lost/{job_id}/{client_id}.{lease_expiry} ────────────────────────────
     // One marker per lease that ended without a result; queue-maintenance
     // retires the job at `plan_lost_lease_limit`.
-    /// Idempotent: the key names the lease.
+    /// Idempotent: the key names the lease. The database queue writes nothing
+    /// for a job that it does not hold.
     async fn write_lost_lease(
         &self,
         job_id: &JobId,
@@ -3274,78 +3263,63 @@ pub trait TodoStore: Send + Sync {
     /// surfaces. A missing `tmp/` source is an error. A backend whose client
     /// retries a rename treats the source as moved when the destination exists,
     /// because an earlier attempt completed.
-    async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()>;
-
-    async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>>;
-    async fn delete_tmp_object(&self, key: &str) -> anyhow::Result<()>;
-
-    // ── backlog snapshots ────────────────────────────────────────────────────
-    /// `None` before the first run, or when corrupt ([`parse_snapshot`]).
-    async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>>;
-    async fn write_backlog(&self, snapshot: &BacklogSnapshot) -> anyhow::Result<()>;
-    /// `None` before the first run, or when corrupt ([`parse_snapshot`]).
-    async fn read_campaign_backlog(&self) -> anyhow::Result<Option<CampaignBacklogSnapshot>>;
-    async fn write_campaign_backlog(
+    ///
+    /// `family` is the job's family key and its run's sizes, in the one order of
+    /// its benchmark type; `None` for a job in no family. Only the database
+    /// queue keeps it, to hand out a family's smaller runs first.
+    async fn promote_avail(
         &self,
-        snapshot: &CampaignBacklogSnapshot,
+        job_id: &JobId,
+        expires_at: ExpiresAt,
+        family: Option<(&str, &[i64])>,
     ) -> anyhow::Result<()>;
 
-    // ── GC orphan candidates ─────────────────────────────────────────────────
-    /// Keys the last run saw orphaned; the sweep deletes only on the second
-    /// sighting. Missing or corrupt reads as empty, delaying GC by one run.
-    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>>;
-    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()>;
+    /// The larger runs of `job_id`'s family, no smaller in any size and larger
+    /// in one, that are queued and not leased, with their bodies. Only the
+    /// database queue keeps the family of [`Self::promote_avail`]; the other
+    /// stores answer none.
+    async fn queued_larger_runs(
+        &self,
+        _job_id: &JobId,
+    ) -> anyhow::Result<Vec<(AvailEntry, serde_json::Value)>> {
+        Ok(Vec::new())
+    }
+
+    /// Deletes each staged job body that is `age` old or older, and returns
+    /// the count of deleted bodies.
+    async fn delete_stale_tmp(&self, age: Duration) -> anyhow::Result<u64>;
+
+    // ── backlog ─────────────────────────────────────────────────────────────
+    // A job counts for a client when a claim would accept it: the client is
+    // indexed for the job, and the job is unleased, before its deadline and
+    // not denied to the client.
+    /// The count of each client. A client with no claimable job has no entry.
+    async fn backlog(&self) -> anyhow::Result<BTreeMap<ClientId, u64>>;
+    /// The count of one client, by campaign. Exclude creating plans whose
+    /// `created_at` is at or before `creating_before`.
+    async fn campaign_backlog(
+        &self,
+        client_id: &ClientId,
+        creating_before: DateTime<Utc>,
+    ) -> anyhow::Result<CampaignBacklog>;
 
     // ── liveness/ ───────────────────────────────────────────────────────────
     /// A blind write of an empty marker whose modification time is the
     /// last-seen time; on S3 the server's clock sets it, so replicas agree.
+    /// The database store writes only while the client record exists.
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()>;
     async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>>;
     /// One listing, no body read; a name that is not a client id is warned and skipped.
     async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>>;
     /// Idempotent.
     async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()>;
-
-    // ── startup validation ────────────────────────────────────────────────────
-    /// Fail fast if this backend cannot do the atomic renames claim and renew
-    /// depend on (S3 needs Express One Zone).
-    async fn validate_backend(&self) -> anyhow::Result<()>;
-}
-
-/// Sets the last-seen time of a device to a given instant. Only `queue import`
-/// uses it, to keep the modification time of each `liveness/` marker that it
-/// copies. A server records liveness with [`TodoStore::stamp_liveness`].
-#[async_trait]
-pub trait LivenessImport: Send + Sync {
-    async fn set_liveness(
-        &self,
-        client_id: &ClientId,
-        last_seen_at: DateTime<Utc>,
-    ) -> anyhow::Result<()>;
-}
-
-/// The jobs each client could claim, as one `queue-maintenance` run counted them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BacklogSnapshot {
-    /// The run's start; every listing counted is from then or later.
-    pub counted_at: DateTime<Utc>,
-    /// A client with no claimable job has no entry.
-    pub jobs: BTreeMap<ClientId, u64>,
-}
-
-/// The jobs each client could claim, by campaign, as one `queue-maintenance`
-/// run counted them. Only the device page reads this snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CampaignBacklogSnapshot {
-    /// The run's start, the same as the [`BacklogSnapshot`] of the run.
-    pub counted_at: DateTime<Utc>,
-    /// A client with no claimable job has no entry.
-    pub devices: BTreeMap<ClientId, CampaignBacklog>,
 }
 
 /// One client's claimable jobs, by campaign. A job counts once in each
 /// campaign that holds it, so the counts can add up to more than the total.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A campaign holds a job through an unexpired membership of one of its
+/// plans, if the plan is not cancelled and its cancellation has not started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CampaignBacklog {
     /// The distinct jobs that the plans of each campaign hold.
     pub by_campaign: BTreeMap<CampaignId, u64>,
@@ -3367,6 +3341,8 @@ pub struct Stores {
     pub todo: Arc<dyn TodoStore>,
     pub plans: Arc<dyn PlanStore>,
     pub campaigns: Arc<dyn CampaignStore>,
+    /// `None` without a `[database]`: no object store keeps campaign groups.
+    pub campaign_groups: Option<Arc<dyn CampaignGroupStore>>,
     pub model_params: Arc<dyn ModelParamsStore>,
     /// `None` without a `[database]`: no object store keeps the audit log.
     pub audit: Option<Arc<dyn AuditStore>>,
@@ -3386,14 +3362,17 @@ pub struct Stores {
 pub struct AuditStores {
     pub orgs: Arc<dyn OrgStore>,
     pub campaigns: Arc<dyn CampaignStore>,
+    /// `None` without a `[database]`: no object store keeps campaign groups.
+    pub campaign_groups: Option<Arc<dyn CampaignGroupStore>>,
     pub plans: Arc<dyn PlanStore>,
     pub vault: Arc<dyn VaultRecords>,
     pub log: Arc<dyn AuditStore>,
 }
 
-/// Best-effort removal of a deleted client's `todo/` state. Failures are
-/// logged, not propagated: the identity is already gone, leftovers are inert,
-/// and `queue-maintenance`'s orphan sweep collects them within two runs.
+/// Best-effort removal of a deleted client's queue state. Failures are
+/// logged, not propagated: the identity is already gone. Keep the worker row
+/// and reindex flags if eligibility cleanup fails so maintenance retries it.
+/// The client's leases and denials stay; the caller settles the leases.
 pub async fn purge_client_todo_state(todo: &dyn TodoStore, client_id: &ClientId) {
     if let Err(e) = todo.delete_liveness(client_id).await {
         tracing::warn!(client_id = %client_id, error = %e,
@@ -3402,15 +3381,18 @@ pub async fn purge_client_todo_state(todo: &dyn TodoStore, client_id: &ClientId)
     if let Err(e) = todo.delete_eligible_for_client(client_id).await {
         tracing::warn!(client_id = %client_id, error = %e,
             "failed to delete eligible markers while deleting client");
+        // Keep the worker row and reindex flags so maintenance retries cleanup.
+        return;
+    }
+    if let Err(e) = todo.delete_worker(client_id).await {
+        tracing::warn!(client_id = %client_id, error = %e,
+            "failed to delete the worker row while deleting client");
     }
     match todo.list_pending_reindex().await {
         Ok(flags) => {
-            for (_, key) in flags
-                .into_iter()
-                .filter(|(flagged, _)| flagged == client_id)
-            {
-                if let Err(e) = todo.delete_pending_reindex(&key).await {
-                    tracing::warn!(client_id = %client_id, key = %key, error = %e,
+            for request in flags.iter().filter(|r| r.client_id == *client_id) {
+                if let Err(e) = todo.delete_pending_reindex(request).await {
+                    tracing::warn!(client_id = %client_id, request_id = %request.request_id, error = %e,
                         "failed to delete pending-reindex flag while deleting client");
                 }
             }
@@ -3643,37 +3625,6 @@ pub async fn reindex_tags(
         .try_collect::<Vec<_>>()
         .await?;
     Ok(report)
-}
-
-/// Refuse a flat `{job_id}.{expires_at}.json` key from an earlier layout. This
-/// build would read such a job as absent and silently sweep its markers,
-/// losing its plan membership for good.
-pub fn reject_unmigrated_avail_keys<'a>(
-    keys: impl IntoIterator<Item = &'a str>,
-) -> Result<(), UnmigratedAvailKeyError> {
-    match keys
-        .into_iter()
-        .find(|key| pipette_core::todo_filename::parse_flat_avail_filename(key).is_ok())
-    {
-        Some(key) => Err(UnmigratedAvailKeyError(key.to_string())),
-        None => Ok(()),
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "avail/ holds the single-segment key {0:?} from an earlier layout; drain the \
-     queue with the earlier build (cancel every plan and let its queue-maintenance \
-     empty avail/), then deploy this build and re-ingest the plans"
-)]
-pub struct UnmigratedAvailKeyError(String);
-
-/// For `serve` at startup. `queue-maintenance` checks the listing it already
-/// holds instead, to avoid a second listing of the whole prefix.
-pub async fn ensure_avail_layout_migrated(todo: &dyn TodoStore) -> anyhow::Result<()> {
-    let keys = todo.list_avail().await?;
-    reject_unmigrated_avail_keys(keys.iter().map(String::as_str))?;
-    Ok(())
 }
 
 /// Max in-flight object-store requests for a fan-out over many keys.

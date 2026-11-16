@@ -18,10 +18,10 @@ use pipette_pipeline::plan_results::JOB_RESULTS_TIMEOUT;
 use pipette_plan_types::{CampaignId, OrgId, PlanId, UserId, UserPermission};
 use pipette_web_testkit::{
     DUCKDB_TIMEOUT, FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner, add_starved_snapshot,
-    approved_client, body_json, created_campaign, file_job_bodies, filed_plan, json_str,
-    post_plan_document, put_idle_campaign, put_plan_document, registered_user, seed_org,
-    seeded_sql_state, seeded_state, set_user_org, signed_empty, signed_json, user_address,
-    with_duckdb,
+    approved_client, approved_object_client, body_json, created_campaign, file_job_bodies,
+    filed_plan, json_str, post_plan_document, put_idle_campaign, put_plan_document,
+    registered_user, seed_org, seeded_object_state, seeded_sql_state, seeded_state, set_user_org,
+    signed_empty, signed_json, user_address, with_duckdb,
 };
 
 async fn read(
@@ -158,7 +158,7 @@ async fn duckdb_campaign() -> anyhow::Result<DuckdbCampaign> {
 #[tokio::test]
 async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (state, _key, client_id) = approved_object_client(dir.path()).await?;
     let owner = registered_user(&state, FULL_EDITOR).await?;
     let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
     let head = filed_plan(&state, &owner, &campaign_id, &client_id, "second").await?;
@@ -182,6 +182,7 @@ async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Res
             "current_plan_id",
             "device_time_all_plans",
             "device_time_current_plan",
+            "group",
             "history",
             "history_truncated",
             "may_administer",
@@ -201,6 +202,8 @@ async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Res
     assert_eq!(body["history_truncated"], json!(false));
     // No `[duckdb]` is configured.
     assert_no_totals(&body);
+    // Nor a `[database]`, which alone keeps groups.
+    assert_eq!(body["group"], Value::Null);
 
     let rows = history(&body)?;
     let ids: Vec<&str> = rows
@@ -854,7 +857,7 @@ async fn test_the_overview_names_the_catalog_org(
 #[tokio::test]
 async fn test_the_overview_names_no_catalog_org_without_a_catalog() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
     let acme = seed_org(&state, "acme").await?.org_id;
     let author = member(&state, &acme, &CATALOG_AUTHOR).await?;
     let params = [("name", "Team"), ("owner", acme.as_str())];

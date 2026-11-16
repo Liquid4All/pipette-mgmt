@@ -117,11 +117,14 @@ mod tests {
     use super::*;
 
     fn stores(data_dir: &Path) -> anyhow::Result<Stores> {
-        build_local_fs_stores(&Config {
-            storage: StorageConfig::local_fs(data_dir.to_path_buf()),
-            auth_storage: StorageConfig::local_fs(data_dir.to_path_buf()),
-            ..Config::default()
-        })
+        build_local_fs_stores(
+            &Config {
+                storage: StorageConfig::local_fs(data_dir.to_path_buf()),
+                auth_storage: StorageConfig::local_fs(data_dir.to_path_buf()),
+                ..Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )
     }
 
     fn eval_failure(job_id: &JobId) -> Value {

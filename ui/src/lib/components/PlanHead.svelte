@@ -3,7 +3,7 @@
   // of its results. Progress has its own section; the queue's row warns only where its count may be stale or jobs
   // still queued are starved (`standing.ts`).
   import { when } from "../format";
-  import { changeText, shownStatus, starvedLine } from "../plans";
+  import { changeText, starvedLine } from "../plans";
   import { userLink } from "../routes";
   import { counted, expiryText, starvedNow } from "../standing";
   import type { PlanJobsWithResults } from "../api";
@@ -33,7 +33,7 @@
 
 <dl class="facts" aria-label="Plan">
   <div><dt>Status</dt>
-    <dd><StatusPill status={shownStatus(plan.status, plan.progress_snapshot?.counts)} />{#if plan.cancel_requested}{" "}cancel requested{/if}</dd></div>
+    <dd><StatusPill status={plan.status} />{#if plan.cancel_requested}{" "}cancel requested{/if}</dd></div>
   {#if plan.note}<div><dt>Note</dt><dd class="note">{plan.note}</dd></div>{/if}
   {#if plan.change}<div><dt>Change</dt><dd>{changeText(plan.change)}</dd></div>{/if}
   <div><dt>ID</dt><dd class="id">{plan.plan_id}</dd></div>

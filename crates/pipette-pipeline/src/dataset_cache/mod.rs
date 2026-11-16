@@ -129,7 +129,9 @@ pub fn stated_samples(benchmark: &pipette_core::benchmark::Benchmark) -> Option<
         | Def::VlMaxMemory(_)
         | Def::AsrThroughput(_)
         | Def::AsrMaxMemory(_)
-        | Def::VlSpecDecode(_) => None,
+        | Def::VlSpecDecode(_)
+        | Def::DecisionLatency(_)
+        | Def::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -430,7 +432,7 @@ async fn reach(
     }
 }
 
-/// One probe of `upstream` in a new scratch directory, stopped at `until`.
+/// Probe `upstream` in a new scratch directory until `until`.
 /// A git probe initializes its scratch repository, so each attempt needs its
 /// own directory.
 async fn attempt(
@@ -465,7 +467,7 @@ async fn attempt(
         Reached::Failed(state, _) => state.to_string(),
     };
     let elapsed_ms = started.elapsed().as_millis();
-    for digest in digests {
+    digests.iter().for_each(|digest| {
         tracing::debug!(
             event = "dataset_probe_attempt",
             upstream = upstream.reference(),
@@ -475,7 +477,7 @@ async fn attempt(
             outcome,
             "dataset upstream probe attempt finished"
         );
-    }
+    });
     reached
 }
 
@@ -1197,7 +1199,7 @@ mod tests {
             storage: StorageConfig::LocalFs { data_dir },
             ..Config::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_testkit::no_queue())
     }
 
     fn entry(subset: &str, pins: &Pins, revision: &GitOid) -> String {
@@ -1837,8 +1839,8 @@ digest   = "{digest}"
                         media.insert(path.to_owned(), file);
                         Ok(())
                     })?;
-                // Sorted as the scores service writes them: the test build's serde_json
-                // keeps insertion order (aws-sdk-s3's test-util enables preserve_order).
+                // Sorted as the scores service writes them: a test build's serde_json
+                // can keep insertion order (a dependency can enable preserve_order).
                 if let Some(kwargs) = &mut line.chat_template_kwargs {
                     kwargs.sort_keys();
                     kwargs
@@ -1941,10 +1943,13 @@ digest   = "{digest}"
                 data_dir.join("benchmarks/prefill_throughput_256.toml"),
                 "benchmark_type = \"prefill_throughput\"\nparameter_prefill_tokens = 256",
             )?;
-            build_local_fs_stores(&Config {
-                storage: StorageConfig::LocalFs { data_dir },
-                ..Config::default()
-            })
+            build_local_fs_stores(
+                &Config {
+                    storage: StorageConfig::LocalFs { data_dir },
+                    ..Config::default()
+                },
+                pipette_store_testkit::no_queue(),
+            )
         }
 
         /// Put the asr_eval entry pinning `pin` and stating `samples` samples
@@ -2037,10 +2042,13 @@ sources = ["https://huggingface.co/org/repo"]
                     ),
                 )?;
             }
-            build_local_fs_stores(&Config {
-                storage: StorageConfig::LocalFs { data_dir },
-                ..Config::default()
-            })
+            build_local_fs_stores(
+                &Config {
+                    storage: StorageConfig::LocalFs { data_dir },
+                    ..Config::default()
+                },
+                pipette_store_testkit::no_queue(),
+            )
         }
 
         async fn artifact(stores: &Stores, digest: &Sha256) -> anyhow::Result<DatasetArtifact> {

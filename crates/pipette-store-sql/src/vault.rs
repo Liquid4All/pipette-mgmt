@@ -306,7 +306,10 @@ mod tests {
             auth_storage: storage,
             ..Default::default()
         };
-        Ok(pipette_store_fs::build_local_fs_stores(&config)?.vault)
+        Ok(
+            pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?
+                .vault,
+        )
     }
 
     fn vault_over(

@@ -79,7 +79,7 @@ leave it out, and
 | [`GET /api/v1/clients`](devices/list_clients.md), [`GET /api/v1/clients/{client_id}`](devices/get_client.md), [`GET /api/v1/clients/capabilities`](devices/get_capability_vocabulary.md) | `403`: every field is a fleet fact |
 | The `warnings` of a filing route's report, and a plan's `warnings` and `progress_snapshot.starved_groups` | withheld tier |
 | [`GET /api/v1/plans/{plan_id}/explain`](plans/explain_plan.md): the `fleet` standing, clause ladder, roster and live match counts | withheld tier |
-| [`GET /api/v1/plans/{plan_id}/jobs`](plans/list_plan_jobs.md): lease holders and, with `results=true`, the device that ran each job and why it failed; the same in [`results.csv`](plans/get_plan_results_csv.md) | withheld tier |
+| [`GET /api/v1/plans/{plan_id}/jobs`](plans/list_plan_jobs.md): lease holders and, with `results=true`, the device that ran each job and the reason it failed (its `failure_code` is served as recorded); the same in [`results.csv`](plans/get_plan_results_csv.md) | withheld tier |
 | The plan document, which names client ids and requirement sets: [`/document`](plans/get_plan_document.md), [`/variants`](plans/get_plan_variants.md), a revision that starts from it ([variant edit](campaigns/edit_variants.md)), and a job body in [`GET /api/v1/jobs/{job_id}/plans`](plans/list_job_plans.md) | withheld whole; `403` where the document is the whole response |
 
 **The withheld tier keeps the route and drops the fleet**, so a submitter can
@@ -111,19 +111,22 @@ A `ClientListRow` is the stored record plus what the server reads beside it.
 | `derived_capabilities` | The flags the server derives from the `device_*` profile; with `capabilities` and `tags`, the set a job's clauses test ([capability matching](#capability-matching)) |
 | `reindex_pending` | The device takes no work until `queue-maintenance` re-evaluates its eligible jobs |
 | `last_seen_at` | The device's last verified, signed request to any device route, a refused one included, to within about a minute; `null` when the server holds no stamp. Age never clears it |
-| `backlog` | `job_count`, the queued jobs the device could claim (unleased, before their deadline, not denied by the device), as the `queue-maintenance` run that started at `counted_at` counted them; `null` before the first count or when the count cannot be read |
+| `backlog` | `job_count`, the queued jobs the device could claim (unleased, before their deadline, not denied by the device), counted at `counted_at`, the time of the request; `null` when the server cannot count them |
 | `contact_email` | Present only for a caller that administers the device ([The scope](#the-scope)), wherever a user reads a device record, the organization's roster and overview included |
 
-A `backlog` is at most one run old. A device that is not
-a worker counts zero, and one awaiting a reindex shows its count from before.
+The count follows the eligible index: a job counts after a `queue-maintenance`
+run indexes it for the device. A lease, a denial or a deadline changes the count
+at the next request. A device that is not a worker counts zero, and one
+awaiting a reindex shows the count of its current index.
 [`GET /api/v1/clients/{client_id}`](devices/get_client.md) adds
 `backlog_by_campaign`: each campaign the caller may read with the distinct jobs
 its plans hold (a job two campaigns hold counts in each, so the counts can sum
 past `backlog`), `outside_campaign_job_count` for jobs no campaign holds, and
 `unreadable_job_count` for the jobs of every other campaign. A campaign holds a
 job when one of its plans has a current membership for it and is not being torn
-down; `unreadable_job_count` also counts the jobs of a campaign whose record is
-gone.
+down. A creating plan at or past `plan_creating_max_age_secs` holds no job for
+this count, even if teardown fails. `unreadable_job_count` also counts the jobs
+of a campaign whose record is gone.
 
 ## Device status
 

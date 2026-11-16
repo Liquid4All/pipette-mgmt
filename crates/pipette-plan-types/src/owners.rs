@@ -101,7 +101,7 @@ impl OwnerFilter {
 }
 
 /// Query parameters every cursor-paginated listing of owned records takes:
-/// `/api/v1/campaigns` and `/api/v1/vault/resources`.
+/// `/api/v1/campaigns`, `/api/v1/campaign-groups` and `/api/v1/vault/resources`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OwnedListQuery {

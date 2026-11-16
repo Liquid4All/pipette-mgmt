@@ -434,7 +434,10 @@ mod tests {
             auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Config::default()
         };
-        let stores = pipette_store_sql::overlay(db.db(), build_local_fs_stores(&config)?);
+        let stores = pipette_store_sql::overlay(
+            db.db(),
+            build_local_fs_stores(&config, pipette_store_testkit::no_queue())?,
+        );
         let catalog = stores
             .descriptor_catalog
             .as_ref()

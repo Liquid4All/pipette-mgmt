@@ -219,18 +219,20 @@ pub fn require_document_detail(
 /// The bounds on a note that the type does not carry: a length limit, and no NUL
 /// character, which a PostgreSQL `text` column refuses.
 pub(crate) fn check_note(note: Option<&NonEmptyTrimmedString>) -> Result<(), AppError> {
-    let Some(note) = note else {
-        return Ok(());
-    };
-    if note.chars().count() > NOTE_MAX_CHARS {
+    note.map_or(Ok(()), |note| check_text("note", note))
+}
+
+/// [`check_note`]'s bounds on other text a filing stores, which `what` names.
+pub(crate) fn check_text(what: &str, text: &NonEmptyTrimmedString) -> Result<(), AppError> {
+    if text.chars().count() > NOTE_MAX_CHARS {
         return Err(AppError::BadRequest(format!(
-            "note is longer than {NOTE_MAX_CHARS} characters"
+            "{what} is longer than {NOTE_MAX_CHARS} characters"
         )));
     }
-    if note.contains('\0') {
-        return Err(AppError::BadRequest(
-            "note must not contain a NUL character".into(),
-        ));
+    if text.contains('\0') {
+        return Err(AppError::BadRequest(format!(
+            "{what} must not contain a NUL character"
+        )));
     }
     Ok(())
 }

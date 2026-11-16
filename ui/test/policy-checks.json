@@ -1,0 +1,173 @@
+[
+  {
+    "name": "a run that swapped no bytes did not swap",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 40, "value_stddev": null, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {"max_swap_bytes": 0}, "device": {}}
+    ]
+  },
+  {
+    "name": "a run that swapped 1 byte swapped",
+    "percent": 5,
+    "flagged": ["swap"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 40, "value_stddev": null, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {"max_swap_bytes": 1}, "device": {}}
+    ]
+  },
+  {
+    "name": "one run can swap and spread",
+    "percent": 5,
+    "flagged": ["swap", "spread"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 100, "value_stddev": 10, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {"max_swap_bytes": 4096}, "device": {}}
+    ]
+  },
+  {
+    "name": "a ratio has no spread",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "eval_test", "benchmark_type": "eval", "metric": "accuracy", "value": 0.5, "value_stddev": 0.2, "unit": "ratio", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a value of 0 has no spread",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 0, "value_stddev": 1, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a stddev of 0.165 on 3.3 is 5%, not over 5%",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 3.3, "value_stddev": 0.165, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a stddev of 0.166 on 3.3 is over 5%",
+    "percent": 5,
+    "flagged": ["spread"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 3.3, "value_stddev": 0.166, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a spread of 6% is not over 10%",
+    "percent": 10,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "decode_throughput_512_100", "benchmark_type": "decode_throughput", "metric": "decode", "value": 100, "value_stddev": 6, "unit": "tokens/sec", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "TTFT at 100.04% of E2E is not over",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 100.04, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "TTFT at 100.05% of E2E is not over: 100.05 over 100",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 100.05, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "TTFT at 100.05% of E2E is not over: 1000.5 over 1000",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 1000.5, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 1000, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "TTFT at 100.06% of E2E is over: 1000.6 over 1000",
+    "percent": 5,
+    "flagged": ["ttft_over_e2e"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 1000.6, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 1000, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a failed TTFT row is left out of the median",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 90, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 200, "value_stddev": null, "unit": "ms", "failed": true, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "the median of an even count is the mean of the middle two: 90% is not over",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 60, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 120, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "the median of an even count is the mean of the middle two: 101% is over",
+    "percent": 5,
+    "flagged": ["ttft_over_e2e"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 90, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 112, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a pair whose E2E is 0 gives way to the clock's next pair",
+    "percent": 5,
+    "flagged": ["ttft_over_e2e"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "ttft", "value": 50, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "end_to_end_latency", "value": 0, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "ttft_ms", "value": 120, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "e2e_ms", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a clock reads its first pair that has both medians",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "ttft", "value": 50, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "end_to_end_latency", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "ttft_ms", "value": 120, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "e2e_ms", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "the runtime's clock is read apart from the client's",
+    "percent": 5,
+    "flagged": ["ttft_over_e2e"],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "ttft_ms", "value": 50, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "e2e_ms", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "runtime_ttft", "value": 120, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}},
+      {"job_id": "job-1", "benchmark_id": "vl_spec_decode_256", "benchmark_type": "vl_spec_decode", "metric": "runtime_e2e_ms", "value": 100, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  },
+  {
+    "name": "a TTFT with no E2E is no pair",
+    "percent": 5,
+    "flagged": [],
+    "rows": [
+      {"job_id": "job-1", "benchmark_id": "vl_throughput_256", "benchmark_type": "vl_throughput", "metric": "ttft", "value": 120, "value_stddev": null, "unit": "ms", "failed": false, "failure_source": null, "failure_code": null, "parameters": {}, "observations": {}, "device": {}}
+    ]
+  }
+]

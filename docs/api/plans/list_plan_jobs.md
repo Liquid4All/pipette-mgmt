@@ -78,7 +78,7 @@ plan names the job it ran again, and a recalculation's after them, as its run
 names the one it scores again. A run not read by then is left out. A
 `scored` result's `rows` are [the result rows](get_plan_results_csv.md#result-rows), cut to the
 reader's tier; a failed run's rows each say `failed`, with its
-`failed_reason` and `failure_source`, and measure nothing. `recalculable` is
+`failed_reason`, `failure_source` and `failure_code`, and measure nothing. `recalculable` is
 judged only beside a `rerun_campaign_id`, and the route still decides.
 
 Each server keeps the runs and the `earlier_runs` of a `complete` plan for
@@ -114,7 +114,7 @@ rows of a vault run, but not on its planned cell.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `rerun_campaign_id` | string | The campaign this plan heads, when the caller may re-run and recalculate its jobs there ([`POST /api/v1/campaigns/{campaign_id}/rerun`](../campaigns/rerun_jobs.md)): it may file into the campaign and holds what a revision needs, over a plan with content digests. Absent otherwise, as on every plan the campaign no longer runs |
+| `rerun_campaign_id` | string | The campaign this plan heads, when the caller may re-run, mark and recalculate its jobs there ([`POST /api/v1/campaigns/{campaign_id}/rerun`](../campaigns/rerun_jobs.md)): it may file into the campaign and holds what a revision needs, over a plan with content digests. Absent otherwise, as on every plan the campaign no longer runs |
 | `may_cancel`, `cancel_permission` | | The grant cancelling this plan takes from the caller ([permissions](cancel_plan.md#permissions)), and whether it holds it. A `complete` or `cancelled` plan takes no cancel either way |
 | `document_state` | string | What the store holds of the plan's document ([`GET /api/v1/plans/{plan_id}/document`](get_plan_document.md)). Below the full tier, `present` says only that the plan names one |
 | `descriptor_names` | object | The catalog names of the runtime and model digests that the page shows, as the reader sees them ([the descriptor catalog](../descriptor-catalog.md)). Each digest is a key. `display` is the member selector that a row shows, for example `llamacpp-v0.7.0::linux-cuda-12-8` or `AcmeLM-VL-3B::gguf::q4_0`. `name` is the entry's name in `display`: bare, `global/<name>`, or `<org-slug>/<name>`. `synonyms` holds the selectors of the other names, in rank order. A digest with no name that the reader can read has no key. Absent without a `[database]`, and when no digest has a name |

@@ -236,7 +236,8 @@ pub struct JobInPlan {
     /// This plan's outcome for the job, whatever else is true of a job another
     /// plan shares.
     pub lapsed: Option<ExpiredJob>,
-    /// The job this one runs again.
+    /// The job this one runs again, or, for a job a re-run's `fail` minted,
+    /// the job whose cell it marks failed.
     pub rerun_of: Option<ParentJob>,
     /// The runs before `rerun_of`, newest first, up to 16. Followed only with
     /// `results=true`, empty elsewhere.

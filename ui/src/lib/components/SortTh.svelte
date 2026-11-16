@@ -2,11 +2,12 @@
   // A header that sorts its table by its column: up, down, then back to the
   // listing's order, kept in the address, or where `onsort` is given, in the page.
   // Where `resize` is given, a grip on its right edge drags the column's width.
+  import type { Snippet } from "svelte";
   import { redirect } from "../route.svelte";
   import { ariaSort, nextSort } from "../table";
   import type { Resize } from "../widths.svelte";
 
-  let { key, label, sort, link, onsort, num = false, resize }: {
+  let { key, label, sort, link, onsort, num = false, resize, extra }: {
     key: string;
     label: string;
     sort: string;
@@ -17,6 +18,8 @@
     /** Right-aligned, as figures are. */
     num?: boolean;
     resize?: Resize;
+    /** Drawn after the label, outside the sort link, so a click on it does not sort. */
+    extra?: Snippet;
   } = $props();
 
   const dir = $derived(ariaSort(sort, key));
@@ -71,7 +74,7 @@
 
 <th bind:this={th} class:num aria-sort={dir} data-key={key}>{#if onsort}<button type="button" class="sort" class:on={dir}
   onclick={() => onsort(nextSort(sort, key))}>{label}{@render arrow()}</button>{:else}<a class="sort" class:on={dir}
-  href={to} onclick={click}>{label}{@render arrow()}</a>{/if}{#if resize}
+  href={to} onclick={click}>{label}{@render arrow()}</a>{/if}{#if extra}{" "}{@render extra()}{/if}{#if resize}
   <!-- A focusable separator is a control, as ARIA's window splitter is, though Svelte counts the role as static. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div class="grip" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Width of {label}"

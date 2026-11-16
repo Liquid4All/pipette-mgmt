@@ -14,11 +14,12 @@ use pipette_core::warehouse::MetricRow;
 use pipette_plan_types::{
     AsrClientExtras, AsrDecoding, AsrErrorUnit, AsrEvalBenchmark, AsrEvalTask,
     AsrMaxMemoryBenchmark, AsrThroughputBenchmark, BatchSize, BenchmarkDefinition, BenchmarkId,
-    BenchmarkType, ClientId, Dataset, DatasetUpstream, DecodeThroughputBenchmark, DeviceFormFactor,
-    EndToEndLatencyBenchmark, EvalBenchmark, FailureSource, JobId, MaxMemoryUsageBenchmark,
-    ModelFlags, PlanId, PrefillThroughputBenchmark, SampleCompletion, VaultResourceId,
-    VlMaxMemoryBenchmark, VlSpecDecodeBenchmark, VlThroughputBenchmark, VlmEvalBenchmark,
-    VlmEvalRecipe, VlmPromptProfile,
+    BenchmarkType, ClientId, Dataset, DatasetUpstream, DecisionBenchmark,
+    DecodeThroughputBenchmark, DeviceFormFactor, EndToEndLatencyBenchmark, EvalBenchmark,
+    FailureSource, JobId, MaxMemoryUsageBenchmark, ModelFlags, PlanId, PositiveCount,
+    PrefillThroughputBenchmark, SampleCompletion, VaultResourceId, VlMaxMemoryBenchmark,
+    VlSpecDecodeBenchmark, VlThroughputBenchmark, VlmEvalBenchmark, VlmEvalRecipe,
+    VlmPromptProfile,
 };
 use pipette_store::{JobState, PlanStore, ScoreQueueStage, Stores, SubmissionRecord, VaultStore};
 
@@ -562,7 +563,9 @@ async fn score_eval_one(
             | BenchmarkDefinition::VlMaxMemory(_)
             | BenchmarkDefinition::AsrThroughput(_)
             | BenchmarkDefinition::AsrMaxMemory(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => {
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => {
                 anyhow::bail!("to_do job {job_id} is not an eval benchmark")
             }
         };
@@ -1204,7 +1207,9 @@ async fn score_success(
             | BenchmarkDefinition::AsrMaxMemory(_)
             | BenchmarkDefinition::VlmEval(_)
             | BenchmarkDefinition::AsrEval(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => ((None, None), (None, None)),
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => ((None, None), (None, None)),
         };
 
     // An ASR row's client_extras keys, validated at intake, stored in their wire
@@ -1228,7 +1233,9 @@ async fn score_success(
             | BenchmarkDefinition::VlMaxMemory(_)
             | BenchmarkDefinition::VlmEval(_)
             | BenchmarkDefinition::AsrEval(_)
-            | BenchmarkDefinition::VlSpecDecode(_) => (None, None, None),
+            | BenchmarkDefinition::VlSpecDecode(_)
+            | BenchmarkDefinition::DecisionLatency(_)
+            | BenchmarkDefinition::DecisionMaxMemory(_) => (None, None, None),
         };
 
     // Compared, recorded, never enforced: a corpus that moved upstream is a fact
@@ -1441,6 +1448,7 @@ async fn score_success(
             parameter_num_beams: get_param_num_beams(benchmark),
             parameter_beam_repetition_penalty: get_param_beam_repetition_penalty(benchmark),
             parameter_beam_length_penalty: get_param_beam_length_penalty(benchmark),
+            parameter_questions: get_param_questions(benchmark),
             benchmark_params: Some(benchmark_params.clone()),
             benchmark_params_sha256: Some(benchmark_params_sha256.clone()),
             device_time_ms: submission.wire.device_time_ms.map(i64::from),
@@ -1660,6 +1668,7 @@ fn record_failure(
             parameter_num_beams: get_param_num_beams(benchmark),
             parameter_beam_repetition_penalty: get_param_beam_repetition_penalty(benchmark),
             parameter_beam_length_penalty: get_param_beam_length_penalty(benchmark),
+            parameter_questions: get_param_questions(benchmark),
             benchmark_params: Some(benchmark_params.clone()),
             benchmark_params_sha256: Some(benchmark_params_sha256.clone()),
             observation_vl_spec_decode_turns: None,
@@ -2490,7 +2499,8 @@ async fn derive_metrics(
         }
         BenchmarkDefinition::MaxMemoryUsage(_)
         | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::AsrMaxMemory(_) => {
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => {
             let max_host =
                 i64::from(require(submission.wire.max_host_bytes, "max_host_bytes")?) as f32;
             let mut metrics = vec![DerivedMetric {
@@ -2646,6 +2656,43 @@ async fn derive_metrics(
                 eval_metadata: None,
             })
         }
+        BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_batch_size,
+            ..
+        }) => {
+            let wire = &submission.wire;
+            let request_ms: f32 = require(
+                wire.decision_latency_request_ms,
+                "decision_latency_request_ms",
+            )?
+            .into();
+            let mut metrics = vec![DerivedMetric {
+                metric: "decision_latency".to_string(),
+                value: request_ms,
+                value_stddev: wire.decision_latency_request_ms_stddev.map(f32::from),
+                unit: "ms".to_string(),
+            }];
+            // Gated as `intended_metrics_of` is, so one benchmark id's rows agree.
+            if parameter_batch_size.as_u32() > 1 {
+                let batch_ms: f32 =
+                    require(wire.decision_latency_batch_ms, "decision_latency_batch_ms")?.into();
+                let throughput = parameter_batch_size.as_u32() as f32 / batch_ms * 1000.0;
+                metrics.push(DerivedMetric {
+                    metric: "decision_throughput".to_string(),
+                    value: throughput,
+                    value_stddev: wire
+                        .decision_latency_batch_ms_stddev
+                        .map(|s| throughput * f32::from(s) / batch_ms),
+                    unit: "requests/sec".to_string(),
+                });
+            }
+            Ok(DerivedResult {
+                metrics,
+                eval_sample_results: None,
+                score_runtime_version: None,
+                eval_metadata: None,
+            })
+        }
     }
 }
 
@@ -2715,7 +2762,8 @@ fn resolved_speculation(def: &BenchmarkDefinition, runtime_flags: Option<&str>) 
 
 /// [`intended_metrics`] for a definition: an asr_eval's task names the unit.
 /// A task this build doesn't know still intends its row, as `error_rate`, so
-/// its failures are counted. Named as `AsrEvalTask::metric` names it.
+/// its failures are counted. Named as `AsrEvalTask::metric` names it. A
+/// decision_latency entry's batch size decides its throughput row.
 fn intended_metrics_of(
     def: &BenchmarkDefinition,
     speculative: Option<bool>,
@@ -2725,6 +2773,11 @@ fn intended_metrics_of(
             Some(AsrErrorUnit::Word) => &[("wer", "ratio")],
             None => &[("error_rate", "ratio")],
         },
+        // The batch time is required only with more than one request in flight.
+        BenchmarkDefinition::DecisionLatency(b) if b.parameter_batch_size.as_u32() > 1 => &[
+            ("decision_latency", "ms"),
+            ("decision_throughput", "requests/sec"),
+        ],
         BenchmarkDefinition::PrefillThroughput(_)
         | BenchmarkDefinition::DecodeThroughput(_)
         | BenchmarkDefinition::EndToEndLatency(_)
@@ -2735,7 +2788,9 @@ fn intended_metrics_of(
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::VlSpecDecode(_)
         | BenchmarkDefinition::AsrThroughput(_)
-        | BenchmarkDefinition::AsrMaxMemory(_) => {
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => {
             intended_metrics(def.benchmark_type(), speculative)
         }
     }
@@ -2824,7 +2879,8 @@ pub fn intended_metrics(
         BenchmarkType::EndToEndLatency => &[("end_to_end_latency", "ms")],
         BenchmarkType::MaxMemoryUsage
         | BenchmarkType::VlMaxMemory
-        | BenchmarkType::AsrMaxMemory => &[("max_host_usage", "bytes")],
+        | BenchmarkType::AsrMaxMemory
+        | BenchmarkType::DecisionMaxMemory => &[("max_host_usage", "bytes")],
         BenchmarkType::Eval => &[("accuracy", "ratio")],
         BenchmarkType::VlmEval => &[("accuracy", "ratio"), ("headline_score", "ratio")],
         // Every task this build knows counts words. A row's own task names
@@ -2840,6 +2896,9 @@ pub fn intended_metrics(
         // resolved the mode.
         BenchmarkType::VlSpecDecode if speculative == Some(true) => &VL_SPEC_DECODE,
         BenchmarkType::VlSpecDecode => &VL_SPEC_DECODE[..6],
+        // An entry with more than one request in flight intends
+        // `decision_throughput` too ([`intended_metrics_of`]).
+        BenchmarkType::DecisionLatency => &[("decision_latency", "ms")],
     }
 }
 
@@ -3012,7 +3071,9 @@ fn get_param_num_beams(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3029,7 +3090,9 @@ fn get_param_beam_repetition_penalty(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3046,7 +3109,9 @@ fn get_param_beam_length_penalty(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3075,7 +3140,9 @@ fn get_param_prefill_tokens(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::VlmEval(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3110,7 +3177,9 @@ fn get_param_decode_tokens(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::Eval(_)
         | BenchmarkDefinition::VlmEval(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3134,7 +3203,9 @@ fn get_param_eval_id(benchmark: &Benchmark) -> Option<String> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3148,6 +3219,14 @@ fn get_param_image_width(benchmark: &Benchmark) -> Option<i32> {
             parameter_image_width,
             ..
         }) => Some(parameter_image_width.into_inner()),
+        BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_image_width,
+            ..
+        })
+        | BenchmarkDefinition::DecisionMaxMemory(DecisionBenchmark {
+            parameter_image_width,
+            ..
+        }) => parameter_image_width.map(PositiveCount::into_inner),
         BenchmarkDefinition::PrefillThroughput(_)
         | BenchmarkDefinition::DecodeThroughput(_)
         | BenchmarkDefinition::EndToEndLatency(_)
@@ -3171,6 +3250,14 @@ fn get_param_image_height(benchmark: &Benchmark) -> Option<i32> {
             parameter_image_height,
             ..
         }) => Some(parameter_image_height.into_inner()),
+        BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_image_height,
+            ..
+        })
+        | BenchmarkDefinition::DecisionMaxMemory(DecisionBenchmark {
+            parameter_image_height,
+            ..
+        }) => parameter_image_height.map(PositiveCount::into_inner),
         BenchmarkDefinition::PrefillThroughput(_)
         | BenchmarkDefinition::DecodeThroughput(_)
         | BenchmarkDefinition::EndToEndLatency(_)
@@ -3199,6 +3286,14 @@ fn get_param_text_tokens(benchmark: &Benchmark) -> Option<i32> {
             ..
         })
         | BenchmarkDefinition::AsrMaxMemory(AsrMaxMemoryBenchmark {
+            parameter_text_tokens,
+            ..
+        })
+        | BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_text_tokens,
+            ..
+        })
+        | BenchmarkDefinition::DecisionMaxMemory(DecisionBenchmark {
             parameter_text_tokens,
             ..
         }) => Some(parameter_text_tokens.into_inner()),
@@ -3235,7 +3330,9 @@ fn get_param_temperature(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlMaxMemory(_) => None,
+        | BenchmarkDefinition::VlMaxMemory(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3256,7 +3353,9 @@ fn get_param_top_p(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3277,7 +3376,9 @@ fn get_param_top_k(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3298,7 +3399,9 @@ fn get_param_min_p(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3327,7 +3430,9 @@ fn get_param_seed(benchmark: &Benchmark) -> Option<i64> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3347,7 +3452,9 @@ fn get_param_presence_penalty(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::AsrEval(_)
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3367,7 +3474,9 @@ fn get_param_repeat_penalty(benchmark: &Benchmark) -> Option<f64> {
         | BenchmarkDefinition::Eval(_)
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3390,7 +3499,9 @@ fn get_param_prompt_profile(benchmark: &Benchmark) -> Option<String> {
         | BenchmarkDefinition::Eval(_)
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3410,7 +3521,9 @@ fn get_param_draft_length(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::VlmEval(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlMaxMemory(_) => None,
+        | BenchmarkDefinition::VlMaxMemory(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3433,7 +3546,9 @@ fn get_param_audio_sample_rate_hz(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3456,7 +3571,9 @@ fn get_param_audio_channels(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3479,7 +3596,9 @@ fn get_param_audio_duration_ms(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrEval(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -3492,12 +3611,45 @@ fn get_param_num_images(benchmark: &Benchmark) -> Option<i32> {
         | BenchmarkDefinition::VlMaxMemory(VlMaxMemoryBenchmark {
             parameter_num_images,
             ..
+        })
+        | BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_num_images,
+            ..
+        })
+        | BenchmarkDefinition::DecisionMaxMemory(DecisionBenchmark {
+            parameter_num_images,
+            ..
         }) => Some(parameter_num_images.into_inner()),
         BenchmarkDefinition::PrefillThroughput(_)
         | BenchmarkDefinition::DecodeThroughput(_)
         | BenchmarkDefinition::EndToEndLatency(_)
         | BenchmarkDefinition::MaxMemoryUsage(_)
         | BenchmarkDefinition::Eval(_)
+        | BenchmarkDefinition::AsrThroughput(_)
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::VlmEval(_)
+        | BenchmarkDefinition::AsrEval(_)
+        | BenchmarkDefinition::VlSpecDecode(_) => None,
+    }
+}
+
+fn get_param_questions(benchmark: &Benchmark) -> Option<i32> {
+    match &benchmark.def {
+        BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
+            parameter_questions,
+            ..
+        })
+        | BenchmarkDefinition::DecisionMaxMemory(DecisionBenchmark {
+            parameter_questions,
+            ..
+        }) => Some(parameter_questions.into_inner()),
+        BenchmarkDefinition::PrefillThroughput(_)
+        | BenchmarkDefinition::DecodeThroughput(_)
+        | BenchmarkDefinition::EndToEndLatency(_)
+        | BenchmarkDefinition::MaxMemoryUsage(_)
+        | BenchmarkDefinition::Eval(_)
+        | BenchmarkDefinition::VlThroughput(_)
+        | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::VlmEval(_)
@@ -4247,6 +4399,40 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_questions_reach_measured_and_failure_rows() -> anyhow::Result<()> {
+        let benchmark = Benchmark {
+            org_id: None,
+            def: BenchmarkDefinition::DecisionLatency(decision_benchmark(
+                "decision_latency_text64_q3",
+                1,
+            )?),
+        };
+        let failed = failure_rows(
+            benchmark.clone(),
+            json!({
+                "benchmark_type": "decision_latency",
+                "retriable": false,
+                "failure_reason": "OOM",
+            }),
+            None,
+        )?;
+        let measured = score_one(
+            benchmark,
+            json!({ "benchmark_type": "decision_latency", "decision_latency_request_ms": 41.5 }),
+        )
+        .await?;
+
+        assert!(!measured.is_empty() && !failed.is_empty());
+        assert!(
+            measured
+                .iter()
+                .chain(&failed)
+                .all(|r| r.parameter_questions == Some(3))
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_a_failure_row_records_the_alias() -> anyhow::Result<()> {
         let benchmark = prefill_benchmark()?;
@@ -4593,6 +4779,18 @@ mod tests {
         }),
         json!({"completions": [{"id": "s1", "completion": "a"}], "observation_dataset_digest": "1".repeat(64)}),
     )]
+    #[case::decision_latency(
+        BenchmarkDefinition::DecisionLatency(decision_benchmark("decision_latency_text64_q3", 1)?),
+        json!({"decision_latency_request_ms": 41.5}),
+    )]
+    #[case::decision_latency_batched(
+        BenchmarkDefinition::DecisionLatency(decision_benchmark("decision_latency_text64_q3_bs64", 64)?),
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_batch_ms": 820.0}),
+    )]
+    #[case::decision_max_memory(
+        BenchmarkDefinition::DecisionMaxMemory(decision_benchmark("decision_max_memory_text64_q3", 1)?),
+        json!({"max_host_bytes": 1_000_000_000_i64}),
+    )]
     #[tokio::test]
     async fn test_intended_metrics_agrees_with_derive_metrics(
         #[case] def: BenchmarkDefinition,
@@ -4744,67 +4942,157 @@ mod tests {
         Ok(())
     }
 
+    fn decision_benchmark(id: &str, batch_size: u32) -> anyhow::Result<DecisionBenchmark> {
+        Ok(DecisionBenchmark {
+            benchmark_id: BenchmarkId::try_new(id)?,
+            parameter_image_width: None,
+            parameter_image_height: None,
+            parameter_text_tokens: NonNegativeCount::try_new(64)?,
+            parameter_num_images: NonNegativeCount::try_new(0)?,
+            parameter_questions: PositiveCount::try_new(3)?,
+            parameter_batch_size: BatchSize::try_new(batch_size)?,
+        })
+    }
+
+    /// The request time lands as sent, its stddev with it; above one in flight
+    /// the batch time adds the throughput, propagated as the other rates are.
+    #[rstest]
+    #[case::one_at_a_time(
+        1,
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_request_ms_stddev": 1.5}),
+        vec![("decision_latency", 41.5, Some(1.5), "ms")],
+    )]
+    #[case::one_at_a_time_with_a_batch_time(
+        1,
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_batch_ms": 41.5}),
+        vec![("decision_latency", 41.5, None, "ms")],
+    )]
+    #[case::packed(
+        64,
+        json!({
+            "decision_latency_request_ms": 41.5,
+            "decision_latency_request_ms_stddev": 1.5,
+            "decision_latency_batch_ms": 800.0,
+            "decision_latency_batch_ms_stddev": 10.0,
+        }),
+        // 64 / 800 ms = 80/s; 80 * 10 / 800 = 1.0
+        vec![("decision_latency", 41.5, Some(1.5), "ms"), ("decision_throughput", 80.0, Some(1.0), "requests/sec")],
+    )]
     #[tokio::test]
-    async fn test_derive_memory_metrics() -> anyhow::Result<()> {
-        let benchmark = Benchmark {
-            org_id: None,
-            def: BenchmarkDefinition::MaxMemoryUsage(MaxMemoryUsageBenchmark {
-                benchmark_id: BenchmarkId::try_new("max_memory_usage_256")?,
-                parameter_prefill_tokens: NonNegativeCount::try_new(256)?,
-            }),
-        };
-        let submission = test_submission(json!({
-            "max_host_bytes": 1073741824_i64,
-            "max_gpu_bytes": 536870912_i64,
-        }))?;
+    async fn test_derive_decision_latency_metrics(
+        #[case] batch_size: u32,
+        #[case] wire: Value,
+        #[case] expected: Vec<(&str, f32, Option<f32>, &str)>,
+    ) -> anyhow::Result<()> {
         let config = Config {
             evals_server_url: "http://unused".to_string(),
-            http_timeout_secs: 10,
             ..Config::default()
         };
-        let client = test_client()?;
-        let derived = derive_metrics(&benchmark, &submission, &config, &client, None).await?;
-        assert!(derived.eval_sample_results.is_none());
-        let metrics = &derived.metrics;
-        assert_eq!(metrics.len(), 2);
-        assert_eq!(metrics[0].metric, "max_host_usage");
-        assert_eq!(metrics[0].value_stddev, None);
-        assert_eq!(metrics[1].metric, "max_gpu_usage");
-        assert_eq!(metrics[1].value_stddev, None);
+        let derived = derive_metrics(
+            &Benchmark {
+                org_id: None,
+                def: BenchmarkDefinition::DecisionLatency(decision_benchmark(
+                    "decision_latency_text64_q3",
+                    batch_size,
+                )?),
+            },
+            &test_submission(wire)?,
+            &config,
+            &test_client()?,
+            None,
+        )
+        .await?;
+        let metrics: Vec<_> = derived
+            .metrics
+            .iter()
+            .map(|m| (m.metric.as_str(), m.value, m.value_stddev, m.unit.as_str()))
+            .collect();
+        assert_eq!(metrics, expected);
         Ok(())
     }
 
+    /// A packed body without its batch time cannot be scored, as intake refuses
+    /// it: the derivation names the field rather than dropping the throughput.
     #[tokio::test]
-    async fn test_derive_vl_max_memory_metrics() -> anyhow::Result<()> {
+    async fn test_derive_decision_latency_requires_the_batch_time() -> anyhow::Result<()> {
         let benchmark = Benchmark {
             org_id: None,
-            def: BenchmarkDefinition::VlMaxMemory(VlMaxMemoryBenchmark {
-                benchmark_id: BenchmarkId::try_new("vl_max_memory_512x512_t0_f1")?,
-                parameter_image_width: PositiveCount::try_new(512)?,
-                parameter_image_height: PositiveCount::try_new(512)?,
-                parameter_text_tokens: NonNegativeCount::try_new(0)?,
-                parameter_decode_tokens: None,
-                parameter_num_images: NonNegativeCount::try_new(1)?,
-            }),
+            def: BenchmarkDefinition::DecisionLatency(decision_benchmark(
+                "decision_latency_text64_q3_bs64",
+                64,
+            )?),
         };
+        let submission = test_submission(json!({"decision_latency_request_ms": 41.5}))?;
+        let config = Config {
+            evals_server_url: "http://unused".to_string(),
+            ..Config::default()
+        };
+        let err = derive_metrics(&benchmark, &submission, &config, &test_client()?, None)
+            .await
+            .err()
+            .context("a packed body without decision_latency_batch_ms was scored")?;
+        assert!(
+            err.to_string().contains("decision_latency_batch_ms"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// The memory types share one arm: the host peak and each optional pool
+    /// land as bytes, and only an image entry stamps its size.
+    #[rstest]
+    #[case::text(
+        BenchmarkDefinition::MaxMemoryUsage(MaxMemoryUsageBenchmark {
+            benchmark_id: BenchmarkId::try_new("max_memory_usage_256")?,
+            parameter_prefill_tokens: NonNegativeCount::try_new(256)?,
+        }),
+        None,
+    )]
+    #[case::vl(
+        BenchmarkDefinition::VlMaxMemory(VlMaxMemoryBenchmark {
+            benchmark_id: BenchmarkId::try_new("vl_max_memory_512x512_t0_f1")?,
+            parameter_image_width: PositiveCount::try_new(512)?,
+            parameter_image_height: PositiveCount::try_new(512)?,
+            parameter_text_tokens: NonNegativeCount::try_new(0)?,
+            parameter_decode_tokens: None,
+            parameter_num_images: NonNegativeCount::try_new(1)?,
+        }),
+        Some(512),
+    )]
+    #[case::decision(
+        BenchmarkDefinition::DecisionMaxMemory(decision_benchmark("decision_max_memory_text64_q3", 1)?),
+        None,
+    )]
+    #[tokio::test]
+    async fn test_derive_memory_metrics(
+        #[case] def: BenchmarkDefinition,
+        #[case] image_width: Option<i32>,
+    ) -> anyhow::Result<()> {
+        let benchmark = Benchmark { org_id: None, def };
         let submission = test_submission(json!({
             "max_host_bytes": 2147483648_i64,
             "max_gpu_bytes": 1073741824_i64,
         }))?;
         let config = Config {
             evals_server_url: "http://unused".to_string(),
-            http_timeout_secs: 10,
             ..Config::default()
         };
-        let client = test_client()?;
-        let derived = derive_metrics(&benchmark, &submission, &config, &client, None).await?;
+        let derived =
+            derive_metrics(&benchmark, &submission, &config, &test_client()?, None).await?;
         assert!(derived.eval_sample_results.is_none());
-        let metrics = &derived.metrics;
-        assert_eq!(metrics.len(), 2);
-        assert_eq!(metrics[0].metric, "max_host_usage");
-        assert!((metrics[0].value - 2_f32.powi(31)).abs() < 1.0);
-        assert_eq!(metrics[1].metric, "max_gpu_usage");
-        assert!((metrics[1].value - 2_f32.powi(30)).abs() < 1.0);
+        let metrics: Vec<_> = derived
+            .metrics
+            .iter()
+            .map(|m| (m.metric.as_str(), m.value, m.value_stddev, m.unit.as_str()))
+            .collect();
+        assert_eq!(
+            metrics,
+            [
+                ("max_host_usage", 2_f32.powi(31), None, "bytes"),
+                ("max_gpu_usage", 2_f32.powi(30), None, "bytes"),
+            ]
+        );
+        assert_eq!(get_param_image_width(&benchmark), image_width);
         Ok(())
     }
 
@@ -6204,7 +6492,7 @@ mod tests {
             auth_storage: StorageConfig::local_fs(dir.to_path_buf()),
             ..CommitConfig::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_testkit::no_queue())
     }
 
     /// Eval-results store that always fails `write`.
@@ -6547,7 +6835,7 @@ mod tests {
             auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
             ..CommitConfig::default()
         };
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
 
         let mut catalog: StdHashMap<BenchmarkId, Benchmark> = StdHashMap::new();
         catalog.insert(
@@ -7454,14 +7742,20 @@ mod tests {
     async fn an_eval_that_never_scores_is_parked() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config = parking_test_config(dir.path())?;
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         let poison = JobId::new_unchecked("poison");
         let body = json!({ "benchmark_id": "eval_test", "client_id": "c1" });
         stores
             .submissions
             .enqueue(ScoreQueueStage::ToDo, &poison, &body)
             .await?;
-        let pass = || async { run_score_eval(&config, build_local_fs_stores(&config)?).await };
+        let pass = || async {
+            run_score_eval(
+                &config,
+                build_local_fs_stores(&config, pipette_store_testkit::no_queue())?,
+            )
+            .await
+        };
 
         futures::TryStreamExt::try_for_each(
             futures::stream::iter((1..MAX_SCORE_ATTEMPTS).map(anyhow::Ok)),
@@ -7528,7 +7822,7 @@ mod tests {
     async fn an_eval_that_scores_clears_its_failures() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config = parking_test_config(dir.path())?;
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         let job_id = JobId::new_unchecked("staged");
         let body = json!({ "benchmark_id": "eval_test", "client_id": "c1" });
         let submissions = &stores.submissions;
@@ -7551,7 +7845,11 @@ mod tests {
             )
             .await?;
 
-        run_score_eval(&config, build_local_fs_stores(&config)?).await?;
+        run_score_eval(
+            &config,
+            build_local_fs_stores(&config, pipette_store_testkit::no_queue())?,
+        )
+        .await?;
         assert_eq!(failed_attempts(&stores, &job_id).await?, None);
         Ok(())
     }

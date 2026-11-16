@@ -1,0 +1,6 @@
+# 64 short states in flight at once, one question each: the d1 model card's
+# "64 states, packed" throughput.
+benchmark_type        = "decision_latency"
+parameter_text_tokens = 64
+parameter_questions   = 1
+parameter_batch_size  = 64

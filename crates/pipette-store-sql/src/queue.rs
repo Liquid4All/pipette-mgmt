@@ -1,6 +1,6 @@
-//! PostgreSQL storage for queue jobs, leases, markers, and maintenance state.
+//! PostgreSQL storage for queue jobs, leases and markers.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -10,12 +10,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, SubsecRound, Utc};
 
 use pipette_core::denial::DenialRecord;
-use pipette_core::todo_filename::{Lease, avail_filename, leased_key, tmp_filename};
-use pipette_plan_types::{ClientId, ExpiresAt, FailureCode, JobId};
+use pipette_core::todo_filename::Lease;
+use pipette_plan_types::{
+    CachedArtifacts, CampaignId, ClientId, ExpiresAt, FailureCode, JobId, PlanStatus,
+};
 use pipette_store::{
-    AvailEntry, BacklogSnapshot, CampaignBacklogSnapshot, ClaimOutcome, ClaimResult,
-    LivenessImport, ReclaimOutcome, RecycleResult, RedateResult, ReindexBatch, ReindexJob,
-    RenewLeaseResult, TodoStore,
+    AvailEntry, CampaignBacklog, ClaimAffinity, ClaimOutcome, ClaimResult, ReclaimOutcome,
+    RecycleResult, RedateResult, ReindexBatch, ReindexJob, ReindexRequest, RenewLeaseResult,
+    TodoStore,
 };
 
 use crate::retry::retry;
@@ -40,56 +42,7 @@ impl SqlTodoStore {
         self.body_reads
             .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
-
-    async fn read_state(&self, name: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = self
-            .db
-            .fetch_optional("read queue state", || {
-                sqlx::query_as("SELECT body FROM queue_maintenance_state WHERE name = $1")
-                    .bind(name)
-            })
-            .await?;
-        Ok(row.map(|(body,)| body))
-    }
-
-    async fn write_state(&self, name: &str, body: &str) -> anyhow::Result<()> {
-        self.db
-            .execute("write queue state", || {
-                sqlx::query(
-                    "INSERT INTO queue_maintenance_state (name, body) VALUES ($1, $2) ON CONFLICT \
-                     (name) DO UPDATE SET body = EXCLUDED.body",
-                )
-                .bind(name)
-                .bind(body)
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// A missing or corrupt body reads as empty ([`pipette_store::parse_key_set`]).
-    async fn read_key_set<T>(&self, name: &str) -> anyhow::Result<HashSet<T>>
-    where
-        T: serde::de::DeserializeOwned + Eq + std::hash::Hash,
-    {
-        Ok(self
-            .read_state(name)
-            .await?
-            .map(|body| pipette_store::parse_key_set(body.as_bytes(), name))
-            .unwrap_or_default())
-    }
-
-    async fn write_key_set<T: serde::Serialize + Sync>(
-        &self,
-        name: &str,
-        set: &HashSet<T>,
-    ) -> anyhow::Result<()> {
-        self.write_state(name, &serde_json::to_string(set)?).await
-    }
 }
-
-const GC_CANDIDATES: &str = "gc-candidates";
-const BACKLOG: &str = "backlog";
-const BACKLOG_CAMPAIGNS: &str = "backlog-campaigns";
 
 fn valid_client(raw: &str) -> Option<ClientId> {
     ClientId::try_new(raw)
@@ -117,7 +70,8 @@ fn parse_body(job: &JobId, body: &str) -> anyhow::Result<serde_json::Value> {
 
 /// Serializes one client's claims until the transaction ends, so the client cannot
 /// acquire two leases at once. Two clients whose IDs hash alike only
-/// wait for each other.
+/// wait for each other. Lock the parent before settlement touches grant rows,
+/// in the same order as cascading client deletion.
 async fn lock_client(
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
     client: &str,
@@ -126,11 +80,68 @@ async fn lock_client(
         .bind(client)
         .execute(&mut **tx)
         .await?;
+    sqlx::query("SELECT client_id FROM clients WHERE client_id = $1 FOR KEY SHARE")
+        .bind(client)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
 /// Recycle lapsed leases under the client lock. Terminal records and pending
 /// repairs need object-store work; keep those jobs leased until it completes.
+/// Records a lost lease. The client may not hold the job's artifacts after a
+/// lost lease, so the statement also forgets the client's last grant of the job.
+const RECORD_LOST_LEASE: &str = "WITH forgot AS (DELETE FROM queue_client_last_grant WHERE \
+     client_id = $2 AND job_id = $1) INSERT INTO queue_lost_leases (job_id, client_id, \
+     lease_expiry) SELECT job_id, $2, $3 FROM queue_jobs WHERE job_id = $1 \
+     ON CONFLICT DO NOTHING";
+
+/// Makes the job the client's last grant, with the job's artifact keys. A claim
+/// grant and a reclaim both run it, because after either one the client runs
+/// the job. Lock the client row until commit; a deleted client stores no grant.
+const RECORD_LAST_GRANT: &str = "INSERT INTO queue_client_last_grant (client_id, job_id, \
+     model_key, runtime_key, granted_at) SELECT c.client_id, j.job_id, j.model_key, \
+     j.runtime_key, $3 FROM queue_jobs j JOIN clients c ON c.client_id = $2 \
+     WHERE j.job_id = $1 FOR KEY SHARE OF c ON CONFLICT (client_id) DO UPDATE SET job_id = \
+     EXCLUDED.job_id, model_key = EXCLUDED.model_key, runtime_key = EXCLUDED.runtime_key, \
+     granted_at = EXCLUDED.granted_at";
+
+/// The model and runtime keys that the client holds. `queue_json_key` gives
+/// both an advertised descriptor's key and the `queue_jobs` key columns, so
+/// they match exactly. A descriptor that jsonb cannot represent has no key
+/// and matches no job. Without an advertised set, the keys of the client's
+/// last grant.
+async fn cached_keys(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    client: &str,
+    cached: Option<&CachedArtifacts>,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let keys = match cached {
+        Some(cached) => {
+            sqlx::query_as(
+                "SELECT array_remove(ARRAY(SELECT queue_json_key(d::text, '{}') FROM \
+                 json_array_elements($1::json) d), NULL), array_remove(ARRAY(SELECT \
+                 queue_json_key(d::text, '{}') FROM json_array_elements($2::json) d), NULL)",
+            )
+            .bind(serde_json::to_string(&cached.models)?)
+            .bind(serde_json::to_string(&cached.runtimes)?)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        None => {
+            let last: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT model_key, runtime_key FROM queue_client_last_grant WHERE client_id = $1",
+            )
+            .bind(client)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let (model, runtime) = last.unwrap_or_default();
+            (Vec::from_iter(model), Vec::from_iter(runtime))
+        }
+    };
+    Ok(keys)
+}
+
 async fn settle_lapsed_in_transaction(
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
     client: &str,
@@ -164,15 +175,12 @@ async fn settle_lapsed_in_transaction(
                 .await?;
             continue;
         }
-        sqlx::query(
-            "INSERT INTO queue_lost_leases (job_id, client_id, lease_expiry) \
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(&job)
-        .bind(client)
-        .bind(lease_expiry)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query(RECORD_LOST_LEASE)
+            .bind(&job)
+            .bind(client)
+            .bind(lease_expiry)
+            .execute(&mut **tx)
+            .await?;
         if lost_lease_limit > 0 {
             let (losses,): (i64,) =
                 sqlx::query_as("SELECT count(*) FROM queue_lost_leases WHERE job_id = $1")
@@ -193,6 +201,19 @@ async fn settle_lapsed_in_transaction(
         .await?;
     }
     Ok(needs_settlement)
+}
+
+fn valid_campaign(raw: &str) -> Option<CampaignId> {
+    CampaignId::try_new(raw)
+        .inspect_err(|error| {
+            tracing::warn!(campaign_id = raw, %error, "skipping a backlog campaign with an invalid id");
+        })
+        .ok()
+}
+
+/// A SQL `count(*)`, which is never negative.
+fn count(rows: i64) -> u64 {
+    u64::try_from(rows).unwrap_or_default()
 }
 
 fn valid_job(raw: &str) -> Option<JobId> {
@@ -230,16 +251,6 @@ impl LeaseRow {
             client_id: client,
             lease_expiry: self.lease_expiry,
         })
-    }
-
-    fn key(self) -> Option<String> {
-        let lease = self.lease()?;
-        Some(leased_key(
-            &lease.job_id,
-            lease.expires_at,
-            &lease.client_id,
-            lease.lease_expiry,
-        ))
     }
 }
 
@@ -325,19 +336,25 @@ impl TodoStore for SqlTodoStore {
         Ok(rows.into_iter().filter_map(LeaseRow::lease).collect())
     }
 
-    async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
+    async fn list_avail_entries(&self) -> anyhow::Result<Vec<AvailEntry>> {
         let rows: Vec<(String, Option<DateTime<Utc>>)> = self
             .db
-            .fetch_all("list available jobs", || {
-                sqlx::query_as("SELECT job_id, expires_at FROM queue_jobs WHERE leased_by IS NULL")
+            .fetch_all("list_avail_entries", || {
+                sqlx::query_as(
+                    "SELECT job_id, expires_at FROM queue_jobs WHERE leased_by IS NULL \
+                     ORDER BY job_id COLLATE \"C\"",
+                )
             })
             .await?;
-        let mut keys: Vec<_> = rows
+        Ok(rows
             .into_iter()
-            .filter_map(|(job, exp)| valid_job(&job).map(|job| avail_filename(&job, deadline(exp))))
-            .collect();
-        keys.sort_unstable();
-        Ok(keys)
+            .filter_map(|(job, exp)| {
+                Some(AvailEntry {
+                    job_id: valid_job(&job)?,
+                    expires_at: deadline(exp),
+                })
+            })
+            .collect())
     }
 
     async fn get_avail(
@@ -399,31 +416,17 @@ impl TodoStore for SqlTodoStore {
         row.map(|(body,)| parse_body(job_id, &body)).transpose()
     }
 
-    async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
+    async fn list_leases(&self) -> anyhow::Result<Vec<Lease>> {
         let rows: Vec<LeaseRow> = self
             .db
-            .fetch_all("list_leased", || {
+            .fetch_all("list_leases", || {
                 sqlx::query_as(
                     "SELECT job_id, expires_at, leased_by, lease_expiry FROM \
                      queue_jobs WHERE leased_by IS NOT NULL",
                 )
             })
             .await?;
-        Ok(rows.into_iter().filter_map(LeaseRow::key).collect())
-    }
-
-    async fn list_leased_for_client(&self, client_id: &ClientId) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<LeaseRow> = self
-            .db
-            .fetch_all("list_leased_for_client", || {
-                sqlx::query_as(
-                    "SELECT job_id, expires_at, leased_by, lease_expiry FROM \
-                     queue_jobs WHERE leased_by = $1",
-                )
-                .bind(client_id.as_str())
-            })
-            .await?;
-        Ok(rows.into_iter().filter_map(LeaseRow::key).collect())
+        Ok(rows.into_iter().filter_map(LeaseRow::lease).collect())
     }
 
     async fn get_leased(
@@ -543,6 +546,7 @@ impl TodoStore for SqlTodoStore {
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&Lease>,
+        cached: Option<&CachedArtifacts>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<ClaimOutcome> {
         let client = client_id.as_str();
@@ -579,15 +583,12 @@ impl TodoStore for SqlTodoStore {
                 return Ok(ClaimOutcome::CheckHeldLease { lease, body });
             }
             let withheld = if lost_lease_limit > 0 {
-                sqlx::query(
-                    "INSERT INTO queue_lost_leases (job_id, client_id, lease_expiry) VALUES ($1, \
-                     $2, $3) ON CONFLICT DO NOTHING",
-                )
-                .bind(&job)
-                .bind(client)
-                .bind(held_until)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query(RECORD_LOST_LEASE)
+                    .bind(&job)
+                    .bind(client)
+                    .bind(held_until)
+                    .execute(&mut *tx)
+                    .await?;
                 let (losses,): (i64,) =
                     sqlx::query_as("SELECT count(*) FROM queue_lost_leases WHERE job_id = $1")
                         .bind(&job)
@@ -603,23 +604,41 @@ impl TodoStore for SqlTodoStore {
                 ClaimOutcome::HandedBack { lease, body }
             }
         } else {
-            // `is_expired` keeps a job whose deadline is exactly `now`.
-            let pick: Option<(String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
-                "SELECT j.job_id, j.body, j.expires_at FROM queue_eligibility e JOIN queue_jobs j \
-                 ON j.job_id = e.job_id WHERE e.client_id = $1 AND j.leased_by IS NULL AND \
-                 (j.expires_at IS NULL OR j.expires_at >= $2) AND NOT EXISTS (SELECT 1 FROM \
-                 queue_denials d WHERE d.job_id = j.job_id AND d.client_id = $1) AND NOT \
-                 (j.job_id = ANY($3)) ORDER BY j.expires_at ASC NULLS LAST, random() LIMIT 1 \
-                 FOR UPDATE OF j SKIP LOCKED",
+            let (models, runtimes) = cached_keys(&mut tx, client, cached).await?;
+            // `is_expired` keeps a job whose deadline is exactly `now`. Within one
+            // deadline: the fewer smaller runs of its family the queue holds, leased
+            // or not, the sooner a job goes, so a device takes a larger run only when
+            // it has nothing ranked before it. Then the model the fewest other clients
+            // lease, so devices spread across the models. Then a job whose model and
+            // runtime the client holds, then one whose model it holds, then one whose
+            // runtime it holds, then any job.
+            let pick: Option<(String, String, Option<DateTime<Utc>>, bool, bool)> = sqlx::query_as(
+                "WITH busy AS (SELECT l.model_key, count(*) AS leases FROM queue_jobs l WHERE \
+                     l.leased_by IS NOT NULL AND l.leased_by <> $1 AND l.lease_expiry > $2 AND \
+                     EXISTS (SELECT 1 FROM queue_eligibility e WHERE e.client_id = $1 AND \
+                     e.job_id = l.job_id) GROUP BY l.model_key) SELECT j.job_id, j.body, \
+                     j.expires_at, (j.model_key = ANY($4)) IS TRUE AS model_held, \
+                     (j.runtime_key = ANY($5)) IS TRUE AS runtime_held FROM queue_eligibility e \
+                     JOIN queue_jobs j ON j.job_id = e.job_id LEFT JOIN busy b \
+                     ON b.model_key = j.model_key WHERE \
+                     e.client_id = $1 AND j.leased_by IS NULL AND (j.expires_at IS NULL OR \
+                     j.expires_at >= $2) AND NOT EXISTS (SELECT 1 FROM queue_denials d WHERE \
+                     d.job_id = j.job_id AND d.client_id = $1) AND NOT (j.job_id = ANY($3)) \
+                     ORDER BY j.expires_at ASC NULLS LAST, (SELECT count(*) FROM queue_jobs s \
+                     WHERE s.family_key = j.family_key AND queue_sizes_below(s.sizes, j.sizes)) \
+                     ASC, COALESCE(b.leases, 0) ASC, model_held DESC, runtime_held DESC, \
+                     random() LIMIT 1 FOR UPDATE OF j SKIP LOCKED",
             )
             .bind(client)
             .bind(now)
             .bind(&passed_over)
+            .bind(&models)
+            .bind(&runtimes)
             .fetch_optional(&mut *tx)
             .await?;
             self.record_body_reads(usize::from(pick.is_some()));
             match pick {
-                Some((job, body, expires_at)) => {
+                Some((job, body, expires_at, model_held, runtime_held)) => {
                     sqlx::query(
                         "UPDATE queue_jobs SET leased_by = $2, lease_expiry = $3, revision = \
                          revision + 1 WHERE job_id = $1",
@@ -629,6 +648,12 @@ impl TodoStore for SqlTodoStore {
                     .bind(lease_expiry)
                     .execute(&mut *tx)
                     .await?;
+                    sqlx::query(RECORD_LAST_GRANT)
+                        .bind(&job)
+                        .bind(client)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
                     let job_id =
                         valid_job(&job).context("the picked queue row has an invalid job id")?;
                     let body = parse_body(&job_id, &body)?;
@@ -638,7 +663,11 @@ impl TodoStore for SqlTodoStore {
                         client_id: client_id.clone(),
                         lease_expiry,
                     };
-                    ClaimOutcome::Granted { lease, body }
+                    ClaimOutcome::Granted {
+                        lease,
+                        body,
+                        affinity: ClaimAffinity::new(model_held, runtime_held),
+                    }
                 }
                 None => ClaimOutcome::Empty,
             }
@@ -719,22 +748,19 @@ impl TodoStore for SqlTodoStore {
                 }
             }
         };
+        if matches!(
+            outcome,
+            ReclaimOutcome::Renewed | ReclaimOutcome::Granted { .. }
+        ) {
+            sqlx::query(RECORD_LAST_GRANT)
+                .bind(job)
+                .bind(client)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(outcome)
-    }
-
-    async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>> {
-        let row: Option<(Option<DateTime<Utc>>,)> = self
-            .db
-            .fetch_optional("avail key", || {
-                sqlx::query_as(
-                    "SELECT expires_at FROM queue_jobs WHERE job_id = $1 AND leased_by \
-                     IS NULL",
-                )
-                .bind(job_id.to_string())
-            })
-            .await?;
-        Ok(row.map(|(exp,)| avail_filename(job_id, deadline(exp))))
     }
 
     async fn redate_avail(
@@ -761,6 +787,32 @@ impl TodoStore for SqlTodoStore {
         } else {
             RedateResult::Redated
         })
+    }
+
+    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64> {
+        // `infinity` stands for `never`, so it ranks after every date. Unlike a
+        // re-date, no reindex flag: an eligibility row holds no deadline. Only
+        // rows `marker_of` parses count, so a bad row cannot fail the cast. The
+        // markers are read through the waiting jobs, as `job_plans` keeps every
+        // plan that ever held a job.
+        self.db
+            .execute("restamp_avail_deadlines", || {
+                sqlx::query(
+                    "WITH member AS (SELECT p.job_id, max(CASE p.expires_at WHEN 'never' THEN \
+                     'infinity' ELSE p.expires_at END::timestamptz) AS horizon FROM job_plans p \
+                     JOIN queue_jobs q ON q.job_id = p.job_id AND q.leased_by IS NULL \
+                     WHERE p.plan_id ~ '^[A-Za-z0-9-]+$' AND (p.expires_at = 'never' OR \
+                     (p.expires_at ~ '^[0-9]{8}T[0-9]{6}Z$' AND \
+                     pg_input_is_valid(p.expires_at, 'timestamptz'))) \
+                     GROUP BY p.job_id, p.plan_id), earliest AS (SELECT job_id, NULLIF(min(horizon), \
+                     'infinity') AS deadline FROM member WHERE horizon >= $1 GROUP BY job_id) \
+                     UPDATE queue_jobs j SET expires_at = e.deadline, revision = j.revision + 1 \
+                     FROM earliest e WHERE j.job_id = e.job_id AND j.leased_by IS NULL AND \
+                     j.expires_at IS DISTINCT FROM e.deadline",
+                )
+                .bind(now)
+            })
+            .await
     }
 
     async fn recycle_lease(
@@ -795,6 +847,19 @@ impl TodoStore for SqlTodoStore {
         })
     }
 
+    async fn forget_last_grant(&self, job_id: &JobId, client_id: &ClientId) -> anyhow::Result<()> {
+        self.db
+            .execute("forget_last_grant", || {
+                sqlx::query(
+                    "DELETE FROM queue_client_last_grant WHERE client_id = $1 AND job_id = $2",
+                )
+                .bind(client_id.as_str())
+                .bind(job_id.as_str())
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn write_denied(
         &self,
         job_id: &JobId,
@@ -807,8 +872,9 @@ impl TodoStore for SqlTodoStore {
                     "WITH flagged AS (UPDATE queue_jobs SET needs_reindex = true, \
                      revision = revision + 1 WHERE job_id = $1) \
                      INSERT INTO queue_denials (job_id, client_id, denied_at, failure_reason, \
-                     failure_code, client_version, runtime_version) VALUES ($1, $2, $3, $4, $5, \
-                     $6, $7) ON CONFLICT (job_id, client_id) DO UPDATE SET denied_at = \
+                     failure_code, client_version, runtime_version) SELECT job_id, $2, $3, $4, \
+                     $5, $6, $7 FROM queue_jobs WHERE job_id = $1 ON CONFLICT (job_id, \
+                     client_id) DO UPDATE SET denied_at = \
                      EXCLUDED.denied_at, failure_reason = EXCLUDED.failure_reason, failure_code = \
                      EXCLUDED.failure_code, client_version = EXCLUDED.client_version, \
                      runtime_version = EXCLUDED.runtime_version",
@@ -855,9 +921,8 @@ impl TodoStore for SqlTodoStore {
                     // A row written before the column holds NULL.
                     failure_code: failure_code
                         .map(|code| {
-                            code.parse::<FailureCode>().map_err(|e| {
-                                anyhow::anyhow!("queue_denials.failure_code {code:?}: {e}")
-                            })
+                            code.parse::<FailureCode>()
+                                .with_context(|| format!("queue_denials.failure_code {code:?}"))
                         })
                         .transpose()?
                         .unwrap_or_default(),
@@ -938,8 +1003,8 @@ impl TodoStore for SqlTodoStore {
         self.db
             .execute("write_eligible", || {
                 sqlx::query(
-                    "INSERT INTO queue_eligibility (client_id, job_id) VALUES ($1, $2) ON \
-                     CONFLICT DO NOTHING",
+                    "INSERT INTO queue_eligibility (client_id, job_id) SELECT $1, job_id FROM \
+                     queue_jobs WHERE job_id = $2 ON CONFLICT DO NOTHING",
                 )
                 .bind(client_id.as_str())
                 .bind(job_id.as_str())
@@ -1005,7 +1070,7 @@ impl TodoStore for SqlTodoStore {
         Ok(())
     }
 
-    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<(ClientId, String)>> {
+    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<ReindexRequest>> {
         let rows: Vec<(String, String)> = self
             .db
             .fetch_all("list_pending_reindex", || {
@@ -1017,18 +1082,20 @@ impl TodoStore for SqlTodoStore {
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(c, r)| Some((valid_client(&c)?, format!("{c}.{r}"))))
+            .filter_map(|(c, request_id)| {
+                Some(ReindexRequest {
+                    client_id: valid_client(&c)?,
+                    request_id,
+                })
+            })
             .collect())
     }
 
-    async fn delete_pending_reindex(&self, key: &str) -> anyhow::Result<()> {
-        let Some((_, request_id)) = key.rsplit_once('.') else {
-            return Ok(());
-        };
+    async fn delete_pending_reindex(&self, request: &ReindexRequest) -> anyhow::Result<()> {
         self.db
             .execute("delete_pending_reindex", || {
                 sqlx::query("DELETE FROM queue_reindex_requests WHERE request_id = $1")
-                    .bind(request_id)
+                    .bind(request.request_id.as_str())
             })
             .await?;
         Ok(())
@@ -1055,13 +1122,10 @@ impl TodoStore for SqlTodoStore {
     ) -> anyhow::Result<()> {
         self.db
             .execute("write_lost_lease", || {
-                sqlx::query(
-                    "INSERT INTO queue_lost_leases (job_id, client_id, lease_expiry) VALUES ($1, \
-                     $2, $3) ON CONFLICT DO NOTHING",
-                )
-                .bind(job_id.as_str())
-                .bind(client_id.as_str())
-                .bind(to_second(lease_expiry))
+                sqlx::query(RECORD_LOST_LEASE)
+                    .bind(job_id.as_str())
+                    .bind(client_id.as_str())
+                    .bind(to_second(lease_expiry))
             })
             .await?;
         Ok(())
@@ -1121,7 +1185,12 @@ impl TodoStore for SqlTodoStore {
         Ok(())
     }
 
-    async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()> {
+    async fn promote_avail(
+        &self,
+        job_id: &JobId,
+        expires_at: ExpiresAt,
+        family: Option<(&str, &[i64])>,
+    ) -> anyhow::Result<()> {
         let revision = first_revision();
         let (moved, inserted, present): (bool, bool, bool) = self
             .db
@@ -1129,14 +1198,16 @@ impl TodoStore for SqlTodoStore {
                 sqlx::query_as(
                     "WITH moved AS (DELETE FROM queue_tmp WHERE job_id = $1 RETURNING \
                      body), ins AS (INSERT INTO queue_jobs (job_id, body, expires_at, \
-                     revision) SELECT $1, body, $2, $3 FROM moved ON CONFLICT DO \
-                     NOTHING RETURNING 1) SELECT EXISTS (SELECT 1 FROM moved), EXISTS \
-                     (SELECT 1 FROM ins), EXISTS (SELECT 1 FROM queue_jobs WHERE job_id \
-                     = $1 AND expires_at IS NOT DISTINCT FROM $2)",
+                     revision, family_key, sizes) SELECT $1, body, $2, $3, $4, $5 \
+                     FROM moved ON CONFLICT DO NOTHING RETURNING 1) SELECT EXISTS (SELECT 1 \
+                     FROM moved), EXISTS (SELECT 1 FROM ins), EXISTS (SELECT 1 FROM \
+                     queue_jobs WHERE job_id = $1 AND expires_at IS NOT DISTINCT FROM $2)",
                 )
                 .bind(job_id.as_str())
                 .bind(expiry(expires_at))
                 .bind(revision)
+                .bind(family.map(|(key, _)| key))
+                .bind(family.map(|(_, sizes)| sizes))
             })
             .await?;
         anyhow::ensure!(
@@ -1149,70 +1220,124 @@ impl TodoStore for SqlTodoStore {
         Ok(())
     }
 
-    async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<(String,)> = self
+    async fn queued_larger_runs(
+        &self,
+        job_id: &JobId,
+    ) -> anyhow::Result<Vec<(AvailEntry, serde_json::Value)>> {
+        let rows: Vec<(String, String, Option<DateTime<Utc>>)> = self
             .db
-            .fetch_all("list stale queue staging", || {
+            .fetch_all("queued_larger_runs", || {
                 sqlx::query_as(
-                    "SELECT job_id FROM queue_tmp WHERE written_at <= now() - $1 * \
-                     interval '1 second'",
+                    "SELECT s.job_id, s.body, s.expires_at FROM queue_jobs s JOIN queue_jobs f \
+                     ON f.job_id = $1 WHERE s.family_key = f.family_key AND \
+                     queue_sizes_below(f.sizes, s.sizes) AND s.leased_by IS NULL",
+                )
+                .bind(job_id.as_str())
+            })
+            .await?;
+        self.record_body_reads(rows.len());
+        rows.into_iter()
+            .filter_map(|(job, body, exp)| Some((valid_job(&job)?, body, exp)))
+            .map(|(job_id, body, exp)| {
+                let body = parse_body(&job_id, &body)?;
+                Ok((
+                    AvailEntry {
+                        job_id,
+                        expires_at: deadline(exp),
+                    },
+                    body,
+                ))
+            })
+            .collect()
+    }
+
+    async fn delete_stale_tmp(&self, age: Duration) -> anyhow::Result<u64> {
+        self.db
+            .execute("delete_stale_tmp", || {
+                sqlx::query(
+                    "DELETE FROM queue_tmp WHERE written_at <= now() - $1 * interval '1 second'",
                 )
                 .bind(age.as_secs_f64())
+            })
+            .await
+    }
+
+    async fn backlog(&self) -> anyhow::Result<BTreeMap<ClientId, u64>> {
+        // The conditions are the claim's: `>=` keeps a job whose deadline is
+        // exactly now.
+        let rows: Vec<(String, i64)> = self
+            .db
+            .fetch_all("backlog", || {
+                sqlx::query_as(
+                    "SELECT e.client_id, count(*) FROM queue_eligibility e JOIN queue_jobs j ON \
+                     j.job_id = e.job_id WHERE j.leased_by IS NULL AND (j.expires_at IS NULL OR \
+                     j.expires_at >= now()) AND NOT EXISTS (SELECT 1 FROM queue_denials d WHERE \
+                     d.job_id = e.job_id AND d.client_id = e.client_id) GROUP BY e.client_id",
+                )
             })
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(job,)| valid_job(&job).map(|job| tmp_filename(&job)))
+            .filter_map(|(client, jobs)| Some((valid_client(&client)?, count(jobs))))
             .collect())
     }
 
-    async fn delete_tmp_object(&self, key: &str) -> anyhow::Result<()> {
-        let Some(job) = key.strip_suffix(".json") else {
-            return Ok(());
-        };
-        self.db
-            .execute("delete_tmp_object", || {
-                sqlx::query("DELETE FROM queue_tmp WHERE job_id = $1").bind(job.to_owned())
+    async fn campaign_backlog(
+        &self,
+        client_id: &ClientId,
+        creating_before: DateTime<Utc>,
+    ) -> anyhow::Result<CampaignBacklog> {
+        // A membership's deadline is stored as text, accurate to the second.
+        let now = ExpiresAt::At(Utc::now()).to_string();
+        let ended = [
+            PlanStatus::Cancelling.label(),
+            PlanStatus::Cancelled.label(),
+        ];
+        // One row for each campaign, and one row with no campaign for the jobs
+        // that no campaign holds.
+        let rows: Vec<(Option<String>, i64)> = self
+            .db
+            .fetch_all("campaign_backlog", || {
+                sqlx::query_as(
+                    "WITH claimable AS (SELECT e.job_id FROM queue_eligibility e JOIN queue_jobs \
+                     j ON j.job_id = e.job_id WHERE e.client_id = $1 AND j.leased_by IS NULL AND \
+                     (j.expires_at IS NULL OR j.expires_at >= now()) AND NOT EXISTS (SELECT 1 \
+                     FROM queue_denials d WHERE d.job_id = e.job_id AND d.client_id = $1)), \
+                     held AS (SELECT DISTINCT c.job_id, p.campaign_id FROM claimable c JOIN \
+                     job_plans m ON m.job_id = c.job_id JOIN plans p ON p.plan_id = m.plan_id \
+                     WHERE p.campaign_id IS NOT NULL AND NOT (p.status = ANY($2)) AND NOT EXISTS \
+                     (SELECT 1 FROM cancelled_plans x WHERE x.plan_id = m.plan_id) AND \
+                     (m.expires_at = 'never' OR m.expires_at >= $3) AND NOT (p.status = $4 AND \
+                     CASE WHEN p.body IS JSON OBJECT THEN \
+                       CASE WHEN pg_input_is_valid(p.body::json ->> 'created_at', 'timestamptz') \
+                         THEN (p.body::json ->> 'created_at')::timestamptz <= $5 \
+                         ELSE false END \
+                       ELSE false END)) \
+                     SELECT campaign_id, count(*) FROM held GROUP BY campaign_id UNION ALL \
+                     SELECT NULL, count(*) FROM claimable c WHERE NOT EXISTS (SELECT 1 FROM held \
+                     h WHERE h.job_id = c.job_id)",
+                )
+                .bind(client_id.as_str())
+                .bind(ended)
+                .bind(now.as_str())
+                .bind(PlanStatus::Creating.label())
+                .bind(creating_before)
             })
             .await?;
-        Ok(())
-    }
-
-    async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>> {
-        Ok(self
-            .read_state(BACKLOG)
-            .await?
-            .map(|body| pipette_store::parse_snapshot(body.as_bytes(), BACKLOG))
-            .unwrap_or_default())
-    }
-
-    async fn write_backlog(&self, snapshot: &BacklogSnapshot) -> anyhow::Result<()> {
-        self.write_state(BACKLOG, &serde_json::to_string(snapshot)?)
-            .await
-    }
-
-    async fn read_campaign_backlog(&self) -> anyhow::Result<Option<CampaignBacklogSnapshot>> {
-        Ok(self
-            .read_state(BACKLOG_CAMPAIGNS)
-            .await?
-            .map(|body| pipette_store::parse_snapshot(body.as_bytes(), BACKLOG_CAMPAIGNS))
-            .unwrap_or_default())
-    }
-
-    async fn write_campaign_backlog(
-        &self,
-        snapshot: &CampaignBacklogSnapshot,
-    ) -> anyhow::Result<()> {
-        self.write_state(BACKLOG_CAMPAIGNS, &serde_json::to_string(snapshot)?)
-            .await
-    }
-
-    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
-        self.read_key_set(GC_CANDIDATES).await
-    }
-
-    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
-        self.write_key_set(GC_CANDIDATES, candidates).await
+        Ok(rows.into_iter().fold(
+            CampaignBacklog::default(),
+            |mut backlog, (campaign, jobs)| {
+                match campaign {
+                    None => backlog.outside_campaigns = count(jobs),
+                    Some(raw) => {
+                        if let Some(campaign_id) = valid_campaign(&raw) {
+                            backlog.by_campaign.insert(campaign_id, count(jobs));
+                        }
+                    }
+                }
+                backlog
+            },
+        ))
     }
 
     async fn jobs_needing_reindex(&self, jobs: &[JobId]) -> anyhow::Result<ReindexBatch> {
@@ -1290,8 +1415,8 @@ impl TodoStore for SqlTodoStore {
         self.db
             .execute("write_eligible_rows", || {
                 sqlx::query(
-                    "INSERT INTO queue_eligibility (client_id, job_id) SELECT $1, unnest($2::text[]) \
-                     ON CONFLICT DO NOTHING",
+                    "INSERT INTO queue_eligibility (client_id, job_id) SELECT $1, job_id FROM \
+                     queue_jobs WHERE job_id = ANY($2) ON CONFLICT DO NOTHING",
                 )
                 .bind(client.as_str())
                 .bind(jobs.clone())
@@ -1401,11 +1526,24 @@ impl TodoStore for SqlTodoStore {
         Ok(())
     }
 
+    async fn delete_worker(&self, client_id: &ClientId) -> anyhow::Result<()> {
+        self.db
+            .execute("delete_worker", || {
+                sqlx::query("DELETE FROM queue_workers WHERE client_id = $1")
+                    .bind(client_id.as_str())
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
+        // Hold the parent row through the upsert so deletion either cascades
+        // this stamp or wins first and makes the stamp a no-op.
         self.db
             .execute("stamp_liveness", || {
                 sqlx::query(
-                    "INSERT INTO client_liveness (client_id, last_seen_at) VALUES ($1, now()) ON \
+                    "INSERT INTO client_liveness (client_id, last_seen_at) \
+                     SELECT client_id, now() FROM clients WHERE client_id = $1 FOR KEY SHARE ON \
                      CONFLICT (client_id) DO UPDATE SET last_seen_at = now()",
                 )
                 .bind(client_id.as_str())
@@ -1449,32 +1587,6 @@ impl TodoStore for SqlTodoStore {
             .await?;
         Ok(())
     }
-
-    async fn validate_backend(&self) -> anyhow::Result<()> {
-        crate::check(&self.db).await
-    }
-}
-
-/// The instant is stored to the second, the precision of an S3 modification time.
-#[async_trait]
-impl LivenessImport for SqlTodoStore {
-    async fn set_liveness(
-        &self,
-        client_id: &ClientId,
-        last_seen_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        self.db
-            .execute("set_liveness", || {
-                sqlx::query(
-                    "INSERT INTO client_liveness (client_id, last_seen_at) VALUES ($1, $2) ON \
-                     CONFLICT (client_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
-                )
-                .bind(client_id.as_str())
-                .bind(to_second(last_seen_at))
-            })
-            .await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1482,8 +1594,11 @@ mod tests {
     use futures::stream::{self, StreamExt, TryStreamExt};
     use rstest::rstest;
 
+    use pipette_store::ClientStore;
+
     use super::*;
-    use crate::testing::{RACERS, race, test_db_or_skip};
+    use crate::scratch::TestDb;
+    use crate::testing::{RACERS, a_client, public_key, race, test_db_or_skip};
 
     fn now() -> anyhow::Result<DateTime<Utc>> {
         Ok("2026-11-01T08:30:00.250Z".parse()?)
@@ -1493,7 +1608,7 @@ mod tests {
         store
             .write_tmp(job, &serde_json::json!({"job": job}))
             .await?;
-        store.promote_avail(job, ExpiresAt::Never).await
+        store.promote_avail(job, ExpiresAt::Never, None).await
     }
 
     #[tokio::test]
@@ -1573,7 +1688,7 @@ mod tests {
         let store = SqlTodoStore::new(test_db.db().clone());
         let job = JobId::try_new("projection-job")?;
         store.write_tmp(&job, &body).await?;
-        store.promote_avail(&job, ExpiresAt::Never).await?;
+        store.promote_avail(&job, ExpiresAt::Never, None).await?;
         assert_eq!(
             store.get_avail(&job, ExpiresAt::Never).await?,
             Some(body.clone())
@@ -1657,11 +1772,68 @@ mod tests {
         .fetch_one(test_db.db().pool())
         .await?;
         assert!(clauses.is_none());
+        let keys: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT model_key, runtime_key FROM queue_jobs WHERE job_id = 'unrepresentable'",
+        )
+        .fetch_one(test_db.db().pool())
+        .await?;
+        assert_eq!(keys, (None, None));
         Ok(())
     }
 
+    #[rstest]
+    #[case::without_reindex_flag(false)]
+    #[case::with_reindex_flag(true)]
     #[tokio::test]
-    async fn projection_preserves_nested_and_escaped_matcher_values() -> anyhow::Result<()> {
+    async fn failed_client_eligibility_cleanup_keeps_the_repair_triggers(
+        #[case] pending: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_deleted")?;
+        let job = JobId::try_new("cleanup-failure")?;
+        store.write_tmp(&job, &serde_json::json!({})).await?;
+        store.promote_avail(&job, ExpiresAt::Never, None).await?;
+        store
+            .write_eligible(&client, &job, ExpiresAt::Never)
+            .await?;
+        store
+            .write_workers(&HashSet::from([client.clone()]))
+            .await?;
+        if pending {
+            store.write_pending_reindex(&client).await?;
+        }
+        sqlx::raw_sql(
+            "CREATE FUNCTION fail_eligibility_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'injected eligibility cleanup failure'; END; $$; \
+             CREATE TRIGGER fail_eligibility_delete BEFORE DELETE ON queue_eligibility \
+             FOR EACH STATEMENT EXECUTE FUNCTION fail_eligibility_delete();",
+        )
+        .execute(test_db.db().pool())
+        .await?;
+
+        pipette_store::purge_client_todo_state(&store, &client).await;
+        assert_eq!(store.read_workers().await?, HashSet::from([client.clone()]));
+        assert_eq!(store.has_pending_reindex(&client).await?, pending);
+        assert_eq!(store.list_eligible_for_client(&client).await?.len(), 1);
+
+        sqlx::query("DROP TRIGGER fail_eligibility_delete ON queue_eligibility")
+            .execute(test_db.db().pool())
+            .await?;
+        pipette_store::purge_client_todo_state(&store, &client).await;
+        assert!(store.read_workers().await?.is_empty());
+        assert!(!store.has_pending_reindex(&client).await?);
+        assert!(store.list_eligible_for_client(&client).await?.is_empty());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::compact(false)]
+    #[case::pretty(true)]
+    #[tokio::test]
+    async fn projection_preserves_nested_and_escaped_matcher_values(
+        #[case] pretty: bool,
+    ) -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
         let expected = serde_json::json!({
             "requires": ["chip:chip-a"],
@@ -1673,20 +1845,57 @@ mod tests {
         });
         let mut body = expected.clone();
         body["spec"] = serde_json::json!({"payload": "\u{0000}", "clients": ["ignored"]});
-        stream::iter([
-            serde_json::to_string(&body)?,
-            serde_json::to_string_pretty(&body)?,
-        ])
-        .map(Ok::<_, anyhow::Error>)
-        .try_for_each(|encoded| async {
-            let actual: serde_json::Value = sqlx::query_scalar("SELECT queue_match_clauses($1)")
-                .bind(encoded)
-                .fetch_one(test_db.db().pool())
-                .await?;
-            assert_eq!(actual, expected);
-            anyhow::Ok(())
-        })
-        .await?;
+        let encoded = if pretty {
+            serde_json::to_string_pretty(&body)?
+        } else {
+            serde_json::to_string(&body)?
+        };
+        let actual: serde_json::Value = sqlx::query_scalar("SELECT queue_match_clauses($1)")
+            .bind(encoded)
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// The tokenizer finds the end of each value when the text has multibyte
+    /// characters or any JSON whitespace character.
+    #[rstest]
+    #[case::multibyte_values(
+        r#"{"clients":["é","日本語","🦀"],"spec":{"extra":"\u0000"}}"#,
+        serde_json::json!({"clients": ["é", "日本語", "🦀"]})
+    )]
+    #[case::multibyte_ignored_key(
+        r#"{"ключ":"é","requires":["chip:é"]}"#,
+        serde_json::json!({"requires": ["chip:é"]})
+    )]
+    #[case::mixed_whitespace(
+        "{ \t\"clients\"\r\n:\t[ \"a\" ,\n\"b\"\t]\r\n,\"requires\" : [ ] }",
+        serde_json::json!({"clients": ["a", "b"], "requires": []})
+    )]
+    #[case::whitespace_inside_strings(
+        r#"{"clients":[" a ","b\t c","\"  \""]}"#,
+        serde_json::json!({"clients": [" a ", "b\t c", "\"  \""]})
+    )]
+    #[case::scalar_value_before_close(
+        "{\"excludes\":  null  \n}",
+        serde_json::json!({"excludes": null})
+    )]
+    #[case::number_value_before_comma(
+        r#"{"any_of":-15 ,"requires":"é"}"#,
+        serde_json::json!({"any_of": -15, "requires": "é"})
+    )]
+    #[tokio::test]
+    async fn projection_handles_unicode_and_whitespace(
+        #[case] body: &str,
+        #[case] expected: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let clauses: serde_json::Value = sqlx::query_scalar("SELECT queue_match_clauses($1)")
+            .bind(body)
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(clauses, expected);
         Ok(())
     }
 
@@ -1700,7 +1909,7 @@ mod tests {
             .collect();
         let body = serde_json::json!({"clients": clients});
         store.write_tmp(&job, &body).await?;
-        store.promote_avail(&job, ExpiresAt::Never).await?;
+        store.promote_avail(&job, ExpiresAt::Never, None).await?;
         assert_eq!(
             store
                 .avail_clause_groups(std::slice::from_ref(&job))
@@ -1798,21 +2007,264 @@ mod tests {
         Ok(())
     }
 
+    /// The state a job is in when the backlog counts it.
+    #[derive(Clone, Copy, Debug)]
+    enum Seeded {
+        Available,
+        NoDeadline,
+        Expired,
+        Denied,
+        LeasedElsewhere,
+        /// Ranked after a smaller run of its family that the client may not claim.
+        BehindASmallerRun,
+    }
+
+    /// Queue `job` for `client` in `state`. The deadlines are relative to the
+    /// database clock, which the backlog query reads.
+    async fn seed(
+        test_db: &TestDb,
+        store: &SqlTodoStore,
+        client: &ClientId,
+        job: &JobId,
+        state: Seeded,
+    ) -> anyhow::Result<()> {
+        let at =
+            |minutes| ExpiresAt::At(to_second(Utc::now() + chrono::Duration::minutes(minutes)));
+        let deadline = match state {
+            Seeded::NoDeadline => ExpiresAt::Never,
+            Seeded::Expired => at(-5),
+            Seeded::Available
+            | Seeded::Denied
+            | Seeded::LeasedElsewhere
+            | Seeded::BehindASmallerRun => at(60),
+        };
+        let sizes: &[i64] = &[512];
+        let family = matches!(state, Seeded::BehindASmallerRun).then_some(("family", sizes));
+        store.write_tmp(job, &serde_json::json!({})).await?;
+        store.promote_avail(job, deadline, family).await?;
+        store.write_eligible(client, job, deadline).await?;
+        match state {
+            Seeded::Denied => {
+                store
+                    .write_denied(job, client, &DenialRecord::default())
+                    .await?
+            }
+            Seeded::LeasedElsewhere => {
+                sqlx::query(
+                    "UPDATE queue_jobs SET leased_by = 'ev1_other', lease_expiry = now() + \
+                     interval '1 hour' WHERE job_id = $1",
+                )
+                .bind(job.as_str())
+                .execute(test_db.db().pool())
+                .await?;
+            }
+            Seeded::BehindASmallerRun => {
+                let smaller = JobId::try_new("smaller-run")?;
+                store.write_tmp(&smaller, &serde_json::json!({})).await?;
+                store
+                    .promote_avail(&smaller, deadline, Some(("family", [256].as_slice())))
+                    .await?;
+            }
+            Seeded::Available | Seeded::NoDeadline | Seeded::Expired => {}
+        }
+        Ok(())
+    }
+
+    /// A job counts when a claim would accept it. A client with no claimable
+    /// job has no entry.
     #[rstest]
-    #[case(GC_CANDIDATES)]
-    #[case(BACKLOG)]
-    #[case(BACKLOG_CAMPAIGNS)]
+    #[case::available(Seeded::Available, Some(1))]
+    #[case::no_deadline(Seeded::NoDeadline, Some(1))]
+    #[case::expired(Seeded::Expired, None)]
+    #[case::denied(Seeded::Denied, None)]
+    #[case::leased_elsewhere(Seeded::LeasedElsewhere, None)]
+    #[case::behind_a_smaller_run(Seeded::BehindASmallerRun, Some(1))]
     #[tokio::test]
-    async fn a_corrupt_state_blob_reads_as_empty(#[case] name: &str) -> anyhow::Result<()> {
+    async fn the_backlog_counts_the_claimable_jobs(
+        #[case] state: Seeded,
+        #[case] expected: Option<u64>,
+    ) -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
         let store = SqlTodoStore::new(test_db.db().clone());
-        sqlx::query("INSERT INTO queue_maintenance_state (name, body) VALUES ($1, 'junk')")
-            .bind(name)
+        let client = ClientId::try_new("ev1_backlog")?;
+        seed(
+            &test_db,
+            &store,
+            &client,
+            &JobId::try_new("backlog-job")?,
+            state,
+        )
+        .await?;
+
+        let backlog = store.backlog().await?;
+        assert_eq!(backlog.get(&client).copied(), expected);
+        assert_eq!(backlog.len(), usize::from(expected.is_some()));
+        assert_eq!(
+            store
+                .campaign_backlog(&client, now()?)
+                .await?
+                .outside_campaigns,
+            expected.unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    /// A job counts once in each campaign that holds it, and in
+    /// `outside_campaigns` when no campaign holds it. A cancelled plan, a plan
+    /// outside a campaign and an expired membership hold no job.
+    #[tokio::test]
+    async fn the_campaign_backlog_counts_each_holding_campaign_once() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_campaigns")?;
+        let campaign = |n: u8| format!("campaign_00000000-0000-0000-0000-00000000000{n}");
+        let past = ExpiresAt::At(to_second(Utc::now() - chrono::Duration::minutes(5))).to_string();
+        // (plan, status, campaign, cancel marker)
+        let plans: [(&str, &str, Option<String>, bool); 7] = [
+            ("plan-a", "active", Some(campaign(1)), false),
+            ("plan-b", "active", Some(campaign(1)), false),
+            ("plan-c", "active", Some(campaign(2)), false),
+            ("plan-d", "cancelling", Some(campaign(3)), false),
+            ("plan-e", "active", None, false),
+            ("plan-f", "active", Some(campaign(4)), false),
+            ("plan-g", "active", Some(campaign(5)), true),
+        ];
+        // (job, plan memberships, membership deadline)
+        let jobs: [(&str, &[&str], &str); 7] = [
+            ("job-two-plans", &["plan-a", "plan-b"], "never"),
+            ("job-two-campaigns", &["plan-a", "plan-c"], "never"),
+            ("job-no-plan", &[], "never"),
+            ("job-cancelling", &["plan-d"], "never"),
+            ("job-no-campaign", &["plan-e"], "never"),
+            ("job-expired-membership", &["plan-f"], &past),
+            ("job-cancel-marker", &["plan-g"], "never"),
+        ];
+        for (plan, status, campaign, cancelled) in &plans {
+            sqlx::query(
+                "INSERT INTO plans (plan_id, status, campaign_id, body) VALUES ($1, $2, $3, '{}')",
+            )
+            .bind(plan)
+            .bind(status)
+            .bind(campaign)
             .execute(test_db.db().pool())
             .await?;
-        assert!(store.read_gc_candidates().await?.is_empty());
-        assert!(store.read_backlog().await?.is_none());
-        assert!(store.read_campaign_backlog().await?.is_none());
+            if *cancelled {
+                sqlx::query("INSERT INTO cancelled_plans (plan_id) VALUES ($1)")
+                    .bind(plan)
+                    .execute(test_db.db().pool())
+                    .await?;
+            }
+        }
+        for (job, members, deadline) in &jobs {
+            let job = JobId::try_new(*job)?;
+            seed(&test_db, &store, &client, &job, Seeded::NoDeadline).await?;
+            for plan in *members {
+                sqlx::query(
+                    "INSERT INTO job_plans (job_id, plan_id, expires_at, written_at) VALUES \
+                     ($1, $2, $3, now())",
+                )
+                .bind(job.as_str())
+                .bind(plan)
+                .bind(deadline)
+                .execute(test_db.db().pool())
+                .await?;
+            }
+        }
+
+        assert_eq!(
+            store.campaign_backlog(&client, now()?).await?,
+            CampaignBacklog {
+                by_campaign: [
+                    (CampaignId::try_new(campaign(1))?, 2),
+                    (CampaignId::try_new(campaign(2))?, 1),
+                ]
+                .into_iter()
+                .collect(),
+                outside_campaigns: 5,
+            }
+        );
+        assert_eq!(
+            store
+                .campaign_backlog(&ClientId::try_new("ev1_idle")?, now()?)
+                .await?,
+            CampaignBacklog::default()
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::fresh_creating(PlanStatus::Creating, Some("2026-11-01T08:30:01Z"), true)]
+    #[case::at_cutoff(PlanStatus::Creating, Some("2026-11-01T08:30:00.250Z"), false)]
+    #[case::stranded(PlanStatus::Creating, Some("2026-11-01T08:30:00Z"), false)]
+    #[case::future(PlanStatus::Creating, Some("2027-01-01T00:00:00Z"), true)]
+    #[case::old_active(PlanStatus::Active, Some("2026-11-01T08:30:00Z"), true)]
+    #[case::old_complete(PlanStatus::Complete, Some("2026-11-01T08:30:00Z"), true)]
+    #[case::invalid_date(PlanStatus::Creating, Some("invalid"), true)]
+    #[case::missing_date(PlanStatus::Creating, None, true)]
+    #[tokio::test]
+    async fn campaign_backlog_excludes_only_stranded_creating_plans(
+        #[case] status: PlanStatus,
+        #[case] created_at: Option<&str>,
+        #[case] counted: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_creating")?;
+        let candidate = CampaignId::try_new("campaign_00000000-0000-0000-0000-000000000001")?;
+        let healthy = CampaignId::try_new("campaign_00000000-0000-0000-0000-000000000002")?;
+        stream::iter([
+            ("candidate", status.label(), &candidate),
+            ("healthy", PlanStatus::Active.label(), &healthy),
+        ])
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each(|(plan, status, campaign)| {
+            let test_db = &test_db;
+            async move {
+                sqlx::query(
+                    "INSERT INTO plans (plan_id, status, campaign_id, body) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(plan)
+                .bind(status)
+                .bind(campaign.as_str())
+                .bind(serde_json::json!({"created_at": created_at}).to_string())
+                .execute(test_db.db().pool())
+                .await?;
+                anyhow::Ok(())
+            }
+        })
+        .await?;
+        stream::iter(["shared", "candidate-only"])
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|name| {
+                let test_db = &test_db;
+                let store = &store;
+                let client = &client;
+                async move {
+                    let job = JobId::try_new(name)?;
+                    seed(test_db, store, client, &job, Seeded::NoDeadline).await?;
+                    sqlx::query(
+                        "INSERT INTO job_plans (job_id, plan_id, expires_at, written_at) \
+                         VALUES ($1, 'candidate', 'never', now())",
+                    )
+                    .bind(name)
+                    .execute(test_db.db().pool())
+                    .await?;
+                    anyhow::Ok(())
+                }
+            })
+            .await?;
+        sqlx::query(
+            "INSERT INTO job_plans (job_id, plan_id, expires_at, written_at) \
+             VALUES ('shared', 'healthy', 'never', now())",
+        )
+        .execute(test_db.db().pool())
+        .await?;
+
+        let backlog = store.campaign_backlog(&client, now()?).await?;
+        assert_eq!(backlog.by_campaign.get(&healthy), Some(&1));
+        assert_eq!(backlog.by_campaign.get(&candidate), counted.then_some(&2));
+        assert_eq!(backlog.outside_campaigns, u64::from(!counted));
+        assert_eq!(store.backlog().await?.get(&client), Some(&2));
         Ok(())
     }
 
@@ -1825,7 +2277,7 @@ mod tests {
         let job = JobId::try_new("redated-job")?;
         let old = ExpiresAt::At(to_second(now()?));
         store.write_tmp(&job, &serde_json::json!({})).await?;
-        store.promote_avail(&job, old).await?;
+        store.promote_avail(&job, old, None).await?;
         store.write_eligible(&client, &job, old).await?;
         store.redate_avail(&job, old, ExpiresAt::Never).await?;
 
@@ -1874,11 +2326,15 @@ mod tests {
 
     /// Clear each requested job's flag, as an index pass with no matching client does.
     async fn index_all(store: &SqlTodoStore, jobs: &[JobId]) -> anyhow::Result<()> {
-        for job in store.jobs_needing_reindex(jobs).await?.jobs {
-            store
-                .replace_eligibility(&job.job_id, job.revision, &[])
-                .await?;
-        }
+        stream::iter(store.jobs_needing_reindex(jobs).await?.jobs)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|job| async move {
+                store
+                    .replace_eligibility(&job.job_id, job.revision, &[])
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -1903,7 +2359,7 @@ mod tests {
         let lease_expiry = to_second(now()?);
         let dated = ExpiresAt::At(to_second(now()?));
         store.write_tmp(&job, &serde_json::json!({})).await?;
-        store.promote_avail(&job, dated).await?;
+        store.promote_avail(&job, dated, None).await?;
         if !matches!(how, BackInQueue::Inserted) {
             index_all(&store, std::slice::from_ref(&job)).await?;
             assert!(
@@ -2026,13 +2482,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_liveness_keeps_the_given_instant_to_the_second() -> anyhow::Result<()> {
+    async fn invalid_denial_code_keeps_its_parse_error_and_column_context() -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
         let store = SqlTodoStore::new(test_db.db().clone());
-        let client = ClientId::try_new("liveness_client")?;
-        store.stamp_liveness(&client).await?;
-        store.set_liveness(&client, now()?).await?;
-        assert_eq!(store.read_liveness(&client).await?, Some(to_second(now()?)));
+        let job = JobId::try_new("invalid-denial-code")?;
+        let client = ClientId::try_new("ev1_denied")?;
+        enqueue(&store, &job).await?;
+        sqlx::query(
+            "INSERT INTO queue_denials (job_id, client_id, failure_code) \
+             VALUES ($1, $2, 'unknown_code')",
+        )
+        .bind(job.as_str())
+        .bind(client.as_str())
+        .execute(test_db.db().pool())
+        .await?;
+
+        let error = store
+            .get_denied(&job, &client)
+            .await
+            .err()
+            .context("an invalid denial code must be rejected")?;
+        assert_eq!(
+            error.to_string(),
+            "queue_denials.failure_code \"unknown_code\""
+        );
+        assert!(error.source().is_some());
+        Ok(())
+    }
+
+    async fn register_client(test_db: &TestDb, id: ClientId) -> anyhow::Result<()> {
+        crate::clients::SqlClientStore::new(test_db.db().clone())
+            .put_client(&a_client(id, public_key(0x01)?)?)
+            .await
+    }
+
+    #[rstest]
+    #[case::new(false)]
+    #[case::existing(true)]
+    #[tokio::test]
+    async fn a_liveness_write_racing_client_deletion_leaves_no_row(
+        #[case] existing: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let clients = crate::clients::SqlClientStore::new(test_db.db().clone());
+        let ids = (0..RACERS / 2)
+            .map(|pair| ClientId::try_new(format!("liveness_race_{pair}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        stream::iter(ids.iter())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|id| {
+                let test_db = &test_db;
+                let store = &store;
+                async move {
+                    register_client(test_db, id.clone()).await?;
+                    if existing {
+                        store.stamp_liveness(id).await?;
+                    }
+                    anyhow::Ok(())
+                }
+            })
+            .await?;
+
+        race(|n| {
+            let store = store.clone();
+            let clients = clients.clone();
+            let id = ids[n / 2].clone();
+            async move {
+                if n % 2 == 0 {
+                    clients.delete_client(&id).await
+                } else {
+                    store.stamp_liveness(&id).await
+                }
+            }
+        })
+        .await?;
+        assert!(store.list_liveness().await?.is_empty());
+
+        // A request authenticated before deletion is a no-op.
+        store.stamp_liveness(&ids[0]).await?;
+        assert!(store.list_liveness().await?.is_empty());
         Ok(())
     }
 
@@ -2040,7 +2569,7 @@ mod tests {
     async fn sql_todo_store_passes_the_todo_contract() -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
         let store = SqlTodoStore::new(test_db.db().clone());
-        store.validate_backend().await?;
+        register_client(&test_db, ClientId::try_new("live_c1")?).await?;
         pipette_store_testkit::assert_todo_store_contract(&store, now()?).await
     }
 
@@ -2076,8 +2605,8 @@ mod tests {
                 .count(),
             RACERS - 1
         );
-        assert_eq!(store.list_leased().await?.len(), 1);
-        assert!(store.list_avail().await?.is_empty());
+        assert_eq!(store.list_leases().await?.len(), 1);
+        assert!(store.list_avail_entries().await?.is_empty());
         Ok(())
     }
 
@@ -2105,7 +2634,7 @@ mod tests {
             let client = clients[n % clients.len()].clone();
             async move {
                 store
-                    .claim_for_client(&client, lease_expiry, 0, &[], None, at)
+                    .claim_for_client(&client, lease_expiry, 0, &[], None, None, at)
                     .await
             }
         })
@@ -2161,7 +2690,7 @@ mod tests {
         } else {
             assert!(matches!(
                 store
-                    .claim_for_client(&client, until, 3, &[], None, at)
+                    .claim_for_client(&client, until, 3, &[], None, None, at)
                     .await?,
                 ClaimOutcome::Granted { .. }
             ));
@@ -2197,7 +2726,15 @@ mod tests {
             .await?;
         assert!(
             store
-                .claim_for_client(&client, at + chrono::Duration::minutes(5), 3, &[], None, at)
+                .claim_for_client(
+                    &client,
+                    at + chrono::Duration::minutes(5),
+                    3,
+                    &[],
+                    None,
+                    None,
+                    at
+                )
                 .await
                 .is_err()
         );
@@ -2222,14 +2759,14 @@ mod tests {
             .claim_job(&job, ExpiresAt::Never, &client, until)
             .await?;
         let result = store
-            .claim_for_client(&client, until, 2, &[], None, at)
+            .claim_for_client(&client, until, 2, &[], None, None, at)
             .await?;
         let ClaimOutcome::CheckHeldLease { lease, .. } = result else {
             anyhow::bail!("a held lease needs an access check before loss accounting");
         };
         assert!(store.list_lost_leases(&job).await?.is_empty());
         let result = store
-            .claim_for_client(&client, until, 2, &[], Some(&lease), at)
+            .claim_for_client(&client, until, 2, &[], Some(&lease), None, at)
             .await?;
         assert!(matches!(result, ClaimOutcome::HandedBack { .. }));
         assert_eq!(store.list_lost_leases(&job).await?.len(), 1);
@@ -2238,14 +2775,14 @@ mod tests {
         let renewed = until + chrono::Duration::minutes(1);
         store.renew_lease(&job, &client, renewed).await?;
         let result = store
-            .claim_for_client(&client, renewed, 2, &[], Some(&lease), at)
+            .claim_for_client(&client, renewed, 2, &[], Some(&lease), None, at)
             .await?;
         let ClaimOutcome::CheckHeldLease { lease, .. } = result else {
             anyhow::bail!("the renewed lease must pass its own access check");
         };
         assert_eq!(store.list_lost_leases(&job).await?.len(), 1);
         let result = store
-            .claim_for_client(&client, renewed, 2, &[], Some(&lease), at)
+            .claim_for_client(&client, renewed, 2, &[], Some(&lease), None, at)
             .await?;
         assert!(matches!(result, ClaimOutcome::Withheld(_)));
         assert_eq!(store.list_lost_leases(&job).await?.len(), 2);
@@ -2292,6 +2829,7 @@ mod tests {
                 at + chrono::Duration::minutes(5),
                 limit,
                 &[],
+                None,
                 None,
                 at,
             )
@@ -2349,7 +2887,7 @@ mod tests {
             store
                 .write_tmp(job, &serde_json::json!({"job": job}))
                 .await?;
-            store.promote_avail(job, deadline).await?;
+            store.promote_avail(job, deadline, None).await?;
             store.write_eligible(&client, job, deadline).await?;
         }
         match rival_kind {
@@ -2384,6 +2922,7 @@ mod tests {
                 0,
                 &passed_over,
                 None,
+                None,
                 at,
             )
             .await?;
@@ -2391,6 +2930,960 @@ mod tests {
             anyhow::bail!("expected a grant, got {outcome:?}");
         };
         assert_eq!(lease.job_id.as_str(), expected);
+        Ok(())
+    }
+
+    /// The lease a claim of `client` grants, `None` when it grants nothing.
+    async fn grant(
+        store: &SqlTodoStore,
+        client: &ClientId,
+        passed_over: &[JobId],
+    ) -> anyhow::Result<Option<Lease>> {
+        let at = now()?;
+        let outcome = store
+            .claim_for_client(
+                client,
+                at + chrono::Duration::hours(1),
+                0,
+                passed_over,
+                None,
+                None,
+                at,
+            )
+            .await?;
+        if matches!(outcome, ClaimOutcome::Empty) {
+            return Ok(None);
+        }
+        let ClaimOutcome::Granted { lease, .. } = outcome else {
+            anyhow::bail!("expected a grant or nothing, got {outcome:?}");
+        };
+        Ok(Some(lease))
+    }
+
+    /// A family hands out its smaller runs first: the fewer smaller runs of its
+    /// family the queue holds, leased or not, the sooner a run goes, and a job in
+    /// no family ranks first. A device with nothing ranked sooner takes a larger
+    /// run, so no device waits for the order.
+    #[tokio::test]
+    async fn a_family_hands_out_its_smaller_runs_first() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let clients = ["ev1_a", "ev1_b", "ev1_c", "ev1_d", "ev1_e"]
+            .map(ClientId::try_new)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        // Prompt tokens and decode tokens.
+        stream::iter([
+            ("small", Some([256, 100])),
+            ("longer-prompt", Some([512, 100])),
+            ("longer-decode", Some([256, 200])),
+            ("large", Some([512, 200])),
+            ("solo", None),
+        ])
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each(|(name, sizes)| {
+            let (store, clients) = (&store, &clients);
+            async move {
+                let job = JobId::try_new(name)?;
+                store.write_tmp(&job, &serde_json::json!({})).await?;
+                let family = sizes.as_ref().map(|sizes| ("family", sizes.as_slice()));
+                store.promote_avail(&job, ExpiresAt::Never, family).await?;
+                stream::iter(clients)
+                    .map(Ok::<_, anyhow::Error>)
+                    .try_for_each(|client| store.write_eligible(client, &job, ExpiresAt::Never))
+                    .await
+            }
+        })
+        .await?;
+        let solo = JobId::try_new("solo")?;
+
+        let small = grant(&store, &clients[0], std::slice::from_ref(&solo))
+            .await?
+            .context("a grant")?;
+        assert_eq!(small.job_id.as_str(), "small");
+        let outside = grant(&store, &clients[1], &[]).await?.context("a grant")?;
+        assert_eq!(outside.job_id, solo);
+        // While the small run runs, the two runs that wait for it alone go out,
+        // then the one that waits for all three.
+        let first = grant(&store, &clients[2], &[]).await?.context("a grant")?;
+        let second = grant(&store, &clients[3], &[]).await?.context("a grant")?;
+        assert_eq!(
+            HashSet::from([first.job_id.as_str(), second.job_id.as_str()]),
+            HashSet::from(["longer-prompt", "longer-decode"])
+        );
+        let large = grant(&store, &clients[4], &[]).await?.context("a grant")?;
+        assert_eq!(large.job_id.as_str(), "large");
+        Ok(())
+    }
+
+    /// Only a run's own family ranks it: another family's first run goes before
+    /// this family's second, however small this family's runs are.
+    #[tokio::test]
+    async fn another_familys_runs_do_not_rank_a_run() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_ranked")?;
+        stream::iter([
+            ("first", "family", 100, false),
+            ("second", "family", 101, true),
+            ("other", "other", 5000, true),
+        ])
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each(|(name, family, size, eligible)| {
+            let (store, client) = (&store, &client);
+            async move {
+                let job = JobId::try_new(name)?;
+                store.write_tmp(&job, &serde_json::json!({})).await?;
+                store
+                    .promote_avail(&job, ExpiresAt::Never, Some((family, [size].as_slice())))
+                    .await?;
+                if eligible {
+                    store.write_eligible(client, &job, ExpiresAt::Never).await?;
+                }
+                Ok(())
+            }
+        })
+        .await?;
+        let granted = grant(&store, &client, &[]).await?.context("a grant")?;
+        assert_eq!(granted.job_id.as_str(), "other");
+        Ok(())
+    }
+
+    /// A job's larger runs are the queued, unleased runs of its family that are
+    /// no smaller in any size and larger in one. A run smaller in some size, a
+    /// twin, a leased run and another family's run are none.
+    #[tokio::test]
+    async fn a_jobs_larger_runs_are_no_smaller_in_any_size() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        // Prompt tokens and decode tokens.
+        stream::iter([
+            ("failed", "family", [256, 100]),
+            ("longer-prompt", "family", [512, 100]),
+            ("longer-both", "family", [512, 200]),
+            ("shorter-prompt-longer-decode", "family", [128, 200]),
+            ("twin", "family", [256, 100]),
+            ("leased", "family", [1024, 100]),
+            ("other-family", "other", [512, 100]),
+        ])
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each(|(name, family, sizes)| {
+            let store = &store;
+            async move {
+                let job = JobId::try_new(name)?;
+                store.write_tmp(&job, &serde_json::json!({})).await?;
+                store
+                    .promote_avail(&job, ExpiresAt::Never, Some((family, sizes.as_slice())))
+                    .await
+            }
+        })
+        .await?;
+        let client = ClientId::try_new("ev1_runner")?;
+        let until = now()? + chrono::Duration::hours(1);
+        let leased = JobId::try_new("leased")?;
+        store
+            .claim_job(&leased, ExpiresAt::Never, &client, until)
+            .await?;
+
+        let larger: HashSet<String> = store
+            .queued_larger_runs(&JobId::try_new("failed")?)
+            .await?
+            .into_iter()
+            .map(|(avail, _)| avail.job_id.to_string())
+            .collect();
+        assert_eq!(
+            larger,
+            HashSet::from(["longer-prompt".to_owned(), "longer-both".to_owned()])
+        );
+        Ok(())
+    }
+
+    /// A job body whose download is `model` and `runtime`.
+    fn artifact_body(job: &JobId, model: &str, runtime: &str) -> serde_json::Value {
+        serde_json::json!({
+            "job_id": job,
+            "spec": {
+                "model": {"type": "fixture", "name": model},
+                "runtime": {"type": "fixture", "name": runtime},
+            },
+        })
+    }
+
+    fn descriptor(name: &str) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+        Ok(serde_json::from_value(
+            serde_json::json!({"name": name, "type": "fixture"}),
+        )?)
+    }
+
+    async fn seed_artifact_job(
+        store: &SqlTodoStore,
+        client: &ClientId,
+        job: &JobId,
+        model: &str,
+        runtime: &str,
+        deadline: ExpiresAt,
+    ) -> anyhow::Result<()> {
+        store
+            .write_tmp(job, &artifact_body(job, model, runtime))
+            .await?;
+        store.promote_avail(job, deadline, None).await?;
+        store.write_eligible(client, job, deadline).await
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PriorEnd {
+        Finished,
+        /// Queue maintenance recycles the lapsed lease, and the client then
+        /// reclaims the job and finishes it.
+        Reclaimed,
+        Failed,
+        /// A failure report for another job, which leaves the last grant.
+        FailedElsewhere,
+        LeaseLost,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Advert {
+        Absent,
+        Empty,
+        ModelA,
+        /// A descriptor that jsonb cannot represent.
+        Unrepresentable,
+    }
+
+    /// The client runs each prior job in turn; the last one ends as `end`. The
+    /// candidates are `model-job` (A, R9), `runtime-job` (Z, R1) and
+    /// `fresh-job` (C, R3). An expected job of `None` means any job.
+    #[rstest]
+    #[case::the_held_model_wins(&[("A", "R1")], PriorEnd::Finished, Advert::Absent, false, ClaimAffinity::Model, Some("model-job"))]
+    #[case::the_held_runtime_wins(&[("Y", "R1")], PriorEnd::Finished, Advert::Absent, false, ClaimAffinity::Runtime, Some("runtime-job"))]
+    #[case::only_the_last_grant_counts(&[("A", "R5"), ("Y", "R1")], PriorEnd::Finished, Advert::Absent, false, ClaimAffinity::Runtime, Some("runtime-job"))]
+    #[case::a_failure_forgets_the_grant(&[("A", "R1")], PriorEnd::Failed, Advert::Absent, false, ClaimAffinity::None, None)]
+    #[case::a_failure_elsewhere_keeps_the_grant(&[("A", "R1")], PriorEnd::FailedElsewhere, Advert::Absent, false, ClaimAffinity::Model, Some("model-job"))]
+    #[case::a_reclaim_restores_the_grant(&[("A", "R1")], PriorEnd::Reclaimed, Advert::Absent, false, ClaimAffinity::Model, Some("model-job"))]
+    #[case::a_lost_lease_forgets_the_grant(&[("A", "R1")], PriorEnd::LeaseLost, Advert::Absent, false, ClaimAffinity::None, None)]
+    #[case::an_advertised_set_replaces_the_grant(&[("Y", "R1")], PriorEnd::Finished, Advert::ModelA, false, ClaimAffinity::Model, Some("model-job"))]
+    #[case::an_empty_advertised_set_holds_nothing(&[("A", "R1")], PriorEnd::Finished, Advert::Empty, false, ClaimAffinity::None, None)]
+    #[case::an_unrepresentable_descriptor_matches_nothing(&[("A", "R1")], PriorEnd::Finished, Advert::Unrepresentable, false, ClaimAffinity::None, None)]
+    #[case::a_sooner_deadline_beats_affinity(&[("A", "R1")], PriorEnd::Finished, Advert::Absent, true, ClaimAffinity::None, Some("fresh-job"))]
+    #[tokio::test]
+    async fn the_claim_prefers_the_artifacts_the_client_holds(
+        #[case] prior: &[(&str, &str)],
+        #[case] end: PriorEnd,
+        #[case] advert: Advert,
+        #[case] fresh_is_sooner: bool,
+        #[case] expected_affinity: ClaimAffinity,
+        #[case] expected_job: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let at = now()?;
+        let client = ClientId::try_new("picker")?;
+        register_client(&test_db, client.clone()).await?;
+        let lease_expiry = to_second(at) + chrono::Duration::hours(1);
+
+        for (index, (model, runtime)) in prior.iter().enumerate() {
+            let job = JobId::try_new(format!("prior-{index}"))?;
+            seed_artifact_job(&store, &client, &job, model, runtime, ExpiresAt::Never).await?;
+            let last = index + 1 == prior.len();
+            // A lease that lapses before the next claim is a lost lease.
+            let expiry = if last && matches!(end, PriorEnd::LeaseLost) {
+                to_second(at) - chrono::Duration::minutes(1)
+            } else {
+                lease_expiry
+            };
+            let outcome = store
+                .claim_for_client(&client, expiry, 0, &[], None, None, at)
+                .await?;
+            let ClaimOutcome::Granted { lease, .. } = outcome else {
+                anyhow::bail!("expected a grant of {job}, got {outcome:?}");
+            };
+            anyhow::ensure!(lease.job_id == job, "granted {}, not {job}", lease.job_id);
+            // An earlier prior job finishes, whatever `end` is.
+            let end = if last { end } else { PriorEnd::Finished };
+            let mut lease = lease;
+            match end {
+                PriorEnd::Finished => {}
+                PriorEnd::Reclaimed => {
+                    // What queue-maintenance does to a lapsed lease.
+                    store
+                        .write_lost_lease(&job, &client, lease.lease_expiry)
+                        .await?;
+                    store
+                        .recycle_lease(&job, lease.expires_at, &client, lease.lease_expiry)
+                        .await?;
+                    let outcome = store
+                        .reclaim_for_client(&job, &client, lease_expiry, 0, at)
+                        .await?;
+                    let ReclaimOutcome::Granted {
+                        lease: reclaimed, ..
+                    } = outcome
+                    else {
+                        anyhow::bail!("expected a reclaim grant of {job}, got {outcome:?}");
+                    };
+                    lease = reclaimed;
+                }
+                PriorEnd::Failed => store.forget_last_grant(&job, &client).await?,
+                PriorEnd::FailedElsewhere => {
+                    store
+                        .forget_last_grant(&JobId::try_new("elsewhere")?, &client)
+                        .await?;
+                }
+                PriorEnd::LeaseLost => continue,
+            }
+            store
+                .delete_lease(&job, lease.expires_at, &client, lease.lease_expiry)
+                .await?;
+        }
+
+        let sooner = ExpiresAt::At(to_second(at) + chrono::Duration::days(1));
+        for (name, model, runtime) in [
+            ("model-job", "A", "R9"),
+            ("runtime-job", "Z", "R1"),
+            ("fresh-job", "C", "R3"),
+        ] {
+            let job = JobId::try_new(name)?;
+            let deadline = if fresh_is_sooner && name == "fresh-job" {
+                sooner
+            } else {
+                ExpiresAt::Never
+            };
+            seed_artifact_job(&store, &client, &job, model, runtime, deadline).await?;
+        }
+
+        let cached = match advert {
+            Advert::Absent => None,
+            Advert::Empty => Some(CachedArtifacts::default()),
+            Advert::ModelA => Some(CachedArtifacts {
+                models: vec![descriptor("A")?],
+                runtimes: Vec::new(),
+            }),
+            Advert::Unrepresentable => Some(CachedArtifacts {
+                models: vec![descriptor("A\u{0}")?, descriptor("\u{0}")?],
+                runtimes: vec![descriptor("\u{0}")?],
+            }),
+        };
+        let outcome = store
+            .claim_for_client(&client, lease_expiry, 0, &[], None, cached.as_ref(), at)
+            .await?;
+        let ClaimOutcome::Granted {
+            lease, affinity, ..
+        } = outcome
+        else {
+            anyhow::bail!("expected a grant, got {outcome:?}");
+        };
+        assert_eq!(affinity, expected_affinity);
+        if let Some(expected) = expected_job {
+            assert_eq!(lease.job_id.as_str(), expected);
+        }
+        Ok(())
+    }
+
+    /// With the client's held set fixed, successive claims take the jobs in
+    /// affinity order: both artifacts, the model, the runtime, then neither.
+    #[tokio::test]
+    async fn the_claim_ranks_both_artifacts_over_the_model_over_the_runtime() -> anyhow::Result<()>
+    {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let at = now()?;
+        let client = ClientId::try_new("picker")?;
+        let lease_expiry = to_second(at) + chrono::Duration::hours(1);
+        for (name, model, runtime) in [
+            ("neither-job", "C", "R3"),
+            ("runtime-job", "Z", "R1"),
+            ("model-job", "A", "R9"),
+            ("both-job", "A", "R1"),
+        ] {
+            let job = JobId::try_new(name)?;
+            seed_artifact_job(&store, &client, &job, model, runtime, ExpiresAt::Never).await?;
+        }
+        let cached = CachedArtifacts {
+            models: vec![descriptor("A")?],
+            runtimes: vec![descriptor("R1")?],
+        };
+
+        let mut taken = Vec::new();
+        for _ in 0..4 {
+            let outcome = store
+                .claim_for_client(&client, lease_expiry, 0, &[], None, Some(&cached), at)
+                .await?;
+            let ClaimOutcome::Granted {
+                lease, affinity, ..
+            } = outcome
+            else {
+                anyhow::bail!("expected a grant, got {outcome:?}");
+            };
+            store
+                .delete_lease(&lease.job_id, lease.expires_at, &client, lease.lease_expiry)
+                .await?;
+            taken.push((lease.job_id.to_string(), affinity));
+        }
+        assert_eq!(
+            taken,
+            vec![
+                ("both-job".to_string(), ClaimAffinity::Both),
+                ("model-job".to_string(), ClaimAffinity::Model),
+                ("runtime-job".to_string(), ClaimAffinity::Runtime),
+                ("neither-job".to_string(), ClaimAffinity::None),
+            ]
+        );
+        Ok(())
+    }
+
+    async fn granted_model(
+        store: &SqlTodoStore,
+        client: &ClientId,
+        cached_model: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let at = now()?;
+        let cached = CachedArtifacts {
+            models: vec![descriptor(cached_model)?],
+            runtimes: Vec::new(),
+        };
+        let outcome = store
+            .claim_for_client(
+                client,
+                at + chrono::Duration::hours(1),
+                0,
+                &[],
+                None,
+                Some(&cached),
+                at,
+            )
+            .await?;
+        let ClaimOutcome::Granted { body, .. } = outcome else {
+            anyhow::bail!("expected a grant, got {outcome:?}");
+        };
+        Ok(body
+            .pointer("/spec/model/name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BJob {
+        Plain,
+        /// Its deadline is later than the job of model A.
+        Later,
+        /// A smaller run of its family is queued, so it ranks after the job of A.
+        Waiting,
+        /// It names no model, and neither do the leased jobs of B.
+        NoModel,
+    }
+
+    /// A job another device leases, as `picker` sees it.
+    #[derive(Clone, Copy, Debug)]
+    enum Leased {
+        Eligible,
+        Ineligible,
+        /// Eligible, but the lease lapsed.
+        Lapsed,
+        /// Eligible, on a runtime no candidate uses.
+        OtherRuntime,
+    }
+
+    /// `picker` holds model A and may claim one job of model A and one of B.
+    /// Each `leased` entry is a job another device leases: its model, and how
+    /// `picker` sees it.
+    #[rstest]
+    #[case::a_model_no_other_device_runs_wins(&[("A", Leased::Eligible)], BJob::Plain, Some("B"))]
+    #[case::equal_counts_go_to_the_held_model(&[("A", Leased::Eligible), ("B", Leased::Eligible)], BJob::Plain, Some("A"))]
+    #[case::a_job_with_no_model_counts_zero(&[("A", Leased::Eligible), ("B", Leased::Eligible)], BJob::NoModel, None)]
+    #[case::a_lease_the_device_cannot_run_does_not_count(&[("A", Leased::Ineligible)], BJob::Plain, Some("A"))]
+    #[case::a_lapsed_lease_does_not_count(&[("A", Leased::Lapsed)], BJob::Plain, Some("A"))]
+    #[case::a_lease_on_another_runtime_counts(&[("A", Leased::OtherRuntime)], BJob::Plain, Some("B"))]
+    #[case::the_deadline_comes_first(&[("A", Leased::Eligible)], BJob::Later, Some("A"))]
+    #[case::smaller_runs_rank_before_the_model_count(&[("A", Leased::Eligible)], BJob::Waiting, Some("A"))]
+    #[tokio::test]
+    async fn the_claim_prefers_the_model_the_fewest_other_devices_run(
+        #[case] leased: &[(&str, Leased)],
+        #[case] b_job: BJob,
+        #[case] expected: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let picker = ClientId::try_new("picker")?;
+        let at = now()?;
+        let body = |job: &JobId, model: &str, runtime: &str| match (b_job, model) {
+            (BJob::NoModel, "B") => serde_json::json!({}),
+            _ => artifact_body(job, model, runtime),
+        };
+        stream::iter(leased.iter().enumerate())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(index, &(model, lease))| {
+                let (store, picker, body) = (&store, &picker, &body);
+                async move {
+                    let job = JobId::try_new(format!("leased-{index}"))?;
+                    let holder = ClientId::try_new(format!("holder-{index}"))?;
+                    let runtime = if matches!(lease, Leased::OtherRuntime) {
+                        "R2"
+                    } else {
+                        "R"
+                    };
+                    store.write_tmp(&job, &body(&job, model, runtime)).await?;
+                    store.promote_avail(&job, ExpiresAt::Never, None).await?;
+                    if !matches!(lease, Leased::Ineligible) {
+                        store.write_eligible(picker, &job, ExpiresAt::Never).await?;
+                    }
+                    let lease_expiry = if matches!(lease, Leased::Lapsed) {
+                        at - chrono::Duration::minutes(1)
+                    } else {
+                        at + chrono::Duration::hours(1)
+                    };
+                    store
+                        .claim_job(&job, ExpiresAt::Never, &holder, lease_expiry)
+                        .await?;
+                    Ok(())
+                }
+            })
+            .await?;
+
+        let soon = ExpiresAt::At(to_second(at) + chrono::Duration::days(1));
+        seed_artifact_job(&store, &picker, &JobId::try_new("a-job")?, "A", "R", soon).await?;
+        let b_deadline = if matches!(b_job, BJob::Later) {
+            ExpiresAt::Never
+        } else {
+            soon
+        };
+        let longer: &[i64] = &[512];
+        let family = matches!(b_job, BJob::Waiting).then_some(("family", longer));
+        let b = JobId::try_new("b-job")?;
+        store.write_tmp(&b, &body(&b, "B", "R")).await?;
+        store.promote_avail(&b, b_deadline, family).await?;
+        store.write_eligible(&picker, &b, b_deadline).await?;
+        if family.is_some() {
+            let shorter = JobId::try_new("b-shorter")?;
+            store.write_tmp(&shorter, &body(&shorter, "B", "R")).await?;
+            store
+                .promote_avail(&shorter, b_deadline, Some(("family", [256].as_slice())))
+                .await?;
+        }
+
+        assert_eq!(
+            granted_model(&store, &picker, "A").await?.as_deref(),
+            expected
+        );
+        Ok(())
+    }
+
+    /// Four devices that all hold model A claim in turn among three jobs of A
+    /// and three of B. Each takes the model fewer of the others run, A on a
+    /// tie, so two devices run each model.
+    #[tokio::test]
+    async fn devices_that_hold_one_model_split_across_the_models() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let devices = (0..4)
+            .map(|n| ClientId::try_new(format!("phone-{n}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let jobs = [
+            ("A", "a-0"),
+            ("A", "a-1"),
+            ("A", "a-2"),
+            ("B", "b-0"),
+            ("B", "b-1"),
+            ("B", "b-2"),
+        ];
+        stream::iter(jobs)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(model, name)| {
+                let (store, devices) = (&store, &devices);
+                async move {
+                    let job = JobId::try_new(name)?;
+                    store
+                        .write_tmp(&job, &artifact_body(&job, model, "R"))
+                        .await?;
+                    store.promote_avail(&job, ExpiresAt::Never, None).await?;
+                    stream::iter(devices)
+                        .map(Ok::<_, anyhow::Error>)
+                        .try_for_each(|device| store.write_eligible(device, &job, ExpiresAt::Never))
+                        .await
+                }
+            })
+            .await?;
+
+        let taken: Vec<Option<String>> = stream::iter(&devices)
+            .then(|device| granted_model(&store, device, "A"))
+            .try_collect()
+            .await?;
+        assert_eq!(
+            taken,
+            ["A", "B", "A", "B"].map(|model| Some(model.to_owned()))
+        );
+        Ok(())
+    }
+
+    /// Whitespace and key order in a body do not change its keys.
+    #[tokio::test]
+    async fn the_artifact_keys_ignore_formatting() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let pool = test_db.db().pool();
+        for (job, body) in [
+            (
+                "compact",
+                r#"{"spec":{"model":{"a":1,"bb":"x"},"runtime":{"c":[1,2]}}}"#,
+            ),
+            (
+                "spaced",
+                r#"{ "spec" : { "runtime" : { "c" : [ 1 , 2 ] }, "model" : { "bb" : "x", "a" : 1 } } }"#,
+            ),
+        ] {
+            sqlx::query("INSERT INTO queue_jobs (job_id, body, revision) VALUES ($1, $2, 1)")
+                .bind(job)
+                .bind(body)
+                .execute(pool)
+                .await?;
+        }
+        let keys: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT model_key, runtime_key FROM queue_jobs ORDER BY job_id")
+                .fetch_all(pool)
+                .await?;
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].0.is_some() && keys[0].1.is_some());
+        assert_eq!(keys[0], keys[1]);
+        Ok(())
+    }
+
+    /// The eligibility, denial and lost-lease rows that name `job`.
+    async fn rows_naming(test_db: &crate::scratch::TestDb, job: &JobId) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM queue_eligibility WHERE job_id = $1) \
+             + (SELECT count(*) FROM queue_denials WHERE job_id = $1) \
+             + (SELECT count(*) FROM queue_lost_leases WHERE job_id = $1)",
+        )
+        .bind(job.as_str())
+        .fetch_one(test_db.db().pool())
+        .await?)
+    }
+
+    async fn write_each_row(
+        store: &SqlTodoStore,
+        job: &JobId,
+        client: &ClientId,
+    ) -> anyhow::Result<()> {
+        store.write_eligible(client, job, ExpiresAt::Never).await?;
+        store
+            .write_eligible_rows(client, std::slice::from_ref(job))
+            .await?;
+        store
+            .write_denied(job, client, &DenialRecord::default())
+            .await?;
+        store.write_lost_lease(job, client, now()?).await
+    }
+
+    #[tokio::test]
+    async fn writes_for_a_missing_job_store_nothing() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let job = JobId::try_new("never-queued")?;
+        write_each_row(&store, &job, &ClientId::try_new("ev1_writer")?).await?;
+        assert_eq!(rows_naming(&test_db, &job).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lost_lease_for_a_deleted_job_forgets_its_last_grant() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let job = JobId::try_new("deleted-grant")?;
+        let client = ClientId::try_new("ev1_holder")?;
+        register_client(&test_db, client.clone()).await?;
+        let at = now()?;
+        enqueue(&store, &job).await?;
+        store
+            .write_eligible(&client, &job, ExpiresAt::Never)
+            .await?;
+        let outcome = store
+            .claim_for_client(
+                &client,
+                at + chrono::Duration::hours(1),
+                0,
+                &[],
+                None,
+                None,
+                at,
+            )
+            .await?;
+        let ClaimOutcome::Granted { lease, .. } = outcome else {
+            anyhow::bail!("expected a grant, got {outcome:?}");
+        };
+        store
+            .delete_lease(&job, lease.expires_at, &client, lease.lease_expiry)
+            .await?;
+        let last_grants = || {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM queue_client_last_grant WHERE client_id = $1",
+            )
+            .bind(client.as_str())
+            .fetch_one(test_db.db().pool())
+        };
+        assert_eq!(last_grants().await?, 1);
+
+        store
+            .write_lost_lease(&job, &client, lease.lease_expiry)
+            .await?;
+        assert_eq!(last_grants().await?, 0);
+        assert_eq!(rows_naming(&test_db, &job).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_client_forgets_its_completed_grant() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let clients = crate::clients::SqlClientStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_completed")?;
+        let job = JobId::try_new("completed-grant")?;
+        let at = now()?;
+        register_client(&test_db, client.clone()).await?;
+        seed_artifact_job(&store, &client, &job, "model", "runtime", ExpiresAt::Never).await?;
+        let outcome = store
+            .claim_for_client(
+                &client,
+                at + chrono::Duration::hours(1),
+                0,
+                &[],
+                None,
+                None,
+                at,
+            )
+            .await?;
+        let ClaimOutcome::Granted { lease, .. } = outcome else {
+            anyhow::bail!("expected a grant, got {outcome:?}");
+        };
+        store
+            .delete_lease(&job, lease.expires_at, &client, lease.lease_expiry)
+            .await?;
+        let count = || {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM queue_client_last_grant")
+                .fetch_one(test_db.db().pool())
+        };
+        assert_eq!(count().await?, 1);
+        clients.delete_client(&client).await?;
+        assert_eq!(count().await?, 0);
+
+        register_client(&test_db, client.clone()).await?;
+        let mut tx = test_db.db().begin_read_committed().await?;
+        assert_eq!(
+            cached_keys(&mut tx, client.as_str(), None).await?,
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn grant_for_deletion_race(
+        store: &SqlTodoStore,
+        client: &ClientId,
+        job: &JobId,
+        reclaim: bool,
+    ) -> anyhow::Result<()> {
+        let at = now()?;
+        let until = at + chrono::Duration::hours(1);
+        if reclaim {
+            let outcome = store.reclaim_for_client(job, client, until, 0, at).await?;
+            anyhow::ensure!(
+                matches!(
+                    outcome,
+                    ReclaimOutcome::Granted { .. } | ReclaimOutcome::Renewed
+                ),
+                "expected a reclaim, got {outcome:?}"
+            );
+        } else {
+            let outcome = store
+                .claim_for_client(client, until, 0, &[], None, None, at)
+                .await?;
+            anyhow::ensure!(
+                matches!(outcome, ClaimOutcome::Granted { .. }),
+                "expected a grant, got {outcome:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::claim(false)]
+    #[case::reclaim(true)]
+    #[tokio::test]
+    async fn lapsed_grant_settlement_racing_client_deletion_does_not_deadlock(
+        #[case] reclaim: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let client = ClientId::try_new("ev1_lapsed_delete")?;
+        let old = JobId::try_new("old-grant")?;
+        let next = JobId::try_new("next-grant")?;
+        let at = now()?;
+        register_client(&test_db, client.clone()).await?;
+        seed_artifact_job(&store, &client, &old, "old", "runtime", ExpiresAt::Never).await?;
+        let outcome = store
+            .claim_for_client(
+                &client,
+                at - chrono::Duration::minutes(1),
+                0,
+                &[],
+                None,
+                None,
+                at - chrono::Duration::minutes(2),
+            )
+            .await?;
+        anyhow::ensure!(
+            matches!(outcome, ClaimOutcome::Granted { .. }),
+            "expected an old grant"
+        );
+        seed_artifact_job(&store, &client, &next, "next", "runtime", ExpiresAt::Never).await?;
+
+        let mut deletion = test_db.db().begin_read_committed().await?;
+        sqlx::query("SELECT client_id FROM clients WHERE client_id = $1 FOR UPDATE")
+            .bind(client.as_str())
+            .execute(&mut *deletion)
+            .await?;
+        let claim = tokio::spawn({
+            let store = store.clone();
+            let client = client.clone();
+            async move { grant_for_deletion_race(&store, &client, &next, reclaim).await }
+        });
+        // Wait for the claim to reach the locked parent before attempting the
+        // cascade. Taking the grant lock first would deadlock these transactions.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE \
+                     application_name = current_setting('application_name') \
+                     AND wait_event_type = 'Lock' AND query LIKE '%clients%')",
+                )
+                .fetch_one(test_db.db().pool())
+                .await?;
+                if waiting {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("the claim must reach the locked client row")??;
+        sqlx::query("DELETE FROM clients WHERE client_id = $1")
+            .bind(client.as_str())
+            .execute(&mut *deletion)
+            .await?;
+        deletion.commit().await?;
+        claim.await??;
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM queue_client_last_grant")
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::claim_new(false, false)]
+    #[case::claim_existing(false, true)]
+    #[case::reclaim_new(true, false)]
+    #[case::reclaim_existing(true, true)]
+    #[tokio::test]
+    async fn a_grant_racing_client_deletion_leaves_no_affinity(
+        #[case] reclaim: bool,
+        #[case] existing: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let clients = crate::clients::SqlClientStore::new(test_db.db().clone());
+        let fixtures = (0..RACERS / 2)
+            .map(|pair| {
+                Ok((
+                    ClientId::try_new(format!("grant_race_{pair}"))?,
+                    JobId::try_new(format!("job-{pair}"))?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        stream::iter(&fixtures)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(client, job)| {
+                let test_db = &test_db;
+                let store = &store;
+                async move {
+                    register_client(test_db, client.clone()).await?;
+                    enqueue(store, job).await?;
+                    store.write_eligible(client, job, ExpiresAt::Never).await?;
+                    if existing {
+                        grant_for_deletion_race(store, client, job, false).await?;
+                        store
+                            .recycle_lease(
+                                job,
+                                ExpiresAt::Never,
+                                client,
+                                now()? + chrono::Duration::hours(1),
+                            )
+                            .await?;
+                    }
+                    anyhow::Ok(())
+                }
+            })
+            .await?;
+        race(|n| {
+            let (client, job) = fixtures[n / 2].clone();
+            let store = store.clone();
+            let clients = clients.clone();
+            async move {
+                if n % 2 == 0 {
+                    clients.delete_client(&client).await
+                } else {
+                    grant_for_deletion_race(&store, &client, &job, reclaim).await
+                }
+            }
+        })
+        .await?;
+
+        let (client, job) = &fixtures[0];
+        store
+            .recycle_lease(
+                job,
+                ExpiresAt::Never,
+                client,
+                now()? + chrono::Duration::hours(1),
+            )
+            .await?;
+        grant_for_deletion_race(&store, client, job, reclaim).await?;
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM queue_client_last_grant")
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TerminalDelete {
+        Avail,
+        Lease,
+    }
+
+    #[rstest]
+    #[case(TerminalDelete::Avail)]
+    #[case(TerminalDelete::Lease)]
+    #[tokio::test]
+    async fn a_terminal_delete_takes_the_jobs_rows(
+        #[case] how: TerminalDelete,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let job = JobId::try_new("finished")?;
+        let client = ClientId::try_new("ev1_finisher")?;
+        enqueue(&store, &job).await?;
+        write_each_row(&store, &job, &client).await?;
+        assert_eq!(rows_naming(&test_db, &job).await?, 3);
+        match how {
+            TerminalDelete::Avail => store.delete_avail_by_job(&job).await?,
+            TerminalDelete::Lease => {
+                let at = now()?;
+                store.claim_job(&job, ExpiresAt::Never, &client, at).await?;
+                store
+                    .delete_lease(&job, ExpiresAt::Never, &client, at)
+                    .await?;
+            }
+        }
+        assert!(store.get_avail_by_job(&job).await?.is_none());
+        assert_eq!(rows_naming(&test_db, &job).await?, 0);
         Ok(())
     }
 
@@ -2431,7 +3924,12 @@ mod tests {
         }
         assert!(store.get_avail(&job, ExpiresAt::Never).await?.is_none());
         assert!(store.get_avail_by_job(&job).await?.is_none());
-        assert!(store.avail_key_for_job(&job).await?.is_none());
+        assert!(
+            store
+                .avail_for_jobs(std::slice::from_ref(&job))
+                .await?
+                .is_empty()
+        );
         assert!(
             store
                 .get_leased(&job, ExpiresAt::Never, &client, at)
@@ -2500,8 +3998,11 @@ mod tests {
             RedateResult::Redated
         );
         assert_eq!(
-            store.avail_key_for_job(&job).await?,
-            Some(avail_filename(&job, exp))
+            store.avail_for_jobs(std::slice::from_ref(&job)).await?,
+            vec![AvailEntry {
+                job_id: job.clone(),
+                expires_at: ExpiresAt::At(at.trunc_subsecs(0))
+            }]
         );
         assert!(store.get_avail(&job, exp).await?.is_some());
         assert_eq!(
@@ -2513,6 +4014,155 @@ mod tests {
         Ok(())
     }
 
+    /// Queue `job` at `deadline`, with one membership marker per `(plan, horizon)`.
+    async fn enqueue_held(
+        test_db: &TestDb,
+        store: &SqlTodoStore,
+        job: &JobId,
+        deadline: ExpiresAt,
+        markers: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        store
+            .write_tmp(job, &serde_json::json!({"job": job}))
+            .await?;
+        store.promote_avail(job, deadline, None).await?;
+        stream::iter(markers)
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each(|(plan, horizon)| async move {
+                sqlx::query(
+                    "INSERT INTO job_plans (job_id, plan_id, expires_at, written_at) VALUES \
+                     ($1, $2, $3, now())",
+                )
+                .bind(job.as_str())
+                .bind(plan)
+                .bind(horizon)
+                .execute(test_db.db().pool())
+                .await?;
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    /// A waiting job takes the earliest horizon of its member plans that has
+    /// not passed, earlier or later than its row. A plan's horizon is its
+    /// latest marker, and `never` ranks after every date.
+    #[rstest]
+    #[case::two_plans_take_the_earlier(
+        "20270210T000000Z",
+        &[("a", "20261210T000000Z"), ("b", "20270210T000000Z")],
+        "20261210T000000Z"
+    )]
+    #[case::a_plan_counts_its_latest_marker(
+        "20270210T000000Z",
+        &[("a", "20261201T000000Z"), ("a", "20270301T000000Z"), ("b", "20270201T000000Z")],
+        "20270201T000000Z"
+    )]
+    #[case::a_date_ranks_before_never(
+        "never",
+        &[("a", "never"), ("b", "20261210T000000Z")],
+        "20261210T000000Z"
+    )]
+    #[case::all_never_is_never("20270101T000000Z", &[("a", "never"), ("b", "never")], "never")]
+    #[case::a_passed_horizon_is_left_out(
+        "20270210T000000Z",
+        &[("a", "20261101T083000Z"), ("b", "20261215T000000Z"), ("c", "20270101T000000Z")],
+        "20261215T000000Z"
+    )]
+    #[case::a_malformed_marker_is_left_out(
+        "20270210T000000Z",
+        &[
+            ("a", "20261210T000000Z"),
+            ("b", "20261340T000000Z"),
+            ("c", "2026-11-20"),
+            ("not.a.plan", "20261120T000000Z"),
+        ],
+        "20261210T000000Z"
+    )]
+    #[case::a_later_horizon_moves_the_row_later(
+        "20261201T000000Z",
+        &[("a", "20270101T000000Z")],
+        "20270101T000000Z"
+    )]
+    #[case::no_live_member_keeps_the_row(
+        "20270210T000000Z",
+        &[("a", "20261031T000000Z")],
+        "20270210T000000Z"
+    )]
+    #[case::no_member_keeps_the_row("20270210T000000Z", &[], "20270210T000000Z")]
+    #[case::a_matching_row_is_left_alone(
+        "20261210T000000Z",
+        &[("a", "20261210T000000Z")],
+        "20261210T000000Z"
+    )]
+    #[tokio::test]
+    async fn a_waiting_job_takes_its_earliest_live_member_horizon(
+        #[case] row: &str,
+        #[case] markers: &[(&str, &str)],
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let job = JobId::try_new("held-job")?;
+        let row: ExpiresAt = row.parse()?;
+        let expected: ExpiresAt = expected.parse()?;
+        enqueue_held(&test_db, &store, &job, row, markers).await?;
+
+        assert_eq!(
+            store.restamp_avail_deadlines(now()?).await?,
+            u64::from(expected != row)
+        );
+        assert_eq!(
+            store.avail_for_jobs(std::slice::from_ref(&job)).await?,
+            vec![AvailEntry {
+                job_id: job.clone(),
+                expires_at: expected
+            }]
+        );
+        assert_eq!(store.restamp_avail_deadlines(now()?).await?, 0);
+        Ok(())
+    }
+
+    /// A lease is named by its job's deadline, so a leased job keeps it until
+    /// it is back in the queue.
+    #[tokio::test]
+    async fn a_leased_job_is_restamped_once_back_in_the_queue() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlTodoStore::new(test_db.db().clone());
+        let job = JobId::try_new("leased-held-job")?;
+        let client = ClientId::try_new("restamp_holder")?;
+        let row: ExpiresAt = "20270210T000000Z".parse()?;
+        let member: ExpiresAt = "20261210T000000Z".parse()?;
+        enqueue_held(&test_db, &store, &job, row, &[("a", "20261210T000000Z")]).await?;
+        let lease_expiry = now()? + chrono::Duration::hours(1);
+        assert!(matches!(
+            store.claim_job(&job, row, &client, lease_expiry).await?,
+            ClaimResult::Claimed(_)
+        ));
+
+        assert_eq!(store.restamp_avail_deadlines(now()?).await?, 0);
+        assert!(
+            store
+                .get_leased(&job, row, &client, lease_expiry)
+                .await?
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .recycle_lease(&job, row, &client, lease_expiry)
+                .await?,
+            RecycleResult::Recycled
+        );
+        assert_eq!(store.restamp_avail_deadlines(now()?).await?, 1);
+        assert_eq!(
+            store.avail_for_jobs(std::slice::from_ref(&job)).await?,
+            vec![AvailEntry {
+                job_id: job.clone(),
+                expires_at: member
+            }]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn promote_retries_and_conflicts_keep_the_queued_body() -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
@@ -2520,23 +4170,28 @@ mod tests {
         let job = JobId::try_new("promote-job")?;
         enqueue(&store, &job).await?;
         let body = store.get_avail_by_job(&job).await?;
-        store.promote_avail(&job, ExpiresAt::Never).await?;
+        store.promote_avail(&job, ExpiresAt::Never, None).await?;
         assert!(
             store
-                .promote_avail(&job, ExpiresAt::At(now()?))
+                .promote_avail(&job, ExpiresAt::At(now()?), None)
                 .await
                 .is_err()
         );
         store
             .write_tmp(&job, &serde_json::json!({"replacement": true}))
             .await?;
-        store.promote_avail(&job, ExpiresAt::At(now()?)).await?;
+        store
+            .promote_avail(&job, ExpiresAt::At(now()?), None)
+            .await?;
         assert_eq!(store.get_avail_by_job(&job).await?, body);
         assert_eq!(
-            store.avail_key_for_job(&job).await?,
-            Some(avail_filename(&job, ExpiresAt::Never))
+            store.avail_for_jobs(std::slice::from_ref(&job)).await?,
+            vec![AvailEntry {
+                job_id: job.clone(),
+                expires_at: ExpiresAt::Never
+            }]
         );
-        assert!(store.list_stale_tmp(Duration::ZERO).await?.is_empty());
+        assert_eq!(store.delete_stale_tmp(Duration::ZERO).await?, 0);
         Ok(())
     }
 

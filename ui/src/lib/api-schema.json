@@ -1,5 +1,20 @@
 {
   "$defs": {
+    "AddCampaignGroupMembersRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "campaign_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "campaign_ids"
+      ],
+      "type": "object"
+    },
     "AddDescriptorMemberRequest": {
       "additionalProperties": false,
       "properties": {
@@ -530,6 +545,41 @@
             "prior_keys"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "group_id": {
+              "type": "string"
+            },
+            "kinds": {
+              "items": {
+                "$ref": "#/$defs/PolicyKind"
+              },
+              "type": "array"
+            },
+            "marked_job_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rerun_job_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "group_policy",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "group_id",
+            "kinds",
+            "rerun_job_count",
+            "marked_job_count"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -740,6 +790,22 @@
           "required": [
             "type",
             "campaign_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "group_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "campaign_group",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "group_id"
           ],
           "type": "object"
         },
@@ -1103,6 +1169,174 @@
                   "type": "null"
                 }
               ]
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decision_latency",
+              "type": "string"
+            },
+            "http_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decision_latency",
+              "type": "string"
+            },
+            "http_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decision_max_memory",
+              "type": "string"
+            },
+            "http_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decision_max_memory",
+              "type": "string"
+            },
+            "http_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
             },
             "runtime_type": {
               "const": "llamacpp_cli_stock_tools",
@@ -4463,6 +4697,14 @@
         {
           "const": "asr_max_memory",
           "type": "string"
+        },
+        {
+          "const": "decision_latency",
+          "type": "string"
+        },
+        {
+          "const": "decision_max_memory",
+          "type": "string"
         }
       ]
     },
@@ -4535,6 +4777,210 @@
       ],
       "type": "object"
     },
+    "CampaignGroup": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/PrincipalOwner"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id",
+        "name",
+        "owner",
+        "created_at",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupPage": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/CampaignGroup"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unreadable": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "items",
+        "next_cursor",
+        "unreadable"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupPolicies": {
+      "properties": {
+        "policies": {
+          "items": {
+            "$ref": "#/$defs/CampaignGroupPolicy"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "policies"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupPolicy": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "enabled_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "max_reruns": {
+          "format": "uint32",
+          "maximum": 15,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings": {
+          "$ref": "#/$defs/PolicySettings"
+        }
+      },
+      "required": [
+        "group_id",
+        "kind",
+        "enabled",
+        "max_reruns",
+        "settings",
+        "enabled_by",
+        "enabled_at"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupPolicyPreview": {
+      "properties": {
+        "members": {
+          "items": {
+            "$ref": "#/$defs/MemberPolicyPreview"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "members"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupRerunResults": {
+      "properties": {
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/PolicyRerun"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "items": {
+            "$ref": "#/$defs/PolicyRerunSummary"
+          },
+          "type": "array"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "summary",
+        "total",
+        "offset",
+        "limit",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "CampaignGroupView": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/CampaignView"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/PrincipalOwner"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id",
+        "name",
+        "owner",
+        "created_at",
+        "updated_at",
+        "members"
+      ],
+      "type": "object"
+    },
     "CampaignPlanRow": {
       "properties": {
         "plan": {
@@ -4572,6 +5018,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "marked_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "plan": {
           "$ref": "#/$defs/PlanFiled"
         },
@@ -4593,6 +5044,7 @@
         "previous_plan_id",
         "carried_job_count",
         "rerun_job_count",
+        "marked_job_count",
         "recalculated_job_count",
         "dropped_job_count",
         "cancel_requested",
@@ -4858,6 +5310,88 @@
       },
       "required": [
         "action"
+      ],
+      "type": "object"
+    },
+    "ChangedCampaignGroup": {
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/PrincipalOwner"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id",
+        "name",
+        "owner",
+        "created_at",
+        "updated_at",
+        "changed"
+      ],
+      "type": "object"
+    },
+    "ChangedCampaignGroupPolicy": {
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "enabled_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "max_reruns": {
+          "format": "uint32",
+          "maximum": 15,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings": {
+          "$ref": "#/$defs/PolicySettings"
+        }
+      },
+      "required": [
+        "group_id",
+        "kind",
+        "enabled",
+        "max_reruns",
+        "settings",
+        "enabled_by",
+        "enabled_at",
+        "changed"
       ],
       "type": "object"
     },
@@ -6062,6 +6596,28 @@
       ],
       "type": "object"
     },
+    "CreateCampaignGroupRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VaultPrincipalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
     "CreateDescriptorEntryRequest": {
       "additionalProperties": false,
       "properties": {
@@ -6959,6 +7515,38 @@
       ],
       "type": "object"
     },
+    "FailureCode": {
+      "oneOf": [
+        {
+          "const": "unspecified",
+          "type": "string"
+        },
+        {
+          "const": "out_of_memory",
+          "type": "string"
+        },
+        {
+          "const": "attempt_timeout",
+          "type": "string"
+        },
+        {
+          "const": "runtime_error",
+          "type": "string"
+        },
+        {
+          "const": "device_error",
+          "type": "string"
+        },
+        {
+          "const": "device_not_ready",
+          "type": "string"
+        },
+        {
+          "const": "harness_error",
+          "type": "string"
+        }
+      ]
+    },
     "FailureSource": {
       "oneOf": [
         {
@@ -6979,6 +7567,14 @@
         },
         {
           "const": "lease_lost",
+          "type": "string"
+        },
+        {
+          "const": "marked",
+          "type": "string"
+        },
+        {
+          "const": "smaller_run_failed",
           "type": "string"
         }
       ]
@@ -8085,6 +8681,134 @@
         }
       ]
     },
+    "MemberPolicyPreview": {
+      "properties": {
+        "answered_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "campaign_id": {
+          "type": "string"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/PolicyCheckCounts"
+          },
+          "type": "array"
+        },
+        "deadline_passed": {
+          "type": "boolean"
+        },
+        "earliest_deadline": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filing_plan_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kept_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_filing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyFiling"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "marked_job_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "missing_model_params": {
+          "items": {
+            "$ref": "#/$defs/ModelParamsGap"
+          },
+          "type": "array"
+        },
+        "plan_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rerun_job_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "skipped": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PolicySkipReason"
+          },
+          "type": "object"
+        },
+        "smaller_failed": {
+          "items": {
+            "$ref": "#/$defs/SmallerFailure"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/PolicyMemberState"
+        },
+        "triggered": {
+          "items": {
+            "$ref": "#/$defs/PolicyKind"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "unclaimed_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "campaign_id",
+        "plan_id",
+        "state",
+        "answered_job_count",
+        "waiting_job_count",
+        "earliest_deadline",
+        "deadline_passed",
+        "checks",
+        "triggered",
+        "rerun_job_ids",
+        "marked_job_ids",
+        "kept_job_count",
+        "skipped",
+        "filing_plan_id",
+        "unclaimed_job_count",
+        "missing_model_params",
+        "smaller_failed",
+        "last_filing"
+      ],
+      "type": "object"
+    },
     "MintClientPreauthRequest": {
       "additionalProperties": false,
       "properties": {
@@ -8807,6 +9531,29 @@
       ],
       "type": "object"
     },
+    "ModelParamsGap": {
+      "properties": {
+        "job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "row_count",
+        "job_count"
+      ],
+      "type": "object"
+    },
     "ModelParamsPage": {
       "properties": {
         "items": {
@@ -9011,6 +9758,16 @@
             }
           ]
         },
+        "group": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CampaignGroup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "history": {
           "items": {
             "$ref": "#/$defs/CampaignPlanRow"
@@ -9070,6 +9827,7 @@
         "owner",
         "created_at",
         "updated_at",
+        "group",
         "may_administer",
         "may_edit_variants",
         "may_rerun",
@@ -11036,6 +11794,407 @@
       ],
       "type": "object"
     },
+    "PolicyBase": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_reruns": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings": {
+          "$ref": "#/$defs/PolicySettings"
+        }
+      },
+      "required": [
+        "enabled",
+        "max_reruns",
+        "settings"
+      ],
+      "type": "object"
+    },
+    "PolicyCheckCounts": {
+      "properties": {
+        "flagged": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kept": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "marked": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "on": {
+          "type": "boolean"
+        },
+        "rerun": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "on",
+        "flagged",
+        "rerun",
+        "marked",
+        "kept"
+      ],
+      "type": "object"
+    },
+    "PolicyFiling": {
+      "properties": {
+        "filed_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "plan_id": {
+          "type": "string"
+        },
+        "queued_job_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "plan_id",
+        "filed_at",
+        "queued_job_count"
+      ],
+      "type": "object"
+    },
+    "PolicyKind": {
+      "oneOf": [
+        {
+          "const": "swap",
+          "type": "string"
+        },
+        {
+          "const": "spread",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        },
+        {
+          "const": "ttft_over_e2e",
+          "type": "string"
+        },
+        {
+          "const": "model_params",
+          "type": "string"
+        },
+        {
+          "const": "smaller_failed",
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyMemberState": {
+      "oneOf": [
+        {
+          "const": "evaluated",
+          "type": "string"
+        },
+        {
+          "const": "other_owner",
+          "type": "string"
+        },
+        {
+          "const": "no_plan",
+          "type": "string"
+        },
+        {
+          "const": "not_ready",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "type": "string"
+        },
+        {
+          "const": "waiting_for_devices",
+          "type": "string"
+        },
+        {
+          "const": "filing_not_advanced",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyRerun": {
+      "properties": {
+        "after": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "after_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "before": {
+          "format": "double",
+          "type": "number"
+        },
+        "before_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "benchmark_id": {
+          "type": "string"
+        },
+        "campaign_id": {
+          "type": "string"
+        },
+        "codes": {
+          "items": {
+            "$ref": "#/$defs/FailureCode"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "filed_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "judged_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "model_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerunOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan_id": {
+          "type": "string"
+        },
+        "rerun_job_id": {
+          "type": "string"
+        },
+        "rerun_of": {
+          "type": "string"
+        },
+        "short_repetition_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "short_repetition_percent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "threshold": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "campaign_id",
+        "kind",
+        "rerun_job_id",
+        "rerun_of",
+        "plan_id",
+        "filed_at",
+        "attempt",
+        "benchmark_id",
+        "model_key",
+        "before",
+        "threshold",
+        "short_repetition_ms",
+        "short_repetition_percent",
+        "codes",
+        "before_code",
+        "after",
+        "after_code",
+        "outcome",
+        "judged_at"
+      ],
+      "type": "object"
+    },
+    "PolicyRerunSummary": {
+      "properties": {
+        "cleared": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "flagged": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "median_after": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "median_before": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "reruns": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "reruns",
+        "waiting",
+        "cleared",
+        "flagged",
+        "failed",
+        "dropped",
+        "median_before",
+        "median_after"
+      ],
+      "type": "object"
+    },
+    "PolicySettings": {
+      "additionalProperties": false,
+      "properties": {
+        "codes": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "percent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "short_repetition_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "short_repetition_percent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PolicySkipReason": {
+      "oneOf": [
+        {
+          "const": "no_content_key",
+          "type": "string"
+        },
+        {
+          "const": "chain_read_failed",
+          "type": "string"
+        },
+        {
+          "const": "earlier_run_without_rows",
+          "type": "string"
+        },
+        {
+          "const": "unreadable_plan",
+          "type": "string"
+        }
+      ]
+    },
     "PrincipalOwner": {
       "oneOf": [
         {
@@ -11266,6 +12425,12 @@
             }
           ]
         },
+        "fail": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
         "job_ids": {
           "items": {
             "type": "string"
@@ -11283,6 +12448,26 @@
         }
       },
       "type": "object"
+    },
+    "RerunOutcome": {
+      "oneOf": [
+        {
+          "const": "cleared",
+          "type": "string"
+        },
+        {
+          "const": "flagged",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        },
+        {
+          "const": "dropped",
+          "type": "string"
+        }
+      ]
     },
     "RestoredVariant": {
       "properties": {
@@ -11402,6 +12587,17 @@
             "string",
             "null"
           ]
+        },
+        "failure_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureCode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "failure_source": {
           "anyOf": [
@@ -11674,6 +12870,7 @@
         "scored_at",
         "device_time_ms",
         "failure_source",
+        "failure_code",
         "rescored_from",
         "run_submitted_at",
         "score_runtime_version",
@@ -11756,6 +12953,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "carry_across_limit": {
+              "type": "boolean"
+            },
             "carry_earlier": {
               "type": "boolean"
             },
@@ -11790,6 +12990,9 @@
         },
         {
           "properties": {
+            "carry_across_limit": {
+              "type": "boolean"
+            },
             "carry_earlier": {
               "type": "boolean"
             },
@@ -11821,10 +13024,27 @@
                 }
               ]
             },
+            "group_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "job_count": {
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "marked_job_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "policies": {
+              "items": {
+                "$ref": "#/$defs/PolicyKind"
+              },
+              "type": "array"
             },
             "type": {
               "const": "rerun",
@@ -11916,6 +13136,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "marked_job_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "new_job_count": {
           "format": "uint",
           "minimum": 0,
@@ -11946,10 +13173,11 @@
           "minimum": 0,
           "type": "integer"
         },
-        "rerun_job_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+        "rerun_job_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "restored_job_count": {
           "format": "uint",
@@ -11978,7 +13206,8 @@
         "satisfied_job_count",
         "restored_job_count",
         "inherited_job_count",
-        "rerun_job_count",
+        "rerun_job_ids",
+        "marked_job_ids",
         "recalculated_job_count",
         "dropped_job_ids",
         "held_jobs",
@@ -13259,6 +14488,398 @@
             "number_gpu_layers": {
               "format": "uint32",
               "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            },
+            "threads": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "benchmark_type": {
+              "const": "decision_latency",
+              "type": "string"
+            },
+            "ctx_size": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "envs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "flash_attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppFlashAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "load_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppLoadMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mmap": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "no_cache": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "number_gpu_layers": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "parallel": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            },
+            "threads": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "benchmark_type": {
+              "const": "decision_latency",
+              "type": "string"
+            },
+            "ctx_size": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "envs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "flash_attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppFlashAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "load_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppLoadMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mmap": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
+            },
+            "no_cache": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "number_gpu_layers": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "parallel": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            },
+            "threads": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "benchmark_type": {
+              "const": "decision_max_memory",
+              "type": "string"
+            },
+            "ctx_size": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "envs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "flash_attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppFlashAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "load_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppLoadMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mmap": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_text",
+              "type": "string"
+            },
+            "no_cache": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "number_gpu_layers": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "parallel": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "raw": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "runtime_type": {
+              "const": "llamacpp_cli_stock_tools",
+              "type": "string"
+            },
+            "threads": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "benchmark_type": {
+              "const": "decision_max_memory",
+              "type": "string"
+            },
+            "ctx_size": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "envs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "flash_attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppFlashAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "load_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LlamacppLoadMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mmap": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "model_type": {
+              "const": "gguf_vision",
+              "type": "string"
+            },
+            "no_cache": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "number_gpu_layers": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "parallel": {
+              "minimum": 1,
               "type": [
                 "integer",
                 "null"
@@ -17222,6 +18843,33 @@
         }
       ]
     },
+    "SetCampaignGroupPolicyRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/PolicyBase"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_reruns": {
+          "format": "uint32",
+          "maximum": 15,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings": {
+          "$ref": "#/$defs/PolicySettings"
+        }
+      },
+      "required": [
+        "enabled",
+        "max_reruns",
+        "settings",
+        "base"
+      ],
+      "type": "object"
+    },
     "SetCampaignOwnerRequest": {
       "additionalProperties": false,
       "properties": {
@@ -17290,6 +18938,58 @@
         "cpu"
       ],
       "type": "string"
+    },
+    "SmallerFailure": {
+      "properties": {
+        "benchmark_id": {
+          "type": "string"
+        },
+        "clean_benchmark_id": {
+          "type": "string"
+        },
+        "clean_job_id": {
+          "type": "string"
+        },
+        "failure_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failure_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "model_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "benchmark_id",
+        "failure_source",
+        "failure_code",
+        "model_key",
+        "clean_job_id",
+        "clean_benchmark_id"
+      ],
+      "type": "object"
     },
     "SourceRepository": {
       "properties": {
@@ -17604,6 +19304,18 @@
       "required": [
         "type",
         "value"
+      ],
+      "type": "object"
+    },
+    "UpdateCampaignGroupRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
       ],
       "type": "object"
     },

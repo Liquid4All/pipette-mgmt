@@ -12,9 +12,10 @@ use serde_json::{Value, json};
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{CampaignId, ClientId, PlanId, UserPermission};
 use pipette_web_testkit::{
-    ONE_CELL_PLAN, UserSigner, add_starved_snapshot, approved_client, body_json, create_org,
-    created_campaign, json_str, post_campaign, post_plan_document, put_idle_campaign,
-    put_loose_plan, registered_user, set_user_org, signed_empty, submit_plan_as, user_address,
+    ONE_CELL_PLAN, UserSigner, add_starved_snapshot, approved_client, approved_object_client,
+    body_json, create_org, created_campaign, json_str, post_campaign, post_plan_document,
+    put_idle_campaign, put_loose_plan, registered_user, set_user_org, signed_empty, submit_plan_as,
+    user_address,
 };
 
 async fn read(
@@ -125,7 +126,7 @@ fn fields(value: &Value) -> anyhow::Result<Vec<&str>> {
 #[tokio::test]
 async fn test_each_row_carries_its_plan_when_asked(#[case] order: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (state, _key, client_id) = approved_object_client(dir.path()).await?;
     let reader = registered_user(
         &state,
         &[

@@ -6,7 +6,9 @@ import { hex, unhex, type SigningKey } from "./keys";
 import { everyPage } from "./table";
 import type {
   AddDescriptorMemberRequest, AddUserKeyRequest, AmendClientPermissionsRequest, AmendUserPermissionsRequest, AnyValueIngestEvent, CampaignCreated, CampaignDocument, CampaignRevised, CatalogImportRuns,
-  CampaignVariants,
+  CampaignVariants, AddCampaignGroupMembersRequest, CampaignGroup, CampaignGroupPage, CampaignGroupPolicyPreview, CampaignGroupRerunResults, CampaignGroupView,
+  CampaignGroupPolicies, ChangedCampaignGroupPolicy, CreateCampaignGroupRequest, PolicyKind,
+  SetCampaignGroupPolicyRequest, UpdateCampaignGroupRequest,
   ChangeDescriptorEntryStateRequest, ChangedModelParams, ChangedOrgView, ClientDetail, ClientListRowPage, ClientPreauthKeyMinted, ClientPreauthKeyViewPage, CreateDescriptorEntryRequest, CreateModelParamsRequest, CreateOrgRequest, CreateUserRequest,
   DescriptorCatalogShortList, DescriptorDigestNames, DescriptorEntryListRow, DescriptorEntryListRowPage, DescriptorEntryLookup, JobPlans, MintClientPreauthRequest, MintUserPreauthRequest,
   ModelParams, ModelParamsPage,
@@ -656,3 +658,45 @@ export const revertCampaign = (signer: Signer, campaign_id: string, base: string
 /** Recalculates finished evals of the plan the campaign runs; the answer names the revision. */
 export const recalculateJobs = (signer: Signer, campaign_id: string, base: string, body: RecalculateJobsRequest) =>
   signed<CampaignRevised>(signer, "POST", campaignPath(campaign_id, `/recalculate?${baseQuery(base)}`), body);
+
+/** One page of the campaign groups the reader reads; `query` arrives encoded, since it is signed as sent. */
+export const campaignGroups = (signer: Signer, query: string) =>
+  signed<CampaignGroupPage>(signer, "GET", `/api/v1/campaign-groups?${query}`);
+
+export const createCampaignGroup = (signer: Signer, body: CreateCampaignGroupRequest) =>
+  signed<CampaignGroup>(signer, "POST", "/api/v1/campaign-groups", body);
+
+const groupPath = (group_id: string, rest = "") => `/api/v1/campaign-groups/${encodeURIComponent(group_id)}${rest}`;
+
+/** One group, with each member campaign the reader may read. */
+export const campaignGroup = (signer: Signer, group_id: string) =>
+  signed<CampaignGroupView>(signer, "GET", groupPath(group_id));
+
+export const updateCampaignGroup = (signer: Signer, group_id: string, body: UpdateCampaignGroupRequest) =>
+  signed<unknown>(signer, "PATCH", groupPath(group_id), body);
+
+/** Its campaigns are kept. */
+export const deleteCampaignGroup = (signer: Signer, group_id: string) =>
+  signed<unknown>(signer, "DELETE", groupPath(group_id));
+
+/** Adds every campaign of `body` to the group, or none of them. */
+export const addCampaignGroupMembers = (signer: Signer, group_id: string, body: AddCampaignGroupMembersRequest) =>
+  signed<unknown>(signer, "POST", groupPath(group_id, "/members"), body);
+
+export const removeCampaignGroupMember = (signer: Signer, group_id: string, campaign_id: string) =>
+  signed<unknown>(signer, "DELETE", groupPath(group_id, `/members/${encodeURIComponent(campaign_id)}`));
+
+export const campaignGroupPolicies = (signer: Signer, group_id: string) =>
+  signed<CampaignGroupPolicies>(signer, "GET", groupPath(group_id, "/policies"));
+
+export const setCampaignGroupPolicy = (signer: Signer, group_id: string, kind: PolicyKind,
+                                       body: SetCampaignGroupPolicyRequest) =>
+  signed<ChangedCampaignGroupPolicy>(signer, "PUT", groupPath(group_id, `/policies/${kind}`), body);
+
+/** What the policies would re-run and mark in each member campaign whose plans the reader may read; files nothing. */
+export const campaignGroupPolicyPreview = (signer: Signer, group_id: string) =>
+  signed<CampaignGroupPolicyPreview>(signer, "GET", groupPath(group_id, "/policy-preview"));
+
+/** Every re-run the policies filed in each member campaign whose plans the reader may read, and how each answered. */
+export const campaignGroupRerunResults = (signer: Signer, group_id: string) =>
+  signed<CampaignGroupRerunResults>(signer, "GET", groupPath(group_id, "/rerun-results?all=true"));

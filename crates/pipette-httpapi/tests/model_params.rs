@@ -13,7 +13,7 @@ const LIST: &str = "/api/v1/model-params";
 async fn admin() -> anyhow::Result<(tempfile::TempDir, AppState, UserSigner)> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let admin = registered_user(&state, UserPermissionGroup::ServerAdmin.permissions()).await?;
     Ok((dir, state, admin))
 }

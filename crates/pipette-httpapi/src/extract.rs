@@ -11,7 +11,9 @@ use axum::extract::path::ErrorKind;
 use axum::extract::rejection::{
     BytesRejection, JsonRejection, MissingJsonContentType, PathRejection, QueryRejection,
 };
-use axum::extract::{FromRequest, FromRequestParts, Path, Query, RawPathParams, Request};
+use axum::extract::{
+    FromRequest, FromRequestParts, OptionalFromRequest, Path, Query, RawPathParams, Request,
+};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -46,6 +48,30 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let bytes = json_body(req, state).await?;
         parse_json(&bytes).map(ApiJson)
+    }
+}
+
+/// An empty body reads as `None`, whatever its `Content-Type`. A body that is
+/// not empty must be JSON, as for [`ApiJson`].
+impl<S, T> OptionalFromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        let json = PlanMediaType::of(req.headers()) == Some(PlanMediaType::Json);
+        let bytes = buffer(req, state).await?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if !json {
+            return Err(AppError::BadRequest(
+                MissingJsonContentType::default().body_text(),
+            ));
+        }
+        parse_json(&bytes).map(|value| Some(ApiJson(value)))
     }
 }
 
@@ -437,7 +463,9 @@ pub(crate) async fn record_path_ids<S: Send + Sync>(parts: &mut Parts, state: &S
     params.iter().for_each(|(name, value)| {
         let field = match name {
             "client_id" => "target_client_id",
-            "job_id" | "plan_id" | "campaign_id" | "benchmark_id" | "resource_id" => name,
+            "job_id" | "plan_id" | "campaign_id" | "benchmark_id" | "resource_id" | "group_id" => {
+                name
+            }
             _ => return,
         };
         // `.` for a versioned benchmark id.
@@ -513,7 +541,7 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match PlanMediaType::of(req.headers()) {
-            Some(PlanMediaType::Json) => ApiJson::<T>::from_request(req, state)
+            Some(PlanMediaType::Json) => <ApiJson<T> as FromRequest<S>>::from_request(req, state)
                 .await
                 .map(|ApiJson(value)| DefinitionBody::Json(value)),
             Some(PlanMediaType::Toml) => read_document(req, state).await.map(DefinitionBody::Toml),

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, ListArray,
     StringArray, StructArray, TimestampMicrosecondArray, new_null_array,
@@ -328,6 +329,9 @@ pub fn parquet_schema() -> Schema {
         Field::new("parameter_num_beams", DataType::Int32, true),
         Field::new("parameter_beam_repetition_penalty", DataType::Float64, true),
         Field::new("parameter_beam_length_penalty", DataType::Float64, true),
+        // Decision: the questions each request asks. NULL for other types and
+        // earlier rows.
+        Field::new("parameter_questions", DataType::Int32, true),
     ])
 }
 
@@ -478,7 +482,8 @@ pub struct MetricRow {
     pub requested_benchmark_flags_sha256: Option<String>,
     /// `None` only in files written before the column; query `failed IS TRUE`.
     pub failed: Option<bool>,
-    /// A client's `failure_reason`, or the server's message when it retired the job.
+    /// A client's `failure_reason`, the server's message when it retired the
+    /// job, or the reason a campaign re-run's `fail` gave.
     pub failed_reason: Option<String>,
     /// Which pass produced the failure. `None` on a success row, and on a
     /// failure body stored before the field existed.
@@ -555,6 +560,9 @@ pub struct MetricRow {
     pub parameter_num_beams: Option<i32>,
     pub parameter_beam_repetition_penalty: Option<f64>,
     pub parameter_beam_length_penalty: Option<f64>,
+    /// `decision_latency` / `decision_max_memory`: the questions each request
+    /// asks; `None` on every other type.
+    pub parameter_questions: Option<i32>,
     /// The catalog entry's `BenchmarkParams` as canonical JSON, tagged with its
     /// `benchmark_type`: every `parameter_*` knob but the corpus subset.
     pub benchmark_params: Option<String>,
@@ -706,6 +714,7 @@ impl Default for MetricRow {
             parameter_num_beams: None,
             parameter_beam_repetition_penalty: None,
             parameter_beam_length_penalty: None,
+            parameter_questions: None,
             benchmark_params: None,
             benchmark_params_sha256: None,
             device_time_ms: None,
@@ -1802,6 +1811,7 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
         optional_column::<Float64Array>(batch, "parameter_beam_repetition_penalty")?;
     let beam_length_penalty_col =
         optional_column::<Float64Array>(batch, "parameter_beam_length_penalty")?;
+    let questions_col = optional_column::<Int32Array>(batch, "parameter_questions")?;
     let vl_spec_decode_turns_col =
         optional_column::<Int32Array>(batch, "observation_vl_spec_decode_turns")?;
     let dataset_digest_col = optional_string_column(batch, "observation_dataset_digest")?;
@@ -2013,7 +2023,7 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
                 .map(|s| {
                     s.parse::<FailureCode>()
-                        .map_err(|e| anyhow::anyhow!("row {i}: failure_code: {e}"))
+                        .with_context(|| format!("row {i}: failure_code"))
                 })
                 .transpose()?,
             job_id: job_id_col.and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
@@ -2059,6 +2069,7 @@ fn batch_to_rows(batch: &RecordBatch) -> anyhow::Result<Vec<MetricRow>> {
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
             parameter_beam_length_penalty: beam_length_penalty_col
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
+            parameter_questions: questions_col.and_then(|a| (!a.is_null(i)).then(|| a.value(i))),
             benchmark_params: benchmark_params_col
                 .and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
             benchmark_params_sha256: benchmark_params_sha256_col
@@ -2423,6 +2434,7 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
         .iter()
         .map(|r| r.parameter_beam_length_penalty)
         .collect();
+    let questions: Vec<Option<i32>> = rows.iter().map(|r| r.parameter_questions).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -2553,6 +2565,7 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
             Arc::new(Int32Array::from(num_beams)),
             Arc::new(Float64Array::from(beam_repetition_penalties)),
             Arc::new(Float64Array::from(beam_length_penalties)),
+            Arc::new(Int32Array::from(questions)),
         ],
     )?;
 
@@ -3421,6 +3434,21 @@ mod tests {
         Ok(())
     }
 
+    /// A file written before `parameter_questions` existed still reads back,
+    /// with it null, and a decision row keeps its count.
+    #[test]
+    fn questions_column_none_when_absent() -> anyhow::Result<()> {
+        let mut new_row = make_test_row("decision_latency", 41.5, "ms")?;
+        new_row.result_id = "job2_0".to_string();
+        new_row.parameter_questions = Some(3);
+
+        let rows = append_to_file_without_columns(&["parameter_questions"], new_row)?;
+
+        assert_eq!(row_by_id(&rows, "job1_0")?.parameter_questions, None);
+        assert_eq!(row_by_id(&rows, "job2_0")?.parameter_questions, Some(3));
+        Ok(())
+    }
+
     /// A file written before the sampling columns existed still reads back,
     /// with them null — the append-only rule in `docs/storage.md`.
     #[test]
@@ -3718,6 +3746,26 @@ mod tests {
         // The appended row carries them.
         assert_eq!(rows[1].failed, Some(false));
         assert_eq!(rows[1].job_id.as_deref(), Some("r1"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_failure_code_keeps_its_parse_error_and_row_context() -> anyhow::Result<()> {
+        let schema = Arc::new(parquet_schema());
+        let batch = rows_to_batch(&schema, &[MetricRow::default(), MetricRow::default()])?;
+        let mut columns = batch.columns().to_vec();
+        columns[schema.index_of("failure_code")?] =
+            Arc::new(StringArray::from(vec![None, Some("unknown_code")]));
+        let batch = RecordBatch::try_new(schema, columns)?;
+
+        let error = batch_to_rows(&batch)
+            .err()
+            .context("an invalid failure code must be rejected")?;
+        assert_eq!(error.to_string(), "row 1: failure_code");
+        assert_eq!(
+            error.downcast_ref::<strum::ParseError>(),
+            Some(&strum::ParseError::VariantNotFound)
+        );
         Ok(())
     }
 

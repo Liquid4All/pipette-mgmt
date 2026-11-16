@@ -51,10 +51,6 @@ authorities = ["localhost:3000", "127.0.0.1:3000", "localhost:5173", "127.0.0.1:
 # plan_creating_max_age_secs = 21600
 # queue_maintenance_read_timeout_secs = 60   # unset: the 30 s request timeout
 
-# --- the `todo/` queue's S3 client (every command) ---
-# todo_attempt_timeout_secs = 5          # one attempt, then the client retries
-# todo_operation_timeout_secs = 20       # a request with its retries
-
 # --- dataset-cache ---
 # dataset_probe_timeout_secs = 30
 # dataset_build_timeout_secs = 900
@@ -81,18 +77,17 @@ data_dir = "./sample_data"
 backend = "local_fs"
 data_dir = "./sample_data"
 
-# Optional: the job queue. If absent, the queue uses [storage]. An S3 queue
-# needs an Express One Zone bucket. Set backend = "database" to use [database].
-# [todo_storage]
-# backend = "s3"
-# bucket = "my-todo--use1-az4--x-s3"
-# region = "us-east-1"
-
 # Optional: the eval corpora the scores service packs, under scores-packages/.
 # If absent, they are read from [storage]. mgmt never writes them.
 # [eval_packages_storage]
 # backend = "s3"
 # bucket = "my-eval-datasets"
+# region = "us-east-1"
+
+# Optional: vault blobs and staged uploads. If absent, [storage].
+# [vault_storage]
+# backend = "s3"
+# bucket = "my-vault"
 # region = "us-east-1"
 
 # Optional: hold a pending client's submissions instead of refusing them.
@@ -147,9 +142,10 @@ data_dir = "./sample_data"
 # database = "internal"
 # timeout_secs = 30
 
-# Optional: the PostgreSQL database the records live on. An absent key falls back
-# to its libpq variable (PGHOST, PGPORT, PGUSER, PGDATABASE, PGSSLMODE).
-# [database]
+# Required: the PostgreSQL database that holds the records and the job queue.
+# An absent key falls back to its libpq variable (PGHOST, PGPORT, PGUSER,
+# PGDATABASE, PGSSLMODE), so a bare [database] section is valid.
+[database]
 # host = "localhost"
 # port = 5432
 # user = "pipette_mgmt"

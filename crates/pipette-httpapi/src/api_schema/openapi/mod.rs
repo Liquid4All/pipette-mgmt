@@ -377,14 +377,15 @@ read went. `GET /api/v1/plans/{plan_id}/results.csv` answers every row as one fi
 results warehouse, which refreshes every five minutes by default, so a run scored since its last \
 refresh appears after the next. The file also lists a plan's jobs from the warehouse, so it is \
 empty for a plan filed since then.\n\n\
-**Paging.** `GET /api/v1/plans`, `/campaigns`, `/vault/resources`, `/clients`, \
-`/descriptor-catalog` and the audit logs (newest first) page by cursor and answer `items`, `next_cursor` and `unreadable`: omit `cursor` for the \
+**Paging.** `GET /api/v1/plans`, `/campaigns`, `/campaign-groups`, `/vault/resources`, \
+`/clients`, `/descriptor-catalog` and the audit logs (newest first) page by cursor and answer `items`, `next_cursor` and `unreadable`: omit `cursor` for the \
 first page, then send each `next_cursor` unchanged, with the same filters and `order`, until it \
 is `null`; a full page can be the last. Their `limit` is 50 by default, at most 200 (the \
 server's `list_default_limit` and `list_max_limit`), and `0` or more than that is a `400`, not \
-clamped. `GET /api/v1/plans/{plan_id}/jobs` pages by `offset` instead and answers `total`: step \
-`offset` by `limit` until it reaches `total`, or send `all=true`. Its `limit` is 100 by default, \
-at most 500, and more than that is clamped to 500. Every other listing answering a `...Page` \
+clamped. `GET /api/v1/plans/{plan_id}/jobs` and `/campaign-groups/{group_id}/rerun-results` page \
+by `offset` instead and answer `total`: step `offset` by `limit` until it reaches `total`, or send \
+`all=true`. Their `limit` is 100 by default, at most 500, and more than that is clamped to 500. \
+Every other listing answering a `...Page` \
 schema answers whole: its `next_cursor` is always `null`.\n\n\
 **Names.** A body names accounts and organizations by id. A read that takes `names=true` adds \
 `names`, an object from each owner id its body carries to a readable name: an account's \
@@ -403,7 +404,7 @@ held what was asked, so a retry is safe.\n\n\
 operation with that `operationId`, where `<tag>` is `users` (Users), `orgs` (Organizations), \
 `devices` (Devices), `model-params` (Model parameters), \
 `descriptor-catalog` (Descriptor catalog), `campaigns` (Campaigns), \
-`plans` (Plans), `vault` (Vault) or `document` (API description). `#tag/document`, the tag of this \
+`campaign-groups` (Campaign groups), `plans` (Plans), `vault` (Vault) or `document` (API description). `#tag/document`, the tag of this \
 document's own route, points to these shared rules.";
 
 const ERROR_DESCRIPTION: &str = "An error. A `4xx` says what the caller got wrong and is safe \
@@ -556,6 +557,7 @@ enum Tag {
     Models,
     DescriptorCatalog,
     Campaigns,
+    CampaignGroups,
     Plans,
     Vault,
     Document,
@@ -570,6 +572,7 @@ impl Tag {
             Self::Models => "Model parameters",
             Self::DescriptorCatalog => "Descriptor catalog",
             Self::Campaigns => "Campaigns",
+            Self::CampaignGroups => "Campaign groups",
             Self::Plans => "Plans",
             Self::Vault => "Vault",
             Self::Document => "API description",
@@ -585,6 +588,7 @@ impl Tag {
             Self::Models => "model-params",
             Self::DescriptorCatalog => "descriptor-catalog",
             Self::Campaigns => "campaigns",
+            Self::CampaignGroups => "campaign-groups",
             Self::Plans => "plans",
             Self::Vault => "vault",
             Self::Document => "document",
@@ -1099,6 +1103,18 @@ const PATH_RULES: &[PathRule] = &[
                       refused.",
     },
     PathRule {
+        at: "/{group_id}",
+        pattern: "^group_[A-Za-z0-9_-]*$",
+        example: "group_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
+        description: "The campaign group: `group_` and, as minted, a UUIDv7.",
+    },
+    PathRule {
+        at: "/policies/{kind}",
+        pattern: "^(swap|spread|failed|ttft_over_e2e|model_params|smaller_failed)$",
+        example: "spread",
+        description: "The check the policy acts on.",
+    },
+    PathRule {
         at: "/{plan_id}",
         pattern: "^[A-Za-z0-9-]+$",
         example: "plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
@@ -1375,6 +1391,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rstest::rstest;
     use sha2::{Digest, Sha256};
+    use strum::IntoEnumIterator as _;
 
     use pipette_core::config::Config;
     use pipette_httpsig::{Nonce, Outgoing, sign};
@@ -1653,7 +1670,8 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let cursor_paged = parameter.get("name").and_then(Value::as_str) == Some("limit")
-                    && !path.ends_with("/jobs");
+                    && !path.ends_with("/jobs")
+                    && !path.ends_with("/rerun-results");
                 description.is_empty() || (cursor_paged && !description.contains(&cursor_limit))
             })
             .map(|(path, parameter)| format!("{path} {parameter}"))
@@ -1737,16 +1755,16 @@ mod tests {
         Ok(())
     }
 
-    /// Both revision routes describe the plans a revision takes runs from, and
-    /// a variant edit the plans it takes variants from.
+    /// Both revision routes describe the runs a revision takes, and a variant
+    /// edit the plans it takes variants from.
     #[rstest]
     #[case::variants(
         "/api/v1/campaigns/{campaign_id}/variants",
-        &["carry_earlier", "inherit_from", "add_from", "restore"]
+        &["carry_earlier", "carry_across_limit", "inherit_from", "add_from", "restore"]
     )]
     #[case::document(
         "/api/v1/campaigns/{campaign_id}/document",
-        &["carry_earlier", "inherit_from"]
+        &["carry_earlier", "carry_across_limit", "inherit_from"]
     )]
     fn test_the_revision_routes_describe_what_they_inherit(
         #[case] path: &str,
@@ -1776,7 +1794,8 @@ mod tests {
     }
 
     /// Every path parameter has exactly one rule, and each rule's pattern takes
-    /// what its handler's type parses: a probe set and the rule's own example.
+    /// what its handler's type parses: a probe set, every policy kind and the
+    /// rule's own example.
     #[test]
     fn test_every_path_parameter_states_its_rule() -> anyhow::Result<()> {
         let unruled: Vec<String> = operations()
@@ -1823,6 +1842,9 @@ mod tests {
             HEX64,
             hex63,
         ];
+        let kinds: Vec<String> = pipette_plan_types::PolicyKind::iter()
+            .map(|kind| kind.to_string())
+            .collect();
         PATH_RULES
             .iter()
             .try_for_each(|rule| -> anyhow::Result<()> {
@@ -1832,6 +1854,7 @@ mod tests {
                     .iter()
                     .copied()
                     .chain([rule.example])
+                    .chain(kinds.iter().map(String::as_str))
                     .try_for_each(|raw| {
                         anyhow::ensure!(
                             validator.is_valid(&raw.into()) == parses(rule.at, raw)?,
@@ -1851,6 +1874,9 @@ mod tests {
         use pipette_plan_types as types;
         Ok(match at {
             "/{campaign_id}" => raw.parse::<types::CampaignId>().is_ok(),
+            "/{group_id}" => raw.parse::<types::CampaignGroupId>().is_ok(),
+            // No `FromStr`: the route reads the kind with serde.
+            "/policies/{kind}" => serde_json::from_value::<types::PolicyKind>(raw.into()).is_ok(),
             "/{plan_id}" => raw.parse::<types::PlanId>().is_ok(),
             "/{job_id}" => raw.parse::<types::JobId>().is_ok(),
             "/{client_id}" => raw.parse::<types::ClientId>().is_ok(),

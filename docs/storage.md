@@ -21,10 +21,11 @@ The storage design keeps these properties:
 
 ### 1.1. Where records live
 
-With a `[database]` section, which production runs, the records are PostgreSQL
-tables: plans and their indexes, campaigns, identities (clients, users, keys,
-permissions, pre-auth keys), organizations with their memberships, ownerships
-and tags, private benchmarks, model params, and vault records. The schema is
+Every config has a `[database]` section. The records and the job queue
+([queue.md](queue.md)) are PostgreSQL tables. The records are plans and their
+indexes, campaigns, identities (clients, users, keys, permissions, pre-auth
+keys), organizations with their memberships, ownerships and tags, private
+benchmarks, model params, and vault records. The schema is
 `crates/pipette-store-sql/migrations/`, and
 [design/sql-record-store.md](design/sql-record-store.md) is the design. The
 record shapes and compatibility rules in §3 hold on either backend; a uniqueness
@@ -45,16 +46,33 @@ Only `[database]` keeps the audit log. No object store keeps it, and
 commands only append events and never edit them. `audit prune` deletes the
 events that are older than the two-year retention.
 
+Campaign groups use four tables. `campaign_groups` holds each group's JSON body
+(name, owner and times) under its `group_id`. `campaign_group_members` holds a
+row for each member, keyed by `campaign_id`, so a campaign is in at most one
+group. The row's `policy_state` is the JSON that the policy pass of
+`queue-maintenance` keeps for the member, NULL until the pass first writes it,
+and it goes when the campaign leaves the group. `campaign_group_policies` holds
+each policy's JSON body under its `group_id` and check `kind`, so a group has
+at most one policy per check. `campaign_group_rerun_results` holds a row for
+each re-run the policies filed, keyed by `group_id`, re-run job and `kind`,
+with the check's value before and after
+([re-run results](api/campaign-groups.md#re-run-results)).
+Deleting a group deletes its member rows, its policies and its re-run results
+and keeps the campaigns; deleting a campaign deletes its member row. Only
+`[database]` keeps these tables, and `db import` and `db export` do not copy
+them.
+
 The `local_fs` and S3 record stores are retiring (PIP-759) and kept for tests.
 Their keyspaces are the second tree in §2. A new record feature lands on SQL
 (and on `local_fs` where tests need it), never on the S3 record store.
 
 The object store keeps:
 
-- the job queue, `todo/`, when `[todo_storage]` selects `local_fs` or `s3`
 - submissions, under `submissions/`
 - the warehouse, under `warehouse/`
-- vault blobs, under `vault-resources/` and `vault-staging/`
+- vault blobs, under `vault-resources/` and `vault-staging/` of
+  `[vault_storage]` (default `[storage]`); the `vault/` and `vault-imports/`
+  records stay in `[database]`
 - the dataset cache, under `dataset-cache/`
 - the eval corpora the scores service packs, under `scores-packages/` of
   `[eval_packages_storage]`, which mgmt only reads
@@ -111,30 +129,6 @@ data/
 │   └── unverified/
 │       └── {client_id}/
 │           └── {job_id}.json
-├── todo/                                ← [todo_storage]
-│   ├── .gc-candidates                   ← keys the last run saw orphaned
-│   ├── .backlog                         ← claimable-job count of each device, and the time of the count
-│   ├── .backlog-campaigns               ← the same count, by campaign
-│   ├── tmp/                             ← job files are staged here first
-│   ├── avail/
-│   │   └── {job_id}/
-│   │       └── {expires_at}.json        ← atomic rename from tmp/; expires_at is ISO 8601 or `never`
-│   ├── eligible/
-│   │   └── clients/
-│   │       └── {client_id}/
-│   │           └── {job_id}.{expires_at}   ← marker: client may claim this job
-│   ├── leased/
-│   │   └── {client_id}/
-│   │       └── {job_id}.{expires_at}.{lease_expiry}.json  ← renamed from avail/ on claim
-│   ├── denied/
-│   │   └── {job_id}.{client_id}         ← marker: client failed this job; its reason as JSON, or empty
-│   ├── pending-reindex/
-│   │   └── {client_id}.{uuid}           ← one marker per client reindex request
-│   ├── lost/
-│   │   └── {job_id}/
-│   │       └── {client_id}.{lease_expiry}  ← empty marker: one lease on this job ended without a result
-│   └── liveness/
-│       └── {client_id}                  ← empty marker: its modification time is the client's last-seen time
 ├── warehouse/
 │   ├── results/
 │   │   └── benchmark_id={benchmark_id}/
@@ -144,9 +138,9 @@ data/
 │   │               └── part-*.parquet
 │   └── eval_sample_results/
 │       └── {job_id}.parquet
-├── vault-resources/
+├── vault-resources/                     ← [vault_storage]
 │   └── {principal_id}/blobs/{sha256}    ← one blob per owner and digest (§3.4)
-├── vault-staging/
+├── vault-staging/                       ← [vault_storage]
 │   └── {principal_id}/{uuid}            ← a blob while mgmt computes its digest; S3 only
 ├── dataset-cache/
 │   └── artifacts/                       ← repacked git corpora and every corpus's record (§5)
@@ -155,9 +149,9 @@ data/
         └── {digest}.tar                 ← an eval corpus, read by build and serve (§5)
 ```
 
-### Record keyspaces (without `[database]`)
+### Record keyspaces (object-store record stores)
 
-On the retiring record stores (§1.1), the records are these keyspaces. With
+On the retiring record stores (§1.1), the records are these keyspaces. In
 `[database]`, each has a table named after it, underscored, holding the same
 fields. The exceptions: `tags-index/` is one `client_tags` table, the `.spent`
 markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
@@ -223,9 +217,9 @@ markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
 │   └── {campaign_id}.json               ← name, owner, current_plan_id, labels, state (§3.3)
 ├── model-params/
 │   └── {key}.json                       ← the model parameter table, one row per model (§3.5)
-├── vault/
+├── vault/                               ← [vault_storage]
 │   └── {resource_id}.json               ← vault record. Written once, never edited (§3.4)
-├── vault-imports/
+├── vault-imports/                       ← [vault_storage]
 │   └── {principal_id}/{sha256}.json     ← the records one import wrote, or one source's archive record
 ├── content-keys/
 │   └── v1/
@@ -262,55 +256,15 @@ markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
   serializes `score-eval` runs only, so two long scoring runs cannot overlap,
   without contending with the mutate lock. Both are transient coordination
   state; see [cli.md](cli.md#concurrency).
-- `todo/` is the job queue. `avail/` holds unclaimed jobs, one directory per
-  job: `{job_id}/{expires_at}.json`, where `job_id` is `job-{UUIDv7}` (so keys
-  list in creation order). The job directory makes `avail/{job_id}/` a prefix a
-  directory bucket accepts, so a read that holds the `job_id` alone costs one
-  listing ([§8](#todo-requires-s3-express-one-zone)). `leased/` encodes the
-  client and the lease expiry in the key. `denied/` holds one marker per client
-  failure. `eligible/clients/` holds the eligibility markers the claim path
-  reads, maintained solely by `queue-maintenance`. `pending-reindex/` holds one
-  marker per reindex request, written by `serve` when a client's profile changes
-  and consumed by `queue-maintenance`; the `uuid` keeps a request that arrives
-  during a rebuild from collapsing into the one being served. See
-  [queue.md](queue.md).
-- The incremental eligibility index has no keys in this layout. The database
-  queue keeps a reindex flag and a stored projection of the six matcher fields
-  on each job row. It also keeps the indexed worker set in a table. Client
-  rebuilds group by that projection and read no bodies. Denial writes also set
-  the job's flag and advance its revision. `queue-maintenance` needs the
-  database queue
-  ([queue.md](queue.md#the-eligible-index)).
-- `todo/lost/{job_id}/{client_id}.{lease_expiry}` records one lease that ended
-  without a result: it lapsed, or its holder claimed again while still holding
-  it. The markers are the job's loss count, which `queue-maintenance` compares
-  against `plan_lost_lease_limit`
-  ([queue.md](queue.md#heartbeat-timeout-dead-device)). The key names the
-  lease, so recording one loss twice writes one marker. The markers go with the
-  job, through the orphan sweep.
-- These files hold `queue-maintenance` run state, not queue records:
-  - `todo/.gc-candidates`
-  - `todo/.backlog`
-  - `todo/.backlog-campaigns`
-
-  `queue-maintenance` rewrites each file whole. The files sit at the root so
-  no marker listing returns one. The reader treats missing or corrupt files as
-  empty. An empty `.gc-candidates` file safely delays deletion by one run. The sweep deletes a key only on a
-  second consecutive sighting, so a listing that raced a write cannot delete
-  live state. `.gc-candidates` also carries the plan-index orphans of the record
-  store (`content-keys/v1/`, `job-plans/`, `plan-sources-pending/`) under a
-  `plans:` key prefix, so they cannot collide with a `todo/` key. `.backlog`
-  holds each device's claimable-job count and the time of the count; the device
-  listings read it ([queue.md](queue.md#device-backlog)). `.backlog-campaigns`
-  holds the count of each device by campaign. Only the device page reads it.
-  Each device page view reads the whole object, so the cost of a view grows
-  with the number of devices times the campaigns that hold a job for each
-  device. If that product becomes large, store one object for each device.
-- `todo/liveness/{client_id}` is an empty marker that each verified, signed
-  device request stamps, at most once a minute per `serve` process. Its
-  modification time is the device's last-seen time, so one listing of
-  `todo/liveness/` reads every device's time and no body
-  ([queue.md](queue.md#device-liveness)).
+- The job queue has no keys in this layout. It is a set of `queue_*` tables
+  in `[database]`, with `client_liveness` for the device last-seen times. See
+  [queue.md](queue.md). Jobs whose benchmark type has sizes also keep their
+  family key and sizes, so claims prefer smaller runs of the same family.
+- The `plan_index_gc_candidates` table holds the plan-index keys of the record
+  store (`content-keys/v1/`, `job-plans/`, `plan-sources-pending/`) that the
+  last `queue-maintenance` run found orphaned, under a `plans:` key prefix. The
+  GC deletes a key only on a second consecutive sighting, so a listing that
+  raced a write cannot delete live state.
 
 ### Record contract
 
@@ -342,7 +296,7 @@ These rules hold for the record keyspaces above and for their tables.
   its record is gone, and a registration under the same id clears what that
   missed, since the id derives from the key. A user has no tags (§3.1.4).
 - Plan manifests are keyed by `plan_id` and live with the records, **not** in
-  the ephemeral `todo/` queue, so a completed or cancelled plan stays queryable
+  the ephemeral job queue, so a completed or cancelled plan stays queryable
   after its jobs leave the queue. The manifest's `job_ids` is the only plan to
   job record (job bodies carry no `plan_id`). Ingestion writes it first
   (`creating`, then `active` or `pending_clients`); from then on
@@ -357,7 +311,7 @@ These rules hold for the record keyspaces above and for their tables.
   [plan-ingestion.md §9](plan-ingestion.md#9-plan-lifecycle).
 - `cancelled_plans/{plan_id}` records that an operator asked to cancel a plan:
   a *request* for teardown. `queue-maintenance` is the sole writer of the
-  manifest's `cancelling` and `cancelled` status and of the `todo/` deletes, so
+  manifest's `cancelling` and `cancelled` status and of the job queue deletes, so
   signalling out of band keeps a cancel from being lost to a concurrent status
   refresh. The marker is a sibling of `plans/`, so a manifest listing never
   filters it out. It is deleted once the manifest reads `cancelling` or
@@ -403,20 +357,21 @@ These rules hold for the record keyspaces above and for their tables.
   marker for **every** job, so an absent marker means the plan released the job
   or its horizon lapsed (the manifest's `expired_jobs` tells them apart).
   Teardown retires a cancelled plan's job only when its last membership goes,
-  and `queue-maintenance` reads the tree to find lapsed plans and to re-date a
-  job whose own deadline passed. `plan_id` excludes `.` by charset and
-  `expires_at` by encoding, so the leaf's single `.` splits unambiguously.
+  and `queue-maintenance` reads the tree to find lapsed plans and to date each
+  waiting job by its plans' earliest horizon. `plan_id` excludes `.` by charset
+  and `expires_at` by encoding, so the leaf's single `.` splits unambiguously.
   `queue-maintenance` deletes a marker whose horizon lapsed, whose job left the
   queue, or whose plan's manifest is gone.
-- `job-sources/{job_id}.json` is the body ingestion promotes into `todo/`, with
-  `job_id` and `expires_at` stamped. A body does not change after promotion, so
-  this is the body the job ran, and it outlives the job's time in `todo/`:
+- `job-sources/{job_id}.json` is the body ingestion promotes into the job queue,
+  with `job_id` and `expires_at` stamped. A body does not change after
+  promotion, so this is the body the job ran, and it outlives the job's time in
+  the job queue:
   - It is write-once. The first plan that asks for the job writes it.
   - A job minted before job sources existed has none until a plan joins it; the
     joiner writes its own stamped body, which has the queued body's content key
     but can differ in field order and in the fields the key leaves out.
-  - The stored `expires_at` keeps the value from ingestion; the `avail/` key is
-    the authority after the expiry pass re-dates a shared job.
+  - The stored `expires_at` keeps the value from ingestion; the queued job's
+    `expires_at` is the authority once `queue-maintenance` moves its deadline.
   - It holds no `auth_token`. A source written before the vault import step can
     hold one, which stays until an operator deletes the source by hand, so a
     reader drops every token before it serves a job source.
@@ -458,8 +413,9 @@ half-written one. The staging names are `.tmp-{uuid}` (some with a further
 `*-index/` claims, and `{principal_id}.{uuid}.staged` for the auth store's
 records. They are siblings of the record being written. None is a record: every
 keyspace selects records by a rule a staging name fails, so a stranded one is
-inert and safe to delete. Nothing sweeps them, unlike `todo/tmp/`, which has a
-stale-file reaper ([operations.md](operations.md)).
+inert and safe to delete. Nothing sweeps them. A staged job body in the job
+queue is different: `queue-maintenance` deletes it after `todo_tmp_max_age_secs`
+([operations.md](operations.md)).
 
 ## 3. Metadata contract
 
@@ -1036,7 +992,9 @@ one an older build deleted.
 administer. It is read as it stands and **not derived through the owner's
 membership**, unlike a user-owned device: moving an account between
 organizations must not hand its personal campaigns to a team. A plan has no
-owner; its campaign does, so handing a campaign over rewrites this record alone.
+owner; its campaign does, so handing a campaign over rewrites this record and no
+plan. It also deletes the campaign's `campaign_group_members` row when its group
+has another owner ([§1.1](#11-where-records-live)).
 Who may read and administer a campaign is
 [Campaigns: Who may do what](api/campaigns.md#who-may-do-what).
 
@@ -1075,18 +1033,29 @@ orphan, refile first to preserve its live jobs
 
 #### 3.3.2. Concurrency
 
-A write replaces the whole record with **no compare-and-swap**: the operator
-surface is its only writer, and no cron pass writes it. Two administrators
-changing one campaign at once is last-writer-wins, and the record still holds
-one name and one owner that were asked for.
+An edit replaces the whole record with a **compare-and-swap on the record
+read**: it lands only if the stored record still equals the one it read, and
+otherwise writes nothing. SQL updates the row only where it still holds what
+was read, and the local filesystem compares under a lock on a `.lock` file
+beside the records. The retiring S3 record store reads, compares and writes with
+no lock, so two edits at once can both land there. Every
+edit moves `updated_at`, so a record never returns to an earlier value and the
+contents serve as the version. A create, and the copies `db import` and
+`db export` make, write blind.
 
-A revision (a variant edit, a document revision, a re-run or a recalculation)
-re-reads the record and advances it only if it still names the plan it revised.
-That narrows the race between two revisions to the gap between the read and the
-write; it does not close it.
+A filing into a campaign (a plan through
+[`POST /api/v1/campaigns/{campaign_id}/plans`](api/campaigns/file_plan.md) or
+`campaigns ingest`, a variant edit, a document revision, a re-run, a
+recalculation or a revert) re-reads the record and advances it only if it still
+names the plan the filing supersedes and has the same owner. Of two filings at
+once, one advances and the other is cancelled. A rename, relabel or archive that
+lands between the read and the write is kept, and the filing writes again on top
+of it, up to three tries in all; a filing that loses all three is cancelled and
+answers `409`. A delete is unconditional: a filing that advances between the
+delete's last read and the delete leaves its plan running with no campaign.
 
-A write that asks for the state the record is already in writes nothing and does
-not move `updated_at`, so it is safe to retry.
+A write that asks for the state the record is already in writes nothing to it and
+does not move `updated_at`, so it is safe to retry.
 
 ### 3.4. The vault
 
@@ -1365,7 +1334,7 @@ lock:
   `incoming/` once the client is approved, through the routing the live path
   takes. Each object is deleted from the unverified tree only after its
   re-stage write succeeds. A held object whose job already has a record, a
-  job source or a `todo/` entry is refused and stays held: its `job_id` was
+  job source or a job queue entry is refused and stays held: its `job_id` was
   never checked against a lease.
 - `delete --client-id <id>` discards a client's held submissions.
 - `prune --older-than <age>` removes held objects across all clients by the
@@ -1399,14 +1368,14 @@ throughput body of a few kilobytes to 2 MiB. So the write that stores a body in
   failure denies the job to one client and returns it to the queue, and another
   may then finish it. Each keeps its own output.
 - **Written first:** the object is written before the result it belongs to, the
-  `incoming/` body or the `denied/` marker, so a result that came with output
+  `incoming/` body or the job's denial, so a result that came with output
   never exists without it. A crash between the two leaves an object with no
   result, which is harmless. A resubmission under the same lease replaces the
   object only if it carries output of its own.
 - **Only when there is output:** a submission with neither stream writes no
   object.
 - **Retriable failures keep theirs:** such a failure records no result, and its
-  `denied/` marker keeps only the last 4 KiB of its reason. This object keeps the
+  denial keeps only the last 4 KiB of its reason. This object keeps the
   rest.
 - **Held bodies keep it inline:** a body under `submissions/unverified/` is
   stored whole. `unverified promote` moves the output here, and `unverified
@@ -1698,7 +1667,7 @@ answers `502`.
   `requested_model_flags`, `requested_runtime_flags`,
   `requested_benchmark_flags`, `eval_metadata`, `client_extras`, `client_id`,
   `device_name`, `submitted_at`,
-  `device_time_ms`, `failure_source`, `rescored_from`, `run_submitted_at`,
+  `device_time_ms`, `failure_source`, `failure_code`, `rescored_from`, `run_submitted_at`,
   `score_runtime_version`, `client_version`, `model_params_total_millions`,
   `model_params_active_millions`, and
   the `device_*` columns `device` lists
@@ -1809,16 +1778,16 @@ measures nothing ([Failure rows](#failure-rows)). `unit` stays required.
 | `parameter_prefill_tokens` | int32 | prefill_throughput, decode_throughput, end_to_end_latency, max_memory_usage |
 | `parameter_decode_tokens` | int32 | decode_throughput, end_to_end_latency, vl_throughput, vl_max_memory (null when the entry sets none: one token), asr_throughput, asr_max_memory |
 | `parameter_eval_id` | string | eval; vlm_eval's `parameter_lmms_task`; asr_eval's `parameter_asr_task` |
-| `parameter_image_width` | int32 | vl_throughput, vl_max_memory |
-| `parameter_image_height` | int32 | vl_throughput, vl_max_memory |
-| `parameter_text_tokens` | int32 | vl_throughput, vl_max_memory, asr_throughput, asr_max_memory |
-| `parameter_num_images` | int32 | vl_throughput, vl_max_memory |
+| `parameter_image_width` | int32 | vl_throughput, vl_max_memory, decision_latency and decision_max_memory (with images) |
+| `parameter_image_height` | int32 | vl_throughput, vl_max_memory, decision_latency and decision_max_memory (with images) |
+| `parameter_text_tokens` | int32 | vl_throughput, vl_max_memory, asr_throughput, asr_max_memory, decision_latency, decision_max_memory |
+| `parameter_num_images` | int32 | vl_throughput, vl_max_memory, decision_latency, decision_max_memory |
 | `parameter_audio_duration_ms` | int32 | asr_throughput, asr_max_memory |
 | `parameter_audio_sample_rate_hz` | int32 | asr_throughput, asr_max_memory |
 | `parameter_audio_channels` | int32 | asr_throughput, asr_max_memory |
 | `parameter_draft_length` | int32 | vl_spec_decode |
 | `parameter_dataset_subset` | string | vl_spec_decode |
-| `parameter_batch_size` | int32 | prefill_throughput, decode_throughput, end_to_end_latency, vl_spec_decode |
+| `parameter_batch_size` | int32 | prefill_throughput, decode_throughput, end_to_end_latency, vl_spec_decode, decision_latency, decision_max_memory |
 | `parameter_temperature` | float64 | eval, vlm_eval, asr_eval, vl_spec_decode |
 | `parameter_top_p` | float64 | eval, vlm_eval, asr_eval |
 | `parameter_top_k` | int32 | eval, vlm_eval, asr_eval |
@@ -1830,6 +1799,7 @@ measures nothing ([Failure rows](#failure-rows)). `unit` stays required.
 | `parameter_num_beams` | int32 | asr_eval |
 | `parameter_beam_repetition_penalty` | float64 | asr_eval |
 | `parameter_beam_length_penalty` | float64 | asr_eval |
+| `parameter_questions` | int32 | decision_latency, decision_max_memory |
 
 Parameter columns are **never namespaced by benchmark type**: one concept gets
 one column wherever it appears, so a `GROUP BY parameter_prefill_tokens` spans
@@ -2032,13 +2002,16 @@ configured with, and every field of it changes the number measured.
 `benchmark_flags` is what the *harness around* it did, which changes how far the
 number can be trusted.
 
-**Resolved, not authored.** A client submits the values it *ran with*, never
-the values it was given. A client that ran ungated because something waived the
-thermal criterion submits `"skip_thermal": true`, not `null`; a client that
-pinned no readiness deadline submits its platform default. A claim's
-`spec.benchmark_flags.readiness` may carry `max_wait_secs` and `skip_thermal`,
-and a host may waive or default either, so this column is the only record of
-what the run applied.
+**Readiness resolved, timeouts as authored.** A client submits the readiness
+block it *ran with*, never the one it was given. A client that ran ungated
+because something waived the thermal criterion submits `"skip_thermal": true`,
+not `null`; a client that pinned no readiness deadline submits its platform
+default. A claim's `spec.benchmark_flags.readiness` may carry `max_wait_secs`
+and `skip_thermal`, and a host may waive or default either, so this column is
+the only record of what the run applied. Submit `http_timeout_seconds` and
+`attempt_timeout_seconds` exactly as the plan specifies them. Omit each timeout
+that the plan does not specify. Thus runs with client defaults remain in the
+same `benchmark_flags_sha256` group as older rows.
 
 A field a client has no notion of is absent, never "unset". A client with
 nothing to report omits the field; a **top-level** empty object is stored as
@@ -2265,10 +2238,12 @@ copies written before the column existed.
 
 The `job_id` this row's job runs again, on a job a campaign re-run minted
 ([plan-ingestion.md](plan-ingestion.md#carrying-a-campaigns-jobs-over)). A device
-ran the new job, so it is a run of its own, with `rescored_from` NULL. It names
-one level up. The scorer reads it from the `rerun_of` map of the plans that link
-the job, so a client cannot supply it. NULL on every other row, and on rows
-scored before the column existed.
+ran the new job, so it is a run of its own, with `rescored_from` NULL. A
+re-run's `fail` mints a job too, which no device runs: its failure rows, with
+`failure_source` `marked`, name the job whose cell it marks failed. It names
+one level up. The scorer reads it from the `rerun_of` map of the plans that
+link the job, so a client cannot supply it. NULL on every other row, and on
+rows scored before the column existed.
 
 ### `run_submitted_at`
 
@@ -2310,9 +2285,10 @@ GROUP BY 1, 2, 3;
 ```
 
 **Count distinct `job_id`, never rows.** One failure holds as many rows as its
-benchmark type has intended metrics: six for `vl_spec_decode` (nine when the
+benchmark has intended metrics: six for `vl_spec_decode` (nine when the
 client resolved speculation on before failing), three for `vl_throughput` and
-`asr_throughput`, two for `prefill_throughput` and `vlm_eval`, one for the rest. `count(*)` inflates by a factor that
+`asr_throughput`, two for `prefill_throughput`, `vlm_eval` and a
+`decision_latency` entry with `parameter_batch_size` above 1, one for the rest. `count(*)` inflates by a factor that
 changes with the type. `count(DISTINCT job_id)` also absorbs the append-only
 duplicates. A re-scored copy is a new `job_id` for the same device run, so to
 count runs keep `rescored_from IS NULL`; a re-run is a run of its own
@@ -2323,10 +2299,10 @@ breakdown, still counting distinct `job_id`. For rows written before the
 | Column | Type | Meaning |
 |---|---|---|
 | `failed` | boolean | `true` on a failure row, `false` on a measured row. NULL in a file written before the column existed |
-| `failed_reason` | string | The client's `failure_reason`, or the message the server wrote when it retired the job. NULL on a measured row |
-| `failure_source` | string | Which pass produced the failure: `client`, `expired`, `all_clients_denied`, `unmatchable`, or `lease_lost`. NULL on a measured row. A body stored before the field existed resolves from its `client_id`: the reserved `"system"` id reads NULL, any other reads `client` |
+| `failed_reason` | string | The client's `failure_reason`, the message the server wrote when it retired the job, or the reason a campaign re-run's `fail` gave. NULL on a measured row |
+| `failure_source` | string | Which pass produced the failure: `client`, `expired`, `all_clients_denied`, `unmatchable`, `lease_lost`, `marked` for a job a campaign re-run marked failed, or `smaller_run_failed` for a queued job failed after a smaller run of its family failed ([queue.md](queue.md#client-reported-failure)). NULL on a measured row. A body stored before the field existed resolves from its `client_id`: the reserved `"system"` id reads NULL, any other reads `client` |
 | `failure_retriable` | boolean | The client's `retriable` flag. `false` on every synthetic `"system"` failure. NULL on a measured row |
-| `failure_code` | string | The client's `failure_code`, `unspecified` when it sent none. On an `all_clients_denied` failure, the code most of the clients' denials name (`unspecified` if none names one); `unspecified` on every other synthetic `"system"` failure. NULL on a measured row and on rows written before the column |
+| `failure_code` | string | The client's `failure_code`, `unspecified` when it sent none. On an `all_clients_denied` failure, the code most of the clients' denials name (`unspecified` if none names one); on a `smaller_run_failed` failure, the smaller run's code; `unspecified` on every other synthetic `"system"` failure. NULL on a measured row and on rows written before the column |
 
 **Read the flag as `failed IS TRUE` / `failed IS NOT TRUE`.** Rows written
 before the column read NULL, so `failed = false` and `failed != true` drop them
@@ -2549,26 +2525,27 @@ joins prompts, completions and scored samples is
 
 ## 7. Backend configuration
 
-Five config sections choose where data lives
+Four config sections choose where data lives
 ([`crates/pipette-core/src/config.rs`](../crates/pipette-core/src/config.rs) is
 the key reference, [`examples/config.toml`](../examples/config.toml) the
 annotated example):
 
+- `[database]` (required): PostgreSQL for every record and the job queue
+  (§1.1). A config without it fails to load.
 - `[storage]`: the object store for the catalog, submissions, the warehouse,
-  eval sample results, blobs and the dataset cache, and, without `[database]`,
-  the records of §2 marked `[storage]`.
-- `[auth_storage]` (required): without `[database]`, the identity records of §2
-  marked `[auth_storage]`.
-- `[todo_storage]`: the job queue. Set `backend = "database"` to use
-  PostgreSQL. This choice requires `[database]`. If `[todo_storage]` is
-  absent, the queue uses `[storage]`. Use that default only for `local_fs`
-  development.
+  eval sample results, blobs and the dataset cache. It also holds the record
+  keyspaces of §2 marked `[storage]` that `db import` reads and `db export`
+  writes.
+- `[auth_storage]` (required): the record keyspaces of §2 marked
+  `[auth_storage]` that `db import` reads and `db export` writes.
 - `[eval_packages_storage]`: the scores service's `scores-packages/`, which
   mgmt only reads. If absent, mgmt reads them from `[storage]`.
-- `[database]`: PostgreSQL for every record (§1.1).
+
+`[todo_storage]` is a retired key. A config that has `[todo_storage]` fails to
+load. Delete the section from every config.
 
 ```toml
-# Local filesystem (default): [todo_storage] not required, shares [storage]
+# Local filesystem
 [storage]
 backend = "local_fs"
 data_dir = "./data"
@@ -2578,7 +2555,6 @@ backend = "local_fs"
 data_dir = "./data"
 
 # S3 / S3-compatible: separate buckets per section.
-# [todo_storage] must be an S3 Express One Zone bucket (§8).
 [storage]
 backend = "s3"
 bucket = "my-data-bucket"
@@ -2587,66 +2563,15 @@ bucket = "my-data-bucket"
 backend = "s3"
 bucket = "my-auth-bucket"
 
-[todo_storage]
-backend = "s3"
-bucket = "my-todo-bucket--use1-az4--x-s3"  # must be Express One Zone
-
-# Records on PostgreSQL; the PG* environment variables fill absent keys
+# Records and the job queue on PostgreSQL; the PG* environment variables fill
+# absent keys
 [database]
-
-# Alternatively, keep the job queue in the same PostgreSQL database:
-# [todo_storage]
-# backend = "database"
 ```
 
 S3 credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, IAM roles), never from the config file.
 
 ## 8. Architectural decisions
-
-### todo/ requires S3 Express One Zone
-
-The job queue relies on atomic rename for two operations: promoting a complete
-job file from `tmp/` to `avail/`, and claiming a job from `avail/` to `leased/`.
-On a local filesystem both are single syscalls. On S3, atomic rename exists only
-as the `RenameObject` API of
-[S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/).
-Standard S3's copy and delete breaks the no-double-assignment guarantee: two
-claimers can both copy a job before either deletes it.
-
-Atomic rename is a simple, correct primitive, and the storage-class cost does
-not matter for small files at modest request volume. Supporting standard S3
-would take a fixed `leased/{job_id}.json` key with conditional writes
-(`If-None-Match: *` on claim, `If-Match: <etag>` on heartbeat) through the claim
-and heartbeat paths; that redesign is the path if Express One Zone (single-AZ,
-limited regions) is unacceptable ([queue.md](queue.md)). The rest of the data
-has no such constraint.
-
-The `aws-sdk-s3` client retries a rename that times out. If the first rename
-completed, S3 can answer the retry with `NoSuchKey`. After a `NoSuchKey`
-answer, the store reads the destination. If the destination exists, the
-rename succeeded. If the destination does not exist, the source is gone. A
-recycle destination in `avail/` is the same for every recycler of a lease. So
-a recycler that lost the race also gets a success, because the job is back in
-`avail/`.
-
-A directory bucket also restricts listing: one delimiter, `/`, only a prefix
-that ends in it (any other prefix is `InvalidRequest`), and no server-side
-`start-after`. So `avail/` gives each job its own directory and `leased/` each
-client its own, and a single listing isolates one job's entry or one client's
-leases.
-
-**Validate iff you rename.** When `[todo_storage]` is `s3`, a process that
-renames against `todo/` (`serve`, `queue-maintenance`, and the `campaigns`
-commands that file a plan) probes the bucket at startup: it stages an object
-under `todo/tmp/`, renames it, and requires the destination to hold it and the
-source to be gone, deleting both keys whatever the verdict. A `NotImplemented`
-rename, any other error, an empty destination, a source still present (a copy,
-not a move), or a failed read-back refuses the start. The claim path reads a
-failed rename as a lost race, so without the probe a misconfigured bucket would
-leave every job unclaimable and report nothing. The `clients` admin commands
-never rename and skip the probe. On `local_fs` the probe is a no-op. If
-`backend = "database"`, startup checks the PostgreSQL schema.
 
 ### `[storage]` and `[auth_storage]` require conditional PUT
 
@@ -2656,9 +2581,8 @@ exists:
 * the storage mutate lock, `locks/mutate.lock` in `[storage]`,
 * the exactly-once pre-auth key spend, `client-preauth/{key_id}.spent` in
   `[auth_storage]` (§3),
-* the duplicate-job content key, `content-keys/v1/{digest}` in `[storage]` (§2).
-  This requirement is why the index is not in `[todo_storage]`, which is probed
-  for rename and not for conditional `PUT`, and
+* the duplicate-job content key, `content-keys/v1/{digest}` in `[storage]` (§2),
+  and
 * the synthetic failure record, written to `submissions/incoming/{job_id}.json`
   in `[storage]` by `queue-maintenance`.
 
@@ -2689,8 +2613,7 @@ On a **versioned** bucket each probe leaves two to four noncurrent objects under
 `probe/`, and the locked batch commands probe on every invocation. Expire them
 with a lifecycle rule on `<prefix>/probe/` covering noncurrent versions and
 expired delete markers, or set `probe_backend_capabilities = false` once the
-backend is known to conform (the skip is logged; the rename probe is
-unaffected).
+backend is known to conform (the skip is logged).
 
 **Validate iff you depend on a write being exclusive.** The locked batch
 commands (`process-submissions`, `score-eval`, `fix-*`, `requeue-eval`) probe
@@ -2704,7 +2627,7 @@ a concurrent client-record change. Read-only commands and the `clients` admin
 commands skip the probe. On `local_fs`, exclusive creation is a kernel guarantee
 and the probe is a no-op.
 
-Like the rename probe, this shows the endpoint refuses a conflicting write at
+This probe shows that the endpoint refuses a conflicting write at
 startup, not that it does so correctly under concurrency.
 
 ### mark_processed is not atomic on S3

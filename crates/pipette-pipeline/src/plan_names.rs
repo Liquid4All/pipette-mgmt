@@ -430,13 +430,18 @@ mod tests {
     impl Fixture {
         async fn new(state: DescriptorEntryState) -> anyhow::Result<Self> {
             let dir = tempfile::tempdir()?;
-            let stores = pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
-                storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-                auth_storage: pipette_core::config::StorageConfig::local_fs(
-                    dir.path().to_path_buf(),
-                ),
-                ..Default::default()
-            })?;
+            let stores = pipette_store_fs::build_local_fs_stores(
+                &pipette_core::config::Config {
+                    storage: pipette_core::config::StorageConfig::local_fs(
+                        dir.path().to_path_buf(),
+                    ),
+                    auth_storage: pipette_core::config::StorageConfig::local_fs(
+                        dir.path().to_path_buf(),
+                    ),
+                    ..Default::default()
+                },
+                pipette_store_testkit::no_queue(),
+            )?;
             let catalog = crate::descriptor_catalog_admin::tests::Memory::default();
             let now = chrono::Utc::now();
             let runtime: pipette_plan_types::Runtime = serde_json::from_value(

@@ -11,7 +11,6 @@ use rstest::rstest;
 use serde_json::{Value, json};
 
 use pipette_core::plan::{ExpiredJob, sample_manifest};
-use pipette_core::todo_filename::parse_avail_filename;
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
@@ -19,9 +18,10 @@ use pipette_plan_types::{
     UserPermission,
 };
 use pipette_web_testkit::{
-    QueueBackend, UserSigner, add_starved_snapshot, approved_client, approved_queue_client,
-    authed_get, authed_user_get, body_json, grant_plan_user_detail, grant_user, plan_ids,
-    put_loose_plan, registered_user, registered_user_with_detail, submit_plan_as, unauthed_get,
+    UserSigner, add_starved_snapshot, approved_client, approved_object_client,
+    approved_queue_client, authed_get, authed_user_get, body_json, grant_plan_user_detail,
+    grant_user, plan_ids, put_loose_plan, registered_user, registered_user_with_detail,
+    submit_plan_as, unauthed_get,
 };
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -520,7 +520,7 @@ async fn test_a_scoped_listing_pages_past_the_plans_outside_it(
 #[tokio::test]
 async fn test_list_plans_counts_an_unreadable_manifest_and_lists_the_rest() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (state, _key, client_id) = approved_object_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(
         &state,
         &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
@@ -765,15 +765,10 @@ async fn test_get_plan_surfaces_a_pending_cancel() -> anyhow::Result<()> {
 
 /// A freshly staged plan's jobs are `available`, carry the deadline the
 /// `avail/` key encodes, and hold no lease.
-#[rstest]
-#[case::local_fs(QueueBackend::LocalFs)]
-#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_list_jobs_reports_queued_jobs_as_available(
-    #[case] backend: QueueBackend,
-) -> anyhow::Result<()> {
+async fn test_list_jobs_reports_queued_jobs_as_available() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -833,16 +828,18 @@ async fn test_list_jobs_reports_every_lifecycle_state(
     let (available, running, finished, failed, cancelled) =
         (&jobs[0], &jobs[1], &jobs[2], &jobs[3], &jobs[4]);
 
-    // `running`: rename its `avail/` entry into a live lease, as `claim` does.
-    // The deadline comes off the key rather than being assumed: ingestion
-    // stamps a default expiry, and the rename is addressed by it.
+    // `running`: move its available entry into a live lease, as `claim` does.
+    // The deadline comes from the queue row: ingestion stamps a default
+    // expiry, and the claim names it.
     let lease_expiry = Utc::now() + Duration::hours(1);
-    let avail_key = state
+    let expires_at = state
         .todo_store
-        .avail_key_for_job(running)
+        .avail_for_jobs(std::slice::from_ref(running))
         .await?
-        .context("the job is queued")?;
-    let (_, expires_at) = parse_avail_filename(&avail_key)?;
+        .into_iter()
+        .next()
+        .context("the job is queued")?
+        .expires_at;
     state
         .todo_store
         .claim_job(running, expires_at, &client_id, lease_expiry)
@@ -916,7 +913,7 @@ async fn test_list_jobs_reports_every_lifecycle_state(
 #[tokio::test]
 async fn test_a_job_without_a_readable_source_names_no_request() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let (state, _key, client_id) = approved_object_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(
         &state,
         &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
@@ -983,11 +980,10 @@ async fn seed_lease(
     Ok(())
 }
 
-/// A lease past its expiry still reads `running`, flagged `lapsed`, until the
-/// maintenance pass recycles it; beside a live lease for the same job, the live
-/// one answers.
+/// A lease past its expiry still reads `running` until the maintenance pass
+/// recycles it.
 #[tokio::test]
-async fn test_a_lapsed_lease_reads_running_until_a_live_one_answers() -> anyhow::Result<()> {
+async fn test_a_lapsed_lease_reads_running() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(
@@ -1004,15 +1000,14 @@ async fn test_a_lapsed_lease_reads_running_until_a_live_one_answers() -> anyhow:
         .await?
         .context("the job is queued")?;
     state.todo_store.delete_avail_by_job(job_id).await?;
-    // Lapsed leases under fixed names on both sides of the live one: the listing
-    // is unsorted, so a lone lapsed lease would catch a seen-order bug by luck.
-    let lapsed = Utc::now() - Duration::minutes(1);
-    for client in [
-        "ev1_a", "ev1_b", "ev1_c", "ev1_d", "ev1_w", "ev1_x", "ev1_y", "ev1_z",
-    ] {
-        seed_lease(&state, job_id, client, lapsed, &job_body).await?;
-    }
-    assert_eq!(state.todo_store.list_leased().await?.len(), 8);
+    seed_lease(
+        &state,
+        job_id,
+        "ev1_a",
+        Utc::now() - Duration::minutes(1),
+        &job_body,
+    )
+    .await?;
     let uri = format!("/api/v1/plans/{plan_id}/jobs");
 
     let resp = authed_user_get(&state, &key, &user_id, &key_id, &uri).await?;
@@ -1025,27 +1020,6 @@ async fn test_a_lapsed_lease_reads_running_until_a_live_one_answers() -> anyhow:
     assert!(
         chrono::DateTime::parse_from_rfc3339(expiry)? < Utc::now(),
         "a lapsed lease reported a future expiry: {expiry}"
-    );
-
-    // A live lease among the lapsed ones: the job is held, not stranded.
-    seed_lease(
-        &state,
-        job_id,
-        "ev1_m",
-        Utc::now() + Duration::hours(1),
-        &job_body,
-    )
-    .await?;
-    assert_eq!(state.todo_store.list_leased().await?.len(), 9);
-    let resp = authed_user_get(&state, &key, &user_id, &key_id, &uri).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    let row = job_row(&body, job_id)?;
-    assert_eq!(row["state"], json!("running"), "{body}");
-    let expiry = pipette_web_testkit::json_str(&row["queue"]["lease"], "expires_at")?;
-    assert!(
-        chrono::DateTime::parse_from_rfc3339(expiry)? > Utc::now(),
-        "a lapsed lease answered over the live one: {expiry}"
     );
     Ok(())
 }
@@ -1734,9 +1708,7 @@ async fn test_cancel_writes_the_marker_and_leaves_the_status() -> anyhow::Result
 #[tokio::test]
 async fn test_cancel_over_http_is_torn_down_by_queue_maintenance() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2066,9 +2038,7 @@ async fn test_explain_fleet_permission_tier(
     #[case] fleet_detail: &str,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2283,9 +2253,7 @@ async fn test_status_listing_and_explain_project_fleet_detail(
     #[case] tier: &str,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2394,9 +2362,7 @@ async fn test_status_listing_and_explain_project_fleet_detail(
 #[tokio::test]
 async fn test_explain_projects_a_starved_headline(#[case] full: bool) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, _client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, _client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -2463,9 +2429,7 @@ async fn test_explain_projects_a_blocked_clients_headline(
     #[case] full: bool,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _key, client_id)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _key, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;

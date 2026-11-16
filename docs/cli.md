@@ -103,7 +103,7 @@ Credentials stay out of the file, with one exception:
 | [`serve`](#pipette-mgmt-serve) | The HTTP server |
 | [`process-submissions`](#pipette-mgmt-process-submissions-alias-score) (`score`) | The fast scoring pass, from cron |
 | [`score-eval`](#pipette-mgmt-score-eval) | The slow eval scoring pass, from cron |
-| [`queue-maintenance`](#pipette-mgmt-queue-maintenance) | Reconcile the `todo/` queue, from cron |
+| [`queue-maintenance`](#pipette-mgmt-queue-maintenance) | Reconcile the job queue, from cron |
 | [`dataset-cache`](#pipette-mgmt-dataset-cache-probebuildpins) | Keep upstream dataset corpora servable, and author their pins |
 | [`plans`](#pipette-mgmt-plans-liststatusresultscancel) | Read and cancel plans |
 | [`campaigns`](#pipette-mgmt-campaigns-createingestvariantsrevisererunrevertlistshowrenameownerdelete) | File and revise plans through campaigns |
@@ -124,7 +124,7 @@ Credentials stay out of the file, with one exception:
 | [`audit`](#pipette-mgmt-audit-listprune) | Read the audit log, and prune it past its retention |
 | [`openapi`](#pipette-mgmt-openapi---site-dir) | Print the OpenAPI document, or write the API reference page |
 
-If `[database]` is set, each run of a command that changes records creates an
+Each run of a command that changes records creates an
 audit event ([Organizations: The audit log](api/orgs.md#the-audit-log)).
 `catalog rename` also creates a separate event with the old and new names.
 A rename that merges two entries creates a `catalog_merge` event in its place.
@@ -141,8 +141,8 @@ These commands make no audit event:
 - `openapi`, which prints the binary's own document.
 - `unlock`, `db migrate`, `db check` and `db export`, because a storage lock,
   the schema and an export change no records. `db import`,
-  `db backfill-job-cells` and `db backfill-run-evidence` change records, so
-  they make an event.
+  `db backfill-job-cells`, `db backfill-run-evidence` and
+  `db backfill-rerun-results` change records, so they make an event.
 
 An event is in the log of each organization that `--org` names. It is also in
 the log of each organization that owns a record the arguments name by id.
@@ -174,14 +174,16 @@ that `serve` runs against storage and the database.
 
 `Config::load` ignores a key that no config field reads, and the default for that
 field applies. The check produces a warning for each such key, for example
-`evals_server_ur` or a section header `[storag]`. The check also reports
-unknown keys inside `[todo_storage]`, such as `todo_storage.data_dri`. The
-check cannot see keys inside `[storage]`, `[auth_storage]` or
-`[eval_packages_storage]`.
+`evals_server_ur` or a section header `[storag]`. The check cannot see keys
+inside `[storage]`, `[auth_storage]` or `[eval_packages_storage]`.
 
-Set `[todo_storage] backend = "database"` to use the PostgreSQL job queue.
-This choice requires `[database]`. If `[database]` is missing, `config check`
-rejects the config. If `[todo_storage]` is absent, the queue uses `[storage]`.
+Every config needs a `[database]` section, because the records and the job
+queue are in PostgreSQL. If `[database]` is missing, `config check` rejects the
+config.
+
+`[todo_storage]`, `todo_attempt_timeout_secs` and `todo_operation_timeout_secs`
+are retired keys. A config that has one of them fails to load. Delete each one
+from every config.
 
 Each known flavor without an offer rule produces a warning that names the runtime
 type and flavor. To offer that flavor, add a `[[descriptor_catalog.offer_rules]]`
@@ -193,8 +195,7 @@ reports every warning before it exits.
 ### `pipette-mgmt serve`
 
 Starts the HTTP server. Before it binds, it loads the benchmark catalog, runs
-`db check` when `[database]` is set, and probes the backends it renames and
-writes against ([operations.md §5.2](operations.md#52-aws-s3)). Stopping it:
+`db check`, and probes the backends it writes against ([operations.md §5.2](operations.md#52-aws-s3)). Stopping it:
 [operations.md §2.1](operations.md#21-stopping-the-server).
 
 ### `pipette-mgmt process-submissions` (alias `score`)
@@ -235,11 +236,11 @@ finalize. It holds its own `score-eval` lock, never the mutate lock
 
 ### `pipette-mgmt queue-maintenance`
 
-Reconciles the `todo/` queue and exits. [operations.md §3.1](operations.md#31-job-queue-maintenance)
+Reconciles the job queue and exits. [operations.md §3.1](operations.md#31-job-queue-maintenance)
 covers its cadence, why runs must not overlap, and its log lines;
 [queue.md](queue.md) is the protocol it maintains. Each run, in order:
 
-1. Recycles expired leases to `avail/`, counting each as a lost lease of its
+1. Recycles expired leases to the queue, counting each as a lost lease of its
    job, and retires a job whose losses reach `plan_lost_lease_limit` as
    `lease_lost`.
 2. Ends the jobs of every plan that owes teardown: one latched `cancelling`, and
@@ -251,22 +252,42 @@ covers its cadence, why runs must not overlap, and its log lines;
 4. Retires the same way a job no possible client can match: a malformed clause,
    or a positive clause contradicting a negative one.
 5. Escalates the same way a job whose closed `clients` roster is fully denied.
-6. Indexes new jobs into `eligible/`, and rebuilds flagged clients.
-7. Collects orphaned `eligible/` and `denied/` markers.
-8. Refreshes each plan's `status` and `progress_snapshot`.
-9. Collects the content keys and membership markers of jobs and plans that are
+6. Indexes new jobs into the eligible index, and rebuilds flagged clients.
+7. Refreshes each plan's `status` and `progress_snapshot`.
+8. Collects the content keys and membership markers of jobs and plans that are
    gone, after `plan_creating_max_age_secs` and a second sighting, since a
    mid-flight ingest's keys can name a job not queued yet.
-10. Deletes `todo/tmp/` files older than `todo_tmp_max_age_secs`.
+9. Deletes staged job bodies older than `todo_tmp_max_age_secs`.
+10. Moves each waiting job's `expires_at` to the earliest horizon of the plans
+    that hold it ([plan-ingestion.md §7](plan-ingestion.md#the-duplicate-job-merge)).
+11. Applies the campaign group policies that are on
+    ([when a policy acts](api/campaign-groups.md#when-a-policy-acts)): it reads
+    each member campaign's current plan and its results in pipette-duckdb, and
+    files at most one revision per campaign. It fails the run while a policy is on and the config has no `[duckdb]`.
+    It starts no member once the run is more than 60 s past its start
+    ([operations.md §3.1](operations.md#31-job-queue-maintenance)).
 
 It never deletes a plan manifest or the document a plan was filed from
 ([plan-ingestion.md §9](plan-ingestion.md#retention)). It takes no mutate lock:
-it writes only `todo/`, `plans/`, and a synthetic failure under a job's own key
-in `submissions/incoming/`.
+it writes only the job queue, `plans/`, and a synthetic failure under a job's own key
+in `submissions/incoming/`, and in pass 11 the policies' revisions, each mark's
+failure under its new job's key in `submissions/incoming/`, their audit events,
+each member's `policy_state` in `campaign_group_members`, and the re-runs and
+their outcomes in `campaign_group_rerun_results`
+([re-run results](api/campaign-groups.md#re-run-results)).
 
-Passes 1 to 5, 8 and 9 log a failed item, skip it and retry it on the next run.
-A failure in passes 6, 7 or 10 aborts the run instead; a rerun is safe. Either
-way the command exits non-zero, so cron monitoring sees a persistent fault.
+Passes 1 to 5 and 8 log a failed item, skip it and retry it on the next run.
+Pass 11 logs a failed item for each member or group it skips or cannot finish:
+a member whose rows pipette-duckdb did not answer or whose store read failed, a
+group with a policy or record that does not decode, and a revision that failed.
+The next run tries most of them again, but not a plan it cannot file again,
+which fails only the run that first meets it, nor the cancel of a plan its
+revision replaced ([operations.md §3.1](operations.md#31-job-queue-maintenance)
+says what to do for each). Members it did not reach in its 60 s are counted,
+not failed. A failure in pass 6, 7, 9 or 10 ends the queue passes instead, and
+a rerun is safe; pass 11 still runs, and the run exits with the first error.
+Either way the command exits non-zero, so cron monitoring sees a persistent
+fault.
 
 ### `pipette-mgmt fix-model-param`
 
@@ -701,11 +722,13 @@ Deletes a registration that is still `pending`, with its ownership and tags, as
 
 ### `pipette-mgmt clients delete <client_id>`
 
-Deletes a client record, pending or approved, then best effort its queue
-markers, ownership and tag markers; `queue-maintenance` and
-[`reindex`](#pipette-mgmt-reindex) collect any it leaves, and a re-run finishes
-the cleanup. An absent record is not an error, so the command reports whether it
-found one. Submissions and warehouse rows naming the client stay.
+Deletes a client record, pending or approved. Then, best effort, it deletes the
+client's queue markers, ownership and tag markers, and settles each lease that
+the client holds. A leased job goes back to the queue, or leaves it if it
+already has a result. [`reindex`](#pipette-mgmt-reindex) collects tag markers
+that the command leaves, and a re-run finishes the cleanup. An absent record is
+not an error, so the command reports whether it found one. The client's
+denials, submissions and warehouse rows stay.
 
 ### `pipette-mgmt clients update <client_id> [flags]`
 
@@ -790,7 +813,7 @@ failure move to `incoming/`. A **retriable** failure is archived to
 resolved, recording it would give a terminal failure to a cell another client
 may have measured. A held body's `job_id` was never checked against a lease,
 so one whose job already exists (a record in `incoming/`, the score queue or
-`processed/`, a job source, or an entry in `todo/avail/` or `todo/leased/`) is
+`processed/`, a job source, or a job in the job queue) is
 refused and stays held for `unverified delete`. The command reports the three
 counts separately, and `--dry-run` reports how many would be refused. Each
 other object leaves the unverified tree only after its re-stage write
@@ -889,11 +912,12 @@ sum of the artifacts' deadlines, an eval corpus counted only while it is
 unregistered. A benchmark that pins a digest another pins with different fields
 is skipped and reported.
 
-`probe` reaches each upstream once per run. If the upstream was `ok` and the
-probe finds it unavailable (a timeout or a network fault), `probe` tries again
-in the same run. The first attempt gets half of `dataset_probe_timeout_secs`,
-and the second attempt gets the rest. Thus one stalled fetch does not refuse
-the benchmarks of the upstream until the next run. `gone` and `moved` are
+`probe` checks each distinct upstream per run and retries an unavailable result
+once if the upstream was previously `ok`. An unavailable result can mean a
+timeout or a network fault. The first attempt gets half of
+`dataset_probe_timeout_secs`, and the second attempt gets the rest. This retry
+can keep the upstream's
+benchmarks available after one stalled fetch. `gone` and `moved` are
 answers from the upstream and get no second attempt. Each attempt logs
 `dataset_probe_attempt` at `debug` for each affected artifact, with `upstream`,
 `digest` and `elapsed_ms`. Each second attempt logs `dataset_probe_retried` at
@@ -929,13 +953,14 @@ no-op when the trees agree.
 It refuses to run when no client record reads back but forward markers exist:
 with the records and the markers in separate sections, that is a misconfigured
 `[auth_storage]` more often than a fleet that is gone, and proceeding would drop
-every tag. The `todo/eligible/` index is [`flag-reindex`](#pipette-mgmt-flag-reindex)'s.
+every tag. Use [`flag-reindex`](#pipette-mgmt-flag-reindex) to request a rebuild
+of the eligible index.
 
 ### `pipette-mgmt flag-reindex`
 
 Writes a pending-reindex flag for one client, or every client with `--all`. The
 next [`queue-maintenance`](#pipette-mgmt-queue-maintenance) run rebuilds each
-flagged client's `todo/eligible/` markers from scratch against its current
+flagged client's eligibility rows from scratch against its current
 record, and clears the flag ([queue.md](queue.md#the-reindex-gate)).
 
 The server writes the same flag itself on every device-profile and capability
@@ -944,14 +969,14 @@ change, so use the command only when that path did not converge:
 - A `PATCH /clients/me` returned `500` **and** a maintenance run consumed its
   first flag. The handler writes one flag before it stores the new record and
   one after; a failure on the second leaves the record stored, and the client's
-  retry sees nothing to report. Stale markers survive only when a rebuild
+  retry sees nothing to report. Stale eligibility rows survive only when a rebuild
   consumed the first flag inside the window the post-rebuild record check does
   not cover.
 - You rolled forward past a build that read the eligibility clauses
   differently. The index records the jobs it indexed and skips them, so only
   `--all` re-matches them
   ([plan-ingestion.md §5](plan-ingestion.md#5-capability-matching)).
-- Markers look wrong for any other reason: a partial restore, a manual edit, or
+- Eligibility rows look wrong for any other reason: a partial restore, a manual edit, or
   a suspected bug.
 
 > **A flagged client is work-gated.** The server refuses its claim, reclaim and
@@ -960,7 +985,7 @@ change, so use the command only when that path did not converge:
 > maintenance interval. Name a single client where you can.
 
 The command checks a named client against the auth store and refuses an unknown
-id. It writes only `todo/` and takes no mutate lock.
+id. It writes only the job queue and takes no mutate lock.
 
 ### `pipette-mgmt plans list|status|results|cancel`
 
@@ -968,7 +993,7 @@ Read and cancel plans. Filing one is
 [`campaigns`](#pipette-mgmt-campaigns-createingestvariantsrevisererunrevertlistshowrenameownerdelete);
 [plan-ingestion.md](plan-ingestion.md) covers the ingestion flow (§8) and the
 plan lifecycle (§9). Only `results` leaves storage. The commands write only
-`plans/` and `todo/`, so they take no mutate lock.
+`plans/` and the job queue, so they take no mutate lock.
 
 Identify a plan by its `plan_id`.
 
@@ -1003,14 +1028,14 @@ register.
 `client_id`, in two lists, each skipped when empty:
 
 - **Running now**: the holder still heartbeats.
-- **Stranded**: the lease is past its deadline and the job sits outside
-  `avail/`, where no claim reaches it, until `queue-maintenance` recycles it.
+- **Stranded**: the lease is past its deadline and the job is still leased,
+  where no claim reaches it, until `queue-maintenance` recycles it.
 
 Each row gives the lease deadline and its distance from the read: forward for a
 live lease, backward for a lapsed one. A short strand is the normal window; one
-older than a maintenance interval points at a stalled cron. A `leased/` key that
+older than a maintenance interval points at a stalled cron. A lease row that
 does not parse names no job, so it joins neither list; the report counts such
-keys last, as the caveat on both lists, and narrows its empty answer to what it
+rows last, as the caveat on both lists, and narrows its empty answer to what it
 could read. The lists are a **live** reading and the **Progress** block the
 cached count, so a job claimed since the last pass appears in one and not the
 other.
@@ -1030,22 +1055,22 @@ one that blocks every outstanding job:
 |---|---|
 | still `creating` | The filing is not complete, so the plan makes none of its jobs claimable, wherever they are in the queue. A lease that a client already holds stays valid. |
 | cancel pending | Teardown owns the plan. `queue-maintenance` retires the jobs. |
-| leases lapsed | Every outstanding job sits behind a lapsed lease. The holders stopped heartbeating, and a claim cannot reach a job outside `avail/`. |
-| nothing outstanding | No job is in `avail/`. Each one is held under a live lease, finished, or retired. |
+| leases lapsed | Every outstanding job sits behind a lapsed lease. The holders stopped heartbeating, and a claim cannot reach a leased job. |
+| nothing outstanding | No job is available. Each one is held under a live lease, finished, or retired. |
 | expired | Every available job is past its deadline. The claim path refuses it. |
-| not indexed | Every claimable job still carries its reindex flag, so no client carries an eligibility marker for it. |
+| not indexed | Every claimable job still carries its reindex flag, so no client has an eligibility row for it. |
 | starved | Every claimable job matches no working client. |
 | clients blocked | No claimable job has a client that can take it: no approved client holds `perform_work`, or every working client that matches a job waits on a rebuild, or has a denial for that job. |
-| schedulable | At least one claimable job matches an unblocked client that holds no `denied/` marker for it. |
+| schedulable | At least one claimable job matches an unblocked client that holds no denial for it. |
 
-One further answer is not a gate: **queue moved** means every claimable job left
-`avail/` while the report read it and none turned up under a live lease, so the
+One further answer is not a gate: **queue moved** means every claimable job stopped
+being available while the report read it and none turned up under a live lease, so the
 report asks for a re-run.
 
 **not indexed** and **leases lapsed** have no other surface, and a stalled
-`queue-maintenance` causes both. Ingestion writes no `eligible/` marker, so
+`queue-maintenance` causes both. Ingestion writes no eligibility row, so
 between an ingest and the first pass nothing is claimable, while the plan reads
-`active` with an empty starved list. A lapsed lease waits in `leased/` until a
+`active` with an empty starved list. A lapsed lease stays on its job until a
 pass recycles it. A plan holding a live lease beside a stranded one reads
 **nothing outstanding**, with the strand counted in the headline.
 
@@ -1088,9 +1113,9 @@ and the next run clears the group.
 
 `--explain` reads availability, leases, and denials only for this plan's jobs.
 It also reads the fleet and the shared indexed-state snapshot. It does not read
-the `eligible/` marker tree. `--explain --leases` costs the same as `--explain`.
+the eligible index. `--explain --leases` costs the same as `--explain`.
 Both blocks use the same lease read. The reports count only the jobs of this
-plan. Queue maintenance logs malformed queue keys.
+plan. Queue maintenance logs malformed queue rows.
 
 **`results`** prints one row per metric of each job's latest scoring run,
 carried-over jobs included, with how many of the plan's jobs reported. A failed
@@ -1137,7 +1162,9 @@ What differs from HTTP:
   `--org`, resolved against the roster before anything is written, and can hand
   a campaign anywhere; the bound in
   [`PUT /api/v1/campaigns/{campaign_id}/owner`](api/campaigns/set_campaign_owner.md) is on the
-  signed routes. A job may name any organization's private benchmark.
+  signed routes. A job may name any organization's private benchmark. `owner`
+  also takes the campaign out of a campaign group of another owner, even when
+  the owner does not change, so running it again finishes a removal that failed.
 - **`--strict-models`.** HTTP always warns on a model with no model-params row,
   and treats an unreadable table as empty, so a table the operator has not
   caught up with never costs a tenant its plan. The flag makes the CLI refuse
@@ -1172,15 +1199,17 @@ What differs from HTTP:
   `plan_warnings`, and `imports`, with the fields of the HTTP dry run
   ([Campaigns: Response `201 Created`](api/campaigns.md#response-201-created)). It runs every
   check an ingest runs before a download, resolving gated models at
-  `hf_import_endpoint`. `variants`, `revise` and `revert` add the revised
-  document and the carry-over counts (`carried_job_count`, `new_job_count`,
-  `requirements_rerun_job_count`, `satisfied_job_count`, `restored_job_count`,
-  `inherited_job_count`, `dropped_job_ids`, `held_jobs`, `repeated_variants`).
+  `hf_import_endpoint`. `variants`, `revise`, `rerun` and `revert` add the
+  revised document and the carry-over counts (`carried_job_count`,
+  `new_job_count`, `requirements_rerun_job_count`, `satisfied_job_count`,
+  `restored_job_count`, `inherited_job_count`, `rerun_job_ids`,
+  `marked_job_ids`, `dropped_job_ids`, `held_jobs`, `repeated_variants`).
   The counts include the cells that an earlier finished run answers
   ([plan-ingestion.md §7](plan-ingestion.md#satisfying-a-cell-from-an-earlier-run)). A `revise` of the
   unchanged document files nothing, and its dry run runs no import, so `imports`
-  is empty. A `revert` to a plan with the document of the head also files
-  nothing.
+  is empty, unless `--carry-earlier` or `--inherit-from` is set. A `revert` to
+  a plan with the document of the head also files nothing.
+- **No marks.** `rerun` takes no `fail`, so marking a cell failed is HTTP only.
 - **Recovery.** If a campaign write reports a failure after filing its plan,
   the command names the campaign and plan. It cancels nothing, even if an
   immediate read does not show the plan: the write can still land. Reconcile
@@ -1189,7 +1218,10 @@ What differs from HTTP:
   jobs. A plan that loses an edit race cancels its own. See
   [failed-filing recovery](operations.md#35-recover-from-a-failed-campaign-filing).
 - **Re-runnable.** A write asking for the state the record is already in prints
-  `no change` and writes nothing.
+  `no change` and leaves the record as it is; `owner` still takes the campaign
+  out of a campaign group of another owner, and says so. `rename` and `owner`
+  write only onto the record they read, so one that meets another edit writes
+  nothing and says to run it again.
 
 `campaigns revert --to <PLAN_ID> --base <PLAN_ID>` files a new plan with a copy
 of the document of an earlier plan. It also cancels the plan that the campaign
@@ -1217,6 +1249,21 @@ current plan, add `--remove` with its number:
 ```console
 $ pipette-mgmt --config config.toml campaigns variants campaign_01a0b60e-… --restore plan-01a0b61c-…:1 --remove 0 --base plan-01a0b7f2-…
 ```
+
+`--carry-across-limit`, on `campaigns revise` and `campaigns variants`, keeps
+the finished runs of the replaced plan, and those the inherited plans offer,
+whatever `attempt_timeout_seconds` each run had, as `carry_across_limit` does on
+the two routes
+([carrying jobs into a revision](api/campaigns.md#carrying-jobs-into-a-revision)).
+Without the flag, a revision keeps such a run when the limit it was requested
+with, or the limit the replaced plan holds it under, is the new one (none on
+both sides included) or, both being set, is not above it, or when a plan on
+offer lists the run for the same body. The revision holds each kept run under
+the new limit, so a later revision needs the flag again only for a limit that
+neither of the two covers. Alone, the flag does not file the unchanged
+document. Run the command with `--dry-run` first:
+`requirements_rerun_job_count` counts the cells that would run again, failed
+ones included, and `dropped_job_ids` lists their jobs.
 
 `campaigns show` walks the chain back from the head, one read per revision, and
 stops after 50. The id is the handle: there is no slug index, and a value
@@ -1306,7 +1353,8 @@ runtimes = [
 ```
 
 Each item of the `models` list has a `quantization` label and a `model`, which
-is the inline model table from a plan. The label matches `[a-z0-9_]+`. The
+is the inline model table from a plan. The label matches
+`[a-z0-9_]+(@[a-z0-9_]+)?`, for example `q4_k_m@unsloth`. The
 model type sets the format, for example `gguf` for `gguf_text`. An entry has at
 most one member for each format and quantization:
 
@@ -1579,6 +1627,30 @@ Undoing `0008` drops the note and the revision change of each plan.
 Undoing `0011` drops the campaign readers' scopes, and is refused while any
 account has one: disable the readers before the rollback, and retire them.
 
+`0039` moves each stored failed policy of a campaign group, and each copy in
+the members' policy states, to `codes`, a key an older binary refuses: every
+code it lists, else `runtime_error`, `device_error` and `unspecified`, at its
+`max_reruns`, which becomes 0. Until the newer binary runs, the older one
+answers 500 on the policy routes and member adds of such a group, and its
+queue-maintenance skips the group and fails. Deploy right after `db migrate`. A
+failed policy the older binary turns on in between is stored without codes,
+and the newer binary reports it unreadable and skips its group until someone
+sets its codes or turns it off. On a rollback, undo `0039` right after the
+older binary is back; the undo gives each failed policy, and each copy in the
+members' policy states, its largest code's re-runs as `max_reruns` and takes
+the codes out.
+
+An older binary also refuses the failure code `device_not_ready`, so deploy
+before any client sends it. Until then the server answers `400` to such a
+failure and records nothing: the job waits out its lease, and the pipette
+worker stops rather than claim the job again. Once one is stored, do not roll
+back below the release that added it; roll forward instead. The older binary
+answers `500` on `GET /jobs/{id}` wherever it reads one, and logs a scoring
+error on every run for one still in `submissions/incoming/`. Once its row is in
+the warehouse, it cannot write a later result of the same benchmark, client
+and day: each scoring run stops at that result, and the next run writes again
+the rows the stopped one wrote just before it, duplicating them.
+
 `db check` exits non-zero unless the database answers, sorts in byte order, and
 holds every migration this binary has, unchanged. `serve` runs it before it
 binds; a newer schema passes, so an older binary runs after a rollback.
@@ -1588,7 +1660,7 @@ binds; a newer schema passes, so an older binary runs after a rollback.
 Copies every record from the object-store sections into `[database]`: clients,
 users, organizations, tags, the key, address and slug claims, the
 organizations' benchmarks, plans with their sources and markers, campaigns,
-model params and vault records. Blobs, `todo/`, submissions, the warehouse, the
+model params and vault records. Blobs, submissions, the warehouse, the
 public benchmark catalog and the dataset cache stay in the object stores.
 The descriptor catalog and the audit log exist only in `[database]`. `db import`
 and `db export` do not copy them. The copy goes
@@ -1631,86 +1703,6 @@ Conflicts and unreadable records are reported, and the command exits non-zero.
 A second run writes and deletes nothing. It takes no lock: stop `serve` and the
 commands that write records, and the copy is exact. The table adds a Deleted
 column to `db import`'s.
-
-### `pipette-mgmt queue import [--dry-run]`
-
-Makes the job queue in `[database]` equal to the object-store queue that
-`[todo_storage]` names (or `[storage]`, if the config has no `[todo_storage]`).
-This command is the cutover of the queue
-([design/sql-job-queue.md](design/sql-job-queue.md#the-cutover)). It requires
-`[database]` and runs `db check` first. It refuses a config with
-`[todo_storage] backend = "database"`, because that config names no object-store
-queue. So run the cold pass before the switch of the config. Follow the
-[production cutover runbook](operations.md#311-moving-the-queue-to-postgresql)
-for the timing gate, task commands, and restart order.
-
-The copy goes through the two `TodoStore` implementations, so the server reads
-each copied entry as any other. It copies these keyspaces:
-
-- `avail/` and `leased/` with their bodies, deadlines, holders and lease
-  expiries.
-- `denied/` with the denial records.
-- `eligible/`, `lost/` and `pending-reindex/`. An eligibility marker compares by
-  client and job, because the database queue takes each marker's deadline from
-  its job.
-- `liveness/`, with the last-seen time of each device, to the second.
-- The three blobs of `queue-maintenance`: `.gc-candidates`, `.backlog` and
-  `.backlog-campaigns`.
-
-The copy does not carry the reindex flags or the worker set. The database
-queue flags each job that the copy inserts, and the next `queue-maintenance`
-run indexes it.
-
-The copy counts `tmp/` and does not copy it, because ingestion stages a body
-there again. The copy writes each entry that the target lacks or holds
-differently. It deletes each entry that the source does not hold. Before it
-deletes an `avail/`, `leased/` or `denied/` entry, a source read
-must confirm that the entry is gone. A listing skips what it cannot read, so the
-copy keeps an entry that only the listing misses.
-
-The database holds one row for each job. A recycle race can leave a job twice
-in the object store. Then the copy keeps one entry, in this order of
-preference:
-
-1. A lease, before an `avail/` entry.
-2. Between two leases, the lease that expires later.
-3. Between two `avail/` entries, the entry with the later deadline.
-
-The copy keeps the later deadline of an `eligible/` marker that names one client
-and one job twice. It logs each dropped entry at `warn` and counts it as
-skipped. The database keeps one flag for each client in `pending-reindex/`. So
-the copy compares those flags by client, and the database gives each copied flag
-a new request id.
-
-The command refuses to run while `avail/` holds a key of the single-segment
-layout. It takes no lock: stop `serve` and the `queue-maintenance` schedule for
-an exact copy. It writes each entry with its own request, with at most 16
-requests at once. If the source has no backlog snapshot, the copy keeps the
-target's snapshot, because no store method deletes a snapshot. A second run
-writes only what changed, and writes nothing if the source did not change. The
-command exits non-zero while an unreadable entry remains; the copy keeps the
-target's entry for it.
-
-The report has one row for each keyspace. A row counts Read, Written,
-Unchanged, Deleted, Skipped and Unreadable, and gives the elapsed time. The
-report then gives the total elapsed time, each skip reason and each unreadable
-entry. On a dry run, Written and Deleted count what the run would change. A dry
-run reads everything, so its elapsed time is the minimum time of a run that
-changes little. That is the time of the cold pass of the cutover. The writes
-add to the time of a run that changes much, such as the warm pass.
-
-### `pipette-mgmt queue export [--dry-run]`
-
-Makes the object-store queue that `[todo_storage]` names equal to the queue in
-`[database]`. This command is the rollback of `queue import`. It copies the
-keyspaces of `queue import` in the other direction, with the same rules. Before
-you run it, change `[todo_storage]` back to the object-store queue, and stop
-`serve` and the `queue-maintenance` schedule. Follow the
-[production rollback procedure](operations.md#311-moving-the-queue-to-postgresql).
-
-An object store cannot take a given modification time. So the export stamps the
-current time on each device that the object-store queue lacks. It counts a
-device that the object-store queue holds as unchanged, at any time.
 
 ### `pipette-mgmt db backfill-job-cells [--dry-run]`
 
@@ -1773,6 +1765,39 @@ keeps its newest run. The command takes no lock, and is safe to run beside
 
 ```
 read 68443 warehouse row(s); wrote 1207 run evidence row(s)
+```
+
+If a read or a write fails, the command stops and exits non-zero. A rerun
+continues safely.
+
+### `pipette-mgmt db backfill-rerun-results <GROUP_ID>...`
+
+The command records the re-runs that each named group's policies filed before
+`queue-maintenance` recorded how each re-run answers
+([re-run results](api/campaign-groups.md#re-run-results)). It requires
+`[database]` and `[duckdb]`, and runs `db check` first.
+
+For each member campaign of each group, it reads each plan of the campaign's
+history that the group's policies filed, and each job that plan minted to run
+another again, its marks left out. It records a row for each policy the plan's
+change names that flags the replaced run, at the policy's threshold as stored
+now, and that has a re-run left, as the pass records only those. A row's
+`attempt` counts the runs in a row that its policy flags, back from the
+replaced run along the group's re-runs, and a policy has a re-run left while
+the `attempt` is at most its `max_reruns`, for failed the re-runs of the
+replaced run's failure code. The row holds the re-run's outcome
+when its rows have landed, and `dropped` when it has neither rows nor a record
+and the campaign's current plan no longer holds it. Per member it reads the
+rows of those jobs from pipette-duckdb at once, and the record of each such job
+with no rows yet.
+
+Run the command once after the deploy that adds migration `0037`
+([operations.md §3.6](operations.md#36-record-the-re-runs-filed-before-migration-0037)),
+and again after the pass fails to record a filing's re-runs. A second run
+records nothing: a row recorded already is kept as it is.
+
+```
+read 6 group filing(s); recorded 212 of their 212 re-run result row(s)
 ```
 
 If a read or a write fails, the command stops and exits non-zero. A rerun

@@ -204,7 +204,9 @@ pub async fn get_benchmark(
         | BenchmarkDefinition::AsrEval(_)
         | BenchmarkDefinition::VlThroughput(_)
         | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::VlSpecDecode(_) => None,
+        | BenchmarkDefinition::VlSpecDecode(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     };
     if let Some((eval_id, dataset_name)) = samples_source {
         let samples = pipette_pipeline::scoring_service::fetch_samples(

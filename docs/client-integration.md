@@ -378,6 +378,16 @@ Key obligations while running:
   `spec.model` / `spec.runtime` the claim delivered, so they match without extra
   work. A plan-attached submission is accepted only from the client that currently
   holds the lease.
+- **Advertise your cache to download less (optional).** When a download
+  completes, keep the claim's `spec.model` or `spec.runtime` with the cached
+  files, exactly as the claim carried it. Remove it when you delete the files.
+  Send the descriptors you keep as `cached` in the claim body
+  ([httpapi.md §2.9.1](httpapi.md#291-request-body)). The server then prefers a
+  job that needs files you already hold, after a family's smaller runs and the
+  model the fewest other devices run ([queue.md](queue.md#claiming-a-job)).
+  Never add a local token to a descriptor that you send. A client that sends no
+  body gets a preference for the model and runtime of its last job, unless that
+  job failed.
 
 ## 5. Error handling and retries
 
@@ -453,10 +463,9 @@ question:
 > **Could another device that is eligible for this job plausibly succeed?**
 
 - **Yes, or unsure → `retriable: true`.** This is the safe default. The failure
-  looks specific to *this* client: out of disk, thermal throttling, a transient
-  local fault, a transient failure fetching the model or benchmark definition.
-  The server records a denial for this client and keeps the job available to
-  others.
+  looks specific to *this* client: out of disk, a transient local fault, a
+  transient failure fetching the model or benchmark definition. The server
+  records a denial for this client and keeps the job available to others.
 - **Definitely not → `retriable: false`.** The job is broken independent of the
   device and would fail the same way anywhere, so re-running elsewhere is
   pointless. This is the narrow shortcut for clearly unworkable jobs: the claim
@@ -471,23 +480,52 @@ doubt, choose `retriable: true`: a wrongly-retriable job is bounded by its
 `expires_at`, whereas a wrongly-non-retriable job is discarded for the whole
 fleet on one device's say-so.
 
+One exception: a device that never gets fit to measure. When its readiness wait
+times out, the pipette worker and pipette-ios-proxy send `harness_error` with
+`retriable: false`, and a later release sends `device_not_ready` instead. Older
+builds send the timeout as retriable, the worker as `device_error` and
+pipette-ios-proxy with no code. Retried, a cell that keeps every device too hot
+or busy, such as a model too large for the phone, goes round the whole fleet
+and then waits out its `expires_at`.
+
+Besides an `attempt_timeout`, a permanent vault refusal and the unworkable jobs
+above, the pipette worker sends these with `retriable: false`: a readiness
+timeout as `harness_error` (`device_not_ready` from a later release), a runtime
+that crashed, overran or refused the model or an operation as `runtime_error`,
+one that ran out of memory as `out_of_memory`, and a llama.cpp peak-memory cell
+it has no memory reader for on that OS as `harness_error`. Faults of the device
+or its network stay retriable, such as a FastRPC abort, a readiness check that
+cannot read a sensor, a host check that refuses the run, or a failed download.
+The failed [policy](api/campaign-groups.md#policies) of the campaign's group
+re-runs a final failure only when the policy is on and lists its code, up to
+the re-runs it gives that code; a retriable failure never reaches it.
+
 A failure is reported through the same `POST /benchmarks` endpoint as a result,
 with `message_type: "failure"`. The body echoes the claim's `job_id`,
 `benchmark_id`, and `model_*` / `runtime_*` fields verbatim, and carries the
 `retriable` flag plus a human-readable `failure_reason`: conventionally a
-timestamp followed by the runtime's own error output. It should also send a
-`failure_code` naming the kind of failure (`out_of_memory`, `attempt_timeout`,
-`runtime_error`, `device_error` or `harness_error`; one it leaves out is
-recorded as `unspecified`). No device or metric fields are sent. A client that ran out of
-memory loading the model reports a *retriable* failure:
+timestamp followed by the runtime's own error output.
+
+Send a `failure_code` that identifies the failure:
+
+- `out_of_memory`
+- `attempt_timeout`
+- `runtime_error`
+- `device_error`
+- `device_not_ready`
+- `harness_error`
+
+If you omit the code, the server records `unspecified`. Do not send device or
+metric fields. A client whose model download timed out reports a *retriable*
+failure:
 
 ```json
 {
   "message_type": "failure",
   "job_id": "job-550e8400-e29b-41d4-a716-446655440000",
   "benchmark_id": "prefill_throughput_256",
-  "failure_reason": "[2026-03-10T12:04:51Z] llama-server failed to load model: out of memory",
-  "failure_code": "out_of_memory",
+  "failure_reason": "[2026-03-10T12:04:51Z] model download timed out",
+  "failure_code": "harness_error",
   "retriable": true,
   "model_name": "llama-3.2-1b",
   "model_quant": "q4_0",
@@ -565,10 +603,11 @@ not count. Readiness-gate waits do not count either, since each gate has its
 own `readiness.max_wait_secs` (300 s by default, 420 s on macOS) before every
 rep. An attempt past the limit is stopped and the run fails. Unset, the
 client's default applies: 300 s on the prefill, decode, end-to-end, max-memory,
-VL and ASR throughput and VL and ASR max-memory cells, from the clients release
-that reads this field; `vl_spec_decode` has no default. Eval cells and the iOS
-`vl_spec_decode` cells refuse the field. The retired `bench_timeout_seconds` is
-accepted and ignored, so queued specs and recorded results still parse.
+VL and ASR throughput, VL and ASR max-memory and decision cells, from the
+clients release that reads this field; `vl_spec_decode` has no default. Eval
+cells and the iOS `vl_spec_decode` cells refuse the field. The retired
+`bench_timeout_seconds` is accepted and ignored, so queued specs and recorded
+results still parse.
 
 `spec` is one type (`pipette-plan-types`' `ClientRunSpec`), so a client
 deserializes it whole rather than field by field, and the flag groups' embedded
@@ -642,12 +681,16 @@ The server records the authored side itself, from the lease it issued, so never
 echo the claim's flags as the run's. A client that does destroys the comparison
 ([storage.md §5](storage.md#requested_model_flags--requested_runtime_flags--requested_benchmark_flags)).
 
-- **`benchmark_flags`**: the harness settings the run applied, including the ones
-  it decided itself. A claim's `spec.benchmark_flags.readiness` may carry
-  `max_wait_secs` and `skip_thermal`, and a host may waive or default either.
-  The submission is the only record of what the run applied, so a run that
-  skipped the thermal criterion sends `"skip_thermal": true` whatever the claim
-  said, and a deadline the client defaulted sends the seconds it used. Omit a setting the harness has no notion of
+- **`benchmark_flags`**: the harness settings the run applied, including the
+  readiness ones it decided itself. A claim's `spec.benchmark_flags.readiness`
+  may carry `max_wait_secs` and `skip_thermal`, and a host may waive or default
+  either. The submission is the only record of what the run applied, so a run
+  that skipped the thermal criterion sends `"skip_thermal": true` whatever the
+  claim said, and a readiness deadline the client defaulted sends the seconds
+  it used. The timeouts (`http_timeout_seconds`, `attempt_timeout_seconds`) are
+  sent as the plan set them and omitted when it set none, so a run on the
+  client's default keeps grouping with older rows under
+  `benchmark_flags_sha256`. Omit a setting the harness has no notion of
   ([storage.md § benchmark_flags](storage.md#benchmark_flags)).
 - **`model_flags` / `runtime_flags`**: send JSON, which the server canonicalizes
   so equal settings group together; a plain string groups only with a

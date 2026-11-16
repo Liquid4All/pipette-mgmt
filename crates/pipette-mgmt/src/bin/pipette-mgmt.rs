@@ -9,7 +9,6 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use futures::stream;
 use futures::stream::{StreamExt, TryStreamExt};
 use strum::VariantNames;
-use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -52,30 +51,29 @@ use pipette_pipeline::plan_results::{ResultListView, ResultsDb};
 use pipette_pipeline::variant_edit::VariantEdit;
 use pipette_pipeline::{
     campaign_admin, campaign_chain, client_admin, dataset_cache, fix_canonical, fix_model_param,
-    fix_vault_labels, model_audit, org_catalog, queue_copy, queue_maintenance, record_copy,
+    fix_vault_labels, group_policies, model_audit, org_catalog, queue_maintenance, record_copy,
     requeue_eval, score, user_admin, vault_admin,
 };
 use pipette_plan_types::{
-    AddDescriptorMemberRequest, AuditAction, AuditOutcome, AuditTarget, BenchmarkId, CampaignId,
-    CatalogName, CatalogScope, ClientId, ClientOwner, ClientPermission, ClientPreauthKeyId,
-    ClientPreauthUsage, ContactEmail, Counts, CreateDescriptorEntryRequest, DescriptorEntryKind,
-    DescriptorEntryState, ExpiresAt, FleetDetail, JobCensus, JobId, ModelFormat, ModelKey,
-    ModelMemberRequest, NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug, OrgStatus, PlanId,
-    PlanStatus, PrincipalOwner, QuantizationLabel, RestoredVariant, Runtime, RuntimeType,
-    SchedulingState, Tag, UserAccountType, UserId, UserKeyId, UserPermission, UserPreauthKeyId,
-    UserPreauthUsage, UserStatus, VaultResourceId, Warning,
+    AddDescriptorMemberRequest, AuditAction, AuditOutcome, AuditTarget, BenchmarkId,
+    CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId, ClientOwner,
+    ClientPermission, ClientPreauthKeyId, ClientPreauthUsage, ContactEmail, Counts,
+    CreateDescriptorEntryRequest, DescriptorEntryKind, DescriptorEntryState, ExpiresAt,
+    FleetDetail, JobCensus, JobId, ModelFormat, ModelKey, ModelMemberRequest,
+    NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug, OrgStatus, PlanId, PlanStatus,
+    PrincipalOwner, QuantizationLabel, RestoredVariant, Runtime, RuntimeType, SchedulingState, Tag,
+    UserAccountType, UserId, UserKeyId, UserPermission, UserPreauthKeyId, UserPreauthUsage,
+    UserStatus, VaultResourceId, Warning,
 };
 use pipette_store::{
     AuditStore, AuditStores, CatalogEntryKey, CatalogImportRunStore, ClientStore, CreateOutcome,
-    DescriptorCatalogStore, DescriptorEntryFilter, EmailClaim, LivenessImport, OrgStore,
-    STORAGE_CONCURRENCY, SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore,
-    drain_campaigns, drain_clients, drain_vault_resources, warn_unreadable_clients,
+    DescriptorCatalogStore, DescriptorEntryFilter, EmailClaim, OrgStore, STORAGE_CONCURRENCY,
+    SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore, drain_campaigns,
+    drain_clients, drain_vault_resources, warn_unreadable_clients,
 };
 use pipette_store_init::storage_lock;
 use pipette_store_init::storage_lock::StorageLock;
-use pipette_store_init::{
-    build_object_stores, build_queue_copy_stores, build_stores, conditional_put, database,
-};
+use pipette_store_init::{build_object_stores, build_stores, conditional_put, database};
 
 #[derive(Parser)]
 #[command(
@@ -257,23 +255,24 @@ enum Command {
         #[arg(value_name = "JOB_ID", value_parser = parse_job_id)]
         job_id: JobId,
     },
-    /// Maintain the `todo/` job queue: recycle expired leases, expire jobs past
-    /// their deadline (writing synthetic failure records), rebuild the
-    /// `eligible/` index from `avail/` jobs and registered client device
-    /// profiles, GC orphaned markers, and delete stale `tmp/` files. Run on a
-    /// cron. Writes only to `todo/` and the synthetic failure records in
-    /// `submissions/incoming/`, so it takes no mutate lock.
+    /// Maintain the job queue: recycle expired leases, expire jobs past their
+    /// deadline (writing synthetic failure records), rebuild eligibility from
+    /// queued jobs and client profiles, GC orphaned markers, and delete stale
+    /// staged job bodies. Then apply enabled campaign group policies, revising
+    /// their member campaigns. Run on a cron. Each failure record is written
+    /// under its own job's key in `submissions/incoming/`, so it takes no mutate
+    /// lock.
     QueueMaintenance,
     /// Rebuild the reverse tag index (`tags-index/by-tag/`) from the
     /// authoritative forward tree, repairing any drift (e.g. from a crash
-    /// mid-write). Idempotent — safe to run any time. The `todo/eligible/`
-    /// index is rebuilt separately by `queue-maintenance`.
+    /// mid-write). Idempotent — safe to run any time. `queue-maintenance`
+    /// rebuilds the queue's eligibility index separately.
     Reindex,
     /// Flag clients so the next `queue-maintenance` run rebuilds their
-    /// `todo/eligible/` markers from scratch. Use it to repair stale markers.
+    /// eligibility from scratch. Use it to repair stale eligibility.
     /// A flagged client cannot claim, reclaim, or submit until that run clears
     /// the flag. `--all` pauses the whole fleet until then. The command writes
-    /// only to `todo/`, so it takes no mutate lock. See `docs/cli.md`.
+    /// only to the job queue, so it takes no mutate lock. See `docs/cli.md`.
     FlagReindex {
         /// Client to flag. Omit it when you use `--all`.
         #[arg(value_parser = parse_client_id, required_unless_present = "all")]
@@ -333,13 +332,6 @@ enum Command {
         #[command(subcommand)]
         action: DbAction,
     },
-    /// Copy the job queue between the object-store queue of `[todo_storage]`
-    /// and `[database]`, for the cutover of the queue
-    /// (`docs/design/sql-job-queue.md`).
-    Queue {
-        #[command(subcommand)]
-        action: QueueAction,
-    },
     /// Read the audit log, and prune it past its retention. Needs `[database]`.
     Audit {
         #[command(subcommand)]
@@ -390,32 +382,6 @@ enum AuditCommand {
         #[arg(long, default_value_t = pipette_core::audit::RETENTION_DAYS)]
         older_than_days: u32,
         /// Count what would be deleted, and delete nothing
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum QueueAction {
-    /// Make the queue in the database equal to the object-store queue.
-    ///
-    /// The command writes each entry that differs, and deletes each entry that
-    /// the object store does not hold. A rerun writes only what changed. The
-    /// command takes no lock: stop `serve` and `queue-maintenance` for an exact
-    /// copy. It exits non-zero while an unreadable entry remains.
-    Import {
-        /// Read everything, report what would change, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Make the object-store queue equal to the queue in the database.
-    ///
-    /// This is the rollback of `queue import`. The command writes each entry
-    /// that differs, and deletes each entry that the database does not hold.
-    /// The command takes no lock: stop `serve` and `queue-maintenance` for an
-    /// exact copy. It exits non-zero while an unreadable entry remains.
-    Export {
-        /// Read everything, report what would change, and change nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -488,6 +454,24 @@ enum DbAction {
         /// Report the rows that the command would write. Write nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Record the re-runs that campaign group policies filed before
+    /// queue-maintenance recorded how each answers.
+    ///
+    /// For each member campaign of each group, the command reads each plan of
+    /// the campaign's history that the group's policies filed. It records a
+    /// row for each job that plan re-ran, per policy its change names that
+    /// flags the replaced run and has a re-run left: the runs in a row it
+    /// flags, back from the replaced run along the group's re-runs, are at
+    /// most its `max_reruns`. A row holds the outcome once the re-run's rows
+    /// have landed, and `dropped` when it has neither rows nor a record and
+    /// the campaign's current plan no longer holds it. Run it once after
+    /// migration `0037`. A second run records nothing. It reads
+    /// pipette-duckdb, so it needs `[duckdb]`.
+    BackfillRerunResults {
+        /// A campaign group whose filings to record. Repeat for more.
+        #[arg(required = true, value_name = "GROUP_ID", value_parser = parse_campaign_group_id)]
+        group_ids: Vec<CampaignGroupId>,
     },
 }
 
@@ -641,6 +625,14 @@ enum CampaignAction {
         /// Files the plan's own document too.
         #[arg(long, requires = "edit")]
         carry_earlier: bool,
+        /// Let a finished run of the replaced plan answer its cell whatever
+        /// `attempt_timeout_seconds` the run had. Without it, the run answers
+        /// when the limit it was requested with, or the limit the replaced
+        /// plan holds it under, is the cell's (none on both sides included)
+        /// or, both being set, is not above the cell's, or when a plan on
+        /// offer lists its job for the cell's very body.
+        #[arg(long, requires = "edit")]
+        carry_across_limit: bool,
         /// A plan of any campaign whose finished runs a cell the replaced
         /// plan has not answered may take, as it takes one of that plan's.
         /// Repeatable. Files the plan's own document too.
@@ -684,6 +676,15 @@ enum CampaignAction {
         /// Files the plan's own document too.
         #[arg(long, requires = "plan")]
         carry_earlier: bool,
+        /// Let a finished run of the replaced plan answer its cell whatever
+        /// `attempt_timeout_seconds` the run had. Without it, the run answers
+        /// when the limit it was requested with, or the limit the replaced
+        /// plan holds it under, is the cell's (none on both sides included)
+        /// or, both being set, is not above the cell's, or when a plan on
+        /// offer lists its job for the cell's very body. Alone, it does not
+        /// file the plan's own document.
+        #[arg(long, requires = "plan")]
+        carry_across_limit: bool,
         /// A plan of any campaign whose finished runs a cell the replaced
         /// plan has not answered may take, as it takes one of that plan's.
         /// Repeatable. Files the plan's own document too.
@@ -2433,7 +2434,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let config = Config::load(&config_path)?;
     let audit = if writes(&cli.command) {
-        start_audit(&config, &matches).await
+        Some(start_audit(&config, &matches).await)
     } else {
         None
     };
@@ -2515,16 +2516,9 @@ async fn run_to_end(
 }
 
 /// The audit event of a command that changes records, opened before it runs.
-/// Without `[database]` there is no audit log to write to. It reads and writes
-/// the database alone, so it opens no object storage.
-async fn start_audit(
-    config: &Config,
-    matches: &clap::ArgMatches,
-) -> Option<(AuditStores, CommandAudit)> {
-    let Some(stores) = pipette_store_init::build_audit_stores(config) else {
-        tracing::debug!("not audited: the audit log is kept only on a [database]");
-        return None;
-    };
+/// It reads and writes the database alone, so it opens no object storage.
+async fn start_audit(config: &Config, matches: &clap::ArgMatches) -> (AuditStores, CommandAudit) {
+    let stores = pipette_store_init::build_audit_stores(config);
     let mut names = Vec::new();
     let mut org_refs = Vec::new();
     let mut leaf = matches;
@@ -2547,7 +2541,7 @@ async fn start_audit(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let audit = CommandAudit::start(&stores, names.join(" "), args, org_refs).await;
-    Some((stores, audit))
+    (stores, audit)
 }
 
 /// Whether `command` changes records. Exhaustive, so a new command is sorted
@@ -2563,11 +2557,9 @@ fn writes(command: &Command) -> bool {
             DbAction::Import { dry_run }
             | DbAction::BackfillJobCells { dry_run }
             | DbAction::BackfillRunEvidence { dry_run } => !dry_run,
+            DbAction::BackfillRerunResults { .. } => true,
             DbAction::Check | DbAction::Migrate { .. } | DbAction::Export { .. } => false,
         },
-        Command::Queue {
-            action: QueueAction::Import { dry_run } | QueueAction::Export { dry_run },
-        } => !dry_run,
         Command::ProcessSubmissions
         | Command::ScoreEval
         | Command::QueueMaintenance
@@ -2871,7 +2863,6 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
         // `main` prints it before loading a config.
         Command::Openapi { site } => print_openapi(site.as_deref()),
         Command::Db { action } => run_db(action, &config).await,
-        Command::Queue { action } => run_queue(action, &config).await,
         Command::Unverified { action } => {
             let stores = build_stores(&config).await?;
             // No mutate lock, as for `users`.
@@ -2933,15 +2924,15 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
             }
         }
         Command::QueueMaintenance => {
+            let started = std::time::Instant::now();
             // Refuse a schema behind this binary before any pass writes.
             database::check(&config).await?;
             let config = config.for_queue_maintenance();
             let stores = build_stores(&config).await?;
-            stores.todo.validate_backend().await?;
             let catalog = org_catalog::load_server_catalog(&*stores.catalog).await?;
             // No mutate lock: its only write to `incoming/` is a create-if-absent
             // body under a key exclusive to one job.
-            queue_maintenance::run(
+            let ran = queue_maintenance::run(
                 &*stores.todo,
                 &*stores.clients,
                 &*stores.tags,
@@ -2956,7 +2947,19 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
                     lost_lease_limit: config.plan_lost_lease_limit,
                 },
             )
-            .await
+            .await;
+            // The policy pass runs after a failed queue pass too.
+            let applied = group_policies::apply(&config, &stores, started, || {
+                validate_plan_index_backend(&config)
+            })
+            .await;
+            if let (Err(_), Err(error)) = (&ran, &applied) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "queue-maintenance: the policy pass failed too"
+                );
+            }
+            ran.and(applied)
         }
         Command::Reindex => {
             let stores = build_stores(&config).await?;
@@ -3643,6 +3646,7 @@ async fn campaign_owner(
             | campaign_admin::CampaignAdminError::NoSuchSourceVariant { .. }
             | campaign_admin::CampaignAdminError::Edit(_)
             | campaign_admin::CampaignAdminError::NothingToRerun
+            | campaign_admin::CampaignAdminError::RerunAndFail(_)
             | campaign_admin::CampaignAdminError::NotInPlan { .. }
             | campaign_admin::CampaignAdminError::Unanswered(_)
             | campaign_admin::CampaignAdminError::NoneAnswered { .. }
@@ -3652,6 +3656,8 @@ async fn campaign_owner(
             | campaign_admin::CampaignAdminError::NotCancelled { .. }
             | campaign_admin::CampaignAdminError::StillRunning { .. }
             | campaign_admin::CampaignAdminError::DeletedDuringFiling { .. }
+            | campaign_admin::CampaignAdminError::AdvanceContended { .. }
+            | campaign_admin::CampaignAdminError::Contended(_)
             | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
         })
 }
@@ -3704,6 +3710,7 @@ async fn ingest_into_campaign(
                 | campaign_admin::CampaignAdminError::NoSuchSourceVariant { .. }
                 | campaign_admin::CampaignAdminError::Edit(_)
                 | campaign_admin::CampaignAdminError::NothingToRerun
+                | campaign_admin::CampaignAdminError::RerunAndFail(_)
                 | campaign_admin::CampaignAdminError::NotInPlan { .. }
                 | campaign_admin::CampaignAdminError::Unanswered(_)
                 | campaign_admin::CampaignAdminError::NoneAnswered { .. }
@@ -3713,6 +3720,8 @@ async fn ingest_into_campaign(
                 | campaign_admin::CampaignAdminError::NotCancelled { .. }
                 | campaign_admin::CampaignAdminError::StillRunning { .. }
                 | campaign_admin::CampaignAdminError::DeletedDuringFiling { .. }
+                | campaign_admin::CampaignAdminError::AdvanceContended { .. }
+                | campaign_admin::CampaignAdminError::Contended(_)
                 | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
             })?;
 
@@ -3819,12 +3828,12 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
         }
         campaign_admin::CampaignAdminError::Overtaken {
             cancelled: true, ..
-        } => anyhow::anyhow!("{e}; it is cancelled, so {retry}"),
+        } => anyhow::anyhow!("{e}, so {retry}"),
         campaign_admin::CampaignAdminError::Overtaken {
             cancelled: false,
             ref plan_id,
             ..
-        } => anyhow::anyhow!("{e}; stop it with `plans cancel {plan_id}`"),
+        } => anyhow::anyhow!("{e} with `plans cancel {plan_id}`"),
         campaign_admin::CampaignAdminError::NotCancelled {
             ref superseded,
             ref source,
@@ -3845,6 +3854,7 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
         | campaign_admin::CampaignAdminError::NoSuchSourceVariant { .. }
         | campaign_admin::CampaignAdminError::Edit(_)
         | campaign_admin::CampaignAdminError::NothingToRerun
+        | campaign_admin::CampaignAdminError::RerunAndFail(_)
         | campaign_admin::CampaignAdminError::NotInPlan { .. }
         | campaign_admin::CampaignAdminError::Unanswered(_)
         | campaign_admin::CampaignAdminError::NoneAnswered { .. }
@@ -3852,6 +3862,8 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
         | campaign_admin::CampaignAdminError::NoneRescorable(_)
         | campaign_admin::CampaignAdminError::StillRunning { .. }
         | campaign_admin::CampaignAdminError::DeletedDuringFiling { .. }
+        | campaign_admin::CampaignAdminError::AdvanceContended { .. }
+        | campaign_admin::CampaignAdminError::Contended(_)
         | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
     }
 }
@@ -3959,6 +3971,7 @@ async fn handle_campaign_action(
             strict_models: _,
             dry_run,
             carry_earlier,
+            carry_across_limit,
             inherit_from,
             add_from,
             restore,
@@ -3986,7 +3999,8 @@ async fn handle_campaign_action(
                 carry_earlier,
                 &campaign_admin::inheriting(&inherit_from, &add_from, &restore),
             )
-            .await?;
+            .await?
+            .across_limit(carry_across_limit);
             let added = offer.variants_of(&*stores.plans, &add_from).await?;
             let restored = offer.restored_variants(&*stores.plans, &restore).await?;
             let edit = edit.adding(added).restoring(restored, restore);
@@ -4014,6 +4028,7 @@ async fn handle_campaign_action(
             strict_models: _,
             dry_run,
             carry_earlier,
+            carry_across_limit,
             inherit_from,
         } => {
             let Some(plan) = plan else {
@@ -4036,7 +4051,8 @@ async fn handle_campaign_action(
                 carry_earlier,
                 &inherit_from,
             )
-            .await?;
+            .await?
+            .across_limit(carry_across_limit);
             if dry_run {
                 let report = campaign_admin::dry_run_revise_document(
                     stores,
@@ -4164,12 +4180,13 @@ async fn handle_campaign_action(
             let name =
                 NonEmptyTrimmedString::try_new(name).map_err(|e| anyhow::anyhow!("--name: {e}"))?;
             let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            let read = campaign.clone();
             let before = campaign.name.clone();
             if !campaign.rename(name.clone(), chrono::Utc::now()) {
                 println!("Campaign {campaign_id}: no change.");
                 return Ok(());
             }
-            campaigns.put_campaign(&campaign).await?;
+            campaign_admin::replace(&*campaigns, &read, &campaign).await?;
             tracing::info!(%campaign_id, "campaign renamed");
             // `as_str`: `{:?}` on the newtype prints `NonEmptyTrimmedString("…")`.
             println!(
@@ -4186,13 +4203,22 @@ async fn handle_campaign_action(
         } => {
             let owner = campaign_owner(stores, user, org).await?;
             let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            let read = campaign.clone();
             let before = campaign.owner.label();
+            let groups = stores.campaign_groups.as_deref();
             if !campaign.set_owner(owner, chrono::Utc::now()) {
-                println!("Campaign {campaign_id}: no change.");
+                let left = campaign_admin::leave_group(&*campaigns, groups, &campaign_id).await?;
+                let group = if left.is_some() {
+                    "; it left its campaign group"
+                } else {
+                    ""
+                };
+                println!("Campaign {campaign_id}: no change{group}.");
                 return Ok(());
             }
-            campaigns.put_campaign(&campaign).await?;
+            campaign_admin::replace(&*campaigns, &read, &campaign).await?;
             tracing::info!(%campaign_id, owner = %campaign.owner.label(), "campaign owner set");
+            campaign_admin::leave_group(&*campaigns, groups, &campaign_id).await?;
             println!(
                 "Campaign {campaign_id}: {before} -> {}.",
                 campaign.owner.label()
@@ -6869,7 +6895,11 @@ async fn handle_unverified_action(action: UnverifiedAction, stores: Stores) -> a
             // Read avail -> leased -> record, the order a job moves, so a claim cannot hide it.
             let held = stream::iter(held)
                 .then(|(job_id, body)| async move {
-                    let avail = stores.todo.avail_key_for_job(&job_id).await?.is_some();
+                    let avail = !stores
+                        .todo
+                        .avail_for_jobs(std::slice::from_ref(&job_id))
+                        .await?
+                        .is_empty();
                     anyhow::Ok((avail, job_id, body))
                 })
                 .try_collect::<Vec<_>>()
@@ -6945,7 +6975,7 @@ async fn held_job_exists(
     leased: &HashSet<JobId>,
     job_id: &JobId,
 ) -> anyhow::Result<bool> {
-    // A job queued before job sources existed has none, so todo/ is read too.
+    // A job queued before job sources existed has none, so the leases are read too.
     Ok(leased.contains(job_id)
         || stores.submissions.has_record(job_id).await?
         || stores.plans.get_job_source(job_id).await?.is_some())
@@ -7190,6 +7220,10 @@ fn parse_campaign_id(s: &str) -> Result<CampaignId, String> {
     CampaignId::try_new(s).map_err(|e| e.to_string())
 }
 
+fn parse_campaign_group_id(s: &str) -> Result<CampaignGroupId, String> {
+    CampaignGroupId::try_new(s).map_err(|e| e.to_string())
+}
+
 fn parse_vault_resource_id(s: &str) -> Result<VaultResourceId, String> {
     VaultResourceId::try_new(s).map_err(|e| e.to_string())
 }
@@ -7289,9 +7323,7 @@ async fn shutdown_signal() {
 }
 
 async fn run_db(action: DbAction, config: &Config) -> anyhow::Result<()> {
-    let Some(database_config) = &config.database else {
-        anyhow::bail!("the config has no [database] section");
-    };
+    let database_config = &config.database;
     match action {
         DbAction::Migrate { to, dry_run } => {
             let moved = database::migrate(database_config, to, dry_run).await?;
@@ -7362,6 +7394,27 @@ async fn run_db(action: DbAction, config: &Config) -> anyhow::Result<()> {
                 report.rows_read, report.rows_written
             );
         }
+        DbAction::BackfillRerunResults { group_ids } => {
+            database::check(config).await?;
+            let duckdb = config.duckdb.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`db backfill-rerun-results` reads pipette-duckdb; add a [duckdb] section to \
+                     the config"
+                )
+            })?;
+            let stores = build_stores(config).await?;
+            let http = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(
+                    config.http_connect_timeout_secs.get(),
+                ))
+                .build()?;
+            let results = ResultsDb::new(http, duckdb)?;
+            let done = group_policies::backfill(&stores, &results, &group_ids).await?;
+            println!(
+                "read {} group filing(s); recorded {} of their {} re-run result row(s)",
+                done.filings, done.recorded, done.found
+            );
+        }
     }
     Ok(())
 }
@@ -7382,93 +7435,6 @@ async fn copy_db(
     };
     let report = record_copy::copy_records(from, to, mode, dry_run).await?;
     finish_copy(&report)
-}
-
-/// An import copies the object-store queue into the database. An export
-/// copies the database queue to the object store, the rollback.
-async fn run_queue(action: QueueAction, config: &Config) -> anyhow::Result<()> {
-    database::check(config).await?;
-    let stores = build_queue_copy_stores(config).await?;
-    let report = match action {
-        QueueAction::Import { dry_run } => {
-            let liveness: &dyn LivenessImport = &*stores.database_liveness;
-            queue_copy::copy_queue(
-                &*stores.objects,
-                queue_copy::QueueCopyTarget::Database {
-                    store: &*stores.database,
-                    liveness,
-                },
-                dry_run,
-            )
-            .instrument(tracing::info_span!("queue_copy", direction = "import"))
-            .await?
-        }
-        QueueAction::Export { dry_run } => {
-            queue_copy::copy_queue(
-                &*stores.database,
-                queue_copy::QueueCopyTarget::Objects(&*stores.objects),
-                dry_run,
-            )
-            .instrument(tracing::info_span!("queue_copy", direction = "export"))
-            .await?
-        }
-    };
-    print_queue_copy_report(&report);
-    let unreadable = report.unreadable();
-    anyhow::ensure!(
-        unreadable == 0,
-        "{unreadable} unreadable queue entries were not copied; resolve them and run again"
-    );
-    Ok(())
-}
-
-#[derive(tabled::Tabled)]
-struct QueueCopyRow {
-    #[tabled(rename = "Keyspace")]
-    keyspace: &'static str,
-    #[tabled(rename = "Read")]
-    read: usize,
-    #[tabled(rename = "Written")]
-    written: usize,
-    #[tabled(rename = "Unchanged")]
-    unchanged: usize,
-    #[tabled(rename = "Deleted")]
-    deleted: usize,
-    #[tabled(rename = "Skipped")]
-    skipped: usize,
-    #[tabled(rename = "Unreadable")]
-    unreadable: usize,
-    #[tabled(rename = "Elapsed")]
-    elapsed: String,
-}
-
-fn print_queue_copy_report(report: &queue_copy::QueueCopyReport) {
-    let seconds = |elapsed: std::time::Duration| format!("{:.1} s", elapsed.as_secs_f64());
-    let rows: Vec<QueueCopyRow> = report
-        .keyspaces
-        .iter()
-        .map(|k| QueueCopyRow {
-            keyspace: k.report.keyspace,
-            read: k.report.read,
-            written: k.report.written,
-            unchanged: k.report.unchanged,
-            deleted: k.report.deleted,
-            skipped: k.report.skipped.len(),
-            unreadable: k.report.unreadable.len(),
-            elapsed: seconds(k.elapsed),
-        })
-        .collect();
-    let mut table = tabled::Table::new(&rows);
-    table.with(tabled::settings::Style::psql());
-    if report.dry_run {
-        println!("Dry run: nothing changed; Written and Deleted count what would be.");
-    }
-    println!("{table}");
-    println!("Total elapsed: {}", seconds(report.elapsed));
-    report
-        .keyspaces
-        .iter()
-        .for_each(|k| print_copy_notes(&k.report));
 }
 
 fn finish_copy(report: &record_copy::CopyReport) -> anyhow::Result<()> {
@@ -7556,12 +7522,6 @@ fn print_copy_notes(k: &record_copy::KeyspaceReport) {
 }
 
 async fn serve(config: Config, stores: Stores) -> anyhow::Result<()> {
-    stores.todo.validate_backend().await?;
-
-    // An unmigrated `avail/` reads as empty, and the merge pass would replace
-    // its jobs as retired.
-    pipette_store::ensure_avail_layout_migrated(&*stores.todo).await?;
-
     // Create only: the auth store's compare-and-swap repair is best-effort, at
     // the cost that a repair can overwrite a concurrent update.
     conditional_put::validate(
@@ -7576,9 +7536,6 @@ async fn serve(config: Config, stores: Stores) -> anyhow::Result<()> {
     validate_plan_index_backend(&config).await?;
 
     database::check(&config).await?;
-    if stores.audit.is_none() {
-        tracing::warn!("no write is audited: the audit log is kept only on a [database]");
-    }
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.http_timeout_secs))
@@ -7975,6 +7932,7 @@ async fn handle_client_action(action: ClientAction, stores: Stores) -> anyhow::R
                 &*stores.orgs,
                 &*stores.tags,
                 &*stores.todo,
+                &*stores.submissions,
                 &client_id,
             )
             .await?;
@@ -8450,13 +8408,10 @@ mod tests {
     #[case::a_migration(&["db", "migrate"], false)]
     #[case::an_import(&["db", "import"], true)]
     #[case::an_import_dry_run(&["db", "import", "--dry-run"], false)]
-    #[case::a_queue_import(&["queue", "import"], true)]
-    #[case::a_queue_import_dry_run(&["queue", "import", "--dry-run"], false)]
-    #[case::a_queue_export(&["queue", "export"], true)]
-    #[case::a_queue_export_dry_run(&["queue", "export", "--dry-run"], false)]
     #[case::a_job_cells_backfill(&["db", "backfill-job-cells"], true)]
     #[case::a_run_evidence_backfill(&["db", "backfill-run-evidence"], true)]
     #[case::a_run_evidence_backfill_dry_run(&["db", "backfill-run-evidence", "--dry-run"], false)]
+    #[case::a_rerun_results_backfill(&["db", "backfill-rerun-results", "group_0195c3e2a4f37b8c"], true)]
     #[case::a_dry_run(&["fix-canonical", "--dry-run"], false)]
     #[case::a_cancel(&["plans", "cancel", "plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"], true)]
     #[case::a_prune(&["audit", "prune"], true)]
@@ -9327,6 +9282,39 @@ mod tests {
     #[case::campaign_revise_read_with_a_base(
         &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--base", NIL_PLAN_ID], false
     )]
+    // `--carry-across-limit` goes with an edit or a document, beside
+    // `--carry-earlier`. A re-run and a revert take neither.
+    #[case::campaign_variants_edit_across_limit(
+        &["pipette-mgmt", "campaigns", "variants", NIL_CAMPAIGN_ID, "--remove", "0",
+          "--base", NIL_PLAN_ID, "--carry-earlier", "--carry-across-limit"],
+        true
+    )]
+    #[case::campaign_variants_list_across_limit(
+        &["pipette-mgmt", "campaigns", "variants", NIL_CAMPAIGN_ID, "--carry-across-limit"], false
+    )]
+    #[case::campaign_revise_across_limit(
+        &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--plan", "p.toml",
+          "--base", NIL_PLAN_ID, "--carry-earlier", "--carry-across-limit"],
+        true
+    )]
+    #[case::campaign_revise_read_across_limit(
+        &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--carry-across-limit"], false
+    )]
+    #[case::campaign_rerun_across_limit(
+        &["pipette-mgmt", "campaigns", "rerun", NIL_CAMPAIGN_ID, "--job", NIL_JOB_ID,
+          "--carry-across-limit"],
+        false
+    )]
+    #[case::campaign_revert(
+        &["pipette-mgmt", "campaigns", "revert", NIL_CAMPAIGN_ID, "--to", NIL_PLAN_ID,
+          "--base", NIL_PLAN_ID],
+        true
+    )]
+    #[case::campaign_revert_across_limit(
+        &["pipette-mgmt", "campaigns", "revert", NIL_CAMPAIGN_ID, "--to", NIL_PLAN_ID,
+          "--base", NIL_PLAN_ID, "--carry-across-limit"],
+        false
+    )]
     #[case::list(&["pipette-mgmt", "plans", "list"], true)]
     #[case::list_filtered(&["pipette-mgmt", "plans", "list", "--status", "pending_clients"], true)]
     #[case::list_columns(
@@ -9844,7 +9832,8 @@ mod tests {
         Ok(())
     }
 
-    fn flag_reindex_stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
+    /// Records on the local_fs stores, with a queue in a new database.
+    async fn flag_reindex_stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
         let dir = tempfile::tempdir()?;
         let config = Config {
             storage: StorageConfig::LocalFs {
@@ -9852,7 +9841,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_sql::scratch::queue().await?)?;
         Ok((dir, stores))
     }
 
@@ -9863,7 +9852,7 @@ mod tests {
             auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         Ok((dir, stores))
     }
 
@@ -10166,11 +10155,14 @@ mod tests {
 
     /// `handle_org_action` consumes `Stores`, so each command re-opens them.
     fn reopen(dir: &tempfile::TempDir) -> anyhow::Result<Stores> {
-        build_local_fs_stores(&Config {
-            storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..Default::default()
-        })
+        build_local_fs_stores(
+            &Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )
     }
 
     async fn create_org(dir: &tempfile::TempDir, handle: &str) -> anyhow::Result<Organization> {
@@ -10595,7 +10587,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         seed_public_catalog(&dir)?;
         let acme = create_org(&dir, "acme").await?;
-        let stores = reopen(&dir)?;
+        let stores = Stores {
+            todo: pipette_store_sql::scratch::queue().await?,
+            ..reopen(&dir)?
+        };
         let id = "prefill_throughput_acme_64";
         let entry = pipette_core::benchmark::Benchmark::from_toml(
             id,
@@ -10652,7 +10647,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             },
         )
         .await?;
-        assert_eq!(stores.todo.list_avail().await?.len(), 1);
+        assert_eq!(stores.todo.list_avail_entries().await?.len(), 1);
         Ok(())
     }
 
@@ -12545,7 +12540,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] all: bool,
         #[case] expected: &[&str],
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         stores
             .clients
             .put_client(&flag_reindex_client("c-one", "01")?)
@@ -12563,7 +12558,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             .list_pending_reindex()
             .await?
             .into_iter()
-            .map(|(client_id, _key)| client_id.to_string())
+            .map(|request| request.client_id.to_string())
             .collect();
         flagged.sort();
         assert_eq!(flagged, expected);
@@ -12572,7 +12567,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn flag_reindex_rejects_unknown_client() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         stores
             .clients
             .put_client(&flag_reindex_client("c-one", "01")?)
@@ -12593,7 +12588,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn flag_reindex_all_on_empty_roster_writes_nothing() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
 
         handle_flag_reindex(None, true, &stores).await?;
 
@@ -12614,7 +12609,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] flags: usize,
         #[case] expected: &[&str],
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
         if let Some(tag) = existing {
@@ -12655,7 +12650,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// returns.
     #[tokio::test]
     async fn tag_add_flags_the_client_when_a_write_fails() -> anyhow::Result<()> {
-        let (dir, stores) = flag_reindex_stores()?;
+        let (dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
         // The forward marker lands and the reverse one fails.
@@ -12710,7 +12705,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] retriable: bool,
         #[case] want_state: JobState,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client_id = ClientId::try_new("ev1_held")?;
         let job_id = JobId::try_new("job-held")?;
         stores
@@ -12737,7 +12732,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             },
             ..Default::default()
         };
-        let stores = build_local_fs_stores(&config)?;
+        let stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
         let record = stores
             .submissions
             .find_job(&job_id)
@@ -12797,7 +12792,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] retriable: bool,
         #[case] victim_at: Victim,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client_id = ClientId::try_new("ev1_held")?;
         let job_id = JobId::try_new("job-held")?;
         let victim = victim_body(&job_id)?;
@@ -12816,7 +12811,10 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             }
             Victim::Avail | Victim::Leased => {
                 stores.todo.write_tmp(&job_id, &victim).await?;
-                stores.todo.promote_avail(&job_id, ExpiresAt::Never).await?;
+                stores
+                    .todo
+                    .promote_avail(&job_id, ExpiresAt::Never, None)
+                    .await?;
                 if matches!(victim_at, Victim::Leased) {
                     let claim = stores
                         .todo
@@ -12853,10 +12851,14 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         )
         .await?;
 
-        // The lease read names only the held job, never the whole `leased/` tree.
+        // Each read names only the held job, never the whole queue, and the
+        // available entry is read before the lease.
         assert_eq!(
             observed.take_reads(),
-            vec![("leases_for_jobs", vec![job_id.clone()])]
+            vec![
+                ("avail_for_jobs", vec![job_id.clone()]),
+                ("leases_for_jobs", vec![job_id.clone()]),
+            ]
         );
         observed.unexpected.none()?;
         let record = stores.submissions.find_job(&job_id).await?;
@@ -12883,7 +12885,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// The create-only write catches a record that lands after the existence check.
     #[tokio::test]
     async fn promote_held_refuses_a_job_with_an_incoming_record() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let store = &*stores.submissions;
         let job_id = JobId::try_new("job-held")?;
         let victim = victim_body(&job_id)?;
@@ -12908,7 +12910,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn runtime_output_text_prints_each_clients_streams() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let job_id = JobId::try_new("job-out")?;
         let store = &*stores.submissions;
         store
@@ -13080,7 +13082,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn client_permission_actions_round_trip() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
         let id = client.client_id.clone();
@@ -13162,7 +13164,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// `add` is the one granting verb that parses names at run time.
     #[tokio::test]
     async fn a_client_grant_refuses_a_user_only_permission() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
         let id = client.client_id.clone();
@@ -13346,7 +13348,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// user name, and removal is how it is cleared.
     #[tokio::test]
     async fn removing_a_user_only_permission_from_a_client_is_allowed() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
 
@@ -13367,7 +13369,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     #[tokio::test]
     async fn tags_and_ownerships_land_in_storage_not_auth_storage() -> anyhow::Result<()> {
         let (data, auth) = (tempfile::tempdir()?, tempfile::tempdir()?);
-        let stores = build_stores(&Config {
+        let stores = build_object_stores(&Config {
             storage: StorageConfig::local_fs(data.path().to_path_buf()),
             auth_storage: StorageConfig::local_fs(auth.path().to_path_buf()),
             ..Default::default()
@@ -13397,7 +13399,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn client_permission_add_by_tag_grants_the_whole_fleet() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let lab = Tag::try_new("lab")?;
         for (id, suffix) in [("c-one", "01"), ("c-two", "02")] {
             let client = flag_reindex_client(id, suffix)?;
@@ -13437,7 +13439,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// The status branch must not swallow the grant for an approved client.
     #[tokio::test]
     async fn approve_grants_permissions_to_an_already_approved_client() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         assert_eq!(client.status, ClientStatus::Approved);
         stores.clients.put_client(&client).await?;
@@ -13461,7 +13463,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// A typo is refused before the store, so a fleet is never half granted.
     #[tokio::test]
     async fn an_unknown_permission_name_aborts_before_the_write() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
 
@@ -13494,7 +13496,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
     #[tokio::test]
     async fn add_without_a_permission_name_is_refused() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let client = flag_reindex_client("c-one", "01")?;
         stores.clients.put_client(&client).await?;
 
@@ -13562,7 +13564,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     /// touches nothing.
     #[tokio::test]
     async fn user_preauth_prune_sweeps_expired_keys_and_spent_markers() -> anyhow::Result<()> {
-        let (_dir, stores) = flag_reindex_stores()?;
+        let (_dir, stores) = flag_reindex_stores().await?;
         let auth = stores.users.clone();
         let now = chrono::Utc::now();
 

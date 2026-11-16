@@ -210,7 +210,9 @@ fn eval_samples(benchmark: &Benchmark) -> Option<(&str, &str)> {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::VlSpecDecode(_)
         | BenchmarkDefinition::AsrThroughput(_)
-        | BenchmarkDefinition::AsrMaxMemory(_) => None,
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
     }
 }
 
@@ -546,7 +548,7 @@ mod tests {
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
             ..Config::default()
         };
-        Ok(build_local_fs_stores(&config)?.catalog)
+        Ok(build_local_fs_stores(&config, pipette_store_testkit::no_queue())?.catalog)
     }
 
     fn entry(id: &str) -> anyhow::Result<Benchmark> {

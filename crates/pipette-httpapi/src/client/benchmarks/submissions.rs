@@ -8,17 +8,19 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use pipette_core::benchmark::Benchmark;
 use pipette_core::client::{Client, ClientStatus};
 use pipette_core::denial::DenialRecord;
+use pipette_pipeline::org_catalog::server_catalog;
+use pipette_pipeline::queue_maintenance::fail_larger_run;
 use pipette_pipeline::submission;
 use pipette_pipeline::submission::{RequestedFlags, Submission, SubmissionInputExt};
 use pipette_plan_types::{
     AuditTarget, BatchItem, BatchSubmitted, BenchmarkDefinition, BenchmarkId, BenchmarkParams,
-    ClientId, ExpiresAt, JobAccepted, JobId, OrgId, SubmissionInput,
+    ClientId, ExpiresAt, FailureCode, JobAccepted, JobId, OrgId, SubmissionInput,
 };
 use pipette_store::{RecycleResult, RenewLeaseResult, SubmissionStore, TodoStore};
 
@@ -201,12 +203,14 @@ fn names_seed_rule(def: &BenchmarkDefinition) -> bool {
         | BenchmarkDefinition::VlMaxMemory(_)
         | BenchmarkDefinition::VlSpecDecode(_)
         | BenchmarkDefinition::AsrThroughput(_)
-        | BenchmarkDefinition::AsrMaxMemory(_) => false,
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::DecisionLatency(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => false,
     }
 }
 
 /// Also returns whether the client supplied the `job_id`: only such an id can
-/// match a queued job, so it gates the claim binding and the `todo/` teardown.
+/// match a queued job, so it gates the claim binding and the queue teardown.
 fn validate_and_prepare_submission(
     body: serde_json::Value,
     client_id: &ClientId,
@@ -364,7 +368,9 @@ pub async fn submit_benchmark(
     log_accepted_submission(&submission);
 
     if !held && client_supplied_job_id {
-        teardown_completed_job(&*state.todo_store, &job_id, &client.client_id).await;
+        fail_larger_runs(&state, &catalog.public, &submission).await;
+        let failed = matches!(submission, Submission::Failure(_));
+        teardown_completed_job(&*state.todo_store, &job_id, &client.client_id, failed).await;
     }
 
     Ok((
@@ -531,7 +537,7 @@ async fn bind_claim(
                 "failed to read the leased job body to check its vault resources: {e:#}"
             )));
         }
-        // A failure needs no vault check, and a `todo/` hiccup must not fail it.
+        // A failure needs no vault check, and a queue hiccup must not fail it.
         Err(e) => {
             tracing::warn!(error = %e, "failed to read the leased job body; recording no requested flags");
             None
@@ -629,10 +635,73 @@ async fn verify_claim(
     }
 }
 
+/// A final timeout or out of memory fails the larger runs of the job's family
+/// still queued, which would fail the same way. Run before the teardown: the
+/// store reads the family from the job's row. Best effort: a failure leaves
+/// them queued.
+async fn fail_larger_runs(
+    state: &AppState,
+    public: &HashMap<BenchmarkId, Benchmark>,
+    submission: &Submission,
+) {
+    let Submission::Failure(failure) = submission else {
+        return;
+    };
+    if failure.wire.retriable
+        || !matches!(
+            failure.wire.failure_code,
+            FailureCode::AttemptTimeout | FailureCode::OutOfMemory
+        )
+    {
+        return;
+    }
+    let failed = async {
+        let todo = state.todo_store.as_ref();
+        let larger = todo.queued_larger_runs(&failure.job_id).await?;
+        if larger.is_empty() {
+            return Ok(());
+        }
+        // The whole server catalog, so an organization's benchmark resolves too.
+        let catalog = &server_catalog(state.catalog_store.as_ref(), public).await?;
+        futures::stream::iter(&larger)
+            .map(anyhow::Ok)
+            .try_for_each(|(avail, body)| async move {
+                fail_larger_run(
+                    todo,
+                    state.submission_store.as_ref(),
+                    catalog,
+                    avail,
+                    body,
+                    &failure.job_id,
+                    &failure.wire.benchmark_id,
+                    failure.wire.failure_code,
+                    Utc::now(),
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+    }
+    .await;
+    if let Err(e) = failed {
+        tracing::warn!(
+            job_id = %failure.job_id,
+            error = %format_args!("{e:#}"),
+            "failed to fail the larger runs of a failed job; they stay queued"
+        );
+    }
+}
+
 /// Terminal only: a retriable failure keeps the job for other clients. Best
 /// effort; `queue-maintenance` reconciles what is left, `denied/` and
-/// `eligible/` included.
-async fn teardown_completed_job(todo: &dyn TodoStore, job_id: &JobId, client_id: &ClientId) {
+/// `eligible/` included. A `failed` job also leaves the client's claim
+/// affinity, because the client may not hold its artifacts.
+async fn teardown_completed_job(
+    todo: &dyn TodoStore,
+    job_id: &JobId,
+    client_id: &ClientId,
+    failed: bool,
+) {
     let drop_lease = async {
         match own_lease(todo, client_id, job_id).await {
             Ok(Some((expires_at, expiry))) => {
@@ -645,7 +714,7 @@ async fn teardown_completed_job(todo: &dyn TodoStore, job_id: &JobId, client_id:
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "todo teardown: list_leased_for_client failed");
+                tracing::warn!(error = %e, "todo teardown: leases_for_client failed");
             }
         }
     };
@@ -654,7 +723,19 @@ async fn teardown_completed_job(todo: &dyn TodoStore, job_id: &JobId, client_id:
             tracing::warn!(error = %e, "todo teardown: delete_avail_by_job failed");
         }
     };
-    tokio::join!(drop_lease, drop_avail);
+    let forget_grant = async {
+        if failed {
+            forget_last_grant(todo, job_id, client_id).await;
+        }
+    };
+    tokio::join!(drop_lease, drop_avail, forget_grant);
+}
+
+/// Best effort: a missed delete costs one claim that prefers the wrong job.
+async fn forget_last_grant(todo: &dyn TodoStore, job_id: &JobId, client_id: &ClientId) {
+    if let Err(e) = todo.forget_last_grant(job_id, client_id).await {
+        tracing::warn!(error = %e, "failed to forget the last grant of a failed job");
+    }
 }
 
 fn retriable_failure(
@@ -678,13 +759,11 @@ async fn own_lease(
     job_id: &JobId,
 ) -> anyhow::Result<Option<(ExpiresAt, chrono::DateTime<Utc>)>> {
     Ok(todo
-        .list_leased_for_client(client_id)
+        .leases_for_client(client_id)
         .await?
-        .iter()
-        .find_map(|k| {
-            let lease = pipette_core::todo_filename::parse_leased_key(k).ok()?;
-            (lease.job_id == *job_id).then_some((lease.expires_at, lease.lease_expiry))
-        }))
+        .into_iter()
+        .find(|lease| lease.job_id == *job_id)
+        .map(|lease| (lease.expires_at, lease.lease_expiry)))
 }
 
 /// No `denied/` marker: the client may still match under its new profile. A
@@ -695,32 +774,19 @@ pub(crate) async fn relinquish_client_leases(
     submissions: &dyn SubmissionStore,
     client_id: &ClientId,
 ) -> Result<(), AppError> {
-    // Unparseable keys are foreign cruft and must not fail the clean check.
-    async fn parsed_leases(
+    async fn client_leases(
         todo: &dyn TodoStore,
         client_id: &ClientId,
     ) -> Result<Vec<pipette_core::todo_filename::Lease>, AppError> {
-        Ok(todo
-            .list_leased_for_client(client_id)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("failed to list the leases to relinquish: {e:#}"))
-            })?
-            .into_iter()
-            .filter_map(|key| match pipette_core::todo_filename::parse_leased_key(&key) {
-                Ok(parsed) => Some(parsed),
-                Err(_) => {
-                    tracing::warn!(key = %key, "skipping unparseable leased key during relinquish");
-                    None
-                }
-            })
-            .collect())
+        todo.leases_for_client(client_id).await.map_err(|e| {
+            AppError::Internal(format!("failed to list the leases to relinquish: {e:#}"))
+        })
     }
 
     const RELINQUISH_PASSES: usize = 2;
     // The last pass only verifies.
     for pass in 0..=RELINQUISH_PASSES {
-        let leases = parsed_leases(todo, client_id).await?;
+        let leases = client_leases(todo, client_id).await?;
         if leases.is_empty() {
             return Ok(());
         }
@@ -835,6 +901,7 @@ async fn handle_retriable_failure(
         own_lease(todo, client_id, job_id),
     );
     denied.map_err(|e| failed_step("write the denied marker", e))?;
+    forget_last_grant(todo, job_id, client_id).await;
     let Some((expires_at, lease_expiry)) =
         leased.map_err(|e| failed_step("list the client's leases", e))?
     else {
@@ -1044,7 +1111,9 @@ async fn process_batch_item(
         Ok(()) => {
             tracing::info!(benchmark_id = %benchmark_id, "accepted batch submission");
             if !held && client_supplied_job_id {
-                teardown_completed_job(&*state.todo_store, &job_id, client_id).await;
+                fail_larger_runs(state, &catalog.public, &submission).await;
+                let failed = matches!(submission, Submission::Failure(_));
+                teardown_completed_job(&*state.todo_store, &job_id, client_id, failed).await;
             }
             BatchItem::Accepted {
                 index,
@@ -1106,24 +1175,18 @@ mod tests {
     use serde_json::json;
 
     use pipette_plan_types::BenchmarkType;
-    use pipette_store_fs::{LocalFsSubmissionStore, LocalFsTodoStore};
+    use pipette_store_fs::LocalFsSubmissionStore;
+    use pipette_store_sql::SqlTodoStore;
+    use pipette_store_sql::scratch::TestDb;
     use pipette_store_testkit::{seed_avail, seed_leased_until};
 
     use super::*;
 
-    fn todo_store(root: &std::path::Path) -> anyhow::Result<LocalFsTodoStore> {
-        let todo_dir = root.join("todo");
-        [
-            "avail",
-            "leased",
-            "denied",
-            "eligible/clients",
-            "pending-reindex",
-            "tmp",
-        ]
-        .iter()
-        .try_for_each(|sub| std::fs::create_dir_all(todo_dir.join(sub)))?;
-        Ok(LocalFsTodoStore::new(todo_dir))
+    /// A queue in a new database, or `None` if no database is available.
+    async fn todo_store() -> anyhow::Result<Option<(SqlTodoStore, TestDb)>> {
+        Ok(TestDb::new()
+            .await?
+            .map(|db| (SqlTodoStore::new(db.db().clone()), db)))
     }
 
     fn failure_from(
@@ -1144,11 +1207,13 @@ mod tests {
         }
     }
 
-    /// The denial is still recorded, and nothing is synthesized into `avail/`.
+    /// The request succeeds, and nothing is synthesized into the queue.
     #[tokio::test]
     async fn retriable_failure_returns_ok_when_lease_vanished() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let todo = todo_store(dir.path())?;
+        let Some((todo, _db)) = todo_store().await? else {
+            return Ok(());
+        };
 
         let client = ClientId::try_new("c1")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
@@ -1161,38 +1226,42 @@ mod tests {
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
         handle_retriable_failure(&todo, &submissions, failure.as_ref(), &client, &job).await?;
 
-        assert!(todo.is_denied(&job, &client).await?);
         assert!(todo.get_avail_by_job(&job).await?.is_none());
         Ok(())
     }
 
-    /// `local_fs` parses a leased body as it reads it, so a body that is not
+    /// The queue parses a leased body as it reads it, so a body that is not
     /// JSON drives the read failure.
     #[rstest]
-    #[case::readable_body_recycles(r#"{"spec":{"benchmark":"prefill_throughput_256"}}"#, true)]
-    #[case::unreadable_body_keeps_the_lease("{not json", false)]
+    #[case::readable_body_recycles(None, true)]
+    #[case::unreadable_body_keeps_the_lease(
+        Some("UPDATE queue_jobs SET body = '{not json'"),
+        false
+    )]
     #[tokio::test]
     async fn retriable_failure_keeps_the_lease_when_the_body_read_fails(
-        #[case] planted_body: &str,
+        #[case] corrupt: Option<&'static str>,
         #[case] handled: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let todo = todo_store(dir.path())?;
+        let Some((todo, db)) = todo_store().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new("ev1_me")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
 
-        let leased =
-            dir.path()
-                .join("todo")
-                .join("leased")
-                .join(pipette_core::todo_filename::leased_key(
-                    &job,
-                    ExpiresAt::Never,
-                    &client,
-                    Utc::now() + chrono::Duration::hours(1),
-                ));
-        std::fs::create_dir_all(leased.parent().context("lease path has no parent")?)?;
-        std::fs::write(&leased, planted_body)?;
+        seed_leased_until(
+            &todo,
+            job.as_str(),
+            ExpiresAt::Never,
+            &client,
+            Utc::now() + chrono::Duration::hours(1),
+            &json!({"spec": {"benchmark": "prefill_throughput_256"}}),
+        )
+        .await?;
+        if let Some(sql) = corrupt {
+            db.execute(sql).await?;
+        }
 
         let failure = failure_from(&json!({
             "job_id": job.as_str(),
@@ -1222,7 +1291,7 @@ mod tests {
             "the job belongs in avail/ only once the handling completed"
         );
         assert_eq!(
-            todo.list_leased_for_client(&client).await?.is_empty(),
+            todo.leases_for_client(&client).await?.is_empty(),
             handled,
             "the lease must survive a failed read so the retry can renew it"
         );
@@ -1239,8 +1308,9 @@ mod tests {
         #[case] plant_lease: bool,
         #[case] expected_runtime: Option<&str>,
     ) -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let todo = todo_store(dir.path())?;
+        let Some((todo, _db)) = todo_store().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new("ev1_me")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
         let locator_expiry = Utc::now() + chrono::Duration::hours(1);
@@ -1282,8 +1352,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_claim_renews_expired_but_present_lease() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let todo = todo_store(dir.path())?;
+        let Some((todo, _db)) = todo_store().await? else {
+            return Ok(());
+        };
         let client = ClientId::try_new("ev1_me")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
 
@@ -1302,13 +1373,11 @@ mod tests {
         verify_claim(&todo, &job, &client, new_expiry).await?;
 
         let expiry = todo
-            .list_leased_for_client(&client)
+            .leases_for_client(&client)
             .await?
-            .iter()
-            .find_map(|k| {
-                let lease = pipette_core::todo_filename::parse_leased_key(k).ok()?;
-                (lease.job_id == job).then_some(lease.lease_expiry)
-            })
+            .into_iter()
+            .find(|lease| lease.job_id == job)
+            .map(|lease| lease.lease_expiry)
             .context("lease should still exist after renewal")?;
         assert!(
             expiry > Utc::now(),
@@ -1325,7 +1394,9 @@ mod tests {
         #[case] recorded: bool,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let todo = todo_store(dir.path())?;
+        let Some((todo, _db)) = todo_store().await? else {
+            return Ok(());
+        };
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
         let job = JobId::new_unchecked("job-recycled");
 

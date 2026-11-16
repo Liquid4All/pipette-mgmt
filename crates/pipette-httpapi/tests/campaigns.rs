@@ -698,6 +698,146 @@ async fn a_revision_whose_campaign_is_deleted_while_it_files_is_cancelled() -> a
     Ok(())
 }
 
+/// `inner`, with another plan becoming the campaign's head just before its
+/// first compare-and-set: a revision landing inside a write.
+fn with_head_move(inner: Arc<dyn CampaignStore>) -> Arc<dyn CampaignStore> {
+    Arc::new(pipette_store_testkit::RivalWrite::new(
+        inner,
+        1,
+        |mut stored: Campaign| {
+            stored.advance(a_plan_id(), chrono::Utc::now());
+            Some(stored)
+        },
+    ))
+}
+
+async fn stored_campaign(state: &AppState, campaign_id: &str) -> anyhow::Result<Campaign> {
+    state
+        .campaign_store
+        .get_campaign(&CampaignId::try_new(campaign_id)?)
+        .await?
+        .context("the campaign exists")
+}
+
+/// A rename that meets a head move answers `409` and writes nothing, so the
+/// head move stands; sent again, it lands on the new head.
+#[tokio::test]
+async fn a_rename_never_undoes_a_head_move() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = seeded_state(dir.path()).await?;
+    let owner = operator(&state).await?;
+    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    state.campaign_store = with_head_move(state.campaign_store.clone());
+
+    let resp = rename(&state, &owner, &campaign_id, "Nightly EU").await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let moved = stored_campaign(&state, &campaign_id).await?;
+    assert_ne!(moved.current_plan_id, Some(first), "the head move stands");
+    assert_eq!(moved.name.as_str(), "Nightly");
+
+    let resp = rename(&state, &owner, &campaign_id, "Nightly EU").await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = stored_campaign(&state, &campaign_id).await?;
+    assert_eq!(stored.name.as_str(), "Nightly EU");
+    assert_eq!(stored.current_plan_id, moved.current_plan_id);
+    Ok(())
+}
+
+/// A hand-over that meets a head move answers `409` and writes nothing; sent
+/// again, it lands.
+#[tokio::test]
+async fn a_hand_over_that_meets_a_head_move_writes_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = seeded_state(dir.path()).await?;
+    let (_admin, team_admin, acme, campaign_id) = a_team_campaign(&state).await?;
+    let member = operator(&state).await?;
+    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
+    let before = stored_campaign(&state, &campaign_id).await?;
+    state.campaign_store = with_head_move(state.campaign_store.clone());
+    let to_member = json!({ "type": "user", "user_id": member.1 });
+
+    assert_eq!(
+        hand_over(&state, &team_admin, &campaign_id, to_member.clone()).await?,
+        StatusCode::CONFLICT
+    );
+    let stored = stored_campaign(&state, &campaign_id).await?;
+    assert_eq!(stored.owner, before.owner);
+    assert_ne!(stored.current_plan_id, before.current_plan_id);
+
+    assert_eq!(
+        hand_over(&state, &team_admin, &campaign_id, to_member).await?,
+        StatusCode::OK
+    );
+    let stored = stored_campaign(&state, &campaign_id).await?;
+    assert_eq!(
+        stored.owner,
+        CampaignOwner::User {
+            user_id: member.1.clone()
+        }
+    );
+    Ok(())
+}
+
+/// A filing whose head write meets another revision loses to it: the campaign
+/// stays on the winner, and the `409` says the filed plan is cancelled.
+#[rstest]
+#[case::plan(false)]
+#[case::variant_edit(true)]
+#[tokio::test]
+async fn a_filing_that_meets_a_head_move_cancels_its_plan(
+    #[case] variant_edit: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = seeded_state(dir.path()).await?;
+    let owner = editor(&state).await?;
+    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    state.campaign_store = with_head_move(state.campaign_store.clone());
+
+    let resp = if variant_edit {
+        edit_variants(
+            &state,
+            &owner,
+            &campaign_id,
+            &format!("?base_plan_id={first}"),
+            MLX_700M_VARIANT,
+        )
+        .await?
+    } else {
+        post_plan_document(
+            &state,
+            &owner,
+            &format!("/api/v1/campaigns/{campaign_id}/plans"),
+            ONE_CELL_PLAN,
+        )
+        .await?
+    };
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let error = json_str(&body_json(resp).await?, "error")?.to_string();
+    assert!(
+        error.ends_with("; the filing cancelled the plan"),
+        "{error}"
+    );
+    let filed: Vec<PlanId> = pipette_store::drain_plans(state.plan_store.as_ref(), None)
+        .await?
+        .items
+        .into_iter()
+        .map(|plan| plan.plan_id)
+        .filter(|plan_id| *plan_id != first)
+        .collect();
+    let [filed] = filed.as_slice() else {
+        anyhow::bail!("expected the one plan filed, found {filed:?}");
+    };
+    assert!(state.plan_store.has_cancel_marker(filed).await?);
+    assert!(!state.plan_store.has_cancel_marker(&first).await?);
+    let head = stored_campaign(&state, &campaign_id).await?.current_plan_id;
+    assert!(
+        head.is_some_and(|head| head != first && head != *filed),
+        "the winner's head stands"
+    );
+    Ok(())
+}
+
 // ── the chain ───────────────────────────────────────────────────────────────
 
 /// A record written before a campaign needed a first plan runs nothing. A
@@ -897,7 +1037,7 @@ async fn a_dry_run_leaves_the_campaign_where_it_is() -> anyhow::Result<()> {
     .await?;
     assert_eq!(read["current_plan_id"], json!(first.as_str()));
     // The one job of the first plan, and none from the dry run.
-    assert_eq!(state.todo_store.list_avail().await?.len(), 1);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 1);
     Ok(())
 }
 
@@ -928,7 +1068,7 @@ async fn an_unknown_key_leaves_the_campaign_where_it_is(#[case] query: &str) -> 
     let read = body_json(authed_user_get(&state, key, user_id, key_id, &uri).await?).await?;
     assert_eq!(read["current_plan_id"], json!(first.as_str()));
     // The one job of the first plan, and none from the refused request.
-    assert_eq!(state.todo_store.list_avail().await?.len(), 1);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 1);
     Ok(())
 }
 
@@ -1003,12 +1143,12 @@ async fn filing_into_someone_elses_campaign_is_refused() -> anyhow::Result<()> {
     )
     .await?;
     let campaign_id = create_campaign(&state, &owner, "Mine", None).await?;
-    let staged = state.todo_store.list_avail().await?.len();
+    let staged = state.todo_store.list_avail_entries().await?.len();
 
     let resp = file_plan(&state, &stranger, &campaign_id, &client_id, "grab").await?;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        state.todo_store.list_avail().await?.len(),
+        state.todo_store.list_avail_entries().await?.len(),
         staged,
         "the refused revision staged a job"
     );
@@ -3802,7 +3942,7 @@ async fn the_listing_pages_newest_first_when_asked() -> anyhow::Result<()> {
 #[tokio::test]
 async fn an_unreadable_campaign_is_counted_not_fatal() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
     let owner = operator(&state).await?;
     let mine = create_campaign(&state, &owner, "Mine", None).await?;
     std::fs::write(
@@ -4030,7 +4170,7 @@ async fn a_variant_edit_keeps_what_it_kept_and_cancels_what_it_replaced() -> any
         "the kept job carried"
     );
     assert!(state.plan_store.has_cancel_marker(&first).await?);
-    assert_eq!(state.todo_store.list_avail().await?.len(), 2);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 2);
 
     let resp = edit_variants(
         &state,
@@ -4082,7 +4222,7 @@ async fn a_dry_run_edit_answers_the_document_and_files_nothing() -> anyhow::Resu
 
     assert_eq!(head(&state, &campaign_id).await?, Some(first.clone()));
     assert!(!state.plan_store.has_cancel_marker(&first).await?);
-    assert_eq!(state.todo_store.list_avail().await?.len(), 1);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 1);
     Ok(())
 }
 
@@ -4956,6 +5096,98 @@ async fn a_variant_edit_inherits_another_campaigns_finished_runs() -> anyhow::Re
     Ok(())
 }
 
+/// A revision that sets an attempt limit on a finished cell runs the cell
+/// again, and with `carry_across_limit` keeps the run, on both revision
+/// routes. The dry run counts either outcome, and the plan's `change` records
+/// the option.
+#[rstest]
+#[case::document(false)]
+#[case::variants(true)]
+#[tokio::test]
+async fn a_revision_carries_a_run_across_a_limit_when_asked(
+    #[case] variants: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(sql) = seeded_sql_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &sql.state;
+    let owner = editor(state).await?;
+    let (campaign_id, first) = created_campaign(state, &owner, &[("name", "Nightly")]).await?;
+    let ran = manifest(state, &first).await?.job_ids[0].clone();
+    pipette_store_testkit::finish_job_with_success_on_build(
+        state.submission_store.as_ref(),
+        state.todo_store.as_ref(),
+        &ran,
+        "prefill_throughput",
+        None,
+    )
+    .await?;
+    let limited = format!(
+        "{ONE_CELL_PLAN}benchmark_flags = [{{ benchmark_type = \"prefill_throughput\", \
+         runtime_type = \"mlx_macos_pipette\", model_type = \"mlx\", \
+         attempt_timeout_seconds = 180 }}]\n"
+    );
+    // The variant edit replaces the variant with its limited copy.
+    let (document, change) = if variants {
+        (
+            limited.replace("benchmarks = [\"prefill_throughput_256\"]", "remove = [0]"),
+            json!({
+                "type": "variants", "removed_variant_count": 1, "added_variant_count": 1,
+                "carry_across_limit": true
+            }),
+        )
+    } else {
+        (
+            limited,
+            json!({"type": "document", "carry_across_limit": true}),
+        )
+    };
+    let revise = |query: String| {
+        let (owner, campaign_id, document) = (&owner, &campaign_id, &document);
+        async move {
+            let resp = if variants {
+                edit_variants(state, owner, campaign_id, &query, document).await?
+            } else {
+                revise_document(state, owner, campaign_id, &query, document).await?
+            };
+            let status = resp.status();
+            anyhow::Ok((status, body_json(resp).await?))
+        }
+    };
+
+    let (status, body) = revise(format!("?base_plan_id={first}&dry_run=true")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["carried_job_count"], 0);
+    assert_eq!(body["new_job_count"], 0);
+    assert_eq!(body["requirements_rerun_job_count"], 1);
+    assert_eq!(body["dropped_job_ids"], json!([ran.as_str()]));
+
+    let query = format!("?base_plan_id={first}&carry_across_limit=true");
+    let (status, body) = revise(format!("{query}&dry_run=true")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["carried_job_count"], 1);
+    assert_eq!(body["requirements_rerun_job_count"], 0);
+    assert_eq!(body["dropped_job_ids"], json!([]));
+    assert_eq!(
+        body["held_jobs"],
+        json!([{"body_index": 0, "plan_id": first.as_str(), "job_id": ran.as_str()}])
+    );
+
+    let (status, body) = revise(query).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["carried_job_count"], 1);
+    assert_eq!(body["dropped_job_count"], 0);
+    assert_eq!(body["plan"]["change"], change);
+    let revision = PlanId::try_new(json_str(&body["plan"], "plan_id")?)?;
+    assert_eq!(manifest(state, &revision).await?.job_ids, vec![ran]);
+
+    let resp = signed_empty(state, &owner, "GET", &format!("/api/v1/plans/{revision}")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await?["change"], change);
+    Ok(())
+}
+
 /// Create a plan with one variant and finish the run it can offer to an edit.
 async fn finished_variant_donor(
     state: &AppState,
@@ -5240,21 +5472,33 @@ async fn a_document_revision_carries_what_it_still_describes() -> anyhow::Result
 
 /// The document the campaign already runs is a success that files nothing:
 /// `200` with the campaign and `changed: false`, the plan left running.
+/// `carry_across_limit` alone changes no job of that document, so it files
+/// nothing either, and its dry run answers `unchanged`.
+#[rstest]
+#[case::the_document_alone("")]
+#[case::carry_across_limit("&carry_across_limit=true")]
 #[tokio::test]
-async fn a_document_revision_that_changes_nothing_is_a_successful_no_op() -> anyhow::Result<()> {
+async fn a_document_revision_that_changes_nothing_is_a_successful_no_op(
+    #[case] option: &str,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let owner = editor(&state).await?;
     let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let query = format!("?base_plan_id={first}{option}");
 
     let resp = revise_document(
         &state,
         &owner,
         &campaign_id,
-        &format!("?base_plan_id={first}"),
+        &format!("{query}&dry_run=true"),
         ONE_CELL_PLAN,
     )
     .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await?["unchanged"], json!(true));
+
+    let resp = revise_document(&state, &owner, &campaign_id, &query, ONE_CELL_PLAN).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
     assert_eq!(body["changed"], json!(false));
@@ -5568,7 +5812,7 @@ async fn a_job_named_twice_is_rerun_once() -> anyhow::Result<()> {
     let revised = manifest(&state, &revision).await?;
     assert_eq!(revised.job_ids.len(), 1);
     assert_ne!(revised.job_ids[0], done, "the cell runs as a new job");
-    assert_eq!(state.todo_store.list_avail().await?.len(), 1);
+    assert_eq!(state.todo_store.list_avail_entries().await?.len(), 1);
     Ok(())
 }
 
@@ -5737,7 +5981,7 @@ async fn a_refused_rerun_files_nothing(
     Some("application/json"),
     "{}",
     StatusCode::BAD_REQUEST,
-    "name either job_ids or answered"
+    "name job_ids, answered or fail"
 )]
 #[case::stranger_malformed_json(
     Rerunner::Stranger,
@@ -5830,7 +6074,7 @@ async fn a_rerun_with_nothing_to_rerun_from_is_a_conflict() -> anyhow::Result<()
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(
         json_str(&body_json(resp).await?, "error")?,
-        format!("plan {bodies} holds no job {job} it can re-run or recalculate")
+        format!("plan {bodies} holds no job {job} it can re-run, mark or recalculate")
     );
     assert_eq!(head(&state, &campaign_id).await?, Some(bodies.clone()));
     assert!(!state.plan_store.has_cancel_marker(&bodies).await?);
@@ -5853,7 +6097,8 @@ async fn a_drifted_rerun_files_nothing(
     #[values("", "?dry_run=true")] query: &str,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    // Records on disk, so the test can remove a job source.
+    let state = seeded_object_state(dir.path()).await?;
     let owner = editor(&state).await?;
     let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
     let done = manifest(&state, &first).await?.job_ids[0].clone();
@@ -5863,7 +6108,9 @@ async fn a_drifted_rerun_files_nothing(
         &done,
     )
     .await?;
-    // The head records another digest for the cell, as if the catalog moved.
+    // The head records another digest for the cell, as if the catalog moved,
+    // for a job filed before sources were kept.
+    pipette_store_testkit::local_fs_remove_job_source(dir.path(), &done)?;
     let mut head = manifest(&state, &first).await?;
     head.content_keys.insert(done.clone(), "0".repeat(64));
     state.plan_store.put_plan(&head).await?;
@@ -5989,7 +6236,7 @@ async fn a_revert_brings_back_a_dropped_cells_run() -> anyhow::Result<()> {
     assert_eq!(jobs.len(), 2);
     assert!(jobs.contains(&dropped), "the dropped cell's run came back");
     assert!(
-        state.todo_store.list_avail().await?.is_empty(),
+        state.todo_store.list_avail_entries().await?.is_empty(),
         "nothing runs again"
     );
     assert!(state.plan_store.has_cancel_marker(&second).await?);
@@ -6075,6 +6322,13 @@ enum RevertTo {
     StatusCode::BAD_REQUEST,
     "base_plan_id"
 )]
+#[case::carry_across_limit(
+    Rerunner::Owner,
+    "?base_plan_id={head}&carry_across_limit=true",
+    RevertTo::First,
+    StatusCode::BAD_REQUEST,
+    "carry_across_limit"
+)]
 #[case::without_cancel(
     Rerunner::OwnerWithoutCancel,
     "?base_plan_id={head}",
@@ -6105,7 +6359,7 @@ async fn a_revert_that_files_nothing(
     #[case] answer: &str,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
     let owner = match who {
         Rerunner::OwnerWithoutCancel => {
             registered_user(&state, &[UserPermission::SubmitPlans]).await?
@@ -6300,7 +6554,7 @@ async fn a_recalculation_answers_a_new_job_from_the_record_and_cancels_what_it_r
     };
     assert_ne!(*fresh, done, "the cell is answered as a new job");
     assert!(
-        state.todo_store.list_avail().await?.is_empty(),
+        state.todo_store.list_avail_entries().await?.is_empty(),
         "nothing is queued"
     );
     let copy = state

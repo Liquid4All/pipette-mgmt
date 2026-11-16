@@ -2,6 +2,7 @@
 //! behalf of a user.
 
 pub mod audit;
+pub mod campaign_groups;
 pub mod campaigns;
 pub mod catalog_import_runs;
 pub mod clients;

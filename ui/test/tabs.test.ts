@@ -21,7 +21,7 @@ function row(over: Partial<ResultRow> = {}): ResultRow {
   next++;
   return {
     job_id: `job-${next}`, benchmark_id: "bench", benchmark_type: "prefill_throughput", metric: "prefill_throughput",
-    value: 100, value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null,
+    value: 100, value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null, failure_code: null,
     model_params_total_millions: 1000, model_params_active_millions: 1000,
     model_descriptor: { org: "acme", path: "Tiny-1B-Q4_K_M.gguf", repo_name: "Tiny-1B-GGUF", type: "gguf_text" } as Model,
     runtime_descriptor: { flavor: "macos-arm64", repository_version: "b100", type: "llamacpp_cli_stock_tools" } as Runtime,

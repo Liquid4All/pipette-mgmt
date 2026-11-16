@@ -81,12 +81,18 @@ describe("a catalog entry from a campaign's progress table", () => {
     expect(namedIn([], ACME, "model")).toBe(false);
   });
 
+  const LABEL_ERROR =
+    "Use only lowercase letters, digits, '_' and one '@' between them in the quantization label, such as q4_k_m@unsloth.";
   test.each([
     ["q4_0", null],
     ["4bit", null],
+    ["q4_k_m@unsloth", null],
     ["", "Type a quantization label, such as q4_0."],
-    ["Q4_0", "Use only lowercase letters, digits and '_' in the quantization label."],
-    ["q4-0", "Use only lowercase letters, digits and '_' in the quantization label."],
+    ["Q4_0", LABEL_ERROR],
+    ["q4-0", LABEL_ERROR],
+    ["@unsloth", LABEL_ERROR],
+    ["q4_0@", LABEL_ERROR],
+    ["q4_0@a@b", LABEL_ERROR],
   ])("checks the quantization label %j with the server's grammar", (text, error) => {
     expect(quantizationError(text)).toBe(error);
   });

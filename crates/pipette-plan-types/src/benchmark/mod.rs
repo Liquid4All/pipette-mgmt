@@ -147,6 +147,11 @@ pub enum BenchmarkType {
     /// Peak memory of one audio clip through a multimodal model: the audio
     /// counterpart of [`VlMaxMemory`](Self::VlMaxMemory).
     AsrMaxMemory,
+    /// One request to a decision model: typed questions over a state, answered
+    /// from one forward pass with no generated tokens.
+    DecisionLatency,
+    /// Peak memory of the `decision_latency` workload, one ungated run.
+    DecisionMaxMemory,
 }
 
 impl FromStr for BenchmarkType {
@@ -179,7 +184,9 @@ impl BenchmarkType {
             | Self::MaxMemoryUsage
             | Self::VlThroughput
             | Self::VlMaxMemory
-            | Self::VlSpecDecode => false,
+            | Self::VlSpecDecode
+            | Self::DecisionLatency
+            | Self::DecisionMaxMemory => false,
         }
     }
 
@@ -221,6 +228,10 @@ impl BenchmarkType {
             Some(Self::AsrThroughput)
         } else if id.starts_with("asr_max_memory") {
             Some(Self::AsrMaxMemory)
+        } else if id.starts_with("decision_latency") {
+            Some(Self::DecisionLatency)
+        } else if id.starts_with("decision_max_memory") {
+            Some(Self::DecisionMaxMemory)
         } else {
             None
         }
@@ -840,6 +851,28 @@ pub struct AsrMaxMemoryBenchmark {
     pub parameter_decode_tokens: AsrDecodeTokens,
 }
 
+/// A request to a decision model (`/v1/systemone`): `decision_latency` times
+/// it, `decision_max_memory` takes its peak. No token is generated. How many
+/// of the server's tasks run at once is the cell's `parallel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionBenchmark {
+    pub benchmark_id: BenchmarkId,
+    /// The VL types' image and text parameters, with no image by default: the
+    /// size is present exactly when `parameter_num_images > 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_image_width: Option<PositiveCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_image_height: Option<PositiveCount>,
+    pub parameter_text_tokens: NonNegativeCount,
+    #[serde(default)]
+    pub parameter_num_images: NonNegativeCount,
+    pub parameter_questions: PositiveCount,
+    /// Requests kept in flight, each with its own state (`_bs<n>`); `1` sends
+    /// one at a time, the model card's latency.
+    #[serde(default)]
+    pub parameter_batch_size: BatchSize,
+}
+
 #[expect(clippy::expect_used, reason = "1 is in range")]
 fn default_num_images() -> NonNegativeCount {
     NonNegativeCount::try_new(1).expect("1 is non-negative")
@@ -860,6 +893,8 @@ pub enum BenchmarkDefinition {
     VlSpecDecode(VlSpecDecodeBenchmark),
     AsrThroughput(AsrThroughputBenchmark),
     AsrMaxMemory(AsrMaxMemoryBenchmark),
+    DecisionLatency(DecisionBenchmark),
+    DecisionMaxMemory(DecisionBenchmark),
 }
 
 impl BenchmarkDefinition {
@@ -877,6 +912,7 @@ impl BenchmarkDefinition {
             Self::VlSpecDecode(b) => &b.benchmark_id,
             Self::AsrThroughput(b) => &b.benchmark_id,
             Self::AsrMaxMemory(b) => &b.benchmark_id,
+            Self::DecisionLatency(b) | Self::DecisionMaxMemory(b) => &b.benchmark_id,
         }
     }
 
@@ -894,6 +930,8 @@ impl BenchmarkDefinition {
             Self::VlSpecDecode(_) => BenchmarkType::VlSpecDecode,
             Self::AsrThroughput(_) => BenchmarkType::AsrThroughput,
             Self::AsrMaxMemory(_) => BenchmarkType::AsrMaxMemory,
+            Self::DecisionLatency(_) => BenchmarkType::DecisionLatency,
+            Self::DecisionMaxMemory(_) => BenchmarkType::DecisionMaxMemory,
         }
     }
 
@@ -912,7 +950,9 @@ impl BenchmarkDefinition {
             | Self::MaxMemoryUsage(_)
             | Self::VlThroughput(_)
             | Self::VlMaxMemory(_)
-            | Self::VlSpecDecode(_) => Ok(SamplingTemperature::greedy()),
+            | Self::VlSpecDecode(_)
+            | Self::DecisionLatency(_)
+            | Self::DecisionMaxMemory(_) => Ok(SamplingTemperature::greedy()),
         }
     }
 
@@ -1016,6 +1056,20 @@ impl BenchmarkDefinition {
         Ok(b)
     }
 
+    pub fn as_decision_latency(&self) -> Result<&DecisionBenchmark, BenchmarkDefinitionError> {
+        let Self::DecisionLatency(b) = self else {
+            return Err(self.unexpected_type("decision_latency"));
+        };
+        Ok(b)
+    }
+
+    pub fn as_decision_max_memory(&self) -> Result<&DecisionBenchmark, BenchmarkDefinitionError> {
+        let Self::DecisionMaxMemory(b) = self else {
+            return Err(self.unexpected_type("decision_max_memory"));
+        };
+        Ok(b)
+    }
+
     /// The corpus this benchmark pulls from mgmt before it runs; `None` for
     /// every kind that pulls none. On the definition so a client need not know
     /// which kinds serve one.
@@ -1032,7 +1086,9 @@ impl BenchmarkDefinition {
             | Self::MaxMemoryUsage(_)
             | Self::Eval(_)
             | Self::VlThroughput(_)
-            | Self::VlMaxMemory(_) => None,
+            | Self::VlMaxMemory(_)
+            | Self::DecisionLatency(_)
+            | Self::DecisionMaxMemory(_) => None,
         }
     }
 
@@ -1050,7 +1106,9 @@ impl BenchmarkDefinition {
             | Self::MaxMemoryUsage(_)
             | Self::Eval(_)
             | Self::VlThroughput(_)
-            | Self::VlMaxMemory(_) => None,
+            | Self::VlMaxMemory(_)
+            | Self::DecisionLatency(_)
+            | Self::DecisionMaxMemory(_) => None,
         }
     }
 
@@ -1063,6 +1121,7 @@ impl BenchmarkDefinition {
             Self::DecodeThroughput(b) => Some(b.parameter_batch_size),
             Self::EndToEndLatency(b) => Some(b.parameter_batch_size),
             Self::VlSpecDecode(b) => Some(b.parameter_batch_size),
+            Self::DecisionLatency(b) | Self::DecisionMaxMemory(b) => Some(b.parameter_batch_size),
             Self::MaxMemoryUsage(_)
             | Self::Eval(_)
             | Self::VlmEval(_)
@@ -1318,6 +1377,11 @@ mod tests {
         Some(BenchmarkType::AsrMaxMemory)
     )]
     #[case("local/asr_max_memory_smoke", Some(BenchmarkType::AsrMaxMemory))]
+    #[case("decision_latency_text64_q1", Some(BenchmarkType::DecisionLatency))]
+    #[case(
+        "decision_max_memory_text64_q1",
+        Some(BenchmarkType::DecisionMaxMemory)
+    )]
     #[case("bogus_id", None)]
     fn from_id_maps_every_benchmark_family(
         #[case] id: &str,
@@ -1371,6 +1435,8 @@ mod tests {
             asr_eval_wire(),
             serde_json::json!({"benchmark_id": "asr_max_memory_2500ms_text0_decode256", "benchmark_type": "asr_max_memory", "parameter_audio_duration_ms": 2500, "parameter_audio_sample_rate_hz": 16000, "parameter_audio_channels": 1, "parameter_text_tokens": 0, "parameter_decode_tokens": 256}),
             serde_json::json!({"benchmark_id": "asr_throughput_2500ms_text1024_decode256", "benchmark_type": "asr_throughput", "parameter_audio_duration_ms": 2500, "parameter_audio_sample_rate_hz": 16000, "parameter_audio_channels": 1, "parameter_text_tokens": 1024, "parameter_decode_tokens": 256}),
+            serde_json::json!({"benchmark_id": "decision_latency_text64_q1", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_questions": 1}),
+            serde_json::json!({"benchmark_id": "decision_max_memory_text64_q1", "benchmark_type": "decision_max_memory", "parameter_text_tokens": 64, "parameter_questions": 1}),
         ];
         // One definition per type, so a new type fails here until it is added.
         let types: std::collections::HashSet<String> = definitions
@@ -1398,6 +1464,8 @@ mod tests {
                     d.as_asr_eval().is_ok(),
                     d.as_asr_max_memory().is_ok(),
                     d.as_asr_throughput().is_ok(),
+                    d.as_decision_latency().is_ok(),
+                    d.as_decision_max_memory().is_ok(),
                 ];
                 let expected: Vec<bool> = (0..opened.len()).map(|i| i == kind).collect();
                 anyhow::ensure!(opened.as_slice() == expected, "{d:?}: {opened:?}");
@@ -1991,6 +2059,25 @@ mod tests {
         ]
         .iter()
         .for_each(|key| assert!(value.get(key).is_none(), "{key} must be absent: {value}"));
+        Ok(())
+    }
+
+    /// A text-only entry omits the image keys, and an image entry round-trips
+    /// with its size.
+    #[rstest]
+    #[case::text(serde_json::json!({"benchmark_id": "decision_latency_text64_q3", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_num_images": 0, "parameter_questions": 3, "parameter_batch_size": 1}), BenchmarkType::DecisionLatency, 1)]
+    #[case::image(serde_json::json!({"benchmark_id": "decision_latency_384x384_text0_img1_q1", "benchmark_type": "decision_latency", "parameter_image_width": 384, "parameter_image_height": 384, "parameter_text_tokens": 0, "parameter_num_images": 1, "parameter_questions": 1, "parameter_batch_size": 1}), BenchmarkType::DecisionLatency, 1)]
+    #[case::packed(serde_json::json!({"benchmark_id": "decision_latency_text64_q1_bs64", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_num_images": 0, "parameter_questions": 1, "parameter_batch_size": 64}), BenchmarkType::DecisionLatency, 64)]
+    #[case::memory(serde_json::json!({"benchmark_id": "decision_max_memory_text3400_q1", "benchmark_type": "decision_max_memory", "parameter_text_tokens": 3400, "parameter_num_images": 0, "parameter_questions": 1, "parameter_batch_size": 1}), BenchmarkType::DecisionMaxMemory, 1)]
+    fn a_decision_definition_round_trips(
+        #[case] wire: Value,
+        #[case] benchmark_type: BenchmarkType,
+        #[case] batch_size: u32,
+    ) -> anyhow::Result<()> {
+        let parsed: BenchmarkDefinition = serde_json::from_value(wire.clone())?;
+        assert_eq!(parsed.benchmark_type(), benchmark_type);
+        assert_eq!(parsed.batch_size().map(BatchSize::as_u32), Some(batch_size));
+        assert_eq!(serde_json::to_value(&parsed)?, wire);
         Ok(())
     }
 

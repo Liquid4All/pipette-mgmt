@@ -19,33 +19,24 @@ pub use tag_store::LocalFsTagStore;
 
 // The key index is handed out as `Arc<dyn KeyIndexStore>`, so the concrete type
 // stays inside this crate.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 pub(crate) use auth::LocalFsKeyIndexStore;
 pub(crate) use campaign_store::LocalFsCampaignStore;
-use chrono::{DateTime, Utc};
 pub(crate) use model_params_store::LocalFsModelParamsStore;
 
 use pipette_core::benchmark::{self, Benchmark};
 use pipette_core::config::Config;
-use pipette_core::denial::DenialRecord;
 use pipette_core::eval_sample_result::{self, EvalSampleResult};
 use pipette_core::parquet_utils::WriterOpts;
 use pipette_core::plan::{PlanManifest, PlanSource, SettledOutcome};
 use pipette_core::tmp_file::TmpFileGuard;
-use pipette_core::todo_filename::{
-    avail_filename, denied_job_prefix, denied_marker_filename, eligible_filename,
-    job_plan_marker_filename, leased_key, lost_lease_filename, parse_denied_marker,
-    parse_eligible_filename, parse_job_plan_marker_filename, parse_leased_key,
-    parse_lost_lease_filename, tmp_filename,
-};
-use pipette_core::types::id_from_key;
+use pipette_core::todo_filename::{job_plan_marker_filename, parse_job_plan_marker_filename};
 use pipette_core::warehouse::{self, JobMetrics, MetricRow};
 use pipette_plan_types::ExpiresAt;
 use pipette_plan_types::IdError;
@@ -54,13 +45,12 @@ use pipette_plan_types::PlanId;
 use pipette_plan_types::PlanStatus;
 use pipette_plan_types::{BenchmarkId, ClientId, OrgId, RuntimeOutput};
 use pipette_store::{
-    BacklogSnapshot, CampaignBacklogSnapshot, CatalogStore, ClaimResult, ClientStore,
-    ContentKeyCas, ContentKeyClaim, ContentKeyError, ContentKeyRecord, ContentKeyVersion,
-    CreateOutcome, EvalPackageStore, EvalSampleResultStore, FinalizeProbe, JobPlanMarker, JobState,
-    ORG_BENCHMARKS_PREFIX, OutcomeProbe, Page, PendingSourceMarker, PlanFilter, PlanPage,
-    PlanStore, RecycleResult, RedateResult, RenewLeaseResult, ScoreQueueStage, Stores,
-    SubmissionRecord, SubmissionStore, TodoStore, UnreadableObjectError, UserStore, WarehouseStore,
-    find_outcomes_per_job, is_content_digest, page_matching_plans,
+    CatalogStore, ClientStore, ContentKeyCas, ContentKeyClaim, ContentKeyError, ContentKeyRecord,
+    ContentKeyVersion, CreateOutcome, EvalPackageStore, EvalSampleResultStore, FinalizeProbe,
+    JobPlanMarker, JobState, ORG_BENCHMARKS_PREFIX, OutcomeProbe, Page, PendingSourceMarker,
+    PlanFilter, PlanPage, PlanStore, ScoreQueueStage, Stores, SubmissionRecord, SubmissionStore,
+    TodoStore, UnreadableObjectError, UserStore, VaultStore, WarehouseStore, find_outcomes_per_job,
+    is_content_digest, page_matching_plans,
 };
 
 pub fn build_local_fs_client_store(
@@ -93,15 +83,23 @@ pub fn build_local_fs_eval_package_store(
     Ok(eval_package_store(data_dir))
 }
 
+pub fn build_local_fs_vault_store(
+    storage: &pipette_core::config::StorageConfig,
+) -> anyhow::Result<Arc<dyn VaultStore>> {
+    let data_dir = storage
+        .data_dir()
+        .ok_or_else(|| anyhow::anyhow!("build_local_fs_vault_store requires local_fs backend"))?;
+    Ok(Arc::new(vault_store::LocalFsVaultStore::new(data_dir)))
+}
+
 fn eval_package_store(data_dir: &Path) -> Arc<dyn EvalPackageStore> {
     Arc::new(dataset_cache::LocalFsEvalPackageStore::new(
         data_dir.join("scores-packages").join("tars"),
     ))
 }
 
-/// The `todo` store is also rooted at `[storage]`: only `build_stores` in the
-/// binary honors `[todo_storage]`.
-pub fn build_local_fs_stores(config: &Config) -> anyhow::Result<Stores> {
+/// The record stores on `[storage]`, with `todo` as the queue.
+pub fn build_local_fs_stores(config: &Config, todo: Arc<dyn TodoStore>) -> anyhow::Result<Stores> {
     let data_dir = config
         .storage
         .data_dir()
@@ -139,9 +137,10 @@ pub fn build_local_fs_stores(config: &Config) -> anyhow::Result<Stores> {
             eval_sample_results_dir,
             writer_opts,
         )),
-        todo: build_local_fs_todo_store(&config.storage)?,
+        todo,
         plans: Arc::new(LocalFsPlanStore::new(data_dir)),
         campaigns: Arc::new(LocalFsCampaignStore::new(data_dir)),
+        campaign_groups: None,
         model_params: Arc::new(LocalFsModelParamsStore::new(data_dir)),
         audit: None,
         descriptor_catalog: None,
@@ -170,8 +169,7 @@ fn create_plan_dirs(data_dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `storage` must be local_fs. Unlike [`build_local_fs_stores`], this leaves
-/// the queue's `todo/` tree alone.
+/// `storage` must be local_fs.
 pub fn build_local_fs_plan_store(
     storage: &pipette_core::config::StorageConfig,
 ) -> anyhow::Result<Arc<dyn PlanStore>> {
@@ -180,25 +178,6 @@ pub fn build_local_fs_plan_store(
         .ok_or_else(|| anyhow::anyhow!("build_local_fs_plan_store requires local_fs backend"))?;
     create_plan_dirs(data_dir)?;
     Ok(Arc::new(LocalFsPlanStore::new(data_dir)))
-}
-
-/// `storage` must be a local_fs backend.
-pub fn build_local_fs_todo_store(
-    storage: &pipette_core::config::StorageConfig,
-) -> anyhow::Result<Arc<dyn TodoStore>> {
-    let todo_dir = storage
-        .data_dir()
-        .ok_or_else(|| anyhow::anyhow!("build_local_fs_todo_store requires local_fs backend"))?
-        .join("todo");
-    std::fs::create_dir_all(todo_dir.join("avail"))?;
-    std::fs::create_dir_all(todo_dir.join("leased"))?;
-    std::fs::create_dir_all(todo_dir.join("denied"))?;
-    std::fs::create_dir_all(todo_dir.join("eligible").join("clients"))?;
-    std::fs::create_dir_all(todo_dir.join("pending-reindex"))?;
-    std::fs::create_dir_all(todo_dir.join("lost"))?;
-    std::fs::create_dir_all(todo_dir.join("tmp"))?;
-    std::fs::create_dir_all(todo_dir.join("liveness"))?;
-    Ok(Arc::new(LocalFsTodoStore::new(todo_dir)))
 }
 
 // ---------------------------------------------------------------------------
@@ -245,45 +224,6 @@ async fn remove_file_idempotent(path: PathBuf) -> anyhow::Result<()> {
     .await
 }
 
-/// A missing or corrupt file reads as empty ([`pipette_store::parse_key_set`]).
-async fn read_key_set<T>(path: PathBuf, what: &'static str) -> anyhow::Result<HashSet<T>>
-where
-    T: serde::de::DeserializeOwned + Eq + std::hash::Hash + Send + 'static,
-{
-    run_blocking(move || match std::fs::read(&path) {
-        Ok(bytes) => Ok(pipette_store::parse_key_set(&bytes, what)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
-        Err(e) => Err(e.into()),
-    })
-    .await
-}
-
-async fn write_key_set<T: serde::Serialize + Sync>(
-    path: PathBuf,
-    set: &HashSet<T>,
-) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(set)?;
-    run_blocking(move || Ok(std::fs::write(&path, &bytes)?)).await
-}
-
-/// Replace the snapshot at `path` atomically through a sibling temp file, so a
-/// console read never sees a truncated snapshot.
-async fn replace_snapshot(path: PathBuf, bytes: Vec<u8>) -> anyhow::Result<()> {
-    run_blocking(move || {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("snapshot path has no file name")?;
-        let tmp = path.with_file_name(format!("{name}.tmp-{}", uuid::Uuid::new_v4()));
-        let guard = TmpFileGuard::new(tmp.clone());
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
-        guard.disarm();
-        Ok(())
-    })
-    .await
-}
-
 /// `Ok(None)` for a path that vanished mid-walk. A failed read propagates: a
 /// partial view is not an answer.
 fn vanished_is_absent<T>(result: std::io::Result<T>) -> anyhow::Result<Option<T>> {
@@ -294,7 +234,7 @@ fn vanished_is_absent<T>(result: std::io::Result<T>) -> anyhow::Result<Option<T>
     }
 }
 
-/// Drop a now-empty directory, matching S3 Express, which reclaims one itself.
+/// Drop a now-empty directory, as S3 keeps no empty prefix.
 /// Best effort: races with other writers are expected, other failures logged.
 fn drop_empty_dir(dir: &Path) {
     match std::fs::remove_dir(dir) {
@@ -346,33 +286,6 @@ fn readable_entry(
             None
         }
     }
-}
-
-/// Whether `entry` passes `is`; `false` when its type cannot be read, which is
-/// logged unless the entry was removed mid-walk.
-fn entry_is(entry: &std::fs::DirEntry, is: fn(&std::fs::FileType) -> bool) -> bool {
-    match entry.file_type() {
-        Ok(file_type) => is(&file_type),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            tracing::warn!(
-                path = %entry.path().display(),
-                error = %e,
-                "skipping directory entry of unreadable type"
-            );
-            false
-        }
-    }
-}
-
-/// The name of an entry that holds a JSON body, else `None`. A non-UTF-8 name
-/// is no key this store writes, so it is foreign cruft too.
-fn json_name(entry: &std::fs::DirEntry) -> Option<String> {
-    entry
-        .file_name()
-        .into_string()
-        .ok()
-        .filter(|name| is_json_name(name))
 }
 
 #[expect(
@@ -630,7 +543,7 @@ impl LocalFsPlanStore {
     }
 
     /// Marker path — the bare `plan_id`, no extension, mirroring the other
-    /// empty-marker trees (`todo/denied/`, `tags-index/`).
+    /// empty-marker trees (`tags-index/`).
     fn cancel_marker_path(&self, plan_id: &PlanId) -> PathBuf {
         self.cancelled_dir.join(plan_id.as_str())
     }
@@ -737,6 +650,31 @@ where
 
 #[async_trait]
 impl PlanStore for LocalFsPlanStore {
+    async fn end_membership(
+        &self,
+        _job_id: &pipette_plan_types::JobId,
+        _plan_id: &pipette_plan_types::PlanId,
+    ) -> anyhow::Result<pipette_store::MembershipEnd> {
+        anyhow::bail!("end_membership is not supported by the object plan store")
+    }
+    async fn join_job(
+        &self,
+        _job_id: &pipette_plan_types::JobId,
+        _plan_id: &pipette_plan_types::PlanId,
+        _expires_at: pipette_plan_types::ExpiresAt,
+    ) -> anyhow::Result<pipette_store::JobJoin> {
+        anyhow::bail!("join_job is not supported by the object plan store")
+    }
+    async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        anyhow::bail!("read_gc_candidates is not supported by the object plan store")
+    }
+    async fn write_gc_candidates(
+        &self,
+        _candidates: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("write_gc_candidates is not supported by the object plan store")
+    }
+
     async fn put_plan(&self, manifest: &PlanManifest) -> anyhow::Result<()> {
         let dir = self.plans_dir.clone();
         let path = self.manifest_path(&manifest.plan_id);
@@ -1845,915 +1783,6 @@ impl EvalSampleResultStore for LocalFsEvalSampleResultStore {
 }
 
 // ---------------------------------------------------------------------------
-// TodoStore
-// ---------------------------------------------------------------------------
-
-pub struct LocalFsTodoStore {
-    avail_dir: PathBuf,
-    leased_dir: PathBuf,
-    denied_dir: PathBuf,
-    eligible_clients_dir: PathBuf,
-    pending_reindex_dir: PathBuf,
-    lost_dir: PathBuf,
-    tmp_dir: PathBuf,
-    liveness_dir: PathBuf,
-    gc_candidates_path: PathBuf,
-    backlog_path: PathBuf,
-    campaign_backlog_path: PathBuf,
-}
-
-impl LocalFsTodoStore {
-    pub fn new(todo_dir: PathBuf) -> Self {
-        Self {
-            avail_dir: todo_dir.join("avail"),
-            leased_dir: todo_dir.join("leased"),
-            denied_dir: todo_dir.join("denied"),
-            eligible_clients_dir: todo_dir.join("eligible").join("clients"),
-            pending_reindex_dir: todo_dir.join("pending-reindex"),
-            lost_dir: todo_dir.join("lost"),
-            tmp_dir: todo_dir.join("tmp"),
-            liveness_dir: todo_dir.join("liveness"),
-            gc_candidates_path: todo_dir.join(".gc-candidates"),
-            backlog_path: todo_dir.join(".backlog"),
-            campaign_backlog_path: todo_dir.join(".backlog-campaigns"),
-        }
-    }
-
-    /// Path to a client's `liveness/{client_id}` marker.
-    fn liveness_path(&self, client_id: &ClientId) -> PathBuf {
-        self.liveness_dir.join(client_id.as_str())
-    }
-
-    /// Path to a job's `denied/{job_id}.{client_id}` marker.
-    fn denied_path(&self, job_id: &JobId, client_id: &ClientId) -> PathBuf {
-        self.denied_dir
-            .join(denied_marker_filename(job_id, client_id))
-    }
-
-    /// Path to a job's `avail/{job_id}/` directory, which holds its one entry.
-    /// [`pipette_core::todo_filename::avail_filename`] gives the layout.
-    fn avail_job_dir(&self, job_id: &JobId) -> PathBuf {
-        self.avail_dir.join(job_id.as_str())
-    }
-}
-
-#[async_trait]
-impl TodoStore for LocalFsTodoStore {
-    async fn list_avail(&self) -> anyhow::Result<Vec<String>> {
-        let avail_dir = self.avail_dir.clone();
-        run_blocking(move || {
-            // Every read error propagates: a job missed here reads as "not in
-            // avail/", and the GC deletes its markers and reindexes it as new.
-            // Non-UTF-8 and non-`.json` names are cruft and dropped.
-            let mut names: Vec<String> =
-                std::fs::read_dir(&avail_dir)?.try_fold(Vec::new(), |mut names, entry| {
-                    let entry = entry?;
-                    let Ok(job) = entry.file_name().into_string() else {
-                        return anyhow::Ok(names);
-                    };
-                    if !entry.file_type()?.is_dir() {
-                        // A file directly under `avail/` is cruft or an older
-                        // layout's entry; report it so the sweep's guard sees it.
-                        names.extend(json_name(&entry));
-                        return anyhow::Ok(names);
-                    }
-                    // A job directory leaves with the job's last entry, so one
-                    // that vanishes mid-walk holds nothing.
-                    let Some(leaves) = vanished_is_absent(std::fs::read_dir(entry.path()))? else {
-                        return anyhow::Ok(names);
-                    };
-                    leaves.into_iter().try_fold(names, |mut names, leaf| {
-                        names.extend(json_name(&leaf?).map(|n| format!("{job}/{n}")));
-                        anyhow::Ok(names)
-                    })
-                })?;
-            names.sort_unstable();
-            Ok(names)
-        })
-        .await
-    }
-
-    async fn get_avail(
-        &self,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        let path = self.avail_dir.join(avail_filename(job_id, expires_at));
-        run_blocking(move || match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn delete_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()> {
-        let job_dir = self.avail_job_dir(job_id);
-        let path = self.avail_dir.join(avail_filename(job_id, expires_at));
-        run_blocking(move || {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                // Idempotent: the entry is already gone.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            drop_empty_dir(&job_dir);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_avail_by_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        let job_dir = self.avail_job_dir(job_id);
-        run_blocking(move || {
-            // A read error must fail the delete: read as absent, it would report
-            // the job torn down while its `avail/` file stays.
-            let Some(mut entries) = vanished_is_absent(std::fs::read_dir(&job_dir))? else {
-                return Ok(());
-            };
-            entries.try_for_each(|entry| -> anyhow::Result<()> {
-                let entry = entry?;
-                if json_name(&entry).is_some() {
-                    std::fs::remove_file(entry.path())?;
-                }
-                Ok(())
-            })?;
-            drop_empty_dir(&job_dir);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn get_avail_by_job(&self, job_id: &JobId) -> anyhow::Result<Option<serde_json::Value>> {
-        let job_dir = self.avail_job_dir(job_id);
-        run_blocking(move || {
-            // A read error propagates: an unreadable dir read as `None` would
-            // skip a legitimate escalation.
-            let Some(entries) = vanished_is_absent(std::fs::read_dir(&job_dir))? else {
-                return Ok(None);
-            };
-            entries
-                .map(|entry| -> anyhow::Result<Option<serde_json::Value>> {
-                    let entry = entry?;
-                    json_name(&entry)
-                        .map(|_| {
-                            Ok(serde_json::from_str(&std::fs::read_to_string(
-                                entry.path(),
-                            )?)?)
-                        })
-                        .transpose()
-                })
-                // The first JSON entry decides; a read error ahead of it still
-                // propagates.
-                .filter_map(|r| r.transpose())
-                .next()
-                .transpose()
-        })
-        .await
-    }
-
-    async fn avail_key_for_job(&self, job_id: &JobId) -> anyhow::Result<Option<String>> {
-        let job_dir = self.avail_job_dir(job_id);
-        let job_id = job_id.clone();
-        run_blocking(move || {
-            // A read error propagates: an empty answer sends a merge target to
-            // the dead-check and a claim to the next candidate.
-            let Some(entries) = vanished_is_absent(std::fs::read_dir(&job_dir))? else {
-                return Ok(None);
-            };
-            entries
-                .map(|entry| -> anyhow::Result<Option<String>> { Ok(json_name(&entry?)) })
-                .filter_map(|r| r.transpose())
-                // The first entry decides the answer, and the job segment goes
-                // back in front of it to make the key the filename parser reads.
-                .next()
-                .transpose()
-                .map(|name| name.map(|name| format!("{job_id}/{name}")))
-        })
-        .await
-    }
-
-    async fn redate_avail(
-        &self,
-        job_id: &JobId,
-        from: ExpiresAt,
-        to: ExpiresAt,
-    ) -> anyhow::Result<RedateResult> {
-        let job_dir = self.avail_job_dir(job_id);
-        let src = self.avail_dir.join(avail_filename(job_id, from));
-        let dst = self.avail_dir.join(avail_filename(job_id, to));
-        run_blocking(move || {
-            // Both names sit in the job's own directory. Create it first, so a
-            // missing directory cannot masquerade as the `Gone` below.
-            std::fs::create_dir_all(&job_dir)?;
-            // Same-directory `rename` is atomic, which `claim_job` relies on. A
-            // missing source is `Gone`: a claim took the entry first.
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => Ok(RedateResult::Redated),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RedateResult::Gone),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await
-    }
-
-    async fn list_leased(&self) -> anyhow::Result<Vec<String>> {
-        let leased_dir = self.leased_dir.clone();
-        run_blocking(move || {
-            // Keys are `{client_id}/{leaf}`. Every read error but a vanished
-            // partition propagates: a lease missed here reads as "not leased",
-            // and the GC deletes its markers.
-            let keys = std::fs::read_dir(&leased_dir)?
-                .map(|client_entry| -> anyhow::Result<Vec<String>> {
-                    let client_entry = client_entry?;
-                    if !client_entry.file_type()?.is_dir() {
-                        return Ok(Vec::new());
-                    }
-                    let client_name = client_entry.file_name().to_string_lossy().into_owned();
-                    match std::fs::read_dir(client_entry.path()) {
-                        Ok(leaves) => leaves
-                            .map(|leaf_entry| -> anyhow::Result<Option<String>> {
-                                let leaf = leaf_entry?.file_name().to_string_lossy().into_owned();
-                                Ok(is_json_name(&leaf).then(|| format!("{client_name}/{leaf}")))
-                            })
-                            .filter_map(|r| r.transpose())
-                            .collect::<anyhow::Result<Vec<_>>>(),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-                        Err(e) => Err(anyhow::Error::from(e)),
-                    }
-                })
-                .collect::<anyhow::Result<Vec<Vec<String>>>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<String>>();
-            Ok(keys)
-        })
-        .await
-    }
-
-    async fn get_leased(
-        &self,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-        client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        let path = self
-            .leased_dir
-            .join(leased_key(job_id, expires_at, client_id, lease_expiry));
-        run_blocking(move || match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn list_leased_for_client(&self, client_id: &ClientId) -> anyhow::Result<Vec<String>> {
-        let client_dir = self.leased_dir.join(client_id.as_str());
-        let client_name = client_id.as_str().to_owned();
-        run_blocking(move || match std::fs::read_dir(&client_dir) {
-            Ok(entries) => Ok(entries
-                .filter_map(|e| readable_entry(&client_dir, e))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| is_json_name(n))
-                .map(|leaf| format!("{client_name}/{leaf}"))
-                .collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn renew_lease(
-        &self,
-        job_id: &JobId,
-        client_id: &ClientId,
-        new_expiry: DateTime<Utc>,
-    ) -> anyhow::Result<RenewLeaseResult> {
-        let leased_dir = self.leased_dir.clone();
-        let job_id = job_id.clone();
-        let client_id = client_id.clone();
-        run_blocking(move || {
-            let job_prefix = format!("{}.", job_id);
-
-            // Renewal needs the lease to exist, not to be unexpired: only the
-            // recycler ends a lease, atomically with this rename. Do not add an
-            // expiry check; it would race the recycler.
-            let own_dir = leased_dir.join(client_id.as_str());
-            let own_leaf = match std::fs::read_dir(&own_dir) {
-                Ok(entries) => entries
-                    .filter_map(|e| readable_entry(&own_dir, e))
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| n.starts_with(&job_prefix))
-                    .find_map(|n| {
-                        parse_leased_key(&format!("{client_id}/{n}"))
-                            .ok()
-                            .map(|lease| (n, lease.expires_at))
-                    }),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e.into()),
-            };
-
-            if let Some((leaf, expires_at)) = own_leaf {
-                let src = own_dir.join(&leaf);
-                let dst = leased_dir.join(leased_key(&job_id, expires_at, &client_id, new_expiry));
-                match std::fs::rename(&src, &dst) {
-                    Ok(()) => return Ok(RenewLeaseResult::Renewed(expires_at)),
-                    // Lost a race with a recycle; fall through to the check below.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            // No lease of ours. Finding the job in another partition is
-            // conclusive (WrongClient, 409); not finding it is only conclusive
-            // if every partition was read. So only `NotFound` reads as "not
-            // here"; any other error propagates rather than fake a 404. Not a
-            // plain `.any()` over `.flatten()`: that swallows the errors.
-            let wrong_client = std::fs::read_dir(&leased_dir)?
-                .filter_map(|e| readable_entry(&leased_dir, e))
-                .filter(|entry| entry_is(entry, std::fs::FileType::is_dir))
-                // Our own partition was checked above.
-                .filter(|entry| entry.file_name().to_string_lossy() != client_id.as_str())
-                .try_fold(false, |found, entry| -> anyhow::Result<bool> {
-                    // Already found a holder: skip the remaining reads.
-                    if found {
-                        return Ok(true);
-                    }
-                    let partition = entry.path();
-                    let held = match std::fs::read_dir(&partition) {
-                        Ok(leaves) => leaves
-                            .filter_map(|e| readable_entry(&partition, e))
-                            .filter(|e| entry_is(e, std::fs::FileType::is_file))
-                            .any(|e| e.file_name().to_string_lossy().starts_with(&job_prefix)),
-                        // Partition vanished → that client holds nothing.
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                        Err(e) => return Err(e.into()),
-                    };
-                    Ok(held)
-                })?;
-
-            Ok(if wrong_client {
-                RenewLeaseResult::WrongClient
-            } else {
-                RenewLeaseResult::NotFound
-            })
-        })
-        .await
-    }
-
-    async fn delete_lease(
-        &self,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-        client_id: &ClientId,
-        expiry: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        remove_file_idempotent(
-            self.leased_dir
-                .join(leased_key(job_id, expires_at, client_id, expiry)),
-        )
-        .await
-    }
-
-    async fn claim_job(
-        &self,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-        client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
-    ) -> anyhow::Result<ClaimResult> {
-        let job_dir = self.avail_job_dir(job_id);
-        let src = self.avail_dir.join(avail_filename(job_id, expires_at));
-        let dst = self
-            .leased_dir
-            .join(leased_key(job_id, expires_at, client_id, lease_expiry));
-        run_blocking(move || {
-            // Ensure the client partition exists before renaming into it. Create
-            // it first so a missing dir doesn't masquerade as a lost claim race.
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => {
-                    let body: serde_json::Value =
-                        serde_json::from_str(&std::fs::read_to_string(&dst)?)?;
-                    drop_empty_dir(&job_dir);
-                    Ok(ClaimResult::Claimed(body))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaimResult::Gone),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await
-    }
-
-    async fn recycle_lease(
-        &self,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-        client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
-    ) -> anyhow::Result<RecycleResult> {
-        let src = self
-            .leased_dir
-            .join(leased_key(job_id, expires_at, client_id, lease_expiry));
-        let dst = self.avail_dir.join(avail_filename(job_id, expires_at));
-        let job_dir = self.avail_job_dir(job_id);
-        run_blocking(move || {
-            // `rename` reports a missing destination dir like a missing source,
-            // so a lost `avail/` would read as `Gone` and strand every lease.
-            std::fs::create_dir_all(&job_dir)?;
-            // A missing source is `Gone`: the lease vanishes when the holder's
-            // terminal submission (or another recycler) beats us to it.
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => Ok(RecycleResult::Recycled),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RecycleResult::Gone),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await
-    }
-
-    async fn write_denied(
-        &self,
-        job_id: &JobId,
-        client_id: &ClientId,
-        record: &DenialRecord,
-    ) -> anyhow::Result<()> {
-        let dir = self.denied_dir.clone();
-        let path = self.denied_path(job_id, client_id);
-        let body = record.to_bytes()?;
-        // A concurrent `get_denied` reads the whole record or no marker.
-        // `list_all_denied` skips the `.tmp-` staging name.
-        run_blocking(move || {
-            storage::replace_atomically(&dir, &path, |tmp| std::fs::write(tmp, body))
-        })
-        .await
-    }
-
-    async fn get_denied(
-        &self,
-        job_id: &JobId,
-        client_id: &ClientId,
-    ) -> anyhow::Result<Option<DenialRecord>> {
-        let path = self.denied_path(job_id, client_id);
-        run_blocking(move || match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(DenialRecord::from_bytes(&bytes)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn is_denied(&self, job_id: &JobId, client_id: &ClientId) -> anyhow::Result<bool> {
-        let path = self.denied_path(job_id, client_id);
-        // `try_exists` rather than `exists`: a permission or IO failure must
-        // propagate, not read as "not denied".
-        run_blocking(move || Ok(path.try_exists()?)).await
-    }
-
-    async fn delete_denied_for_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        let denied_dir = self.denied_dir.clone();
-        let prefix = denied_job_prefix(job_id);
-        run_blocking(move || {
-            for entry in std::fs::read_dir(&denied_dir)? {
-                let entry = entry?;
-                if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_denied(&self, job_id: &JobId, client_id: &ClientId) -> anyhow::Result<()> {
-        remove_file_idempotent(self.denied_path(job_id, client_id)).await
-    }
-
-    async fn list_all_denied(&self) -> anyhow::Result<Vec<(JobId, ClientId)>> {
-        let denied_dir = self.denied_dir.clone();
-        run_blocking(move || {
-            let entries = match std::fs::read_dir(&denied_dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-                Err(e) => return Err(e.into()),
-            };
-            // Malformed markers are logged and skipped: harmless un-GC'd, as
-            // the sweep only deletes. A `.tmp-` name is a `write_denied` in
-            // progress.
-            let markers = entries
-                .filter_map(|e| readable_entry(&denied_dir, e))
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| !name.starts_with(".tmp-"))
-                .filter_map(|name| {
-                    parse_denied_marker(&name)
-                        .inspect_err(|e| {
-                            tracing::warn!(marker = %name, error = %e, "skipping malformed denied marker");
-                        })
-                        .ok()
-                })
-                .collect();
-            Ok(markers)
-        })
-        .await
-    }
-
-    async fn list_eligible_for_client(
-        &self,
-        client_id: &ClientId,
-    ) -> anyhow::Result<Vec<(JobId, ExpiresAt)>> {
-        let client_dir = self.eligible_clients_dir.join(client_id.as_str());
-        run_blocking(move || match std::fs::read_dir(&client_dir) {
-            Ok(entries) => entries
-                .map(|e| parse_eligible_filename(e?.file_name().to_string_lossy().as_ref()))
-                .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn write_eligible(
-        &self,
-        client_id: &ClientId,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-    ) -> anyhow::Result<()> {
-        let client_dir = self.eligible_clients_dir.join(client_id.as_str());
-        let path = client_dir.join(eligible_filename(job_id, expires_at));
-        run_blocking(move || {
-            std::fs::create_dir_all(&client_dir)?;
-            Ok(std::fs::write(&path, b"")?)
-        })
-        .await
-    }
-
-    async fn delete_eligible_for_client(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        let client_dir = self.eligible_clients_dir.join(client_id.as_str());
-        run_blocking(move || match std::fs::remove_dir_all(&client_dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn delete_eligible(
-        &self,
-        client_id: &ClientId,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-    ) -> anyhow::Result<()> {
-        remove_file_idempotent(
-            self.eligible_clients_dir
-                .join(client_id.as_str())
-                .join(eligible_filename(job_id, expires_at)),
-        )
-        .await
-    }
-
-    async fn list_all_eligible(&self) -> anyhow::Result<Vec<(ClientId, JobId, ExpiresAt)>> {
-        let eligible_clients_dir = self.eligible_clients_dir.clone();
-        run_blocking(move || {
-            let client_entries = match std::fs::read_dir(&eligible_clients_dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-                Err(e) => return Err(e.into()),
-            };
-            // Tolerates concurrent mutation (`clients delete` mid-sweep).
-            // Malformed names are logged and skipped: the sweep only deletes.
-            let mut result = Vec::new();
-            for client_entry in
-                client_entries.filter_map(|e| readable_entry(&eligible_clients_dir, e))
-            {
-                if !entry_is(&client_entry, std::fs::FileType::is_dir) {
-                    continue;
-                }
-                let dir_name = client_entry.file_name().to_string_lossy().into_owned();
-                let client_id = match id_from_key(dir_name.as_str(), ClientId::try_new) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!(partition = %dir_name, error = %e, "skipping eligible partition with invalid client_id");
-                        continue;
-                    }
-                };
-                let client_dir = client_entry.path();
-                let job_entries = match std::fs::read_dir(&client_dir) {
-                    Ok(entries) => entries,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                for job_entry in job_entries.filter_map(|e| readable_entry(&client_dir, e)) {
-                    let name = job_entry.file_name().to_string_lossy().into_owned();
-                    match parse_eligible_filename(&name) {
-                        Ok((job_id, expires_at)) => {
-                            result.push((client_id.clone(), job_id, expires_at))
-                        }
-                        Err(e) => {
-                            tracing::warn!(marker = %name, client_id = %client_id, error = %e, "skipping malformed eligible marker")
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        })
-        .await
-    }
-
-    async fn write_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        let path =
-            self.pending_reindex_dir
-                .join(pipette_core::todo_filename::pending_reindex_filename(
-                    client_id,
-                ));
-        run_blocking(move || Ok(std::fs::write(&path, b"")?)).await
-    }
-
-    async fn list_pending_reindex(&self) -> anyhow::Result<Vec<(ClientId, String)>> {
-        let pending_reindex_dir = self.pending_reindex_dir.clone();
-        run_blocking(move || {
-            // Read errors propagate (the gate must not lose a flag); an
-            // unparseable name is cruft, warned and skipped.
-            std::fs::read_dir(&pending_reindex_dir)?
-                .map(|e| anyhow::Ok(e?.file_name().to_string_lossy().into_owned()))
-                .filter_map(|r| {
-                    r.map(
-                        |name| match pipette_core::todo_filename::parse_pending_reindex_filename(
-                            &name,
-                        ) {
-                            Ok(client_id) => Some((client_id, name)),
-                            Err(_) => {
-                                tracing::warn!(
-                                    key = %name,
-                                    "skipping unparseable pending-reindex flag"
-                                );
-                                None
-                            }
-                        },
-                    )
-                    .transpose()
-                })
-                .collect()
-        })
-        .await
-    }
-
-    async fn delete_pending_reindex(&self, key: &str) -> anyhow::Result<()> {
-        remove_file_idempotent(self.pending_reindex_dir.join(key)).await
-    }
-
-    async fn has_pending_reindex(&self, client_id: &ClientId) -> anyhow::Result<bool> {
-        let pending_reindex_dir = self.pending_reindex_dir.clone();
-        let client_id = client_id.clone();
-        // Entry read errors propagate, per the trait contract — the gate must
-        // not read "couldn't check" as "not flagged".
-        run_blocking(move || {
-            std::fs::read_dir(&pending_reindex_dir)?.try_fold(false, |found, e| {
-                let name = e?.file_name().to_string_lossy().into_owned();
-                anyhow::Ok(
-                    found
-                        || matches!(
-                            pipette_core::todo_filename::parse_pending_reindex_filename(&name),
-                            Ok(flagged) if flagged == client_id
-                        ),
-                )
-            })
-        })
-        .await
-    }
-
-    async fn write_lost_lease(
-        &self,
-        job_id: &JobId,
-        client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        let job_dir = self.lost_dir.join(job_id.as_str());
-        let path = job_dir.join(lost_lease_filename(client_id, lease_expiry));
-        run_blocking(move || {
-            std::fs::create_dir_all(&job_dir)?;
-            Ok(std::fs::write(&path, b"")?)
-        })
-        .await
-    }
-
-    async fn list_lost_leases(
-        &self,
-        job_id: &JobId,
-    ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
-        let job_dir = self.lost_dir.join(job_id.as_str());
-        run_blocking(move || {
-            let Some(entries) = vanished_is_absent(std::fs::read_dir(&job_dir))? else {
-                return Ok(Vec::new());
-            };
-            let mut losses = entries
-                .map(|e| anyhow::Ok(e?.file_name().to_string_lossy().into_owned()))
-                .filter_map(|r| {
-                    r.map(|name| {
-                        parse_lost_lease_filename(&name)
-                            .inspect_err(|e| {
-                                tracing::warn!(key = %name, error = %e, "skipping unparseable lost-lease marker");
-                            })
-                            .ok()
-                    })
-                    .transpose()
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            losses.sort_by_key(|(_, expiry)| *expiry);
-            Ok(losses)
-        })
-        .await
-    }
-
-    async fn delete_lost_leases_for_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        let job_dir = self.lost_dir.join(job_id.as_str());
-        run_blocking(move || match std::fs::remove_dir_all(&job_dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        })
-        .await
-    }
-
-    async fn list_lost_lease_jobs(&self) -> anyhow::Result<Vec<JobId>> {
-        let lost_dir = self.lost_dir.clone();
-        run_blocking(move || {
-            let Some(entries) = vanished_is_absent(std::fs::read_dir(&lost_dir))? else {
-                return Ok(Vec::new());
-            };
-            entries
-                .map(|e| anyhow::Ok(e?.file_name().to_string_lossy().into_owned()))
-                .filter_map(|r| {
-                    r.map(|name| {
-                        JobId::try_new(&name)
-                            .inspect_err(|_| {
-                                tracing::warn!(key = %name, "skipping unparseable lost/ entry");
-                            })
-                            .ok()
-                    })
-                    .transpose()
-                })
-                .collect()
-        })
-        .await
-    }
-
-    async fn write_tmp(&self, job_id: &JobId, body: &serde_json::Value) -> anyhow::Result<()> {
-        let path = self.tmp_dir.join(tmp_filename(job_id));
-        let bytes = serde_json::to_vec(body)?;
-        run_blocking(move || Ok(std::fs::write(&path, bytes)?)).await
-    }
-
-    async fn promote_avail(&self, job_id: &JobId, expires_at: ExpiresAt) -> anyhow::Result<()> {
-        // Same-filesystem `rename` is atomic: the job appears in `avail/` whole
-        // or not at all. `avail/` is created first, so `NotFound` names the source.
-        let src = self.tmp_dir.join(tmp_filename(job_id));
-        let dst = self.avail_dir.join(avail_filename(job_id, expires_at));
-        let job_dir = self.avail_job_dir(job_id);
-        run_blocking(move || {
-            std::fs::create_dir_all(&job_dir)?;
-            std::fs::rename(&src, &dst).map_err(|e| {
-                anyhow::anyhow!(
-                    "promote_avail rename {} -> {}: {e}",
-                    src.display(),
-                    dst.display()
-                )
-            })
-        })
-        .await
-    }
-
-    async fn list_stale_tmp(&self, age: Duration) -> anyhow::Result<Vec<String>> {
-        let tmp_dir = self.tmp_dir.clone();
-        run_blocking(move || {
-            let now = std::time::SystemTime::now();
-            let mut stale = Vec::new();
-            for entry in std::fs::read_dir(&tmp_dir)? {
-                let entry = entry?;
-                let modified = entry.metadata()?.modified()?;
-                if now.duration_since(modified).unwrap_or_default() >= age {
-                    stale.push(entry.file_name().to_string_lossy().into_owned());
-                }
-            }
-            Ok(stale)
-        })
-        .await
-    }
-
-    async fn delete_tmp_object(&self, key: &str) -> anyhow::Result<()> {
-        remove_file_idempotent(self.tmp_dir.join(key)).await
-    }
-
-    async fn read_backlog(&self) -> anyhow::Result<Option<BacklogSnapshot>> {
-        let path = self.backlog_path.clone();
-        run_blocking(move || {
-            Ok(vanished_is_absent(std::fs::read(&path))?
-                .and_then(|bytes| pipette_store::parse_snapshot(&bytes, "todo/.backlog")))
-        })
-        .await
-    }
-
-    async fn write_backlog(&self, snapshot: &BacklogSnapshot) -> anyhow::Result<()> {
-        replace_snapshot(self.backlog_path.clone(), serde_json::to_vec(snapshot)?).await
-    }
-
-    async fn read_campaign_backlog(&self) -> anyhow::Result<Option<CampaignBacklogSnapshot>> {
-        let path = self.campaign_backlog_path.clone();
-        run_blocking(move || {
-            Ok(vanished_is_absent(std::fs::read(&path))?
-                .and_then(|bytes| pipette_store::parse_snapshot(&bytes, "todo/.backlog-campaigns")))
-        })
-        .await
-    }
-
-    async fn write_campaign_backlog(
-        &self,
-        snapshot: &CampaignBacklogSnapshot,
-    ) -> anyhow::Result<()> {
-        replace_snapshot(
-            self.campaign_backlog_path.clone(),
-            serde_json::to_vec(snapshot)?,
-        )
-        .await
-    }
-
-    async fn read_gc_candidates(&self) -> anyhow::Result<HashSet<String>> {
-        read_key_set(self.gc_candidates_path.clone(), "gc-candidates").await
-    }
-
-    async fn write_gc_candidates(&self, candidates: &HashSet<String>) -> anyhow::Result<()> {
-        write_key_set(self.gc_candidates_path.clone(), candidates).await
-    }
-
-    async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        let path = self.liveness_path(client_id);
-        // Truncating a file that is already empty need not move its `mtime`, so
-        // the stamp sets the time itself.
-        run_blocking(move || {
-            Ok(std::fs::File::create(&path)?.set_modified(std::time::SystemTime::now())?)
-        })
-        .await
-    }
-
-    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>> {
-        let path = self.liveness_path(client_id);
-        run_blocking(move || {
-            Ok(
-                vanished_is_absent(std::fs::metadata(&path).and_then(|m| m.modified()))?
-                    .map(DateTime::<Utc>::from),
-            )
-        })
-        .await
-    }
-
-    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
-        let dir = self.liveness_dir.clone();
-        run_blocking(move || {
-            let Some(entries) = vanished_is_absent(std::fs::read_dir(&dir))? else {
-                return Ok(Vec::new());
-            };
-            // An unreadable marker is logged and skipped; the orphan sweep keeps
-            // its device until a later run.
-            Ok(entries
-                .filter_map(|entry| readable_entry(&dir, entry))
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let Ok(client_id) = id_from_key(&name, ClientId::try_new) else {
-                        tracing::warn!(key = %name, "skipping unparseable liveness marker");
-                        return None;
-                    };
-                    match entry.metadata().and_then(|m| m.modified()) {
-                        Ok(modified) => Some((client_id, modified.into())),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            tracing::warn!(
-                                key = %name,
-                                error = %e,
-                                "skipping liveness marker with an unreadable modification time"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect())
-        })
-        .await
-    }
-
-    async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
-        remove_file_idempotent(self.liveness_path(client_id)).await
-    }
-
-    /// Always atomic: same-filesystem `rename` is atomic on POSIX.
-    async fn validate_backend(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2842,8 +1871,8 @@ mod tests {
         .await
     }
 
-    /// An abandoned `.tmp-` file, a stray file and a non-org directory are
-    /// passed over.
+    /// The listing skips abandoned `.tmp-` files, stray files and directories
+    /// that do not identify an organization.
     #[tokio::test]
     async fn test_localfs_org_benchmark_ids_skip_what_is_not_an_entry() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3890,79 +2919,7 @@ parameter_prefill_tokens = 256"#,
         Ok(())
     }
 
-    // ── TodoStore ───────────────────────────────────────────────────────────
-
-    use std::time::Duration;
-
-    use chrono::DateTime;
-
-    use pipette_core::todo_filename::{avail_filename, leased_key};
     use pipette_plan_types::ExpiresAt;
-    use pipette_store::{ClaimResult, RecycleResult, RenewLeaseResult, TodoStore};
-
-    /// Creates the `{client_id}/` partition dir first, as the layout requires.
-    fn plant_leased(
-        leased_dir: &std::path::Path,
-        job: &JobId,
-        expires_at: ExpiresAt,
-        client: &ClientId,
-        expiry: DateTime<Utc>,
-        body: &[u8],
-    ) -> anyhow::Result<()> {
-        let path = leased_dir.join(leased_key(job, expires_at, client, expiry));
-        std::fs::create_dir_all(
-            path.parent()
-                .context("the fixture path has a parent directoryath")?,
-        )?;
-        std::fs::write(path, body)?;
-        Ok(())
-    }
-
-    /// A store over a fresh tempdir with the `todo/` layout that
-    /// `build_local_fs_stores` creates, plus the `todo/` root for fixtures.
-    fn todo_store() -> anyhow::Result<(LocalFsTodoStore, tempfile::TempDir, PathBuf)> {
-        let dir = tempfile::tempdir()?;
-        let todo_dir = dir.path().join("todo");
-        [
-            "avail",
-            "leased",
-            "denied",
-            "eligible/clients",
-            "pending-reindex",
-            "lost",
-            "tmp",
-            "liveness",
-        ]
-        .into_iter()
-        .try_for_each(|sub| std::fs::create_dir_all(todo_dir.join(sub)))?;
-        let store = LocalFsTodoStore::new(todo_dir.clone());
-        Ok((store, dir, todo_dir))
-    }
-
-    fn dt(s: &str) -> anyhow::Result<DateTime<Utc>> {
-        Ok(s.parse::<DateTime<Utc>>()?)
-    }
-
-    /// Write a body straight into `avail/{job_id}/{expires_at}.json`.
-    fn seed_avail(
-        todo_dir: &Path,
-        job_id: &JobId,
-        expires_at: ExpiresAt,
-        body: &[u8],
-    ) -> anyhow::Result<()> {
-        let path = todo_dir
-            .join("avail")
-            .join(avail_filename(job_id, expires_at));
-        std::fs::create_dir_all(path.parent().context("an avail key has a job directory")?)?;
-        Ok(std::fs::write(path, body)?)
-    }
-
-    #[tokio::test]
-    async fn test_localfs_todo_store_meets_the_shared_contract() -> anyhow::Result<()> {
-        let (store, _dir, _todo_dir) = todo_store()?;
-        pipette_store_testkit::assert_todo_store_contract(&store, dt("2026-06-15T08:30:00.250Z")?)
-            .await
-    }
 
     /// The content-key index is held to the shared contract, so the digest-based
     /// version check answers the same questions S3's `If-Match` does.
@@ -3971,6 +2928,15 @@ parameter_prefill_tokens = 256"#,
         let dir = tempfile::tempdir()?;
         pipette_store_testkit::assert_content_key_roundtrip(&LocalFsPlanStore::new(dir.path()))
             .await
+    }
+
+    #[tokio::test]
+    async fn object_plans_reject_queue_operations() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        pipette_store_testkit::assert_object_plans_reject_queue_operations(&LocalFsPlanStore::new(
+            dir.path(),
+        ))
+        .await
     }
 
     #[tokio::test]
@@ -4492,308 +3458,6 @@ parameter_prefill_tokens = 256"#,
         Ok(())
     }
 
-    /// The claim also removes the emptied job directory, as Express reclaims
-    /// an empty prefix.
-    #[tokio::test]
-    async fn test_localfs_todo_claim_drops_the_emptied_job_directory() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("job1");
-        let client = ClientId::try_new("client1")?;
-        seed_avail(&todo_dir, &job, ExpiresAt::Never, br#"{"job_id":"job1"}"#)?;
-
-        assert!(matches!(
-            store
-                .claim_job(&job, ExpiresAt::Never, &client, dt("2026-06-15T08:30:00Z")?)
-                .await?,
-            ClaimResult::Claimed(_)
-        ));
-        assert!(!todo_dir.join("avail").join(job.as_str()).exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_localfs_delete_avail_by_job_removes_every_expiry_for_job() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("job1");
-        let other = JobId::new_unchecked("job2");
-        let avail = todo_dir.join("avail");
-
-        // Two expiries: teardown knows the job_id but not the expiry on disk.
-        for exp in [ExpiresAt::Never, ExpiresAt::At(dt("2026-06-15T08:30:00Z")?)] {
-            seed_avail(&todo_dir, &job, exp, b"{}")?;
-        }
-        // A different job must survive the by-job delete.
-        seed_avail(&todo_dir, &other, ExpiresAt::Never, b"{}")?;
-
-        store.delete_avail_by_job(&job).await?;
-
-        assert_eq!(
-            store.list_avail().await?,
-            vec![avail_filename(&other, ExpiresAt::Never)],
-            "only the targeted job's entries (all expiries) are removed"
-        );
-        assert!(
-            !avail.join(job.as_str()).exists(),
-            "the emptied job directory goes with its last entry"
-        );
-
-        // Idempotent: a second call with nothing matching is a no-op.
-        store.delete_avail_by_job(&job).await?;
-        Ok(())
-    }
-
-    /// A leaf with the job prefix that does not parse is cruft: renewal reports
-    /// `NotFound` and leaves it. The scan-past case is pinned by the S3 store's
-    /// `renew_skips_unparseable_key`, where the listing order is fixed.
-    #[tokio::test]
-    async fn test_localfs_todo_renew_lease_skips_unparseable_leaf() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let client = ClientId::try_new("client1")?;
-        let old = dt("2026-06-15T08:00:00Z")?;
-        let new = dt("2026-06-15T08:05:00Z")?;
-        let leased = todo_dir.join("leased");
-        let own_dir = leased.join(client.as_str());
-        std::fs::create_dir_all(&own_dir)?;
-
-        // Cruft alone: a two-field leaf is the old key shape.
-        let job = JobId::new_unchecked("jobcruft");
-        let cruft = own_dir.join(format!("{job}.20260615T080000Z.json"));
-        std::fs::write(&cruft, b"{}")?;
-        assert_eq!(
-            store.renew_lease(&job, &client, new).await?,
-            RenewLeaseResult::NotFound
-        );
-        assert!(cruft.exists(), "cruft must be left in place, not renamed");
-
-        // Cruft plus a real lease: the scan renews the one that parses.
-        plant_leased(&leased, &job, ExpiresAt::Never, &client, old, b"{}")?;
-        assert_eq!(
-            store.renew_lease(&job, &client, new).await?,
-            RenewLeaseResult::Renewed(ExpiresAt::Never)
-        );
-        assert!(
-            leased
-                .join(leased_key(&job, ExpiresAt::Never, &client, new))
-                .exists()
-        );
-        assert!(cruft.exists(), "cruft must survive a successful renewal");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_localfs_list_leased_tolerates_stray_entries() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let leased = todo_dir.join("leased");
-        let client = ClientId::try_new("client1")?;
-        let job = JobId::new_unchecked("job1");
-        let lease = dt("2026-06-15T08:30:00Z")?;
-        plant_leased(&leased, &job, ExpiresAt::Never, &client, lease, b"{}")?;
-
-        // A stray file at the partition root and an empty partition are
-        // skipped, as when a partition is created or emptied concurrently.
-        std::fs::write(leased.join(".DS_Store"), b"junk")?;
-        std::fs::create_dir_all(leased.join("emptyclient"))?;
-
-        assert_eq!(
-            store.list_leased().await?,
-            vec![leased_key(&job, ExpiresAt::Never, &client, lease)]
-        );
-        Ok(())
-    }
-
-    /// The recycle recreates a missing `avail/` directory. It does not report
-    /// the lease as `Gone`.
-    #[tokio::test]
-    async fn test_localfs_todo_recycle_lease_recreates_a_missing_avail_dir() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("jobx");
-        let client = ClientId::try_new("client1")?;
-        let lease = dt("2026-06-20T10:00:00Z")?;
-        plant_leased(
-            &todo_dir.join("leased"),
-            &job,
-            ExpiresAt::Never,
-            &client,
-            lease,
-            br#"{"job_id":"jobx"}"#,
-        )?;
-        std::fs::remove_dir_all(todo_dir.join("avail"))?;
-
-        assert_eq!(
-            store
-                .recycle_lease(&job, ExpiresAt::Never, &client, lease)
-                .await?,
-            RecycleResult::Recycled
-        );
-        assert_eq!(
-            store.list_avail().await?,
-            vec![avail_filename(&job, ExpiresAt::Never)]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_localfs_todo_list_avail_skips_a_non_json_sibling() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("a");
-        seed_avail(&todo_dir, &job, ExpiresAt::Never, b"{}")?;
-        std::fs::write(todo_dir.join("avail").join("notjson.txt"), b"")?;
-
-        assert_eq!(
-            store.list_avail().await?,
-            vec![avail_filename(&job, ExpiresAt::Never)]
-        );
-        Ok(())
-    }
-
-    /// An emptied job directory never accumulates in the `avail/` walk.
-    #[tokio::test]
-    async fn test_localfs_delete_avail_drops_the_emptied_job_directory() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("job1");
-        let first = ExpiresAt::Never;
-        let second = ExpiresAt::At(dt("2026-06-15T08:30:00Z")?);
-        let job_dir = todo_dir.join("avail").join(job.as_str());
-        seed_avail(&todo_dir, &job, first, b"{}")?;
-        seed_avail(&todo_dir, &job, second, b"{}")?;
-
-        // The directory still holds the second entry, so it stays.
-        store.delete_avail(&job, first).await?;
-        assert!(
-            job_dir.exists(),
-            "a directory that still holds an entry stays"
-        );
-
-        store.delete_avail(&job, second).await?;
-        assert!(
-            !job_dir.exists(),
-            "the emptied job directory goes with its last entry"
-        );
-        Ok(())
-    }
-
-    /// A second stamp moves the modification time forward. The listing skips
-    /// foreign files. A todo directory without `liveness/` lists nothing.
-    #[tokio::test]
-    async fn test_localfs_todo_liveness_follows_the_marker_mtime() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let client = ClientId::try_new("client1")?;
-        let before = Utc::now() - chrono::TimeDelta::seconds(1);
-        store.stamp_liveness(&client).await?;
-
-        // Backdate the marker, so that the second stamp must move the time.
-        let marker = todo_dir.join("liveness").join("client1");
-        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&marker)?
-            .set_modified(hour_ago)?;
-        assert!(store.read_liveness(&client).await?.context("backdated")? < before);
-        store.stamp_liveness(&client).await?;
-        assert!(store.read_liveness(&client).await?.context("restamped")? >= before);
-
-        std::fs::write(todo_dir.join("liveness").join(".DS_Store"), b"")?;
-        assert_eq!(store.list_liveness().await?.len(), 1);
-
-        std::fs::remove_dir_all(todo_dir.join("liveness"))?;
-        assert!(store.list_liveness().await?.is_empty());
-        Ok(())
-    }
-
-    /// An empty marker body reads as the default record. A `write_denied`
-    /// staging file is not a marker.
-    #[tokio::test]
-    async fn test_localfs_todo_denied_reads_an_empty_body_and_skips_staging() -> anyhow::Result<()>
-    {
-        let (store, _dir, _todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("jobd");
-        let client = ClientId::try_new("ca")?;
-        let record = DenialRecord::new(
-            Utc::now(),
-            "runtime OOM",
-            pipette_plan_types::FailureCode::OutOfMemory,
-            Some("1.4.2"),
-            None,
-        );
-        store.write_denied(&job, &client, &record).await?;
-
-        std::fs::write(store.denied_path(&job, &client), b"")?;
-        assert_eq!(
-            store.get_denied(&job, &client).await?,
-            Some(DenialRecord::default())
-        );
-
-        std::fs::write(store.denied_dir.join(".tmp-staged"), b"{")?;
-        assert_eq!(store.list_all_denied().await?, vec![(job, client)]);
-        Ok(())
-    }
-
-    /// A denial read as absent hands the client back a job it reported failed,
-    /// so any stat failure but `NotFound` must error (`try_exists`).
-    #[tokio::test]
-    async fn test_localfs_is_denied_propagates_a_non_notfound_error() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let denied_dir = todo_dir.join("denied");
-        std::fs::remove_dir(&denied_dir)?;
-        std::fs::write(&denied_dir, b"")?;
-
-        let err = store
-            .is_denied(&JobId::new_unchecked("jobd"), &ClientId::try_new("ca")?)
-            .await;
-        assert!(
-            err.is_err(),
-            "an unreadable denied/ must not read as 'not denied'"
-        );
-
-        Ok(())
-    }
-
-    /// The listing skips foreign names in `lost/` and in a job's directory.
-    #[tokio::test]
-    async fn test_localfs_todo_lost_leases_skip_cruft() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        let job = JobId::new_unchecked("job-1");
-        let client = ClientId::try_new("ev1_a")?;
-        let lease = dt("2026-10-03T04:50:00Z")?;
-        store.write_lost_lease(&job, &client, lease).await?;
-        std::fs::write(todo_dir.join("lost/job-1/.DS_Store"), b"")?;
-        std::fs::write(todo_dir.join("lost/.DS_Store"), b"")?;
-
-        assert_eq!(store.list_lost_leases(&job).await?, vec![(client, lease)]);
-        assert_eq!(store.list_lost_lease_jobs().await?, vec![job]);
-        Ok(())
-    }
-
-    /// The incremental index lives in the database queue only.
-    #[tokio::test]
-    async fn test_localfs_todo_index_needs_the_database() -> anyhow::Result<()> {
-        let (store, _dir, _) = todo_store()?;
-        let Err(error) = store.jobs_needing_reindex(&[]).await else {
-            anyhow::bail!("local_fs listed jobs that need a reindex");
-        };
-        assert!(
-            error
-                .downcast_ref::<pipette_store::QueueNeedsDatabaseError>()
-                .is_some(),
-            "{error:#}"
-        );
-        Ok(())
-    }
-
-    /// A corrupt state file reads as empty.
-    #[tokio::test]
-    async fn test_localfs_todo_corrupt_state_reads_as_empty() -> anyhow::Result<()> {
-        let (store, _dir, todo_dir) = todo_store()?;
-        [".gc-candidates", ".backlog", ".backlog-campaigns"]
-            .into_iter()
-            .try_for_each(|name| std::fs::write(todo_dir.join(name), b"not json"))?;
-
-        assert!(store.read_gc_candidates().await?.is_empty());
-        assert_eq!(store.read_backlog().await?, None);
-        assert_eq!(store.read_campaign_backlog().await?, None);
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_build_local_fs_stores_use_a_separate_auth_dir() -> anyhow::Result<()> {
         let data_dir = tempfile::tempdir()?;
@@ -4808,7 +3472,7 @@ parameter_prefill_tokens = 256"#,
             ),
             ..Config::default()
         };
-        let mut stores = build_local_fs_stores(&config)?;
+        let mut stores = build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
 
         let auth_storage =
             pipette_core::config::StorageConfig::local_fs(auth_dir.path().to_path_buf());

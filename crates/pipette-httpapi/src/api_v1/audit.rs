@@ -164,6 +164,8 @@ fn keep_only_org(event: &mut AuditEvent, org_id: &OrgId) {
         AuditAction::FirstClerkSignIn { .. }
         | AuditAction::CatalogRename { .. }
         | AuditAction::CatalogMerge { .. } => {}
+        // A group id, like a campaign target's, names no organization.
+        AuditAction::GroupPolicy { .. } => {}
     }
 }
 
@@ -231,7 +233,9 @@ async fn names(
                 AuditTarget::VaultResource { resource_id } => {
                     resources.insert(resource_id.clone());
                 }
-                AuditTarget::Plan { .. } | AuditTarget::Job { .. } => {}
+                AuditTarget::CampaignGroup { .. }
+                | AuditTarget::Plan { .. }
+                | AuditTarget::Job { .. } => {}
             }
         }
     }

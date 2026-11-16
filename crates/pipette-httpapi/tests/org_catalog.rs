@@ -54,7 +54,7 @@ fn a_corpus_pin(digest: &str) -> Value {
 async fn setup() -> anyhow::Result<(tempfile::TempDir, AppState, Organization)> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let acme = seed_org(&state, "acme").await?;
     Ok((dir, state, acme))
 }
@@ -383,7 +383,7 @@ async fn a_count_stored_before_the_bounds_is_unreadable_not_fatal() -> anyhow::R
         dir.path().join("benchmarks").join("eval_public_zero.toml"),
         ACME_EVAL_TOML.replace("4096", "0"),
     )?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let acme = seed_org(&state, "acme").await?;
     let signer = org_admin(&state, &acme).await?;
     assert_eq!(
@@ -1018,7 +1018,7 @@ license  = "Apache-2.0"
 "#
         ),
     )?;
-    let state = make_state(dir.path()).await?;
+    let state = make_object_state(dir.path()).await?;
     let public = unauthed_get(&state, "/benchmarks/vl_spec_decode_public_k8").await?;
     assert_eq!(public.status(), StatusCode::OK, "the public entry loads");
     let acme = seed_org(&state, "acme").await?;

@@ -1,0 +1,4 @@
+# Peak memory of one question over a long state, the latency entry's twin.
+benchmark_type        = "decision_max_memory"
+parameter_text_tokens = 3400
+parameter_questions   = 1

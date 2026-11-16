@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   COLUMNS, byJob, cellText, cellsLink, changeOf, columnsOf, listedText, deviceTypeNames, deviceTypes, drawnFilters, drawnLink, earlierRows, filtering, issuesOf, jobChoices, jobFilters, keeps, linesCsv,
-  columnNameOf, linesOf, modelNameOf, outcomeOf, runtimeNameOf, sortLines, sortOf, spreadOf, swapped, tierOf, toggled, SWAP_COLUMNS, type Line,
+  columnNameOf, linesOf, modelNameOf, outcomeOf, rerunOfText, rerunsOf, runtimeNameOf, sortLines, sortOf, spreadOf, swapped, tierOf, toggled, SWAP_COLUMNS, type Line,
 } from "../src/lib/jobs";
 import { bytesText } from "../src/lib/plans";
 import { canonical } from "../src/lib/report";
@@ -24,7 +24,8 @@ const PLANNED: PlanCell = {
 /** A result row: `metric` measured at `value`; `over` for the rest. */
 const row = (metric: string, value: number | null, over: Partial<ResultRow> = {}): ResultRow => ({
   job_id: "job", benchmark_id: PLANNED.benchmark, benchmark_type: "decode_throughput", metric, value,
-  value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null, model_descriptor: DESCRIPTOR,
+  value_stddev: null, unit: "tokens/sec", failed: false, failed_reason: null, failure_source: null, failure_code: null,
+  model_descriptor: DESCRIPTOR,
   model_params_total_millions: 1000, model_params_active_millions: 1000,
   runtime_descriptor: null, runtime_descriptor_sha256: null, model_descriptor_sha256: null, model_flags: null, runtime_flags: null, benchmark_flags: null, requested_model_flags: null,
   requested_runtime_flags: null, requested_benchmark_flags: null, model_vault_descriptor: null, eval_metadata: null,
@@ -244,6 +245,66 @@ describe("the cells' lines", () => {
   });
 });
 
+describe("a job's re-runs", () => {
+  /**
+   * A job's plan detail: the job it re-ran, then the jobs before that one, newest first, each named with its plan
+   * but those in `unread`.
+   */
+  const plan = (rerun_of: string | null, history: string[] = [], unread: string[] = []) => {
+    const parent = (job_id: string) => ({ job_id, plan_id: unread.includes(job_id) ? null : "plan-0" });
+    return { lapsed: null, rerun_of: rerun_of ? parent(rerun_of) : null, rerun_history: history.map(parent) };
+  };
+  const jobs = [
+    job("job-a", "finished", { plan: plan(null) }),
+    job("job-b", "finished", { plan: plan("job-b0") }),
+    job("job-c", "failed", { plan: plan("job-c1", ["job-c0"]) }),
+    job("job-d", "finished"),
+    job("job-e", "finished", { plan: plan("job-e1", ["job-e0"], ["job-e0"]) }),
+  ];
+  const lines = linesOf(jobs);
+
+  test("count the jobs the chain ran again, none where the read did not reach its first job", () => {
+    expect(jobs.map(rerunsOf)).toEqual([0, 1, 2, null, null]);
+  });
+
+  test("leave out a mark, which replaced a job without running it", () => {
+    const marked = row("decode", null, { failed: true, failure_source: "marked" });
+    const mark = job("job-f", "failed", { plan: plan("job-f0"), result: scored(marked) });
+    // A re-run of a marked cell: the mark between it and the first run is no re-run.
+    const after: JobResult = {
+      status: "scored", rows: [row("decode", 40)], rescored_from: null, recalculable: false,
+      earlier_runs: [{ job: { job_id: "job-g1", plan_id: "plan-0" }, rows: [marked] },
+                     { job: { job_id: "job-g0", plan_id: "plan-0" }, rows: [row("decode", 30)] }],
+    };
+    const rerun = job("job-g", "finished", { plan: plan("job-g1", ["job-g0"]), result: after });
+    // Until its rows are read, a mark counts as a re-run.
+    const unread = job("job-h", "failed", { plan: plan("job-h0") });
+    expect([mark, rerun, unread].map(rerunsOf)).toEqual([0, 1, 1]);
+  });
+
+  test("label a mark's parent as the job it failed in place of, by the job's own rows", () => {
+    const marked = row("decode", null, { failed: true, failure_source: "marked" });
+    const mark = job("job-f", "failed", { plan: plan("job-f0"), result: scored(marked) });
+    // A re-run of a marked cell ran its parent again, though that parent was a mark.
+    const after: JobResult = {
+      status: "scored", rows: [row("decode", 40)], rescored_from: null, recalculable: false,
+      earlier_runs: [{ job: { job_id: "job-g1", plan_id: "plan-0" }, rows: [marked] }],
+    };
+    const rerun = job("job-g", "finished", { plan: plan("job-g1", ["job-g0"]), result: after });
+    // Until its rows are read, a mark reads as a re-run.
+    const unread = job("job-h", "failed", { plan: plan("job-h0") });
+    expect([mark, rerun, unread].map(rerunOfText)).toEqual(["marked failed in place of", "re-run of", "re-run of"]);
+  });
+
+  test("are a column, a select by count and a filter", () => {
+    const reruns = COLUMNS.find((column) => column.key === "reruns")!;
+    expect(lines.map((line) => cellText(reruns, line, ctx))).toEqual(["0", "1", "2", "", ""]);
+    expect(jobChoices(lines, ctx, {}).reruns.map((c) => [c.value, c.count])).toEqual([["0", 1], ["1", 1], ["2", 1]]);
+    expect(lines.filter((line) => keeps(line, jobFilters(new URLSearchParams("reruns=1&reruns=2")), ctx))
+      .map((line) => line.job.job_id)).toEqual(["job-b", "job-c"]);
+  });
+});
+
 describe("the cells' sort", () => {
   const jobs = [
     job("job-b10", "finished", { result: scored(row("decode", 40), row("ttft", 120)) }),
@@ -442,7 +503,7 @@ describe("the columns and the CSV", () => {
     }),
     job("job-b", "failed", {
       result: scored(row("ttft", null, { failed: true, failure_source: "client", failed_reason: 'said "no", then quit',
-                                         unit: "ms" })),
+                                         failure_code: "out_of_memory", unit: "ms" })),
     }),
   ];
   const lines = linesOf(jobs);
@@ -469,7 +530,7 @@ describe("the columns and the CSV", () => {
     expect(keys.filter((key) => key.includes("swap"))).toEqual(["swap"]);
     expect(drawnColumns(columns, null).map((c) => c.key)).toEqual([
       "job", "state", "model_descriptor", "runtime_descriptor", "benchmark_type", "benchmark", "metric", "parameters",
-      "value", "unit", "spread", "issues", "failure", "failed_reason", "failure_source", "device", "device_type",
+      "value", "unit", "spread", "issues", "failure", "failed_reason", "failure_source", "failure_code", "device", "device_type",
       "device_name", "device.gpu_model", "device.gpu_vram_bytes", "device.battery_level", "device_time", "swap", "runtime_flags", "model_flags", "benchmark_flags",
       "row_requested_runtime_flags", "row_requested_model_flags", "row_requested_benchmark_flags", "row_runtime_flags",
       "row_model_flags", "row_benchmark_flags",
@@ -502,8 +563,9 @@ describe("the columns and the CSV", () => {
     const text = (key: string, line = lines[0]!) => cellText(COLUMNS.find((c) => c.key === key)!, line, ctx);
     expect([text("value"), text("unit"), text("stddev"), text("spread"), text("model")])
       .toEqual(["4,385.67", "tokens/sec", "±7.84 tokens/sec", "±0.2%", canonical(MODEL)]);
-    expect([text("value", lines[1]), text("unit", lines[1]), text("failure", lines[1])])
-      .toEqual(["", "secs", "failed: reported by its client"]);
+    expect([text("value", lines[1]), text("unit", lines[1]), text("failure", lines[1]), text("failure_code", lines[1])])
+      .toEqual(["", "secs", "failed: reported by its client", "out_of_memory"]);
+    expect(text("failure_code")).toBe("");
   });
 
   test("count the jobs listed, of all where filters narrow them, and their rows", () => {

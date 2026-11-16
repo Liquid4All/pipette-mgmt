@@ -30,6 +30,12 @@ take, axis keys included
 scoring service that graded it. Every other row, and a row whose scoring
 failed, carries `null` in that field.
 
+A failed row's `failure_code` is the kind of failure its client reported,
+`unspecified` where it named none; a failure no client sent carries the code
+[its source](../plans.md#failures-no-client-sent) gives it. It is `null` on a
+measured row, on a row scored before the warehouse recorded it, and on one
+whose code this build does not know.
+
 `runtime_descriptor_sha256` is the digest of `runtime_descriptor` that the
 scorer stored. The digest leaves out a vault `custom_label`
 ([storage.md](../../storage.md#model_descriptor--runtime_descriptor)). It is
@@ -50,11 +56,15 @@ name.
 **The withheld tier.** `client_id`, `device_name`, `client_version`,
 `client_extras` and `failed_reason` are `null` and `device` is empty: free text
 can list client ids, as an all-denied or `lease_lost` failure does. Of
-`failure_source`, only `expired` and `lease_lost`, which describe the job
-itself, are kept. Any other reads `null`, `client` included, so that a `null`
+`failure_source`, only `expired`, `lease_lost`, `marked` and
+`smaller_run_failed`, which describe the job itself, are kept. Any other
+reads `null`, `client` included, so that a `null`
 does not single out an `all_clients_denied` or `unmatchable` failure, which
 tells a closed roster or a bad clause of the document that tier withholds
-([fleet disclosure](../devices.md#fleet-disclosure)).
+([fleet disclosure](../devices.md#fleet-disclosure)). `failure_code` is served
+as recorded at every tier, since it names no machine. It does tell an
+`all_clients_denied` failure, which records the code most of its clients'
+reports named, from an `unmatchable` one, which always records `unspecified`.
 
 "Unknown" is the **unknown wrapper** `{"type": "unknown", "value": ...}`, for
 a stored value that does not decode (not JSON, or a shape or variant this build

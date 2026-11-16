@@ -20,8 +20,8 @@ const CAMPAIGNS: Keyspace = Keyspace {
     report_prefix: "campaigns/",
 };
 
-/// Every write is a whole-row upsert or a delete, so concurrent writers are
-/// last-writer-wins, as on the object stores.
+/// A put is a whole-row upsert, last writer wins; a replace updates the row only
+/// while it still holds what the caller read.
 #[derive(Clone)]
 pub(crate) struct SqlCampaignStore {
     db: SqlDatabase,
@@ -69,6 +69,48 @@ impl CampaignStore for SqlCampaignStore {
             })
             .await?;
         Ok(())
+    }
+
+    async fn replace_campaign(&self, read: &Campaign, updated: &Campaign) -> anyhow::Result<bool> {
+        let id = read.campaign_id.as_str();
+        let row: Option<(String, String, String)> = self
+            .db
+            .fetch_optional("replace_campaign_read", || {
+                sqlx::query_as(
+                    "SELECT body, labels::text, state FROM campaigns WHERE campaign_id = $1",
+                )
+                .bind(id)
+            })
+            .await?;
+        let Some((stored, stored_labels, stored_state)) = row else {
+            return Ok(false);
+        };
+        if read_campaign(&stored, &stored_labels, &stored_state)
+            .with_context(|| CAMPAIGNS.report_key(id))?
+            != *read
+        {
+            return Ok(false);
+        }
+        let (body, labels, state) = campaign_row(updated)?;
+        // The row as read, not `read` serialized: a body an older build wrote
+        // can hold a field this one drops.
+        let written = self
+            .db
+            .execute("replace_campaign", || {
+                sqlx::query(
+                    "UPDATE campaigns SET body = $2, labels = $3::jsonb, state = $4
+                     WHERE campaign_id = $1 AND body = $5 AND labels = $6::jsonb AND state = $7",
+                )
+                .bind(id)
+                .bind(body.as_str())
+                .bind(labels.as_str())
+                .bind(state)
+                .bind(stored.as_str())
+                .bind(stored_labels.as_str())
+                .bind(stored_state.as_str())
+            })
+            .await?;
+        Ok(written == 1)
     }
 
     async fn list_campaigns(
@@ -206,6 +248,24 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         pipette_store_testkit::assert_campaign_store_roundtrip(&SqlCampaignStore::new(
             test_db.db().clone(),
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn replace_is_conditional() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        pipette_store_testkit::assert_campaign_replace_is_conditional(&SqlCampaignStore::new(
+            test_db.db().clone(),
+        ))
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_replaces_from_one_read_land_once() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        pipette_store_testkit::assert_racing_campaign_replaces_land_once(std::sync::Arc::new(
+            SqlCampaignStore::new(test_db.db().clone()),
         ))
         .await
     }

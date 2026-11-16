@@ -80,10 +80,18 @@ published=${binding##*:}
 # a socket probe would report that server ready before the real one starts.
 for _ in $(seq 1 60); do
   if docker exec "$NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
-    settings=$(docker exec --env PGPASSWORD= --env PGPASSFILE=/dev/null "$NAME" \
+    # psql exits with 2 when it cannot connect, and with 1 when the query fails.
+    # libpq ignores a missing password file without a warning on stderr.
+    status=0
+    settings=$(docker exec --env PGPASSWORD= --env PGPASSFILE=/nonexistent "$NAME" \
       psql -X -U postgres -h 127.0.0.1 -AtF '|' \
-      -c "SELECT current_setting('lc_collate'), current_setting('lc_ctype'), current_setting('server_encoding')" \
-      2>/dev/null) || reject_container 'a password-free TCP connection failed'
+      -c "SELECT datcollate, datctype, current_setting('server_encoding') FROM pg_database WHERE datname = current_database()" \
+      2>&1) || status=$?
+    if ((status == 2)); then
+      reject_container "a password-free TCP connection failed: $settings"
+    elif ((status != 0)); then
+      reject_container "the locale query failed: $settings"
+    fi
     [[ "$settings" == 'C|C|UTF8' ]] ||
       reject_container "the initialized locale or encoding differs ($settings)"
     echo "PostgreSQL is ready on port $published." >&2

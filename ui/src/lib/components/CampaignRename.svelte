@@ -1,22 +1,20 @@
 <script lang="ts">
-  // A campaign's name, the General row of its Settings: checked as typed where the route would refuse it.
-  import { updateCampaign } from "../api";
-  import { NAME_MAX_CHARS, nameProblem, renameBody } from "../campaigns";
-  import { session } from "../session.svelte";
-  import type { NamedCampaignOverview } from "../api-types";
+  // A campaign's or a group's name, a General row of its Settings: checked as typed where the route would refuse it.
+  import { NAME_MAX_CHARS, nameProblem } from "../campaigns";
   import SettingRow from "./SettingRow.svelte";
   import { Busy } from "./work.svelte";
 
-  let { detail, onchange }: {
-    detail: NamedCampaignOverview;
-    /** Read the campaign again, after a write. */
-    onchange: () => Promise<void>;
+  let { title, name: current, save }: {
+    title: string;
+    name: string;
+    /** Write the new name, then read the record again. */
+    save: (to: string) => Promise<void>;
   } = $props();
 
   const uid = $props.id();
-  // Taken again from each read, as a write reads the campaign again.
-  let name = $derived(detail.name);
-  const changed = $derived(name.trim() !== detail.name);
+  // Taken again from each read, as a write reads the record again.
+  let name = $derived(current);
+  const changed = $derived(name.trim() !== current);
   const problem = $derived(nameProblem(name));
   const renaming = new Busy();
   /** What the last rename did, until the name is typed again. */
@@ -27,14 +25,13 @@
     if (renaming.busy || problem || !changed) return;
     const to = name.trim();
     await renaming.attempt(async () => {
-      await updateCampaign(session.signer, detail.campaign_id, renameBody(to));
-      await onchange();
+      await save(to);
       done = `Renamed to “${to}”.`;
     });
   }
 </script>
 
-<SettingRow title="Campaign name"
+<SettingRow {title}
             text={`Shown in listings and atop this page; up to ${NAME_MAX_CHARS.toLocaleString("en")} characters.`}>
   {#snippet children(ids)}
     <form novalidate onsubmit={rename}>
@@ -44,7 +41,7 @@
                oninput={(e) => { name = e.currentTarget.value; done = ""; }}>
         <button type="submit" class="primary" aria-disabled={renaming.busy || !changed || !!problem}>{
           renaming.busy ? "Saving…" : "Save changes"}</button>
-        {#if changed}<button type="button" onclick={() => (name = detail.name)}>Reset</button>{/if}
+        {#if changed}<button type="button" onclick={() => (name = current)}>Reset</button>{/if}
       </div>
       <div id="{uid}-note" class="hint" class:err={!!problem} class:ok={!problem && !!done} role="status"
            hidden={!problem && !done}>{problem || done}</div>

@@ -326,7 +326,7 @@ pub async fn file_job_bodies(
     campaign_admin::advance(
         state.campaign_store.as_ref(),
         state.plan_store.as_ref(),
-        &campaign_id,
+        &campaign,
         report.plan_id.clone(),
     )
     .await?;

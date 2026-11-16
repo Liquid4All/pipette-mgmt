@@ -14,10 +14,12 @@ use pipette_core::matching::{FleetTags, job_matches_client};
 use pipette_core::plan::{ExpiredJob, PlanManifest, ProgressSnapshot, SettledOutcome, past_gate};
 use pipette_core::todo_filename::Lease;
 use pipette_plan_types::{ClientId, Counts, ExpiresAt, JobId, PlanId, PlanStatus};
-use pipette_store::{JobPlanMarker, PlanStore, SubmissionStore, TodoStore};
+use pipette_store::{
+    AvailEntry, JobPlanMarker, MembershipEnd, PlanStore, SubmissionStore, TodoStore,
+};
 
 use crate::plan_ingestion::requirement_key;
-use crate::queue_maintenance::{AvailKey, cached_body, confirm_or_stage, millis};
+use crate::queue_maintenance::{cached_body, confirm_or_stage, millis};
 
 /// The run's snapshot of the `job-plans/` tree, indexed by job.
 ///
@@ -82,12 +84,11 @@ struct Ending<'a> {
 
 /// What [`tear_down_plans`] left behind, for the caller to fold into the run.
 pub(crate) struct TeardownOutcome {
-    pub avail: Vec<AvailKey>,
+    pub avail: Vec<AvailEntry>,
     /// One list, so the GC live set and the recycle keys describe the same
     /// leases.
     pub leased: Vec<Lease>,
-    /// Confirmed terminal for this run's GC sweeps, skipping the two-sighting
-    /// orphan path.
+    /// Retired by this pass, so this run's live set leaves them out.
     pub retired: HashSet<JobId>,
     pub endings: PlanEndings,
     pub failures: usize,
@@ -98,20 +99,18 @@ pub(crate) struct TeardownOutcome {
 ///
 /// A job is retired only when its last membership goes; otherwise it is
 /// released to the plans still holding it. Lenient per job: a failure is logged,
-/// counted, and retried next run, except a failed restore, which loses the job
-/// (see `docs/plan-ingestion.md`).
+/// counted, and retried next run.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is distinct context the caller already holds; a bundle type \
               would be single-use"
 )]
 pub(crate) async fn tear_down_plans(
-    todo: &dyn TodoStore,
     plans: &dyn PlanStore,
     manifests: &[PlanManifest],
     markers: &HashSet<PlanId>,
     membership: &Membership,
-    avail: Vec<AvailKey>,
+    avail: Vec<AvailEntry>,
     leases: Vec<Lease>,
     now: DateTime<Utc>,
     creating_max_age: Duration,
@@ -139,7 +138,7 @@ pub(crate) async fn tear_down_plans(
         });
     }
 
-    let avail_by_job: HashMap<&JobId, &AvailKey> = avail.iter().map(|a| (&a.job_id, a)).collect();
+    let avail_by_job: HashMap<&JobId, &AvailEntry> = avail.iter().map(|a| (&a.job_id, a)).collect();
     let leases_by_job: HashMap<&JobId, Vec<&Lease>> =
         leases.iter().fold(HashMap::new(), |mut acc, lease| {
             acc.entry(&lease.job_id).or_default().push(lease);
@@ -166,8 +165,8 @@ pub(crate) async fn tear_down_plans(
                 // Finished, retired by an earlier pass, or never promoted.
                 continue;
             }
-            match end_membership(todo, plans, &manifest.plan_id, job_id, entry, held).await {
-                Ok(JobFate::Retired) => {
+            match plans.end_membership(job_id, &manifest.plan_id).await {
+                Ok(MembershipEnd::Retired) => {
                     retired.insert(job_id.clone());
                     jobs_retired += 1;
                     tracing::debug!(
@@ -177,7 +176,7 @@ pub(crate) async fn tear_down_plans(
                         "queue-maintenance: retired a job of an ending plan"
                     );
                 }
-                Ok(JobFate::Released { surviving_plans }) => {
+                Ok(MembershipEnd::Released { surviving_plans }) => {
                     released
                         .entry(manifest.plan_id.clone())
                         .or_default()
@@ -192,8 +191,8 @@ pub(crate) async fn tear_down_plans(
                     );
                 }
                 // Not retired by this call, so not perturbed; it still leaves
-                // the plan's outstanding set. The age-gated GC takes its markers.
-                Ok(JobFate::AlreadyGone) => {
+                // the plan's outstanding set.
+                Ok(MembershipEnd::Absent) => {
                     released
                         .entry(manifest.plan_id.clone())
                         .or_default()
@@ -252,121 +251,6 @@ pub(crate) async fn tear_down_plans(
     })
 }
 
-/// What teardown did with one job of an ending plan.
-enum JobFate {
-    Retired,
-    Released {
-        surviving_plans: usize,
-    },
-    /// No other plan holds it, and it left the queue before the deletes landed:
-    /// live under an unlisted lease, or already resolved.
-    AlreadyGone,
-}
-
-/// Drop one plan's membership of one job, and retire the job when that was the
-/// last membership.
-///
-/// Listings are fresh: a joiner writes its marker before re-checking liveness,
-/// so a missed marker's joiner will see the retire and mint a new job. A joiner
-/// that lands inside the retire window is caught by the re-list, and the job is
-/// restored under its original key.
-async fn end_membership(
-    todo: &dyn TodoStore,
-    plans: &dyn PlanStore,
-    plan_id: &PlanId,
-    job_id: &JobId,
-    entry: Option<&AvailKey>,
-    held: &[&Lease],
-) -> anyhow::Result<JobFate> {
-    // Fresh listing, so a marker the run's snapshot never saw is still dropped.
-    for expires_at in plans
-        .list_job_plan_markers(job_id)
-        .await?
-        .into_iter()
-        .filter(|(member, _)| member == plan_id)
-        .map(|(_, expires_at)| expires_at)
-    {
-        plans
-            .delete_job_plan_marker(job_id, plan_id, expires_at)
-            .await?;
-    }
-
-    let remaining = plans.list_job_plan_markers(job_id).await?;
-    if !remaining.is_empty() {
-        return Ok(JobFate::Released {
-            surviving_plans: remaining.len(),
-        });
-    }
-
-    // Read before the deletes so a restore can put the job back as it stood.
-    let (expires_at, body) = match entry {
-        Some(entry) => (
-            entry.expires_at,
-            todo.get_avail(job_id, entry.expires_at).await?,
-        ),
-        None => match held.first() {
-            Some(lease) => (
-                lease.expires_at,
-                todo.get_leased(
-                    job_id,
-                    lease.expires_at,
-                    &lease.client_id,
-                    lease.lease_expiry,
-                )
-                .await?,
-            ),
-            // Unreachable through `tear_down_plans`; nothing is left to delete.
-            None => return Ok(JobFate::Retired),
-        },
-    };
-
-    // From here to the promote the body has no queue copy: a crash loses a job a
-    // joiner holds (PIP-543). Not staging first: nothing promotes an orphan `tmp/`.
-    retire_job(todo, job_id, entry.is_some(), held).await?;
-
-    let joiners = plans.list_job_plan_markers(job_id).await?;
-    // Usually claimed since the snapshot, so live under an unlisted lease: never
-    // report it retired, or the orphan sweep strips its `eligible/` markers.
-    let Some(body) = body else {
-        // Flag it either way: the deletes above may have taken its `avail/`
-        // entry, so its markers need re-matching when it returns.
-        todo.flag_for_reindex(std::slice::from_ref(job_id)).await?;
-        if joiners.is_empty() {
-            tracing::warn!(
-                plan_id = %plan_id,
-                job_id = %job_id,
-                "queue-maintenance: a job left the queue before teardown could retire it"
-            );
-            return Ok(JobFate::AlreadyGone);
-        }
-        tracing::warn!(
-            plan_id = %plan_id,
-            job_id = %job_id,
-            joining_plans = joiners.len(),
-            "queue-maintenance: released a job whose body was already gone"
-        );
-        return Ok(JobFate::Released {
-            surviving_plans: joiners.len(),
-        });
-    };
-    if joiners.is_empty() {
-        return Ok(JobFate::Retired);
-    }
-    todo.write_tmp(job_id, &body).await?;
-    todo.promote_avail(job_id, expires_at).await?;
-    // Out of `avail/` while the index ran, so its markers may be stale.
-    todo.flag_for_reindex(std::slice::from_ref(job_id)).await?;
-    tracing::info!(
-        plan_id = %plan_id,
-        job_id = %job_id,
-        joining_plans = joiners.len(),
-        "queue-maintenance: restored a job a plan joined inside the retire window"
-    );
-    Ok(JobFate::Released {
-        surviving_plans: joiners.len(),
-    })
-}
-
 /// Why a plan owes teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -412,30 +296,6 @@ fn teardown_cause(
         }
         PlanStatus::Creating | PlanStatus::Active | PlanStatus::PendingClients => None,
     }
-}
-
-/// Every delete is idempotent, so an entry that vanishes mid-call is a no-op.
-async fn retire_job(
-    todo: &dyn TodoStore,
-    job_id: &JobId,
-    in_avail: bool,
-    held: &[&Lease],
-) -> anyhow::Result<()> {
-    if in_avail {
-        // By job id: a recycled or re-dated job can carry an `expires_at` this
-        // run never listed.
-        todo.delete_avail_by_job(job_id).await?;
-    }
-    for lease in held {
-        todo.delete_lease(
-            job_id,
-            lease.expires_at,
-            &lease.client_id,
-            lease.lease_expiry,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 /// Record every member plan's lapse of a job whose horizon for that plan (the
@@ -632,7 +492,7 @@ pub(crate) async fn reconcile_plans(
     markers: &HashSet<PlanId>,
     endings: &PlanEndings,
     membership: &Membership,
-    avail: &[AvailKey],
+    avail: &[AvailEntry],
     leased_ids: &HashSet<JobId>,
     live_ids: &HashSet<JobId>,
     workers: &[&Client],
@@ -640,11 +500,11 @@ pub(crate) async fn reconcile_plans(
     matched: &HashSet<JobId>,
     fallback: &HashSet<JobId>,
     denied: &[(JobId, ClientId)],
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     now: DateTime<Utc>,
     creating_max_age: Duration,
 ) -> anyhow::Result<ReconcileReport> {
-    let avail_by_job: HashMap<&JobId, &AvailKey> = avail.iter().map(|a| (&a.job_id, a)).collect();
+    let avail_by_job: HashMap<&JobId, &AvailEntry> = avail.iter().map(|a| (&a.job_id, a)).collect();
     let denied: HashSet<(&JobId, &ClientId)> =
         denied.iter().map(|(job, client)| (job, client)).collect();
 
@@ -745,7 +605,7 @@ async fn reconcile_one_plan(
     manifest: &PlanManifest,
     ending: &Ending<'_>,
     membership: &Membership,
-    avail_by_job: &HashMap<&JobId, &AvailKey>,
+    avail_by_job: &HashMap<&JobId, &AvailEntry>,
     leased_ids: &HashSet<JobId>,
     live_ids: &HashSet<JobId>,
     workers: &[&Client],
@@ -753,7 +613,7 @@ async fn reconcile_one_plan(
     matched: &HashSet<JobId>,
     fallback: &HashSet<JobId>,
     denied: &HashSet<(&JobId, &ClientId)>,
-    bodies: &mut HashMap<String, Value>,
+    bodies: &mut HashMap<AvailEntry, Value>,
     settled: &mut HashMap<JobId, SettledOutcome>,
     report: &mut ReconcileReport,
     now: DateTime<Utc>,
@@ -1022,7 +882,7 @@ async fn collect_orphaned_marker(plans: &dyn PlanStore, plan_id: &PlanId) -> any
 async fn count_jobs(
     submissions: &dyn SubmissionStore,
     manifest: &PlanManifest,
-    avail_by_job: &HashMap<&JobId, &AvailKey>,
+    avail_by_job: &HashMap<&JobId, &AvailEntry>,
     leased_ids: &HashSet<JobId>,
     settled: &mut HashMap<JobId, SettledOutcome>,
     probes: &mut usize,
@@ -1092,8 +952,7 @@ fn add_outcome(counts: &mut Counts, outcome: SettledOutcome) {
     }
 }
 
-/// Keeps plan-index candidates from colliding with `todo/` keys in the shared
-/// `todo/.gc-candidates` set.
+/// Marks each plan-index key in the candidate set.
 const PLAN_INDEX_KEY_PREFIX: &str = "plans:";
 
 /// What [`gc_plan_index`] did, for the run's candidate set, exit status, and
@@ -1127,7 +986,6 @@ pub(crate) async fn gc_plan_index(
     let mut failures = 0usize;
     let mut records_removed = 0usize;
     let mut markers_removed = 0usize;
-    let no_same_run_removals = HashSet::new();
 
     // A listing failure costs only the record arm; the marker arm still runs.
     let listed = match plans.list_content_keys().await {
@@ -1145,7 +1003,7 @@ pub(crate) async fn gc_plan_index(
             continue;
         }
         let key = format!("{PLAN_INDEX_KEY_PREFIX}content-keys/v1/{digest}");
-        if !confirm_or_stage(prior, &no_same_run_removals, &mut next, key, None) {
+        if !confirm_or_stage(prior, &mut next, key) {
             continue;
         }
         match plans.delete_content_key(&digest, &version).await {
@@ -1187,7 +1045,7 @@ pub(crate) async fn gc_plan_index(
                 marker.expires_at
             )
         );
-        if !confirm_or_stage(prior, &no_same_run_removals, &mut next, key, None) {
+        if !confirm_or_stage(prior, &mut next, key) {
             continue;
         }
         match plans
@@ -1250,7 +1108,6 @@ pub(crate) async fn gc_pending_plan_sources(
             return (next, 1);
         }
     };
-    let no_same_run_removals = HashSet::new();
     let mut failures = 0usize;
     for marker in markers {
         if !past_gate(marker.written_at, now, creating_max_age) {
@@ -1260,7 +1117,7 @@ pub(crate) async fn gc_pending_plan_sources(
             "{PLAN_INDEX_KEY_PREFIX}plan-sources-pending/{}",
             marker.plan_id
         );
-        if !confirm_or_stage(prior, &no_same_run_removals, &mut next, key, None) {
+        if !confirm_or_stage(prior, &mut next, key) {
             continue;
         }
         if let Err(e) = collect_pending_source(plans, &marker.plan_id).await {
@@ -1353,6 +1210,31 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PlanStore for ListContentKeysFailsPlanStore {
+        async fn end_membership(
+            &self,
+            _job_id: &pipette_plan_types::JobId,
+            _plan_id: &pipette_plan_types::PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            Err(self.unexpected.record("end_membership"))
+        }
+        async fn join_job(
+            &self,
+            _job_id: &pipette_plan_types::JobId,
+            _plan_id: &pipette_plan_types::PlanId,
+            _expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            Err(self.unexpected.record("join_job"))
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            Err(self.unexpected.record("read_gc_candidates"))
+        }
+        async fn write_gc_candidates(
+            &self,
+            _candidates: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            Err(self.unexpected.record("write_gc_candidates"))
+        }
+
         async fn put_plan(&self, _manifest: &PlanManifest) -> anyhow::Result<()> {
             Err(self.unexpected.record("put_plan"))
         }
@@ -1540,189 +1422,20 @@ mod tests {
         Ok(())
     }
 
-    /// A [`PlanStore`] that lets a joining plan's marker appear at a chosen
-    /// listing; the third lands it inside the retire window.
-    struct JoinerAppearsPlanStore {
-        inner: std::sync::Arc<dyn PlanStore>,
-        listings: std::sync::atomic::AtomicUsize,
-        inject_before: usize,
-        job_id: JobId,
-        joiner: PlanId,
-    }
-
-    #[async_trait::async_trait]
-    impl PlanStore for JoinerAppearsPlanStore {
-        async fn list_job_plan_markers(
-            &self,
-            job_id: &JobId,
-        ) -> anyhow::Result<Vec<(PlanId, pipette_plan_types::ExpiresAt)>> {
-            let nth = self
-                .listings
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            if nth == self.inject_before {
-                self.inner
-                    .write_job_plan_marker(&self.job_id, &self.joiner, ExpiresAt::Never)
-                    .await?;
-            }
-            self.inner.list_job_plan_markers(job_id).await
-        }
-        async fn write_job_plan_marker(
-            &self,
-            job_id: &JobId,
-            plan_id: &PlanId,
-            expires_at: ExpiresAt,
-        ) -> anyhow::Result<()> {
-            self.inner
-                .write_job_plan_marker(job_id, plan_id, expires_at)
-                .await
-        }
-        async fn delete_job_plan_marker(
-            &self,
-            job_id: &JobId,
-            plan_id: &PlanId,
-            expires_at: ExpiresAt,
-        ) -> anyhow::Result<()> {
-            self.inner
-                .delete_job_plan_marker(job_id, plan_id, expires_at)
-                .await
-        }
-        async fn list_all_job_plan_markers(&self) -> anyhow::Result<Vec<JobPlanMarker>> {
-            self.inner.list_all_job_plan_markers().await
-        }
-        async fn put_plan(&self, manifest: &PlanManifest) -> anyhow::Result<()> {
-            self.inner.put_plan(manifest).await
-        }
-        async fn get_plan(&self, plan_id: &PlanId) -> anyhow::Result<Option<PlanManifest>> {
-            self.inner.get_plan(plan_id).await
-        }
-        async fn list_matching_plans(
-            &self,
-            filter: &pipette_store::PlanFilter,
-            after: Option<&PlanId>,
-            limit: std::num::NonZeroUsize,
-        ) -> anyhow::Result<pipette_store::PlanPage> {
-            self.inner.list_matching_plans(filter, after, limit).await
-        }
-        async fn write_cancel_marker(&self, plan_id: &PlanId) -> anyhow::Result<()> {
-            self.inner.write_cancel_marker(plan_id).await
-        }
-        async fn has_cancel_marker(&self, plan_id: &PlanId) -> anyhow::Result<bool> {
-            self.inner.has_cancel_marker(plan_id).await
-        }
-        async fn list_cancel_markers(&self) -> anyhow::Result<Vec<PlanId>> {
-            self.inner.list_cancel_markers().await
-        }
-        async fn delete_cancel_marker(&self, plan_id: &PlanId) -> anyhow::Result<()> {
-            self.inner.delete_cancel_marker(plan_id).await
-        }
-        async fn get_content_key(
-            &self,
-            digest: &str,
-        ) -> anyhow::Result<Option<(ContentKeyRecord, ContentKeyVersion)>> {
-            self.inner.get_content_key(digest).await
-        }
-        async fn create_content_key(
-            &self,
-            digest: &str,
-            record: &ContentKeyRecord,
-        ) -> anyhow::Result<ContentKeyClaim> {
-            self.inner.create_content_key(digest, record).await
-        }
-        async fn replace_content_key(
-            &self,
-            digest: &str,
-            version: &ContentKeyVersion,
-            record: &ContentKeyRecord,
-        ) -> anyhow::Result<ContentKeyCas> {
-            self.inner
-                .replace_content_key(digest, version, record)
-                .await
-        }
-        async fn delete_content_key(
-            &self,
-            digest: &str,
-            version: &ContentKeyVersion,
-        ) -> anyhow::Result<ContentKeyCas> {
-            self.inner.delete_content_key(digest, version).await
-        }
-        async fn list_content_keys(
-            &self,
-        ) -> anyhow::Result<Vec<(String, ContentKeyRecord, ContentKeyVersion)>> {
-            self.inner.list_content_keys().await
-        }
-        async fn put_plan_source(
-            &self,
-            plan_id: &PlanId,
-            source: &pipette_core::plan::PlanSource,
-        ) -> anyhow::Result<pipette_store::CreateOutcome> {
-            self.inner.put_plan_source(plan_id, source).await
-        }
-        async fn get_plan_source(
-            &self,
-            plan_id: &PlanId,
-        ) -> anyhow::Result<Option<pipette_core::plan::PlanSource>> {
-            self.inner.get_plan_source(plan_id).await
-        }
-        async fn delete_plan_source(&self, plan_id: &PlanId) -> anyhow::Result<()> {
-            self.inner.delete_plan_source(plan_id).await
-        }
-        async fn write_pending_source_marker(&self, plan_id: &PlanId) -> anyhow::Result<()> {
-            self.inner.write_pending_source_marker(plan_id).await
-        }
-        async fn list_pending_source_markers(
-            &self,
-        ) -> anyhow::Result<Vec<pipette_store::PendingSourceMarker>> {
-            self.inner.list_pending_source_markers().await
-        }
-        async fn delete_pending_source_marker(&self, plan_id: &PlanId) -> anyhow::Result<()> {
-            self.inner.delete_pending_source_marker(plan_id).await
-        }
-        async fn put_job_source(
-            &self,
-            job_id: &JobId,
-            body: &serde_json::Value,
-        ) -> anyhow::Result<CreateOutcome> {
-            self.inner.put_job_source(job_id, body).await
-        }
-        async fn get_job_source(
-            &self,
-            job_id: &JobId,
-        ) -> anyhow::Result<Option<serde_json::Value>> {
-            self.inner.get_job_source(job_id).await
-        }
-        async fn put_job_plan_link(
-            &self,
-            job_id: &JobId,
-            plan_id: &PlanId,
-        ) -> anyhow::Result<CreateOutcome> {
-            self.inner.put_job_plan_link(job_id, plan_id).await
-        }
-        async fn list_job_plan_links(&self, job_id: &JobId) -> anyhow::Result<Vec<PlanId>> {
-            self.inner.list_job_plan_links(job_id).await
-        }
-    }
-
-    /// One teardown run over a job that stays live inside the retire window.
-    struct RetireWindow {
-        _dir: tempfile::TempDir,
-        _db: pipette_store_sql::scratch::TestDb,
-        todo: std::sync::Arc<dyn TodoStore>,
-        plans: std::sync::Arc<dyn PlanStore>,
-        job_id: JobId,
-        cancelling: PlanId,
-        joiner: PlanId,
-        body: Value,
-        holder: Option<(pipette_plan_types::ClientId, DateTime<Utc>)>,
-        outcome: TeardownOutcome,
-    }
-
-    async fn tear_down_in_retire_window(
-        claim_first: bool,
-        joiner_appears: bool,
-    ) -> anyhow::Result<Option<RetireWindow>> {
+    /// Teardown of a cancelling plan's job on the database stores. With no
+    /// other member, the job leaves the queue, lease included. With another
+    /// member, the job stays and keeps that member's marker.
+    #[rstest]
+    #[case::available(false, false)]
+    #[case::leased(true, false)]
+    #[case::shared(false, true)]
+    #[tokio::test]
+    async fn teardown_ends_the_cancelling_plans_membership(
+        #[case] claimed: bool,
+        #[case] shared: bool,
+    ) -> anyhow::Result<()> {
         let Some(db) = pipette_store_sql::scratch::TestDb::new().await? else {
-            return Ok(None);
+            return Ok(());
         };
         let dir = tempfile::tempdir()?;
         let stores = db.stores(pipette_store_fs::build_local_fs_stores(
@@ -1733,24 +1446,29 @@ mod tests {
                 ),
                 ..pipette_core::config::Config::default()
             },
+            pipette_store_testkit::no_queue(),
         )?);
         let todo = stores.todo.clone();
 
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(7));
         let cancelling = PlanId::from_uuid(uuid::Uuid::from_u128(1));
-        let joiner = PlanId::from_uuid(uuid::Uuid::from_u128(2));
-        let body = serde_json::json!({"job_id": job_id.as_str(), "requires": ["os:macos"]});
+        let other = PlanId::from_uuid(uuid::Uuid::from_u128(2));
+        let body = serde_json::json!({"job_id": job_id.as_str()});
         todo.write_tmp(&job_id, &body).await?;
-        todo.promote_avail(&job_id, ExpiresAt::Never).await?;
+        todo.promote_avail(&job_id, ExpiresAt::Never, None).await?;
         stores
             .plans
             .write_job_plan_marker(&job_id, &cancelling, ExpiresAt::Never)
             .await?;
-
-        // After the run's listings, so the snapshot below carries no lease.
-        let holder = if claim_first {
-            let client = pipette_plan_types::ClientId::try_new("holder")?;
-            let lease_expiry: DateTime<Utc> = "2026-06-01T00:30:00Z".parse()?;
+        if shared {
+            stores
+                .plans
+                .write_job_plan_marker(&job_id, &other, ExpiresAt::Never)
+                .await?;
+        }
+        let client = pipette_plan_types::ClientId::try_new("holder")?;
+        let lease_expiry: DateTime<Utc> = "2026-06-01T00:30:00Z".parse()?;
+        let leases = if claimed {
             anyhow::ensure!(
                 matches!(
                     todo.claim_job(&job_id, ExpiresAt::Never, &client, lease_expiry)
@@ -1759,28 +1477,28 @@ mod tests {
                 ),
                 "the job is claimable before teardown runs"
             );
-            Some((client, lease_expiry))
-        } else {
-            None
-        };
-
-        // The joiner's marker lands between the deletes and the re-listing.
-        let plans: std::sync::Arc<dyn PlanStore> = if joiner_appears {
-            std::sync::Arc::new(JoinerAppearsPlanStore {
-                inner: stores.plans.clone(),
-                listings: std::sync::atomic::AtomicUsize::new(0),
-                inject_before: 3,
+            vec![Lease {
                 job_id: job_id.clone(),
-                joiner: joiner.clone(),
-            })
+                expires_at: ExpiresAt::Never,
+                client_id: client.clone(),
+                lease_expiry,
+            }]
         } else {
-            stores.plans.clone()
+            Vec::new()
+        };
+        let avail = if claimed {
+            Vec::new()
+        } else {
+            vec![AvailEntry {
+                job_id: job_id.clone(),
+                expires_at: ExpiresAt::Never,
+            }]
         };
 
         let now = Utc::now();
         let manifest = PlanManifest {
             plan_id: cancelling.clone(),
-            status: PlanStatus::Active,
+            status: PlanStatus::Cancelling,
             created_at: now,
             submitted_by: None,
             campaign_id: None,
@@ -1799,165 +1517,61 @@ mod tests {
             progress_snapshot: None,
             terminal_at: None,
         };
-        // The stale snapshot.
-        let avail = vec![AvailKey {
-            key: pipette_core::todo_filename::avail_filename(&job_id, ExpiresAt::Never),
-            job_id: job_id.clone(),
-            expires_at: ExpiresAt::Never,
-        }];
         let membership = Membership::new(stores.plans.list_all_job_plan_markers().await?);
-
         let outcome = tear_down_plans(
-            &*todo,
-            &*plans,
+            &*stores.plans,
             &[manifest],
-            &HashSet::from([cancelling.clone()]),
+            &HashSet::new(),
             &membership,
             avail,
-            Vec::new(),
+            leases,
             now,
             Duration::from_secs(21_600),
         )
         .await?;
 
-        Ok(Some(RetireWindow {
-            _dir: dir,
-            _db: db,
-            todo,
-            plans: stores.plans.clone(),
-            job_id,
-            cancelling,
-            joiner,
-            body,
-            holder,
-            outcome,
-        }))
-    }
-
-    fn assert_not_retired(w: &RetireWindow) {
-        assert!(
-            w.outcome.retired.is_empty(),
-            "the job is live, so the pass reports no retire"
-        );
-        assert_eq!(
-            w.outcome.endings.released.get(&w.cancelling),
-            Some(&HashSet::from([w.job_id.clone()])),
-            "the job leaves the cancelling plan's outstanding set"
-        );
-        assert!(
-            !w.outcome.endings.perturbed.contains(&w.cancelling),
-            "the pass deleted nothing that survived, so it does not hold the settle"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_job_joined_inside_the_retire_window_is_restored() -> anyhow::Result<()> {
-        let Some(w) = tear_down_in_retire_window(false, true).await? else {
-            return Ok(());
+        let job = HashSet::from([job_id.clone()]);
+        let remaining = if shared {
+            vec![(other, ExpiresAt::Never)]
+        } else {
+            Vec::new()
         };
-        assert_not_retired(&w);
-
-        let restored = w
-            .todo
-            .get_avail(&w.job_id, ExpiresAt::Never)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("the job is back in avail/"))?;
         assert_eq!(
-            restored, w.body,
-            "restored under its original key, body intact"
+            stores.plans.list_job_plan_markers(&job_id).await?,
+            remaining
         );
         assert_eq!(
-            w.todo
-                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
-                .await?,
-            HashSet::from([w.job_id.clone()]),
-            "the job was invisible to the index while it was gone, so it is re-matched"
+            outcome.retired,
+            if shared { HashSet::new() } else { job.clone() }
         );
         assert_eq!(
-            w.plans.list_job_plan_markers(&w.job_id).await?,
-            vec![(w.joiner.clone(), ExpiresAt::Never)],
-            "the joiner keeps its membership; the cancelling plan's is gone"
+            outcome.endings.released.get(&cancelling),
+            shared.then_some(&job)
         );
-        Ok(())
-    }
-
-    /// A `Retired` report would let the orphan sweep strip the live job's
-    /// `eligible/` markers.
-    #[tokio::test]
-    async fn a_job_claimed_inside_the_retire_window_is_released() -> anyhow::Result<()> {
-        let Some(w) = tear_down_in_retire_window(true, true).await? else {
-            return Ok(());
-        };
-        assert_not_retired(&w);
-
-        let (client, lease_expiry) = w
-            .holder
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("this case claims the job"))?;
-        assert!(
-            w.todo
-                .get_leased(&w.job_id, ExpiresAt::Never, &client, lease_expiry)
+        assert_eq!(outcome.endings.perturbed.contains(&cancelling), !shared);
+        assert!(outcome.leased.is_empty() || shared);
+        let queued = todo.get_avail_by_job(&job_id).await?.is_some()
+            || todo
+                .get_leased(&job_id, ExpiresAt::Never, &client, lease_expiry)
                 .await?
-                .is_some(),
-            "the holder's lease survives teardown"
-        );
-        assert_eq!(
-            w.todo
-                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
-                .await?,
-            HashSet::from([w.job_id.clone()]),
-            "the job is flagged, so its markers are re-matched once it is queued again"
-        );
-        assert_eq!(
-            w.plans.list_job_plan_markers(&w.job_id).await?,
-            vec![(w.joiner.clone(), ExpiresAt::Never)],
-            "the joiner keeps its membership; the cancelling plan's is gone"
-        );
-        Ok(())
-    }
-
-    /// The same claim with the cancelling plan as the only member: teardown
-    /// reports it already gone.
-    #[tokio::test]
-    async fn a_claimed_job_with_no_other_member_is_not_reported_retired() -> anyhow::Result<()> {
-        let Some(w) = tear_down_in_retire_window(true, false).await? else {
-            return Ok(());
-        };
-        assert_not_retired(&w);
-
-        let (client, lease_expiry) = w
-            .holder
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("this case claims the job"))?;
-        assert!(
-            w.todo
-                .get_leased(&w.job_id, ExpiresAt::Never, &client, lease_expiry)
-                .await?
-                .is_some(),
-            "the holder's lease survives teardown"
-        );
-        assert_eq!(
-            w.todo
-                .jobs_awaiting_index(std::slice::from_ref(&w.job_id))
-                .await?,
-            HashSet::from([w.job_id.clone()]),
-            "the job is flagged, so its markers are re-matched once it is queued again"
-        );
-        assert!(
-            w.plans.list_job_plan_markers(&w.job_id).await?.is_empty(),
-            "the cancelling plan's membership is still dropped"
-        );
+                .is_some();
+        assert_eq!(queued, shared, "only a shared job stays in the queue");
         Ok(())
     }
 
     #[tokio::test]
     async fn a_release_from_an_earlier_pass_is_not_repeated() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
-            storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..pipette_core::config::Config::default()
-        })?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
+                storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: pipette_core::config::StorageConfig::local_fs(
+                    dir.path().to_path_buf(),
+                ),
+                ..pipette_core::config::Config::default()
+            },
+            pipette_store_sql::scratch::queue().await?,
+        )?;
         let todo = stores.todo.clone();
 
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(13));
@@ -1965,7 +1579,7 @@ mod tests {
         let holder = PlanId::from_uuid(uuid::Uuid::from_u128(2));
         let body = serde_json::json!({"job_id": job_id.as_str(), "requires": ["os:macos"]});
         todo.write_tmp(&job_id, &body).await?;
-        todo.promote_avail(&job_id, ExpiresAt::Never).await?;
+        todo.promote_avail(&job_id, ExpiresAt::Never, None).await?;
         // An earlier pass dropped this plan's marker; the other plan keeps its.
         stores
             .plans
@@ -1994,15 +1608,13 @@ mod tests {
             progress_snapshot: None,
             terminal_at: Some(now),
         };
-        let avail = vec![AvailKey {
-            key: pipette_core::todo_filename::avail_filename(&job_id, ExpiresAt::Never),
+        let avail = vec![AvailEntry {
             job_id: job_id.clone(),
             expires_at: ExpiresAt::Never,
         }];
         let membership = Membership::new(stores.plans.list_all_job_plan_markers().await?);
 
         let outcome = tear_down_plans(
-            &*todo,
             stores.plans.as_ref(),
             &[manifest],
             &HashSet::new(),
@@ -2122,6 +1734,31 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PlanStore for FailsOnePlanStore {
+        async fn end_membership(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            self.inner.end_membership(job_id, plan_id).await
+        }
+        async fn join_job(
+            &self,
+            job_id: &pipette_plan_types::JobId,
+            plan_id: &pipette_plan_types::PlanId,
+            expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            self.inner.join_job(job_id, plan_id, expires_at).await
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            self.inner.read_gc_candidates().await
+        }
+        async fn write_gc_candidates(
+            &self,
+            candidates: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            self.inner.write_gc_candidates(candidates).await
+        }
+
         async fn put_plan(&self, manifest: &PlanManifest) -> anyhow::Result<()> {
             match self.fail {
                 LapseStep::Record => anyhow::bail!("simulated manifest write failure"),
@@ -2281,11 +1918,16 @@ mod tests {
         #[case] fail: LapseStep,
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stores = pipette_store_fs::build_local_fs_stores(&pipette_core::config::Config {
-            storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            auth_storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
-            ..pipette_core::config::Config::default()
-        })?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
+                storage: pipette_core::config::StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: pipette_core::config::StorageConfig::local_fs(
+                    dir.path().to_path_buf(),
+                ),
+                ..pipette_core::config::Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )?;
         let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
         let horizon = ExpiresAt::At("2026-05-01T00:00:00Z".parse::<DateTime<Utc>>()?);
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(7));
@@ -2476,8 +2118,7 @@ mod tests {
         for (job_id, &(seen, lapsed)) in ids.iter().zip(jobs) {
             let record = |message_type: &str| serde_json::json!({"job_id": job_id.as_str(), "message_type": message_type});
             match seen {
-                Seen::Avail => avail.push(AvailKey {
-                    key: format!("{job_id}/never.json"),
+                Seen::Avail => avail.push(AvailEntry {
                     job_id: job_id.clone(),
                     expires_at: ExpiresAt::Never,
                 }),
@@ -2530,7 +2171,7 @@ mod tests {
                 false,
             )?
         };
-        let avail_by_job: HashMap<&JobId, &AvailKey> =
+        let avail_by_job: HashMap<&JobId, &AvailEntry> =
             avail.iter().map(|a| (&a.job_id, a)).collect();
 
         let mut probed = 0;
@@ -2834,8 +2475,7 @@ mod tests {
 
         // A settled job back in `avail/` counts `available`, and a lapse counts
         // `failed` whatever the record said.
-        let entry = AvailKey {
-            key: format!("{finished}/never.json"),
+        let entry = AvailEntry {
             job_id: finished.clone(),
             expires_at: ExpiresAt::Never,
         };

@@ -25,6 +25,7 @@
 
   const TEXT = "Moves the campaign and every plan, running ones included, to another person or organization. "
     + "Afterwards you keep only the access the new owner gives you.";
+  const text = $derived(detail.group ? `${TEXT} The campaign also leaves its group, ${detail.group.name}.` : TEXT);
   const uid = $props.id();
   const id = $derived(detail.campaign_id);
   let confirm = $state<ReturnType<typeof ConfirmDialog>>();
@@ -42,7 +43,7 @@
     to = null;
     ownerError = "";
     void confirm?.ask({
-      title: "Transfer ownership?", text: TEXT, action: "Transfer ownership", pending: "Transferring…",
+      title: "Transfer ownership?", text, action: "Transfer ownership", pending: "Transferring…",
       phrase: detail.name, fields, run: handOver, done: () => ondone(said),
     });
   }
@@ -90,7 +91,7 @@
   </div>
 {/snippet}
 
-<SettingRow title="Transfer ownership" text={TEXT}>
+<SettingRow title="Transfer ownership" {text}>
   {#snippet control(ids)}
     <button type="button" class="danger" aria-haspopup="dialog" aria-describedby={ids.text}
             aria-disabled={handing.busy} onclick={open}>{handing.busy ? "Transferring…" : "Transfer ownership"}</button>

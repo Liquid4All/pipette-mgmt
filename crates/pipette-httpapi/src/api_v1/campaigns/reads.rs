@@ -13,10 +13,10 @@ use pipette_core::plan::PlanManifest;
 use pipette_pipeline::campaign_chain;
 use pipette_pipeline::plan_document::{SourceRead, read_source};
 use pipette_plan_types::{
-    CampaignId, CampaignListQuery, CampaignOverview, CampaignOverviewQuery, CampaignPlanRow,
-    CampaignPlans, CampaignReadQuery, CampaignView, DeviceTimeTotal, Highlights, ListPage, Named,
-    OrgId, OwnedListQuery, OwnerFilter, OwnerLookupQuery, PlanId, PlanReadQuery, PlanSummary,
-    UserId, UserPermission,
+    CampaignGroup, CampaignId, CampaignListQuery, CampaignOverview, CampaignOverviewQuery,
+    CampaignPlanRow, CampaignPlans, CampaignReadQuery, CampaignView, DeviceTimeTotal, Highlights,
+    ListPage, Named, OrgId, OwnedListQuery, OwnerFilter, OwnerLookupQuery, PlanId, PlanReadQuery,
+    PlanSummary, UserId, UserPermission,
 };
 use pipette_store::{STORAGE_CONCURRENCY, drain_campaigns};
 
@@ -267,10 +267,13 @@ pub async fn get_campaign_overview(
     ApiQuery(read): ApiQuery<CampaignOverviewQuery>,
 ) -> Result<Json<Named<CampaignOverview>>, AppError> {
     let caller = active.caller();
-    let campaign = for_read(&state, caller, &campaign_id).await?;
+    // [`for_read`], keeping the reach that also judges the campaign's group.
+    let reach = CampaignReach::over_records(&state, caller).await?;
+    let campaign = require(&state, &campaign_id).await?;
+    reach.require(&campaign)?;
     let with_device_time = read.device_time.unwrap_or(false);
     Ok(Json(
-        overview(&state, caller, campaign, with_device_time).await?,
+        overview(&state, caller, &reach, campaign, with_device_time).await?,
     ))
 }
 
@@ -443,12 +446,13 @@ pub(crate) async fn may_rerun(
     Ok(head.is_some_and(|head| !head.content_keys.is_empty()))
 }
 
-/// One campaign with the plans it has run. `campaign` must come from [`for_read`],
-/// as this checks no reach. A plan outside the reader's scope is drawn as withheld
-/// (its id alone), not absent, so a running campaign never reads as idle.
+/// One campaign with the plans it has run. `campaign` must be one `reach`
+/// admits, as this checks no reach. A plan outside the reader's scope is drawn as
+/// withheld (its id alone), not absent, so a running campaign never reads as idle.
 pub(crate) async fn overview(
     state: &AppState,
     caller: Caller<'_>,
+    reach: &CampaignReach,
     campaign: Campaign,
     with_device_time: bool,
 ) -> Result<Named<CampaignOverview>, AppError> {
@@ -486,6 +490,7 @@ pub(crate) async fn overview(
         campaign.current_plan_id.is_some() && links.first().is_some_and(|(_, plan)| plan.is_some());
     let may_administer = may_administer(state, caller, &campaign).await?;
     let catalog_org_id = catalog_org(state, caller, &campaign).await?;
+    let group = readable_group(state, reach, &campaign.campaign_id).await?;
     let revisable = if head_readable {
         CampaignReviser::revisable_head(state, caller, &campaign).await?
     } else {
@@ -516,6 +521,7 @@ pub(crate) async fn overview(
     Ok(Named {
         body: CampaignOverview {
             campaign: campaign.into(),
+            group,
             may_administer,
             may_edit_variants: revisable.is_some(),
             // [`may_rerun`]'s rule, from the reads above.
@@ -532,6 +538,32 @@ pub(crate) async fn overview(
         // Always given, empty or not: the page draws the owner from it.
         names: Some(names),
     })
+}
+
+/// The group `campaign_id` is in, if `reach` admits its owner as
+/// `GET /api/v1/campaign-groups/{group_id}` does.
+async fn readable_group(
+    state: &AppState,
+    reach: &CampaignReach,
+    campaign_id: &CampaignId,
+) -> Result<Option<CampaignGroup>, AppError> {
+    let Some(store) = state.campaign_group_store.as_deref() else {
+        return Ok(None);
+    };
+    let group_id = store
+        .group_of(campaign_id)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to read the campaign's group")))?;
+    let Some(group_id) = group_id else {
+        return Ok(None);
+    };
+    let group = store
+        .get_group(&group_id)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to read the campaign group")))?;
+    Ok(group
+        .filter(|group| reach.admits_owner(&group.owner))
+        .map(CampaignGroup::from))
 }
 
 /// A scope is `None` unless the reader may read each of its plans; the

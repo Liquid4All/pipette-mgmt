@@ -22,12 +22,11 @@ use pipette_httpapi::state::AppState;
 use pipette_pipeline::score;
 use pipette_plan_types::BenchmarkId;
 use pipette_store::ScoreQueueStage;
-use pipette_store_fs::build_local_fs_stores;
 use pipette_store_testkit::TEST_LIST_LIMIT;
 use pipette_web_testkit::{
-    QueueBackend, authed_get, authed_post, body_json, job, make_state, make_state_with_evals_url,
+    authed_get, authed_post, body_json, job, make_state, make_state_with_evals_url,
     register_and_approve, run_full_score, run_mocked, run_qm, seed_avail, seed_leased,
-    seeded_queue_state, setup_benchmarks, setup_models, submit_benchmark,
+    seeded_queue_state, setup_benchmarks, setup_models, stores_of, submit_benchmark,
 };
 
 /// Small enough that a run spans several chunks.
@@ -244,7 +243,7 @@ async fn test_throughput_scoring_produces_metrics() -> anyhow::Result<()> {
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -314,12 +313,12 @@ async fn test_scorer_preserves_mlx_model_name_and_quant() -> anyhow::Result<()> 
         "runtime_version": "0.26.0",
         "prefill_time_ms": 34.7
     });
-    build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &body)
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -400,7 +399,7 @@ async fn test_scorer_trims_device_model_runtime_fields() -> anyhow::Result<()> {
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -492,7 +491,7 @@ async fn test_max_memory_usage_scoring_produces_metrics() -> anyhow::Result<()> 
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -547,7 +546,7 @@ async fn test_max_memory_usage_legacy_field_names_still_score() -> anyhow::Resul
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -607,7 +606,7 @@ async fn test_scoring_moves_submission_to_processed() -> anyhow::Result<()> {
         .join(format!("{job_id}.json"));
     let expected = std::fs::read_to_string(&incoming_path)?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     assert!(!incoming_path.exists());
 
@@ -680,7 +679,7 @@ parameter_seed = 7
     )
     .await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let data_dir = state
         .config
@@ -996,7 +995,7 @@ async fn test_vlm_eval_scoring_stamps_the_pinned_sampling_and_profile() -> anyho
     )
     .await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let data_dir = state
         .config
@@ -1253,7 +1252,7 @@ async fn test_asr_eval_scoring_reports_wer_and_its_beams() -> anyhow::Result<()>
     )
     .await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1399,7 +1398,7 @@ async fn partial_asr_eval(completions: serde_json::Value) -> anyhow::Result<()> 
         }),
     )
     .await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let key = job(&job_id)?;
     let mut body = stores
         .submissions
@@ -1412,10 +1411,10 @@ async fn partial_asr_eval(completions: serde_json::Value) -> anyhow::Result<()> 
         .ok_or_else(|| anyhow::anyhow!("the stored body has completions"))? = completions;
     stores.submissions.write_incoming(&key, &body).await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     score.assert_calls_async(0).await;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let to_do = stores
         .submissions
         .list_queue(ScoreQueueStage::ToDo, TEST_LIST_LIMIT)
@@ -1466,7 +1465,7 @@ async fn test_eval_scoring_produces_accuracy_and_eval_sample_results() -> anyhow
     )
     .await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1546,14 +1545,14 @@ async fn test_malformed_submission_on_disk_stays_in_incoming() -> anyhow::Result
         "job_id": job_id,
         "submitted_at": "2026-01-01T00:00:00Z",
     });
-    pipette_store_fs::build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &bad_body)
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
-    let stores = pipette_store_fs::build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let incoming = stores.submissions.list_incoming(TEST_LIST_LIMIT).await?;
     assert!(
         incoming.iter().any(|k| k.as_str() == job_id),
@@ -1604,11 +1603,11 @@ async fn test_eval_scoring_fails_on_malformed_upstream_score_response() -> anyho
     .await?;
 
     // Route -> eval scoring (malformed response fails) -> finalize (nothing).
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     // The eval was routed out of incoming, but scoring failed on the malformed
     // response, so it stays parked in score-queue/to_do — never finalized.
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let to_do = stores
         .submissions
         .list_queue(ScoreQueueStage::ToDo, TEST_LIST_LIMIT)
@@ -1660,10 +1659,10 @@ async fn test_eval_scoring_skips_when_service_down() -> anyhow::Result<()> {
     // Both runs must succeed (the crons exit 0 and retry on their schedule):
     // the fast pass routes the evals into to_do, the slow pass pauses when the
     // service is unreachable, leaving them in to_do.
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let to_do: std::collections::HashSet<String> = stores
         .submissions
         .list_queue(ScoreQueueStage::ToDo, TEST_LIST_LIMIT)
@@ -1709,7 +1708,7 @@ async fn test_eval_sample_results_404_for_non_eval_job() -> anyhow::Result<()> {
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(
         &state,
@@ -1802,7 +1801,7 @@ async fn test_eval_sample_results_read_failed_reason_from_stop_detail() -> anyho
         ])),
     )
     .await?;
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let resp = authed_get(
         &state,
@@ -1889,7 +1888,7 @@ async fn test_eval_sample_results_of_another_clients_job_read_as_not_found() -> 
         ])),
     )
     .await?;
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
     let uri = format!("/jobs/{job_id}/eval-sample-results");
 
     // Scored and readable, so ownership alone stands behind the other 404.
@@ -1931,7 +1930,7 @@ async fn test_eval_sample_results_derive_failed_from_stop_reason() -> anyhow::Re
         ])),
     )
     .await?;
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let resp = authed_get(
         &state,
@@ -2002,10 +2001,10 @@ async fn test_eval_sample_results_404_for_failed_job() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     // Processed, so the 404 below is the failure's and not the unscored job's.
-    let record = build_local_fs_stores(&state.config)?
+    let record = stores_of(&state)
         .submissions
         .find_job(&job(claimed)?)
         .await?
@@ -2042,7 +2041,7 @@ async fn test_eval_sample_results_404_for_failure_archived_unrecorded() -> anyho
     // Four days back: its partition closed a day ago under the 72-hour window.
     let submitted_at = chrono::Utc::now() - chrono::TimeDelta::days(4);
     let job_id = job("job-archived-failure")?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     stores
         .submissions
         .write_incoming(
@@ -2059,7 +2058,7 @@ async fn test_eval_sample_results_404_for_failure_archived_unrecorded() -> anyho
             }),
         )
         .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let record = stores
         .submissions
@@ -2126,12 +2125,12 @@ async fn test_scorer_dedupes_duplicate_completion_ids_in_legacy_submission() -> 
             {"id": "s3", "completion": "blue"},
         ]
     });
-    build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &body)
         .await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2254,7 +2253,7 @@ async fn assert_score_request_body(
     }
     let job_id = submit_benchmark(&state, &sk, &client_id, &body).await?;
 
-    run_full_score(&state.config).await?;
+    run_full_score(&state).await?;
 
     // A body that differs by a byte misses the matcher, answers 404, and
     // leaves the job unscored.
@@ -2317,7 +2316,7 @@ async fn test_vl_throughput_scoring_canonicalizes_model_descriptor() -> anyhow::
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2466,7 +2465,7 @@ async fn test_vl_throughput_end_to_end_latency_takes_the_client_total() -> anyho
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2551,7 +2550,7 @@ async fn test_asr_throughput_scores_and_records_its_token_counts() -> anyhow::Re
     };
 
     let job_id = submit_benchmark(&state, &sk, &client_id, &body(json!({}))?).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2672,7 +2671,7 @@ async fn test_asr_max_memory_scores_a_peak_and_records_the_clip() -> anyhow::Res
         "client_extras": r#"{"asr_context_sizing":"upper_bound","asr_beyond_model_audio_limit":true}"#
     });
     let job_id = submit_benchmark(&state, &sk, &client_id, &body).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2739,6 +2738,99 @@ async fn test_asr_max_memory_scores_a_peak_and_records_the_clip() -> anyhow::Res
     Ok(())
 }
 
+/// A packed decision run scores its request latency and its throughput, and
+/// both rows record the state, the requests in flight and the run's swap peak.
+#[tokio::test]
+async fn test_decision_latency_scores_a_packed_batch_and_records_its_swap() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    std::fs::write(
+        dir.path()
+            .join("benchmarks/decision_latency_text64_q3_bs64.toml"),
+        "benchmark_type = \"decision_latency\"\n\
+         parameter_text_tokens = 64\n\
+         parameter_questions = 3\n\
+         parameter_batch_size = 64\n",
+    )?;
+    let state = make_state(dir.path()).await?;
+    let (sk, client_id) = register_and_approve(&state).await?;
+
+    let body = json!({
+        "benchmark_id": "decision_latency_text64_q3_bs64",
+        "device_name": "test-device",
+        "device_form_factor": "embedded",
+        "device_os_name": "Linux",
+        "device_os_version": "22.04",
+        "device_chip_model": "test-chip",
+        "device_ram_bytes": 17179869184i64,
+        "model_name": "LiquidAI/d1-3B-GGUF",
+        "model_quant": "Q4_K_M",
+        "runtime_name": "llama.cpp",
+        "runtime_version": "b11488",
+        "decision_latency_request_ms": 41.5,
+        "decision_latency_batch_ms": 800.0,
+        "observation_max_swap_bytes": 1_073_741_824_i64
+    });
+    let job_id = submit_benchmark(&state, &sk, &client_id, &body).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
+
+    let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let job = body_json(resp).await?;
+    assert_eq!(job["status"], "processed");
+    let metrics: Vec<_> = job["metrics"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing metrics array"))?
+        .iter()
+        .map(|m| (m["metric"].clone(), m["value"].clone(), m["unit"].clone()))
+        .collect();
+    // 64 requests in 800 ms is 80 a second.
+    assert_eq!(
+        metrics,
+        [
+            (json!("decision_latency"), json!(41.5), json!("ms")),
+            (
+                json!("decision_throughput"),
+                json!(80.0),
+                json!("requests/sec")
+            ),
+        ]
+    );
+
+    let data_dir = state
+        .config
+        .storage
+        .data_dir()
+        .ok_or_else(|| anyhow::anyhow!("expected local_fs config"))?;
+    let partition = warehouse::warehouse_day_partition_dir(
+        &data_dir.join("warehouse/results"),
+        &BenchmarkId::try_new("decision_latency_text64_q3_bs64")?,
+        &client_id,
+        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+    );
+    let rows = [
+        ("parameter_text_tokens", Some(64)),
+        ("parameter_num_images", Some(0)),
+        ("parameter_image_width", None),
+        ("parameter_image_height", None),
+        ("parameter_questions", Some(3)),
+        ("parameter_batch_size", Some(64)),
+    ]
+    .into_iter()
+    .map(|(column, expected)| assert_i32_column(&partition, column, expected))
+    .collect::<anyhow::Result<Vec<_>>>()?;
+    assert!(rows.iter().all(|&n| n == 2), "one row per metric: {rows:?}");
+    assert_eq!(
+        assert_i64_column(
+            &partition,
+            "observation_max_swap_bytes",
+            Some(1_073_741_824)
+        )?,
+        2
+    );
+    Ok(())
+}
+
 /// Score one `prefill_throughput` run with `extra` added to the standard body,
 /// and return its warehouse partition. Hold the `TempDir` while reading it.
 async fn score_one_submission(
@@ -2772,7 +2864,7 @@ async fn score_one_submission(
         );
 
     submit_benchmark(&state, &sk, &client_id, &body).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -2969,7 +3061,7 @@ async fn test_requested_and_effective_flags_both_reach_the_warehouse() -> anyhow
     // is present.
     body["runtime_flags"] = json!(r#"{"n_gpu_layers":99,"threads":8}"#);
     submit_benchmark(&state, &sk, &client_id, &body).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -3064,8 +3156,8 @@ async fn test_observed_memory_reaches_the_warehouse(
 async fn test_scorer_backfills_model_params_from_lookup() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?;
     let (_sk, client_id) = register_and_approve(&state).await?;
 
     // Written directly: the HTTP handler would reject a body without it.
@@ -3091,12 +3183,12 @@ async fn test_scorer_backfills_model_params_from_lookup() -> anyhow::Result<()> 
         "runtime_version": "b5000",
         "prefill_time_ms": 34.7
     });
-    build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &body)
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -3161,8 +3253,8 @@ async fn test_a_vault_model_is_recorded_under_its_origin(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?;
     assert_vault_model_recorded(&state, "prefill_throughput_256", imported).await
 }
 
@@ -3172,8 +3264,8 @@ async fn test_an_eval_vault_model_is_recorded_under_its_origin() -> anyhow::Resu
     let evals = mock_evals_server().await;
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+    setup_models(&state).await?;
     assert_vault_model_recorded(&state, "eval_test", true).await
 }
 
@@ -3233,8 +3325,8 @@ fn submission_body(
 async fn test_a_rerun_job_records_the_job_it_runs_again() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?;
     assert_rerun_recorded(
         &state,
         "prefill_throughput_256",
@@ -3249,8 +3341,8 @@ async fn test_an_eval_rerun_job_records_the_job_it_runs_again() -> anyhow::Resul
     let evals = mock_evals_server().await;
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
+    setup_models(&state).await?;
     assert_rerun_recorded(
         &state,
         "eval_test",
@@ -3267,7 +3359,7 @@ async fn assert_rerun_recorded(
     params: &str,
 ) -> anyhow::Result<()> {
     let (_sk, client_id) = register_and_approve(state).await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(state);
 
     let (rerun, parent) = (job("rerun-job")?, job("first-job")?);
     let manifest = pipette_core::plan::PlanManifest {
@@ -3299,7 +3391,7 @@ async fn assert_rerun_recorded(
         &descriptor,
     )?;
     stores.submissions.write_incoming(&rerun, &body).await?;
-    run_full_score(&state.config).await?;
+    run_full_score(state).await?;
 
     let data_dir = state
         .config
@@ -3327,7 +3419,7 @@ async fn assert_vault_model_recorded(
     imported: bool,
 ) -> anyhow::Result<()> {
     let (_sk, client_id) = register_and_approve(state).await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(state);
 
     let record = pipette_core::vault::VaultResource {
         origin: imported
@@ -3354,7 +3446,7 @@ async fn assert_vault_model_recorded(
         .submissions
         .write_incoming(&job(job_id)?, &body)
         .await?;
-    run_full_score(&state.config).await?;
+    run_full_score(state).await?;
 
     let data_dir = state
         .config
@@ -3409,8 +3501,8 @@ async fn assert_vault_model_recorded(
 async fn test_scorer_normalizes_wrong_model_params_for_known_model() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?;
     let (_sk, client_id) = register_and_approve(&state).await?;
 
     let job_id = "wrong-value-job";
@@ -3436,12 +3528,12 @@ async fn test_scorer_normalizes_wrong_model_params_for_known_model() -> anyhow::
         "runtime_version": "b5000",
         "prefill_time_ms": 34.7
     });
-    build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &body)
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -3509,8 +3601,8 @@ async fn test_scorer_resolves_moe_params_from_catalog(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?;
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
     // Client sends wrong (9999) params to exercise the catalog override; the
@@ -3542,7 +3634,7 @@ async fn test_scorer_resolves_moe_params_from_catalog(
     }
 
     let _job_id = submit_benchmark(&state, &sk, &client_id, &body).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -3598,8 +3690,8 @@ async fn test_scorer_leaves_null_when_neither_catalog_nor_submission_has_values(
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    setup_models(dir.path()).await?; // catalog has LFM2-700M, llama-3.2-1b, LFM2-8B-A1B
     let state = make_state(dir.path()).await?;
+    setup_models(&state).await?; // catalog has LFM2-700M, llama-3.2-1b, LFM2-8B-A1B
     let (sk, client_id) = register_and_approve(&state).await?;
 
     let _job_id = submit_benchmark(
@@ -3623,7 +3715,7 @@ async fn test_scorer_leaves_null_when_neither_catalog_nor_submission_has_values(
     )
     .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let data_dir = state
         .config
@@ -3719,9 +3811,9 @@ async fn test_run_score_drains_backlog_in_chunks() -> anyhow::Result<()> {
         job_ids.push(job_id);
     }
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     assert!(
         stores
             .submissions
@@ -3783,7 +3875,7 @@ async fn test_run_score_chunked_mixed_success_and_failure() -> anyhow::Result<()
     }
 
     // Poison pills: written directly, missing required fields.
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let mut bad_job_ids = Vec::new();
     for i in 0..2 {
         let job_id = format!("poison-{i}");
@@ -3798,9 +3890,9 @@ async fn test_run_score_chunked_mixed_success_and_failure() -> anyhow::Result<()
         bad_job_ids.push(job_id);
     }
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let remaining = stores.submissions.list_incoming(TEST_LIST_LIMIT).await?;
     let remaining_ids: std::collections::HashSet<&str> =
         remaining.iter().map(|k| k.as_str()).collect();
@@ -3844,14 +3936,14 @@ async fn test_run_score_does_not_loop_on_failed_submissions() -> anyhow::Result<
         "job_id": job_id,
         "submitted_at": "2026-01-01T00:00:00Z",
     });
-    build_local_fs_stores(&state.config)?
+    stores_of(&state)
         .submissions
         .write_incoming(&key, &bad_body)
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let incoming = stores.submissions.list_incoming(TEST_LIST_LIMIT).await?;
     assert!(
         incoming.iter().any(|k| k.as_str() == job_id),
@@ -3899,24 +3991,18 @@ async fn test_eval_pipeline_stages_through_score_queue() -> anyhow::Result<()> {
     .await?;
 
     let in_stage = |stage| {
-        let config = state.config.clone();
+        let submissions = state.submission_store.clone();
         let job_id = job_id.clone();
         async move {
-            let jobs = build_local_fs_stores(&config)?
-                .submissions
-                .list_queue(stage, TEST_LIST_LIMIT)
-                .await?;
+            let jobs = submissions.list_queue(stage, TEST_LIST_LIMIT).await?;
             anyhow::Ok(jobs.iter().any(|j| j.as_str() == job_id))
         }
     };
     let in_incoming = || {
-        let config = state.config.clone();
+        let submissions = state.submission_store.clone();
         let job_id = job_id.clone();
         async move {
-            let jobs = build_local_fs_stores(&config)?
-                .submissions
-                .list_incoming(TEST_LIST_LIMIT)
-                .await?;
+            let jobs = submissions.list_incoming(TEST_LIST_LIMIT).await?;
             anyhow::Ok(jobs.iter().any(|j| j.as_str() == job_id))
         }
     };
@@ -3924,13 +4010,13 @@ async fn test_eval_pipeline_stages_through_score_queue() -> anyhow::Result<()> {
     assert!(in_incoming().await?, "starts in incoming/");
 
     // Fast pass routes the eval out of incoming/ into to_do.
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
     assert!(!in_incoming().await?, "left incoming/ after route");
     assert!(in_stage(ScoreQueueStage::ToDo).await?, "routed to to_do");
     assert!(!in_stage(ScoreQueueStage::ToFinalize).await?);
 
     // Slow pass calls the scoring service and stages the result for finalize.
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
     assert!(
         !in_stage(ScoreQueueStage::ToDo).await?,
         "left to_do after scoring"
@@ -3941,7 +4027,7 @@ async fn test_eval_pipeline_stages_through_score_queue() -> anyhow::Result<()> {
     );
 
     // Fast pass finalizes: warehouse write + archive to processed/.
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
     assert!(
         !in_stage(ScoreQueueStage::ToFinalize).await?,
         "left to_finalize"
@@ -4003,10 +4089,10 @@ async fn evals_that_keep_failing_do_not_stall_the_score_queue() -> anyhow::Resul
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     // Each sorts ahead of the good job.
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let poison = json!({"benchmark_id": "eval_test", "client_id": client_id.as_str()});
     futures::stream::iter((0..1001).map(|i| job(format!("0-poison-{i:04}"))))
         .try_for_each(|poison_id| {
@@ -4020,9 +4106,9 @@ async fn evals_that_keep_failing_do_not_stall_the_score_queue() -> anyhow::Resul
         })
         .await?;
 
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
-    let staged = build_local_fs_stores(&state.config)?
+    let staged = stores_of(&state)
         .submissions
         .list_queue(ScoreQueueStage::ToFinalize, TEST_LIST_LIMIT)
         .await?;
@@ -4058,7 +4144,7 @@ async fn test_eval_in_the_score_queue_reads_as_scoring() -> anyhow::Result<()> {
     // The fast pass routes the eval to `to_do`, then the slow pass stages it in
     // `to_finalize`. No finalize pass runs, so it never reaches `processed/`.
     for stage in [ScoreQueueStage::ToDo, ScoreQueueStage::ToFinalize] {
-        let stores = build_local_fs_stores(&state.config)?;
+        let stores = stores_of(&state);
         match stage {
             ScoreQueueStage::ToDo => score::run_process_submissions(&state.config, stores).await?,
             ScoreQueueStage::ToFinalize => score::run_score_eval(&state.config, stores).await?,
@@ -4067,7 +4153,7 @@ async fn test_eval_in_the_score_queue_reads_as_scoring() -> anyhow::Result<()> {
             }
         }
         assert!(
-            build_local_fs_stores(&state.config)?
+            stores_of(&state)
                 .submissions
                 .read_queue(stage, &job(&job_id)?)
                 .await?
@@ -4134,7 +4220,7 @@ async fn test_score_eval_skips_job_already_in_to_finalize() -> anyhow::Result<()
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state_with_evals_url(dir.path(), "http://127.0.0.1:1").await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let job = job("evaljob")?;
 
     // Simulate a crash after staging to_finalize but before clearing to_do.
@@ -4155,7 +4241,7 @@ async fn test_score_eval_skips_job_already_in_to_finalize() -> anyhow::Result<()
         )
         .await?;
 
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
     // Skip path: to_do cleared without re-scoring; to_finalize left intact.
     assert!(
@@ -4183,7 +4269,7 @@ async fn test_score_eval_isolates_a_failing_to_do_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
 
     let good = job("good")?;
     let bad = job("bad")?;
@@ -4202,7 +4288,7 @@ async fn test_score_eval_isolates_a_failing_to_do_job() -> anyhow::Result<()> {
         .enqueue(ScoreQueueStage::ToDo, &bad, &bad_body)
         .await?;
 
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
     // good advanced to to_finalize and left to_do; bad stayed in to_do.
     assert!(
@@ -4266,11 +4352,11 @@ async fn test_finalize_isolates_a_failing_job() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
     // Inject a malformed to_finalize entry (no `score`) that finalize can't process.
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let bad = job("badfinal")?;
     stores
         .submissions
@@ -4282,7 +4368,7 @@ async fn test_finalize_isolates_a_failing_job() -> anyhow::Result<()> {
         .await?;
 
     // Finalize pass: good lands in processed/, bad is deferred in to_finalize.
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{good_job}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -4335,12 +4421,11 @@ async fn an_eval_whose_score_never_finalizes_is_parked() -> anyhow::Result<()> {
         &eval_submission(json!([{"id": "s1", "completion": "4"}])),
     )
     .await?;
-    let finalize_pass = || async {
-        score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await
-    };
+    let finalize_pass =
+        || async { score::run_process_submissions(&state.config, stores_of(&state)).await };
     finalize_pass().await?;
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
+    let stores = stores_of(&state);
     let submissions = &*stores.submissions;
     let staged = submissions
         .read_queue(ScoreQueueStage::ToFinalize, &job(&job_id)?)
@@ -4416,7 +4501,7 @@ async fn a_scorer_error_status_counts_against_the_job_only_when_it_may_be_its_ow
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state_with_evals_url(dir.path(), &evals.base_url()).await?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let submissions = &*stores.submissions;
     let jobs = ["a", "b"];
     futures::stream::iter(jobs.map(anyhow::Ok))
@@ -4431,7 +4516,7 @@ async fn a_scorer_error_status_counts_against_the_job_only_when_it_may_be_its_ow
         })
         .await?;
 
-    score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_score_eval(&state.config, stores_of(&state)).await?;
 
     let got =
         futures::future::try_join_all(jobs.map(|id| failed_attempts(submissions, id))).await?;
@@ -4464,7 +4549,7 @@ async fn an_eval_that_always_times_out_is_parked() -> anyhow::Result<()> {
     let mut config = (*state.config).clone();
     config.http_timeout_secs = 1;
     state.config = std::sync::Arc::new(config);
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let submissions = &*stores.submissions;
     futures::stream::iter(["a", "b"].map(anyhow::Ok))
         .try_for_each(|id| async move {
@@ -4477,9 +4562,7 @@ async fn an_eval_that_always_times_out_is_parked() -> anyhow::Result<()> {
                 .await
         })
         .await?;
-    let pass = || async {
-        score::run_score_eval(&state.config, build_local_fs_stores(&state.config)?).await
-    };
+    let pass = || async { score::run_score_eval(&state.config, stores_of(&state)).await };
 
     pass().await?;
     assert_eq!(failed_attempts(submissions, "a").await?, Some(1));
@@ -4652,7 +4735,7 @@ async fn test_client_failure_records_intended_metric_rows() -> anyhow::Result<()
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let partition = today_partition(&state, "prefill_throughput_256", &client_id)?;
     assert!(partition.exists(), "expected a failure partition");
@@ -4737,7 +4820,7 @@ async fn test_recorded_failure_leaves_incoming_for_processed() -> anyhow::Result
     )
     .await?;
 
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     let before = stores
         .submissions
         .find_job(&job(claimed)?)
@@ -4745,7 +4828,7 @@ async fn test_recorded_failure_leaves_incoming_for_processed() -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("expected a stored failure"))?;
     assert_eq!(before.state, pipette_store::JobState::Incoming);
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let after = stores
         .submissions
@@ -4793,10 +4876,10 @@ async fn test_archived_failure_still_reads_as_failed() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     // The route below reads the archive, not `incoming/`.
-    let archived = build_local_fs_stores(&state.config)?
+    let archived = stores_of(&state)
         .submissions
         .find_job(&job(claimed)?)
         .await?
@@ -4841,7 +4924,7 @@ async fn test_synthetic_failure_records_its_source(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
-    let Some(queue) = seeded_queue_state(dir.path(), QueueBackend::Database).await? else {
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -4892,7 +4975,7 @@ async fn test_synthetic_failure_records_its_source(
     }
 
     run_qm(state).await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(state)).await?;
 
     // A synthetic failure is attributed to the reserved `system` client.
     let system = pipette_plan_types::ClientId::try_new("system")?;
@@ -4951,7 +5034,7 @@ async fn test_backlog_failure_body_resolves_its_source(
 
     // Written straight to `incoming/`, with no `failure_source` key at all.
     let job_id = job("job-backlog")?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     stores
         .submissions
         .write_incoming(
@@ -4969,7 +5052,7 @@ async fn test_backlog_failure_body_resolves_its_source(
         )
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let owner = pipette_plan_types::ClientId::try_new(client_id)?;
     let partition = today_partition(&state, "prefill_throughput_256", &owner)?;
@@ -5000,7 +5083,7 @@ async fn test_failure_past_the_lock_window_archives_unrecorded(
     let submitted_at = chrono::Utc::now() - chrono::TimeDelta::days(days_back);
     let client_id = pipette_plan_types::ClientId::try_new("ev1_backlog")?;
     let job_id = job("job-lock-window")?;
-    let stores = build_local_fs_stores(&state.config)?;
+    let stores = stores_of(&state);
     stores
         .submissions
         .write_incoming(
@@ -5018,7 +5101,7 @@ async fn test_failure_past_the_lock_window_archives_unrecorded(
         )
         .await?;
 
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     // Either way the body is archived, so the scorer never sees it again. This
     // is the property that keeps a closed-partition body from wedging the run.
@@ -5101,7 +5184,7 @@ async fn test_intended_metric_rows_per_benchmark_type(
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let partition = today_partition(&state, benchmark_id, &client_id)?;
     assert_eq!(
@@ -5118,7 +5201,7 @@ async fn test_intended_metric_rows_per_benchmark_type(
     );
     // The failure was recorded on the fast path, not handed to the slow scorer.
     assert!(
-        build_local_fs_stores(&state.config)?
+        stores_of(&state)
             .submissions
             .list_queue(ScoreQueueStage::ToDo, TEST_LIST_LIMIT)
             .await?
@@ -5181,7 +5264,7 @@ async fn test_failed_is_not_true_selects_exactly_the_measured_rows() -> anyhow::
         }),
     )
     .await?;
-    score::run_process_submissions(&state.config, build_local_fs_stores(&state.config)?).await?;
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
 
     let partition = today_partition(&state, "prefill_throughput_256", &client_id)?;
     let rows = read_row_facts(&partition)?;

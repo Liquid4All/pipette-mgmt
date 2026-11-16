@@ -28,6 +28,8 @@ const PREAUTH_KEY: &str = "0195c3e2a4f37b8c";
 const CLIENT_PREAUTH_KEY: &str = "0195c3e2a4f37b8d";
 const ORG: &str = "org_0195c3e2a4f37b8c";
 const CAMPAIGN: &str = "campaign_0195c3e2a4f37b8c";
+const GROUP: &str = "group_0195c3e2a4f37b8c";
+const POLICY_KIND: &str = "spread";
 const PLAN: &str = "plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e";
 const JOB: &str = "job-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e";
 const RESOURCE: &str = "vault_0195c3e2a4f37b8c";
@@ -45,6 +47,8 @@ const IDS: &[&str] = &[
     CLIENT_PREAUTH_KEY,
     ORG,
     CAMPAIGN,
+    GROUP,
+    POLICY_KIND,
     PLAN,
     JOB,
     RESOURCE,
@@ -168,6 +172,30 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         ("POST", format!("/api/v1/campaigns/{CAMPAIGN}/revert")),
         ("POST", format!("/api/v1/campaigns/{CAMPAIGN}/recalculate")),
         ("PUT", format!("/api/v1/campaigns/{CAMPAIGN}/owner")),
+        // Campaign groups.
+        ("GET", "/api/v1/campaign-groups".into()),
+        ("POST", "/api/v1/campaign-groups".into()),
+        ("GET", format!("/api/v1/campaign-groups/{GROUP}")),
+        ("PATCH", format!("/api/v1/campaign-groups/{GROUP}")),
+        ("DELETE", format!("/api/v1/campaign-groups/{GROUP}")),
+        ("POST", format!("/api/v1/campaign-groups/{GROUP}/members")),
+        (
+            "DELETE",
+            format!("/api/v1/campaign-groups/{GROUP}/members/{CAMPAIGN}"),
+        ),
+        ("GET", format!("/api/v1/campaign-groups/{GROUP}/policies")),
+        (
+            "PUT",
+            format!("/api/v1/campaign-groups/{GROUP}/policies/{POLICY_KIND}"),
+        ),
+        (
+            "GET",
+            format!("/api/v1/campaign-groups/{GROUP}/policy-preview"),
+        ),
+        (
+            "GET",
+            format!("/api/v1/campaign-groups/{GROUP}/rerun-results"),
+        ),
         // The vault.
         ("PUT", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
         ("HEAD", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
@@ -368,6 +396,9 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
             ("GET", "/api/v1/campaigns/{}/overview"),
             ("GET", "/api/v1/campaigns/{}/plan"),
             ("GET", "/api/v1/campaigns/{}/plans"),
+            ("GET", "/api/v1/campaign-groups"),
+            ("GET", "/api/v1/campaign-groups/{}"),
+            ("GET", "/api/v1/campaign-groups/{}/policies"),
         ],
     ),
     (
@@ -377,11 +408,15 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
             ("DELETE", "/api/v1/campaigns/{}"),
             ("GET", "/api/v1/campaigns/{}/owners"),
             ("PUT", "/api/v1/campaigns/{}/owner"),
+            ("PATCH", "/api/v1/campaign-groups/{}"),
+            ("DELETE", "/api/v1/campaign-groups/{}"),
         ],
     ),
     (
         "user lacks the read_plans permission",
         &[
+            ("GET", "/api/v1/campaign-groups/{}/policy-preview"),
+            ("GET", "/api/v1/campaign-groups/{}/rerun-results"),
             ("GET", "/api/v1/plans"),
             ("GET", "/api/v1/plans/{}"),
             ("GET", "/api/v1/plans/{}/document"),
@@ -410,6 +445,10 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
             ("POST", "/api/v1/campaigns/{}/rerun"),
             ("POST", "/api/v1/campaigns/{}/revert"),
             ("POST", "/api/v1/campaigns/{}/recalculate"),
+            ("POST", "/api/v1/campaign-groups"),
+            ("POST", "/api/v1/campaign-groups/{}/members"),
+            ("DELETE", "/api/v1/campaign-groups/{}/members/{}"),
+            ("PUT", "/api/v1/campaign-groups/{}/policies/{}"),
         ],
     ),
     (

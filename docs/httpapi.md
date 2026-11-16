@@ -15,6 +15,7 @@ intro per tag:
 - [Organizations](api/orgs.md): organizations, their members, catalogs and overviews
 - [Devices](api/devices.md): the fleet, its administration, and the pre-auth keys that enroll devices
 - [Campaigns](api/campaigns.md): campaigns, filing their plans and their revisions
+- [Campaign groups](api/campaign-groups.md): campaigns of one owner listed together, and their policies
 - [Plans](api/plans.md): checking, reading and cancelling plans and their jobs
 - [Vault](api/vault.md): private models and runtimes
 - [Model parameters](api/model-params.md): the parameter counts scoring reads for each model
@@ -220,8 +221,9 @@ The server applies filters after it reads each object. Therefore, a selective
 filter can make the server read many more objects than it returns. The
 configured limits control returned rows. They do not control scanned objects.
 
-**Newest first.** `GET /api/v1/campaigns`, `GET /api/v1/vault/resources` and
-[`GET /api/v1/plans`](api/plans/list_plans.md) also take `order`: `oldest`, the
+**Newest first.** `GET /api/v1/campaigns`, `GET /api/v1/campaign-groups`,
+`GET /api/v1/vault/resources` and [`GET /api/v1/plans`](api/plans/list_plans.md)
+also take `order`: `oldest`, the
 default above, or `newest`, which sorts rows by object key in **descending**
 order. Ids end in a UUIDv7, so this is creation order, newest first.
 `next_cursor` is then an exclusive **upper** limit for the key: it remains
@@ -288,8 +290,8 @@ files for another host ([CLI](cli.md#pipette-mgmt-openapi---site-dir)).
 ## 1.6. Write answers
 
 A write that edits one record answers the record as stored after it, plus
-`changed`. `changed: false` is a success that wrote nothing, since the record
-already held what was asked, so a retry is safe. Each route's section says what
+`changed`. `changed: false` is a success that wrote nothing to the record, since
+it already held what was asked, so a retry is safe. Each route's section says what
 its no-op is.
 
 ## 2. Endpoints
@@ -643,7 +645,8 @@ Both also carry the entry's `recipe`.
 #### 2.6.2. Response `200 OK`
 
 Same fields as section 2.5, plus for `prefill_throughput`,
-`decode_throughput` and `end_to_end_latency` benchmarks:
+`decode_throughput`, `end_to_end_latency`, `decision_latency` and
+`decision_max_memory` benchmarks:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -882,7 +885,7 @@ or byte count is not negative, and a token or turn count is a positive `i32`.
 | `runtime_version` | string or null | no | Optional version label (e.g. `"b5000"`), stored verbatim and never interpreted |
 | `runtime_descriptor` | string (JSON) or null | no | Full, lossless runtime specification as a JSON **string**, version baked in. Opaque to the server and normalized like `model_descriptor`. When present, must be valid JSON (`400` otherwise). Recommended shape: the serialized `pipette-plan-types` `Runtime` variant ([examples](storage.md#model_descriptor--runtime_descriptor)) |
 | `runtime_flags` | string or null | no | Opaque configuration affecting the runtime itself. Typically a JSON string going forward but a plain string is equally valid; never validated or interpreted. Normalized exactly like `model_flags` ([why](storage.md#model_flags--runtime_flags)) |
-| `benchmark_flags` | string (JSON) or null | no | The **resolved** harness configuration the run actually executed under (readiness gating, timeouts, loop detection) as a JSON **string**. Opaque to the server: schema never interpreted, only key-order/whitespace normalized like `model_descriptor`. When present, must be a valid JSON object (`400` otherwise). Resolved, not authored: a client that left a setting unset submits the value it ran with, never `null` ([why](storage.md#benchmark_flags)) |
+| `benchmark_flags` | string (JSON) or null | no | The harness configuration the run executed under (readiness gating, timeouts, loop detection) as a JSON **string**. Opaque to the server: schema never interpreted, only key-order/whitespace normalized like `model_descriptor`. When present, must be a valid JSON object (`400` otherwise). The readiness block is resolved, not authored: a readiness setting the plan left unset is submitted as the value the run used, never `null`. The timeouts (`http_timeout_seconds`, `attempt_timeout_seconds`) are submitted as the plan set them and omitted when it set none, so a run on the client's default keeps grouping with older rows ([why](storage.md#benchmark_flags)) |
 | `client_configuration` | string (JSON) or null | no | The environment the client forwarded into the runtime process it spawned, as a JSON **string**: `{"envs":[...]}`. Opaque and stored verbatim, unlike `benchmark_flags`, which is normalized and hashed. When present, must be a valid JSON object (`400` otherwise). Absent, not null, when the client had no entry for the runtime it ran ([why](storage.md#client_configuration)) |
 | `runtime_cpu_variant` | string or null | no | Runtime-selected CPU kernel variant, interpreted per `runtime_name`; for llama.cpp/ggml the `ggml-cpu-<tag>` variant (e.g. `"armv8.2_1"`, `"apple_m2_m3"`). Null on single-static-backend builds |
 | `client_version` | string or null | no | Version of the **client build** that produced the run: the harness, not the inference runtime it drove (`runtime_version`). Opaque to the server: stored verbatim, never parsed, ordered, or compared. Must be non-blank when present (`400` otherwise) |
@@ -1026,8 +1029,8 @@ job itself (a terminal result).
 | `message_type` | string | yes | Must be `"failure"` |
 | `job_id` | string | yes | Job identifier from the [`POST /plans/claim`](#29-post-plansclaim) response, echoed verbatim. The descriptors are serialized from the claim's `spec.model` / `spec.runtime` (with any local HuggingFace token stripped) |
 | `failure_reason` | string | yes | Why the benchmark could not be run. Typically includes a timestamp and the runtime's own error output |
-| `failure_code` | string | no | What kind of failure this is: `unspecified`, `out_of_memory` (the runtime's output shows an allocation failure, or the OS killed the app; wins over `runtime_error`), `attempt_timeout` (an attempt ran past `attempt_timeout_seconds`), `runtime_error` (the runtime crashed, exited, aborted, refused the model or an op, answered wrongly, or ran past a limit other than `attempt_timeout_seconds`), `device_error` (a reboot, a readiness wait, an unreachable device) or `harness_error` (a vault fetch, an install, the spec, a missing model, the submit, or a download or wait that timed out). Absent reads as `unspecified`; any other value answers `400`. Kept in the denial of a retriable failure and in the `failure_code` column of a terminal one's rows |
-| `retriable` | bool | yes | Whether **another** client may still attempt this job. `true`: the failure is specific to this client (e.g. out of disk, thermal throttle, transient local fault): the server denies the job to this client and keeps it available to others. `false`: the failure is inherent to the benchmark/model/runtime and would recur anywhere: the server records it as the job's terminal result and tears the job down. See [queue.md](queue.md#consequences-of-failure) |
+| `failure_code` | string | no | The failure category. See the failure-code definitions below. Absent reads as `unspecified`; any other value answers `400`. Kept in the denial of a retriable failure and in the `failure_code` column of a terminal one's rows |
+| `retriable` | bool | yes | Whether **another** client may still attempt this job. `true`: the failure is specific to this client (e.g. out of disk, transient local fault): the server denies the job to this client and keeps it available to others. `false`: the failure is inherent to the benchmark/model/runtime and would recur anywhere: the server records it as the job's terminal result and tears the job down. See [queue.md](queue.md#consequences-of-failure) |
 | `benchmark_id` | string | yes | Benchmark that was being attempted |
 | `benchmark_type` | string or null | no | With `benchmark_params`, checked like the success variant's pair |
 | `benchmark_params` | object or null | no | See `benchmark_type`. A client reporting a claim on a benchmark it may not read has its pair ignored, as if it sent none, so the answer reveals nothing about the definition |
@@ -1038,6 +1041,34 @@ job itself (a terminal result).
 | `device_time_ms` | int or null | no | The milliseconds from the claim to the moment the failure is ready to submit. See the success table above. This is the only `device_*` field that a failure carries |
 | `client_extras` | string (JSON) or null | no | See the success table above |
 | `runtime_stdout`, `runtime_stderr` | string or null | no | What the runtime printed before it failed; see the success table above. Kept for a retriable failure too, which records no result |
+
+Failure-code definitions:
+
+- `unspecified`: The client sent no code.
+- `out_of_memory`: The runtime's output shows an allocation failure, or the OS
+  killed the app. This code wins over `runtime_error` when both apply.
+- `attempt_timeout`: An attempt ran past `attempt_timeout_seconds`.
+- `runtime_error`: The runtime failed in one of these ways:
+  - Crashed, exited or aborted.
+  - Refused the model or an operation.
+  - Answered wrongly.
+  - Ran past a limit other than `attempt_timeout_seconds`.
+- `device_error`: The device or its host failed:
+  - It rebooted or was unreachable.
+  - Its readiness check could not read a sensor or had a sensor set up wrong.
+  - A host check (battery, GPU driver) refused the run.
+- `device_not_ready`: The readiness wait timed out: the device stayed too hot
+  or busy to measure. The pipette worker and pipette-ios-proxy send this with
+  `retriable: false` from the release after the one that sends `harness_error`,
+  so a cell that keeps every device too hot or busy fails once instead of going
+  round the fleet.
+- `harness_error`: The client failed in one of these ways:
+  - A vault fetch, an install or the spec failed.
+  - A model was missing.
+  - The submit failed.
+  - A download or wait timed out.
+  - The readiness wait timed out, sent with `retriable: false` by a pipette
+    build from before `device_not_ready`.
 
 Example:
 
@@ -1061,7 +1092,10 @@ The scorer records one result row per metric the job intended to measure, each
 with a null `value` and the failure fields set
 ([storage.md](storage.md#failure-rows)), and no eval sample results.
 `GET /jobs/{job_id}` reports `status: "failed"` with the `failure_reason`
-verbatim, before and after scoring.
+verbatim, before and after scoring. On the database queue, one with
+`failure_code` `attempt_timeout` or `out_of_memory` also fails, before it is
+answered, each larger run of the job's family still queued
+([queue.md](queue.md#client-reported-failure)).
 
 A **retriable** failure (`retriable: true`) is *not* a job result. The server
 denies the job to the reporting client and keeps it available to other eligible
@@ -1256,7 +1290,22 @@ claim-binding check expects. Failures use the same endpoint with
 
 #### 2.9.1. Request body
 
-Empty (`{}` or no body).
+Optional. No body, an empty body and `{}` all claim the same way. The server
+ignores unknown top-level fields.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cached` | object | no | The artifacts the device holds. Without `cached`, the server assumes that the device holds the model and runtime from its last grant. A failure report clears this assumption. A lost lease also clears it unless the device reclaims the job. Over jobs with the same deadline, the server prefers a job with fewer smaller runs of its family in the queue ([queue.md](queue.md#claiming-a-job)), then a job whose model the fewest other devices run, then a job that needs both a held model and a held runtime, then a held model, then a held runtime |
+| `cached.models` | array of objects | no | Model descriptors, at most 256. Send each one exactly as `spec.model` of an earlier claim carried it |
+| `cached.runtimes` | array of objects | no | Runtime descriptors, at most 256. Send each one exactly as `spec.runtime` of an earlier claim carried it |
+
+The server compares descriptors as JSON values, so key order and whitespace have
+no effect. A descriptor that differs in any value matches nothing. Do not add a
+locally injected token (such as a Hugging Face `auth_token`) to a descriptor:
+it then matches nothing, and the request carries a secret. `cached` refuses
+unknown fields. A list with more than 256 entries, or an entry that is not an
+object, is a `400`. An empty `cached` means that the device holds nothing. Only
+the database queue uses `cached`.
 
 #### 2.9.2. Response `200 OK`
 
@@ -1378,7 +1427,7 @@ Returned when no job is currently available for this client. Possible reasons:
 
 - No jobs in the queue list this client as eligible.
 - All eligible jobs are currently leased to other clients.
-- A job in `avail/` is held only by `creating` or missing plans. Queue
+- An available job is held only by `creating` or missing plans. Queue
   maintenance leaves it out of the eligible index until a plan becomes final
   ([queue.md](queue.md#committed-filings)).
 - All eligible jobs have passed their `expires_at`. An expired job is never

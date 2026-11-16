@@ -224,7 +224,7 @@ mod tests {
             auth_storage: pipette_core::config::StorageConfig::local_fs(dir.to_path_buf()),
             ..pipette_core::config::Config::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_testkit::no_queue())
     }
 
     /// Seed one partition with `rows` and run `fix-model-param` over `only_models`.

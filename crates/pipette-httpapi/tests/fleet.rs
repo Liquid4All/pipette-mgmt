@@ -7,17 +7,19 @@ use ed25519_dalek::SigningKey;
 use rstest::rstest;
 use serde_json::{Value, json};
 
+use pipette_core::denial::DenialRecord;
+use pipette_core::plan::{PlanManifest, sample_manifest};
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
     CampaignId, ClientId, ClientOwner, ClientPermission, ExpiresAt, NonEmptyTrimmedString, OrgId,
-    Tag, UserId, UserKeyId, UserPermission,
+    PlanId, PlanStatus, Tag, UserId, UserKeyId, UserPermission,
 };
-use pipette_store::{CampaignBacklog, CampaignBacklogSnapshot};
 use pipette_web_testkit::{
-    QueueBackend, approved_client, approved_queue_client, authed_get, authed_post, authed_user_get,
-    body_json, filter_fleet, fleet_ids, put_idle_campaign, register_and_approve, registered_user,
-    registered_user_with_detail, run_qm, seed_avail, submit_plan_as, unauthed_get,
+    approved_client, approved_object_client, approved_queue_client, authed_get, authed_post,
+    authed_user_get, body_json, filter_fleet, fleet_ids, put_idle_campaign, register_and_approve,
+    registered_user, registered_user_with_detail, run_qm, seed_avail, seeded_object_state,
+    submit_plan_as, unauthed_get,
 };
 
 fn row<'a>(body: &'a Value, client_id: &str) -> anyhow::Result<&'a Value> {
@@ -286,7 +288,7 @@ async fn test_the_listing_pages_ascending_by_client_id() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_the_listing_counts_an_unreadable_record_and_lists_the_rest() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, approved) = approved_client(dir.path()).await?;
+    let (state, _key, approved) = approved_object_client(dir.path()).await?;
     let (_pending_key, pending) = pipette_web_testkit::register_pending(&state).await?;
     std::fs::write(
         dir.path().join("clients").join(format!("{pending}.json")),
@@ -557,7 +559,8 @@ async fn test_get_fleet_client_refuses_an_id_outside_the_charset() -> anyhow::Re
 #[tokio::test]
 async fn test_get_fleet_client_with_an_unreadable_record_is_a_redacted_500() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, client_id) = approved_client(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
+    let (_key, client_id) = register_and_approve(&state).await?;
     std::fs::write(
         dir.path().join("clients").join(format!("{client_id}.json")),
         b"{",
@@ -659,55 +662,119 @@ async fn test_a_signed_request_sets_last_seen_at(
     Ok(())
 }
 
-/// A device the count does not name reads zero; before the first run, `null`.
+/// A job counts once the index covers it. Claims, lease recycling and denials
+/// change the next backlog read without another maintenance run.
 #[tokio::test]
-async fn test_a_maintenance_run_sets_the_backlog() -> anyhow::Result<()> {
+async fn test_the_backlog_follows_the_queue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _, listed)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _, listed)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
     let (_, unlisted) = register_and_approve(state).await?;
     let user = registered_user(state, &[UserPermission::ReadClients]).await?;
     let listing = || read_conforming(state, &user, "/api/v1/clients?status=", "ClientListRowPage");
-
-    let before = listing().await?;
-    assert_eq!(row(&before, listed.as_str())?["backlog"], Value::Null);
     let record_path = format!("/api/v1/clients/{listed}");
     let record = || read_conforming(state, &user, &record_path, "ClientDetail");
-    assert_eq!(record().await?["backlog_by_campaign"], Value::Null);
+    let outside = |count: u64| json!({"campaigns": [], "outside_campaign_job_count": count, "unreadable_job_count": 0});
+    let without_time = |mut value: Value| {
+        value.as_object_mut().map(|v| v.remove("counted_at"));
+        value
+    };
 
-    seed_avail(
+    let before = listing().await?;
+    let backlog = &row(&before, listed.as_str())?["backlog"];
+    assert_eq!(backlog["job_count"], json!(0));
+    assert!(backlog["counted_at"].is_string());
+    assert_eq!(
+        without_time(record().await?["backlog_by_campaign"].clone()),
+        outside(0)
+    );
+
+    let job = seed_avail(
         state.todo_store.as_ref(),
         "job-1",
         ExpiresAt::Never,
         &json!({"clients": [listed.as_str()]}),
     )
     .await?;
+    assert_eq!(
+        row(&listing().await?, listed.as_str())?["backlog"]["job_count"],
+        json!(0)
+    );
     run_qm(state).await?;
 
     let after = listing().await?;
-    let backlog = &row(&after, listed.as_str())?["backlog"];
-    assert_eq!(backlog["job_count"], json!(1));
-    assert!(backlog["counted_at"].is_string());
+    assert_eq!(
+        row(&after, listed.as_str())?["backlog"]["job_count"],
+        json!(1)
+    );
     assert_eq!(
         row(&after, unlisted.as_str())?["backlog"]["job_count"],
         json!(0)
     );
-
-    let record = record().await?;
-    assert_eq!(&record["backlog"], backlog);
+    let detail = record().await?;
+    assert_eq!(detail["backlog"]["job_count"], json!(1));
+    // The console pairs the two counts by their time.
+    assert_eq!(
+        detail["backlog_by_campaign"]["counted_at"],
+        detail["backlog"]["counted_at"]
+    );
     // No plan holds the seeded job.
     assert_eq!(
-        record["backlog_by_campaign"],
-        json!({
-            "campaigns": [],
-            "outside_campaign_job_count": 1,
-            "unreadable_job_count": 0,
-            "counted_at": backlog["counted_at"],
-        })
+        without_time(detail["backlog_by_campaign"].clone()),
+        outside(1)
+    );
+
+    let lease_expiry = chrono::Utc::now() + chrono::Duration::minutes(5);
+    assert!(matches!(
+        state
+            .todo_store
+            .claim_job(&job, ExpiresAt::Never, &unlisted, lease_expiry)
+            .await?,
+        pipette_store::ClaimResult::Claimed(_)
+    ));
+    assert_eq!(
+        row(&listing().await?, listed.as_str())?["backlog"]["job_count"],
+        json!(0)
+    );
+    let leased = record().await?;
+    assert_eq!(leased["backlog"]["job_count"], json!(0));
+    assert_eq!(
+        without_time(leased["backlog_by_campaign"].clone()),
+        outside(0)
+    );
+
+    assert_eq!(
+        state
+            .todo_store
+            .recycle_lease(&job, ExpiresAt::Never, &unlisted, lease_expiry)
+            .await?,
+        pipette_store::RecycleResult::Recycled
+    );
+    assert_eq!(
+        row(&listing().await?, listed.as_str())?["backlog"]["job_count"],
+        json!(1)
+    );
+    let recycled = record().await?;
+    assert_eq!(recycled["backlog"]["job_count"], json!(1));
+    assert_eq!(
+        without_time(recycled["backlog_by_campaign"].clone()),
+        outside(1)
+    );
+
+    state
+        .todo_store
+        .write_denied(&job, &listed, &DenialRecord::default())
+        .await?;
+    let denied = listing().await?;
+    assert_eq!(
+        row(&denied, listed.as_str())?["backlog"]["job_count"],
+        json!(0)
+    );
+    assert_eq!(
+        without_time(record().await?["backlog_by_campaign"].clone()),
+        outside(0)
     );
     Ok(())
 }
@@ -716,9 +783,7 @@ async fn test_a_maintenance_run_sets_the_backlog() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_a_maintenance_run_counts_the_backlog_by_campaign() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, _, client)) =
-        approved_queue_client(dir.path(), QueueBackend::Database).await?
-    else {
+    let Some((queue, _, client)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -752,6 +817,116 @@ async fn test_a_maintenance_run_counts_the_backlog_by_campaign() -> anyhow::Resu
     Ok(())
 }
 
+#[rstest]
+#[case::stranded(60, false)]
+#[case::fresh(7200, true)]
+#[tokio::test]
+async fn test_campaign_backlog_uses_the_configured_creating_age(
+    #[case] max_age_secs: u64,
+    #[case] counted: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((queue, _, client)) = approved_queue_client(dir.path()).await? else {
+        return Ok(());
+    };
+    let mut state = queue.state;
+    let mut config = (*state.config).clone();
+    config.plan_creating_max_age_secs = max_age_secs.try_into()?;
+    state.config = std::sync::Arc::new(config);
+    let user = registered_user(
+        &state,
+        &[UserPermission::ReadClients, UserPermission::ReadPlans],
+    )
+    .await?;
+    let campaign = put_idle_campaign(&state, &user.1, "Creating").await?;
+    let plan = PlanManifest {
+        campaign_id: Some(campaign.clone()),
+        created_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        ..sample_manifest(
+            PlanId::from_uuid(uuid::Uuid::now_v7()),
+            PlanStatus::Creating,
+            false,
+        )?
+    };
+    state.plan_store.put_plan(&plan).await?;
+    let job = seed_avail(
+        state.todo_store.as_ref(),
+        "job-1",
+        ExpiresAt::Never,
+        &json!({"clients": [client.as_str()]}),
+    )
+    .await?;
+    state
+        .todo_store
+        .write_eligible(&client, &job, ExpiresAt::Never)
+        .await?;
+    state
+        .plan_store
+        .write_job_plan_marker(&job, &plan.plan_id, ExpiresAt::Never)
+        .await?;
+
+    let record = read_conforming(
+        &state,
+        &user,
+        &format!("/api/v1/clients/{client}"),
+        "ClientDetail",
+    )
+    .await?;
+    assert_eq!(record["backlog"]["job_count"], json!(1));
+    assert_eq!(
+        record["backlog_by_campaign"]["campaigns"],
+        if counted {
+            json!([{"campaign_id": campaign.as_str(), "name": "Creating", "job_count": 1}])
+        } else {
+            json!([])
+        }
+    );
+    assert_eq!(
+        record["backlog_by_campaign"]["outside_campaign_job_count"],
+        json!(u64::from(!counted))
+    );
+    Ok(())
+}
+
+/// Queue `jobs` jobs that `client` can claim. Each job is a member of one plan
+/// of `campaign`, or of no plan without a campaign. The campaign needs no
+/// record.
+async fn queue_in_campaign(
+    state: &AppState,
+    client: &ClientId,
+    campaign: Option<&CampaignId>,
+    jobs: usize,
+) -> anyhow::Result<()> {
+    let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
+    if let Some(campaign) = campaign {
+        let manifest = PlanManifest {
+            campaign_id: Some(campaign.clone()),
+            ..sample_manifest(plan_id.clone(), PlanStatus::Active, false)?
+        };
+        state.plan_store.put_plan(&manifest).await?;
+    }
+    for n in 0..jobs {
+        let job = seed_avail(
+            state.todo_store.as_ref(),
+            &format!("job-{plan_id}-{n}"),
+            ExpiresAt::Never,
+            &json!({"clients": [client.as_str()]}),
+        )
+        .await?;
+        state
+            .todo_store
+            .write_eligible(client, &job, ExpiresAt::Never)
+            .await?;
+        if campaign.is_some() {
+            state
+                .plan_store
+                .write_job_plan_marker(&job, &plan_id, ExpiresAt::Never)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// The server sums each campaign that is outside the reach of the reader, or
 /// that has no record, into `unreadable`. A reader with no campaign grant has
 /// every campaign in that sum.
@@ -767,30 +942,23 @@ async fn test_the_backlog_by_campaign_shows_the_readable_campaigns(
     #[case] unreadable: u64,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _, client) = approved_client(dir.path()).await?;
+    let Some((queue, _, client)) = approved_queue_client(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = queue.state;
     let user = registered_user(&state, permissions).await?;
     let (_, other, _) = registered_user(&state, &[UserPermission::ReadPlans]).await?;
     let own = put_idle_campaign(&state, &user.1, "Mine").await?;
     let theirs = put_idle_campaign(&state, &other, "Theirs").await?;
     let deleted = CampaignId::mint();
-    let counted_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).context("timestamp")?;
-    state
-        .todo_store
-        .write_campaign_backlog(&CampaignBacklogSnapshot {
-            counted_at,
-            devices: [(
-                client.clone(),
-                CampaignBacklog {
-                    by_campaign: [(own.clone(), 2), (theirs.clone(), 3), (deleted, 1)]
-                        .into_iter()
-                        .collect(),
-                    outside_campaigns: 4,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        })
-        .await?;
+    for (campaign, jobs) in [
+        (Some(&own), 2),
+        (Some(&theirs), 3),
+        (Some(&deleted), 1),
+        (None, 4),
+    ] {
+        queue_in_campaign(&state, &client, campaign, jobs).await?;
+    }
 
     let record = read_conforming(
         &state,
@@ -812,40 +980,9 @@ async fn test_the_backlog_by_campaign_shows_the_readable_campaigns(
             "campaigns": campaigns,
             "outside_campaign_job_count": 4,
             "unreadable_job_count": unreadable,
-            "counted_at": "2027-01-15T08:00:00Z",
+            "counted_at": record["backlog_by_campaign"]["counted_at"],
         })
     );
-    Ok(())
-}
-
-/// Read leniently: both reads still answer `200`. A directory at the snapshot's
-/// path fails the read.
-#[tokio::test]
-async fn test_an_unreadable_backlog_shows_no_backlog() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, _, client) = approved_client(dir.path()).await?;
-    let user = registered_user(&state, &[UserPermission::ReadClients]).await?;
-    std::fs::create_dir_all(dir.path().join("todo").join(".backlog"))?;
-    std::fs::create_dir_all(dir.path().join("todo").join(".backlog-campaigns"))?;
-
-    let listing = read_conforming(
-        &state,
-        &user,
-        "/api/v1/clients?status=",
-        "ClientListRowPage",
-    )
-    .await?;
-    assert_eq!(row(&listing, client.as_str())?["backlog"], Value::Null);
-
-    let record = read_conforming(
-        &state,
-        &user,
-        &format!("/api/v1/clients/{client}"),
-        "ClientDetail",
-    )
-    .await?;
-    assert_eq!(record["backlog"], Value::Null);
-    assert_eq!(record["backlog_by_campaign"], Value::Null);
     Ok(())
 }
 
@@ -858,7 +995,10 @@ async fn test_a_second_request_within_the_wait_does_not_stamp(
     #[case] fail_first: bool,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, client_key, client) = approved_client(dir.path()).await?;
+    let Some((queue, client_key, client)) = approved_queue_client(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = queue.state.clone();
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadClients]).await?;
     let last_seen_at = || {
         let (state, key, user_id, key_id) =
@@ -871,12 +1011,16 @@ async fn test_a_second_request_within_the_wait_does_not_stamp(
             anyhow::Ok(row(&body_json(resp).await?, client.as_str())?["last_seen_at"].clone())
         }
     };
-    // The stamp writes into `liveness/` without creating it, so a missing
-    // directory fails the write.
-    let liveness_dir = dir.path().join("todo").join("liveness");
-
+    // A trigger makes the stamp fail.
     if fail_first {
-        std::fs::remove_dir_all(&liveness_dir)?;
+        queue
+            .execute_sql(
+                "CREATE FUNCTION refuse_stamp() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'stamp refused'; END $$; \
+             CREATE TRIGGER refuse_stamp BEFORE INSERT OR UPDATE ON client_liveness \
+             FOR EACH ROW EXECUTE FUNCTION refuse_stamp();",
+            )
+            .await?;
     }
     let resp = authed_post(&state, &client_key, &client, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -884,7 +1028,9 @@ async fn test_a_second_request_within_the_wait_does_not_stamp(
     assert_eq!(first.is_null(), fail_first);
 
     if fail_first {
-        std::fs::create_dir_all(&liveness_dir)?;
+        queue
+            .execute_sql("DROP TRIGGER refuse_stamp ON client_liveness")
+            .await?;
     }
     let resp = authed_post(&state, &client_key, &client, "/plans/claim", &json!({})).await?;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1186,7 +1332,8 @@ async fn test_the_capability_vocabulary_reports_unreadable_records(
     #[case] expected_clients: usize,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _key, approved) = approved_client(dir.path()).await?;
+    let state = seeded_object_state(dir.path()).await?;
+    let (_key, approved) = register_and_approve(&state).await?;
     describe(&state, &approved, None, &["runtime:llama_cpp"]).await?;
     let (_pending_key, pending) = pipette_web_testkit::register_pending(&state).await?;
     describe(&state, &pending, None, &["runtime:onnx"]).await?;

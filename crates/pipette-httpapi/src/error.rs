@@ -246,6 +246,7 @@ impl From<pipette_pipeline::campaign_admin::CampaignAdminError> for AppError {
             | CampaignAdminError::NoSuchOrg(_)
             | CampaignAdminError::NoOwnerNamed
             | CampaignAdminError::NothingToRerun
+            | CampaignAdminError::RerunAndFail(_)
             | CampaignAdminError::NoSuchSourceVariant { .. } => AppError::BadRequest(message),
             CampaignAdminError::Edit(e) if e.is_caller_fault() => AppError::BadRequest(message),
             CampaignAdminError::Edit(e) => AppError::internal(anyhow::Error::new(e)),
@@ -260,7 +261,9 @@ impl From<pipette_pipeline::campaign_admin::CampaignAdminError> for AppError {
             | CampaignAdminError::NoneRescorable(_)
             | CampaignAdminError::Overtaken { .. }
             | CampaignAdminError::DeletedDuringFiling { .. }
-            | CampaignAdminError::StillRunning { .. } => AppError::Conflict(message),
+            | CampaignAdminError::AdvanceContended { .. }
+            | CampaignAdminError::StillRunning { .. }
+            | CampaignAdminError::Contended(_) => AppError::Conflict(message),
             CampaignAdminError::NotAdvanced { source, .. }
             | CampaignAdminError::NotCancelled { source, .. } => {
                 AppError::internal(source.context(message))

@@ -623,6 +623,12 @@ const DENY_LLAMA_VLM_EVAL: &[&str] =
     concat_str_slices!(DENY_LLAMA_SERVER, LLAMA_VLM_EVAL_RECIPE_OWNED);
 const DENY_LLAMA_ASR_EVAL: &[&str] =
     concat_str_slices!(DENY_LLAMA_SERVER, LLAMA_ASR_EVAL_RECIPE_OWNED);
+/// The server denylist plus the slot count, which the decision cells type as
+/// `parallel`. No plan predates them, so unlike eval a raw one is refused.
+const DENY_LLAMA_DECISION: &[&str] = concat_str_slices!(
+    DENY_LLAMA_SERVER,
+    LlamacppCliStockTools::RESERVED_SLOTS_DERIVED
+);
 const DENY_VLLM: &[&str] = concat_str_slices!(VLLM_TYPED_ALIASES, VLLM_RESERVED);
 const DENY_VLLM_VLM_EVAL: &[&str] = concat_str_slices!(VLLM_TYPED_ALIASES, RESERVED_VLLM_VLM_EVAL);
 const DENY_SGLANG: &[&str] = concat_str_slices!(SGLANG_TYPED_ALIASES, SGLANG_RESERVED);
@@ -670,6 +676,12 @@ impl RuntimeFlags {
             }
             RuntimeFlags::VlmEvalLlamacppCliStockToolsGgufVision { .. } => DENY_LLAMA_VLM_EVAL,
             RuntimeFlags::AsrEvalLlamacppCliStockToolsGgufVision { .. } => DENY_LLAMA_ASR_EVAL,
+            RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufVision { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. } => {
+                DENY_LLAMA_DECISION
+            }
             RuntimeFlags::PrefillThroughputDockerVllmTorch { .. }
             | RuntimeFlags::DecodeThroughputDockerVllmTorch { .. }
             | RuntimeFlags::EndToEndLatencyDockerVllmTorch { .. }
@@ -751,6 +763,10 @@ impl RuntimeFlags {
             | RuntimeFlags::EvalLlamacppCliStockToolsGgufText { .. }
             | RuntimeFlags::VlThroughputLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. }
+            | RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufVision { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::VlSpecDecodeLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::VlSpecDecodeLlamacppCliStockToolsGgufVisionSpeculative { .. } => {
                 LlamacppCliStockTools::RESERVED_SERVER
@@ -908,6 +924,10 @@ impl RuntimeFlags {
             | RuntimeFlags::AsrEvalLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision { .. }
+            | RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionLatencyLlamacppCliStockToolsGgufVision { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. }
+            | RuntimeFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | RuntimeFlags::PrefillThroughputDockerVllmTorch { .. }
             | RuntimeFlags::DecodeThroughputDockerVllmTorch { .. }
             | RuntimeFlags::EndToEndLatencyDockerVllmTorch { .. }
@@ -1492,7 +1512,7 @@ mod tests {
     /// An ASR cell's context is sized for one clip and its server runs with
     /// thinking off and the recipe's template, so a raw slot count, reasoning
     /// or template flag is refused on both ASR families, in every spelling.
-    /// Other llama-server families keep a raw slot count (see
+    /// Other non-decision llama-server families keep a raw slot count (see
     /// `raw_parallel_still_parses_on_every_llama_server_cell`).
     #[rstest]
     fn an_asr_cell_refuses_raw_slots_and_reasoning(
@@ -1669,6 +1689,31 @@ mod tests {
             expected,
             "{token}"
         );
+    }
+
+    /// The decision cells type the slot count and have no older plans to keep
+    /// parsing, so a raw one points the author at `parallel`.
+    #[rstest]
+    #[case::long_form("[\"--parallel\", \"8\"]")]
+    #[case::short_form("[\"-np\", \"8\"]")]
+    #[case::glued_short_form("[\"-np8\"]")]
+    fn raw_parallel_is_refused_on_a_decision_cell(
+        #[case] raw: &str,
+        #[values("decision_latency", "decision_max_memory")] benchmark: &str,
+        #[values("gguf_text", "gguf_vision")] model: &str,
+    ) -> anyhow::Result<()> {
+        let wire = format!(
+            "{}raw = {raw}\n",
+            axes_wire(benchmark, "llamacpp_cli_stock_tools", model)
+        );
+        let Err(err) = parse(&wire) else {
+            anyhow::bail!("{wire}: parsed");
+        };
+        assert!(
+            err.to_string().contains("aliases a typed knob"),
+            "{wire}: {err}"
+        );
+        Ok(())
     }
 
     #[rstest]

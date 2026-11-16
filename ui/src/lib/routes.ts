@@ -67,7 +67,13 @@ const PATTERNS = {
   "campaign-plan-settings": "/app/campaigns/:campaign_id/plans/:plan_id/settings",
   "campaign-document": "/app/campaigns/:campaign_id/document",
   "me-campaigns": "/app/me/campaigns",
+  "me-campaign-groups": "/app/me/campaigns/groups",
   "org-campaigns": "/app/orgs/:org/campaigns",
+  "org-campaign-groups": "/app/orgs/:org/campaigns/groups",
+  "campaign-group": "/app/campaign-groups/:group_id",
+  "campaign-group-policies": "/app/campaign-groups/:group_id/policies",
+  "campaign-group-activity": "/app/campaign-groups/:group_id/activity",
+  "campaign-group-settings": "/app/campaign-groups/:group_id/settings",
 } as const;
 
 /** Addresses that draw another's page in place rather than redirect, so a query like `?clerk=1` survives. */
@@ -152,10 +158,12 @@ export function pathOf(route: Route): string {
     encodeURIComponent(params[name] ?? ""));
 }
 
-/** Pages drawn as tabs of one screen, by the page whose address names it: a plan's, on its own pages or its campaign's, and an account's. */
+/** Pages drawn as tabs of one screen, by the page whose address names it: a plan's, on its own pages or its campaign's, an account's, and a campaign group's. */
 const SCREENS: Partial<Record<Page, Page>> = {
   user: "user", "user-plans": "user", "user-permissions": "user", "user-keys": "user", "user-preauth": "user", "user-settings": "user",
   account: "account", "account-keys": "account",
+  "campaign-group": "campaign-group", "campaign-group-policies": "campaign-group", "campaign-group-activity": "campaign-group",
+  "campaign-group-settings": "campaign-group",
   plan: "plan", "plan-cells": "plan", "plan-analysis": "plan", "plan-analysis-report": "plan", "plan-revisions": "plan",
   "plan-settings": "plan",
   "campaign-plan": "campaign-plan", "campaign-plan-cells": "campaign-plan", "campaign-plan-analysis": "campaign-plan",
@@ -257,6 +265,8 @@ export const campaignPlanLink = (campaignId: string, planId: string, rest = "") 
 /** The address of a campaign's page, or of `rest` under it. */
 export const campaignLink = (campaignId: string, rest = "") =>
   `/app/campaigns/${encodeURIComponent(campaignId)}${rest}`;
+
+export const campaignGroupLink = (groupId: string) => `/app/campaign-groups/${encodeURIComponent(groupId)}`;
 
 /** Whether `href` is an address in this app, rather than one it hands to the browser. */
 export const inApp = (href: string) =>

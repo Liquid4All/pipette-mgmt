@@ -12,9 +12,7 @@ field follows these rules:
 - An absent or `null` value leaves the note unchanged.
 
 The server writes the `change` of a revision (`RevisionChange`). The value does
-not change. Only a server with `[database]` keeps the note and the change.
-Without `[database]`, a plan has neither. A request that changes the note
-returns `500`.
+not change. The database keeps the note and the change.
 
 The caller must hold `submit_plans`, and one of these conditions must be true:
 

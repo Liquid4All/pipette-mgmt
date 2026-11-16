@@ -1,7 +1,7 @@
 # Design: the job queue on PostgreSQL
 
-**Status: the migration and the job methods of `SqlTodoStore` are implemented.
-No caller uses `SqlTodoStore`.** The epic
+**Status: implemented. `SqlTodoStore` is the only job queue, and every config
+needs `[database]` (PIP-882).** The epic
 is PIP-822. This design replaces the keyspace layout in
 [storage.md §2](../storage.md#2-logical-layout-and-invariants) and keeps the
 protocol in [queue.md](../queue.md). The other records moved to PostgreSQL in
@@ -77,16 +77,22 @@ CREATE TABLE queue_jobs (
   job_id        text PRIMARY KEY,
   body          text NOT NULL,                 -- the job JSON that ingestion promoted
   match_clauses jsonb GENERATED ALWAYS AS (queue_match_clauses(body)) STORED,
+  model_key     text GENERATED ALWAYS AS (queue_json_key(body, '{spec,model}')) STORED,
+  runtime_key   text GENERATED ALWAYS AS (queue_json_key(body, '{spec,runtime}')) STORED,
   needs_reindex boolean NOT NULL DEFAULT true,
   expires_at    timestamptz,                   -- the deadline; NULL = never
   enqueued_at   timestamptz NOT NULL DEFAULT now(),
   leased_by     text,                          -- the client that holds the lease
   lease_expiry  timestamptz,
   revision      bigint NOT NULL,               -- CAS: every write of the row bumps it
-  CHECK ((leased_by IS NULL) = (lease_expiry IS NULL))
+  family_key    text,                          -- the job's family (migration 0035); NULL = none
+  sizes         bigint[],                      -- the run's sizes, set with family_key
+  CHECK ((leased_by IS NULL) = (lease_expiry IS NULL)),
+  CHECK ((family_key IS NULL) = (sizes IS NULL))
 );
 CREATE INDEX queue_jobs_avail  ON queue_jobs (expires_at) WHERE leased_by IS NULL;
 CREATE INDEX queue_jobs_leased ON queue_jobs (leased_by, lease_expiry) WHERE leased_by IS NOT NULL;
+CREATE INDEX queue_jobs_family ON queue_jobs (family_key) WHERE family_key IS NOT NULL;
 
 -- Staged bodies between write_tmp and promote_avail.
 CREATE TABLE queue_tmp (job_id text PRIMARY KEY, body text NOT NULL, written_at timestamptz NOT NULL DEFAULT now());
@@ -113,6 +119,12 @@ CREATE TABLE queue_lost_leases (
   PRIMARY KEY (job_id, client_id, lease_expiry)
 );
 
+-- One row per client: the artifact keys of its last grant (migration 0027).
+CREATE TABLE queue_client_last_grant (
+  client_id text PRIMARY KEY, job_id text NOT NULL,
+  model_key text, runtime_key text, granted_at timestamptz NOT NULL
+);
+
 -- One row per reindex request. The pass deletes only the rows it captured.
 CREATE TABLE queue_reindex_requests (
   request_id text PRIMARY KEY, client_id text NOT NULL, requested_at timestamptz NOT NULL
@@ -120,10 +132,6 @@ CREATE TABLE queue_reindex_requests (
 CREATE INDEX queue_reindex_requests_client ON queue_reindex_requests (client_id);
 
 CREATE TABLE queue_reindex_jobs (job_id text PRIMARY KEY);
-
-CREATE TABLE queue_suspensions (
-  client_id text PRIMARY KEY, suspended_at timestamptz NOT NULL, conflicting_job_id text NOT NULL
-);
 
 -- The last signed request of each device. SQL sets last_seen_at with now(),
 -- so the replicas agree, as the S3 server clock does.
@@ -134,6 +142,13 @@ CREATE TABLE client_liveness (client_id text PRIMARY KEY, last_seen_at timestamp
 -- .backlog-campaigns stay.
 CREATE TABLE queue_maintenance_state (name text PRIMARY KEY, body text NOT NULL);
 ```
+
+Migration `0034_queue_drop_suspensions` drops `queue_suspensions`. Its down
+script recreates the table empty for rollbacks to builds that read it.
+
+Migration `0035_queue_run_sizes` adds `family_key`, `sizes`, their index and
+the function `queue_sizes_below` (**Smaller runs first**, below). Rows queued
+before it have neither value. Its down script drops them.
 
 The incremental eligibility stage is the migration
 `queue_incremental_eligibility` (0024):
@@ -198,17 +213,14 @@ outlives the queue row by design, and `gc_plan_index` collects it later.
   a timestamp through one `to_second()` at the store boundary. So a claim and
   then a recycle with the same raw value find the same row.
   `revert_claim_if_void` and `put_back_out_of_vault_reach` depend on this.
-- **Availability filters.** `get_avail*`, `delete_avail*`, `avail_key_for_job`
-  and `redate_avail` filter on `leased_by IS NULL`. So the merge's
+- **Availability filters.** `get_avail*`, `delete_avail*`, `avail_for_jobs`,
+  `list_avail_entries` and `redate_avail` filter on `leased_by IS NULL`. So the merge's
   `avail_state` never reads a leased job as queued, and `retire_job` never
   deletes a lease.
-- **Byte-identical keys.** The store builds `{job_id}/{expires_at}.json` and
-  `{client}/{job}.{expires_at}.{lease_expiry}.json` exactly as
-  `pipette_core::todo_filename` does (`never`, the basic format, `.json`). So
-  the `.gc-candidates` strings that an S3 run wrote read correctly in a SQL
-  run. `list_avail` builds the keys and sorts them in
-  Rust. The Rust sort gives the S3 byte order. In that order, `-` sorts
-  before the `/` that ends a job id.
+- **Typed listings.** `list_avail_entries` returns `AvailEntry` rows in the
+  byte order of the job ID (`ORDER BY job_id COLLATE "C"`). `list_leases`
+  returns `Lease` rows in an unspecified order. `leases_for_client` returns
+  typed `Lease` rows for one client, with no object-store key encoding.
 - **The server clock for liveness.** Liveness uses `now()` in SQL, not a
   timestamp that the application binds.
 
@@ -229,10 +241,15 @@ Every write is one transaction through the crate's `retry`, at
 3. If one live lease remains, hand it back. This is the idempotent claim. It
    counts as a lost lease, and past the limit the claim is withheld, as the S3
    store does.
-4. Else select the tier that expires soonest, then pick at `random()` within
-   it. The candidates are the client's eligibility rows, joined to the jobs
-   that are not leased and not expired, minus the client's denials, with
-   `FOR UPDATE SKIP LOCKED LIMIT 1`. Lease the job.
+4. Else select the tier that expires soonest. Within the tier, prefer a job
+   with fewer smaller runs of its family in the queue (**Smaller runs first**,
+   below), then one whose model the fewest other clients lease (**Spread across
+   models**, below), then a job whose model and runtime the client holds, then a job
+   whose model it holds, then a job whose runtime it holds, then pick at
+   `random()` (**Claim affinity**, below). The candidates are the
+   client's eligibility rows, joined to the jobs that are not leased and not
+   expired, minus the client's denials, with `FOR UPDATE SKIP LOCKED LIMIT 1`.
+   Lease the job, and record it as the client's last grant.
 
 The vault reach check stays outside the transaction. It reverts with a recycle
 and a denial, as the S3 store does. After steps 1 to 3 a client cannot hold two
@@ -243,6 +260,102 @@ with the same deadline. They conflict as N²/M, and the 8 retries can run out.
 Why not a partial unique index on `leased_by`: a client can claim a new job
 while its lapsed lease waits for a recycle. The index cannot express
 `lease_expiry > now()`.
+
+**Claim affinity.** A job's download is its `spec.model` and its
+`spec.runtime`. Migration 0027 stores a key for each one in `model_key` and
+`runtime_key`. The function `queue_json_key` converts the descriptor to JSONB
+and takes the md5 of its text. JSONB sorts object keys, so whitespace and key
+order do not change the key. A body that JSONB cannot represent gets NULL keys,
+and its job stays claimable. The claim uses one of two sets of held keys:
+
+- **The client advertises its cache** in the claim body. The server computes
+  the key of each advertised descriptor with the same function, and uses only
+  those keys.
+- **The client advertises nothing.** The server uses the keys in
+  `queue_client_last_grant`. That table holds the client's last grant only,
+  because the server cannot know what the client deleted before it. A failure
+  report for that job deletes the row, and so does a lost lease. After a
+  failure, the client may not hold the job's artifacts. A reclaim of the job
+  writes the row again, because the client runs the job.
+
+Affinity orders jobs only within one deadline tier. It never delays a job with
+a sooner deadline. The object-store backends ignore it. Like `match_clauses`,
+the two generated columns rewrite `queue_jobs` under a lock when the migration
+runs.
+
+**Smaller runs first.** Ingestion sets `sizes` and `family_key` on a job whose
+benchmark type has sizes (`BenchmarkParams::sizes`, listed in
+[queue.md](../queue.md#claiming-a-job)), in the one order of that type. The key
+is the cell digest of the job with the sizes taken out of its benchmark's
+parameters and the campaign id added, so the eligibility clauses stay outside
+it. Every other row has neither. Within a deadline tier, the claim orders the
+candidates by the smaller rows of their family in the queue, leased or not,
+before the affinity keys:
+
+```sql
+(SELECT count(*) FROM queue_jobs s
+ WHERE s.family_key = j.family_key AND queue_sizes_below(s.sizes, j.sizes)) ASC
+```
+
+It orders and never filters, so a client with nothing ranked sooner takes a
+larger run, and the backlog counts are unchanged. `queue_sizes_below(a, b)`
+holds when `a` and `b` differ and no size of `a` is larger than the same size of
+`b`. It compares six positions in one expression, which the planner inlines;
+`queue_jobs_sizes_compared` keeps `sizes` to six. Twins, equal in every size,
+rank each other in neither direction. A row without a key matches no row, so it
+ranks first. `queue_jobs_family` serves the lookup; a family holds a few dozen
+rows at most. Over 15,000 queued jobs in families of 15, all eligible for one
+client, the pick takes 78 ms against 20 ms without the order; for a client
+eligible for 1,875 of them, about one phone campaign, 11 ms against 4 ms. The
+object-store backends keep neither value.
+
+A final `attempt_timeout` or `out_of_memory` fails the family's larger runs
+that are not leased ([queue.md](../queue.md#client-reported-failure)). The
+submit reads them before the teardown deletes the reporting job's row, whose
+family and sizes the query reads:
+
+```sql
+SELECT s.job_id, s.body, s.expires_at FROM queue_jobs s JOIN queue_jobs f ON f.job_id = $1
+WHERE s.family_key = f.family_key AND queue_sizes_below(f.sizes, s.sizes) AND s.leased_by IS NULL
+```
+
+A client with nothing ranked sooner can take one of them between the read and
+its delete. The delete then misses the leased row, the job runs, and that
+client's result becomes the job's latest run over the written failure.
+
+**Spread across models.** Several devices of one type serve a campaign. With
+affinity alone, the devices that hold one model all stay on it. So within a
+tier, after the smaller runs, the claim ranks a job by how many other clients
+lease a job of its model, counted over the claiming client's eligibility rows:
+
+```sql
+WITH busy AS (SELECT l.model_key, count(*) AS leases FROM queue_jobs l
+              WHERE l.leased_by IS NOT NULL AND l.leased_by <> $client
+                AND l.lease_expiry > now()
+                AND EXISTS (SELECT 1 FROM queue_eligibility e
+                            WHERE e.client_id = $client AND e.job_id = l.job_id)
+              GROUP BY l.model_key)
+SELECT … FROM queue_eligibility e JOIN queue_jobs j ON j.job_id = e.job_id
+  LEFT JOIN busy b ON b.model_key = j.model_key
+WHERE …
+ORDER BY j.expires_at ASC NULLS LAST, <smaller runs> ASC, COALESCE(b.leases, 0) ASC,
+         model_held DESC, runtime_held DESC, random()
+```
+
+The count starts from the leased rows, which `queue_jobs_leased` holds, and
+probes the eligibility primary key for each. In a separate run on the same
+15,000 queued jobs, all eligible for one client, with 10 other devices leasing,
+the pick takes 104-108 ms against 97-100 ms with the smaller-run ranking alone;
+for a client eligible for 1,875 of them, 15.0-16.3 ms against 14.4-15.5 ms.
+Its base times are its own; the figures above come from another run. Counting
+over the client's eligibility rows keeps device types apart: other devices on
+the same model for jobs this client cannot run do not push it away. A job with
+a NULL `model_key` counts zero. A tie goes to the held model, so once each
+device runs a model of its own it keeps it instead of downloading another. Like
+affinity, the count never delays a job with a sooner deadline, and the
+object-store backends ignore it. A client rebuild writes rows for available
+jobs only, so after one the count misses the jobs other clients already lease
+until they finish or return to the queue.
 
 **Heartbeat and reclaim** are one `UPDATE … WHERE job_id AND leased_by = $client`.
 
@@ -296,7 +409,8 @@ Migration 0025 stores six matcher fields in `match_clauses`:
 The projection preserves absent keys and JSON null values. It validates the
 body as JSON, then converts only the six top-level matcher values to JSONB.
 Unrelated fields can contain escapes such as `\u0000` that JSONB cannot
-represent.
+represent. Migration 0031 defines the current body of the function. The run
+time of the function grows in proportion to the length of the body.
 
 If the body is invalid JSON, or a matcher value does not fit in JSONB, the
 projection is SQL NULL.
@@ -354,7 +468,7 @@ through the store, 16 at once.
 The cold pass reads the whole queue and writes only the differences since the
 warm pass. A timed dry run against production is the gate before anyone
 schedules the pause. The
-[production runbook](../operations.md#311-moving-the-queue-to-postgresql)
+production runbook (`docs/operations.md` §3.1.1 at the cutover release, before PIP-882)
 gives the commands, the timing gate, and the rollback.
 
 The runbook assumes a deployment that runs `serve` as 2 replicas. Each replica
@@ -393,7 +507,7 @@ partial import can delete valid jobs from the object-store queue. If SQL
 accepted requests, the rollback stops all queue writers, restores the config
 parameter, and runs `queue export`. `queue export` reads the object-store
 queue from the restored parameter. The
-[production runbook](../operations.md#311-moving-the-queue-to-postgresql)
+production runbook (`docs/operations.md` §3.1.1 at the cutover release, before PIP-882)
 gives the steps.
 
 ## The alternative not taken: a live composite store

@@ -14,6 +14,7 @@
 mod api_schema;
 mod audit;
 mod benchmarks;
+mod campaign_groups;
 mod campaign_listings;
 mod campaign_page;
 mod campaign_readers;

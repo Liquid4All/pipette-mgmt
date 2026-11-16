@@ -1,14 +1,16 @@
 //! `/api/v1/campaigns`: a campaign, the plans it filed, what its writes did,
 //! and its revisions.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::owners::PrincipalOwner;
 use crate::plans::{Answered, PlanDryRun, PlanFiled, PlanSummary, RestoredVariant, RevisionChange};
 use crate::{
-    CampaignId, Changed, ElapsedMillis, JobId, Labels, NonEmptyTrimmedString, OrgId, PlanId,
-    VaultPrincipalId,
+    CampaignGroupId, CampaignId, Changed, ElapsedMillis, JobId, Labels, NonEmptyTrimmedString,
+    OrgId, PlanId, VaultPrincipalId,
 };
 
 /// A campaign.
@@ -71,6 +73,21 @@ impl std::str::FromStr for CampaignState {
     }
 }
 
+/// A campaign group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CampaignGroup {
+    /// `group_` and a UUIDv7; it never changes.
+    pub group_id: CampaignGroupId,
+    /// What to print for a human; nothing keys on it.
+    pub name: NonEmptyTrimmedString,
+    /// Whose group it is, and the owner a campaign needs to join it.
+    pub owner: PrincipalOwner,
+    pub created_at: DateTime<Utc>,
+    /// Moves with a rename alone, not with a member joining or leaving.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// The plans a campaign has run, newest first. Ids rather than rows: a caller
 /// wanting a plan's state reads the plan, under its own scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,9 +121,13 @@ pub struct Revised {
     pub carried_job_count: usize,
     /// Its jobs the new plan runs again as new jobs.
     pub rerun_job_count: usize,
+    /// Its jobs whose cells the new plan marks failed, as new jobs that no
+    /// device runs.
+    pub marked_job_count: usize,
     /// Its jobs whose completions the new plan scores again as new jobs.
     pub recalculated_job_count: usize,
-    /// Its jobs the new plan neither holds nor runs again.
+    /// Its jobs the new plan neither holds, runs again, scores again nor marks
+    /// failed.
     pub dropped_job_count: usize,
     /// `false` when it had already ended, or was already being cancelled.
     pub cancel_requested: bool,
@@ -134,8 +155,10 @@ pub struct RevisionPreview {
     pub carried_job_count: usize,
     /// Cells the head never ran, which the revision would queue.
     pub new_job_count: usize,
-    /// Cells the head ran under other requirements, which the revision would
-    /// run again: the run failed, or its device or build is not known to meet them.
+    /// Cells the head ran under other requirements or another attempt limit,
+    /// which the revision would run again: the run failed, its device or build
+    /// is not known to meet the requirements, or it is not known to have
+    /// passed the limit.
     pub requirements_rerun_job_count: usize,
     /// Cells that an earlier finished run answers, which the revision would
     /// hold that run for and not queue.
@@ -147,9 +170,16 @@ pub struct RevisionPreview {
     /// Finished jobs of the `inherit_from` plans the revision would hold.
     #[serde(default)]
     pub inherited_job_count: usize,
-    pub rerun_job_count: usize,
+    /// The head's jobs the revision would run again, as named or as `answered`
+    /// picks them.
+    pub rerun_job_ids: Vec<JobId>,
+    /// The head's jobs the revision would mark failed (`fail`). It would stop
+    /// one still queued or running too, unless another plan holds it.
+    #[serde(default)]
+    pub marked_job_ids: Vec<JobId>,
     pub recalculated_job_count: usize,
-    /// The head's jobs the revision would stop.
+    /// The head's jobs the revision would neither hold, run again, score again
+    /// nor mark failed, so it would stop them.
     pub dropped_job_ids: Vec<JobId>,
     /// Each body that would hold an existing job, and the plan the job comes
     /// from. A body not listed queues a new job or takes an earlier finished
@@ -236,7 +266,7 @@ pub struct SetCampaignOwnerRequest {
 }
 
 /// `POST /api/v1/campaigns/{campaign_id}/rerun` request body: `job_ids` or
-/// `answered`. Unknown keys are refused.
+/// `answered`, or `fail`, alone or beside `job_ids`. Unknown keys are refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -251,6 +281,16 @@ pub struct RerunJobsRequest {
     pub job_ids: Option<Vec<JobId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered: Option<Answered>,
+    /// Jobs of the plan the campaign runs to mark failed, each with its reason
+    /// of at most 4096 characters. A job needs no result: one still queued or
+    /// running stops with the plan, unless another plan holds it. Not with
+    /// `answered`, nor a job `job_ids` names.
+    #[serde(
+        default,
+        deserialize_with = "crate::parsed_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub fail: BTreeMap<JobId, NonEmptyTrimmedString>,
     /// The revision's note, as on `POST /api/v1/campaigns/{campaign_id}/plans`.
     /// The server also records the change that the revision makes.
     #[serde(
@@ -385,6 +425,10 @@ pub struct CampaignPlanRow {
 pub struct CampaignOverview {
     #[serde(flatten)]
     pub campaign: Campaign,
+    /// The campaign group it is in: `null` when it is in none, without a
+    /// `[database]`, and when the reader may not read the group, as a campaign
+    /// reader may not.
+    pub group: Option<CampaignGroup>,
     /// Whether the reader may rename it and hand it over.
     pub may_administer: bool,
     /// Whether a revision would admit this reader; the variant edit takes the
@@ -478,6 +522,15 @@ pub struct ReviseCampaignQuery {
     /// own document too.
     #[serde(default)]
     pub carry_earlier: bool,
+    /// Let a finished run of the head, or of a plan `carry_earlier` or
+    /// `inherit_from` offers, answer its cell whatever `attempt_timeout_seconds`
+    /// the run had. Without it, the run answers when the limit it was requested
+    /// with, or the limit the head holds it under, is the cell's (none on both
+    /// sides included) or, both being set, is not above the cell's, or when a
+    /// plan on offer lists its job for the cell's very body. A failed run runs
+    /// again. Alone, it does not file the head's own document.
+    #[serde(default)]
+    pub carry_across_limit: bool,
     /// Plans of any campaign, comma-separated, whose finished runs a cell the
     /// head has not answered may take, as it takes one of the head's. Files the
     /// head's own document too. At most 32, `add_from`'s and `restore`'s
@@ -646,6 +699,30 @@ mod tests {
                 .map(|note| note.as_ref().map(NonEmptyTrimmedString::as_str)),
             [expected; 6]
         );
+        Ok(())
+    }
+
+    /// Each key of `fail` is checked as a job id, and each reason trimmed and
+    /// refused blank.
+    #[rstest::rstest]
+    #[case::read(json!({"fail": {"job-1": " swap after 5 runs "}}), Some("swap after 5 runs"))]
+    #[case::not_a_job_id(json!({"fail": {"bad!id": "swap"}}), None)]
+    #[case::blank_reason(json!({"fail": {"job-1": "  "}}), None)]
+    fn a_rerun_reads_fail_by_job_id(
+        #[case] body: Value,
+        #[case] reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let read = serde_json::from_value::<RerunJobsRequest>(body);
+        match reason {
+            Some(reason) => assert_eq!(
+                read?
+                    .fail
+                    .get(&JobId::try_new("job-1")?)
+                    .map(NonEmptyTrimmedString::as_str),
+                Some(reason)
+            ),
+            None => assert!(read.is_err(), "{read:?}"),
+        }
         Ok(())
     }
 }

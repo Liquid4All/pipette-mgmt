@@ -26,8 +26,8 @@
   import StatusPill from "./StatusPill.svelte";
   import TableBar from "./TableBar.svelte";
 
-  let { spec, rows, id, noun, empty, path, kept = [], keep = [], columnsKey, cells = {}, action, actionHead = "",
-        marked }: {
+  let { spec, rows, id, noun, empty, path, kept = [], keep = [], columnsKey, cells = {}, heads = {}, action,
+        actionHead = "", marked }: {
     spec: TableSpec<R>;
     /** Every row read, before the filters. */
     rows: readonly R[];
@@ -46,6 +46,8 @@
     columnsKey?: string;
     /** A column's own markup, by its key; any other is drawn from its `raw`. */
     cells?: Record<string, Snippet<[R]>>;
+    /** Markup a column's header draws after its label, by its key. */
+    heads?: Record<string, Snippet>;
     /** A row's own control, in a last column under `actionHead`. */
     action?: Snippet<[R]>;
     actionHead?: string;
@@ -89,7 +91,7 @@
         <SortTh key={column.key} label={column.label} sort={table.sort} num={column.num}
                 link={paging ? (sort) => link({ ...table, sort }) : undefined}
                 onsort={paging ? undefined : (sort) => (held = { ...table, sort })}
-                resize={widths?.grip(column.key, () => headerWidths(head))} />
+                resize={widths?.grip(column.key, () => headerWidths(head))} extra={heads[column.key]} />
       {/each}
       {#if action}<th aria-label={actionHead ? undefined : "actions"} data-key={ACTION}>{actionHead}</th>{/if}
     </tr></thead>

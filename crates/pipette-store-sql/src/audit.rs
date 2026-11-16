@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::AssertSqlSafe;
 
 use pipette_plan_types::{
-    AuditAction, AuditActor, AuditEvent, AuditEventId, AuditOutcome, AuditTarget, CampaignId,
-    ClientId, JobId, OrgId, PlanId, UserId, VaultResourceId,
+    AuditAction, AuditActor, AuditEvent, AuditEventId, AuditOutcome, AuditTarget, CampaignGroupId,
+    CampaignId, ClientId, JobId, OrgId, PlanId, UserId, VaultResourceId,
 };
 use pipette_store::{AuditFilter, AuditPage, AuditStore, UnreadableObjectError};
 
@@ -64,6 +64,7 @@ enum StoredTarget {
     User(UserId),
     Client(ClientId),
     Campaign(CampaignId),
+    CampaignGroup(CampaignGroupId),
     Plan(PlanId),
     Job(JobId),
     VaultResource(VaultResourceId),
@@ -76,6 +77,7 @@ impl From<AuditTarget> for StoredTarget {
             AuditTarget::User { user_id } => Self::User(user_id),
             AuditTarget::Client { client_id } => Self::Client(client_id),
             AuditTarget::Campaign { campaign_id } => Self::Campaign(campaign_id),
+            AuditTarget::CampaignGroup { group_id } => Self::CampaignGroup(group_id),
             AuditTarget::Plan { plan_id } => Self::Plan(plan_id),
             AuditTarget::Job { job_id } => Self::Job(job_id),
             AuditTarget::VaultResource { resource_id } => Self::VaultResource(resource_id),
@@ -90,6 +92,7 @@ impl From<StoredTarget> for AuditTarget {
             StoredTarget::User(user_id) => Self::User { user_id },
             StoredTarget::Client(client_id) => Self::Client { client_id },
             StoredTarget::Campaign(campaign_id) => Self::Campaign { campaign_id },
+            StoredTarget::CampaignGroup(group_id) => Self::CampaignGroup { group_id },
             StoredTarget::Plan(plan_id) => Self::Plan { plan_id },
             StoredTarget::Job(job_id) => Self::Job { job_id },
             StoredTarget::VaultResource(resource_id) => Self::VaultResource { resource_id },
@@ -416,7 +419,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use pipette_plan_types::{
-        AuditActorKind, NonEmptyTrimmedString, PublicKeyHex, UserKey, UserKeyId,
+        AuditActorKind, CampaignGroupId, NonEmptyTrimmedString, PolicyKind, PublicKeyHex, UserKey,
+        UserKeyId,
     };
     use pipette_store_testkit::TEST_LIST_LIMIT;
 
@@ -570,6 +574,23 @@ mod tests {
         "user",
         &[("user", USER)]
     )]
+    #[case::group_policy(
+        Part::Action(AuditAction::GroupPolicy {
+            group_id: CampaignGroupId::try_new("group_0195c3e2")?,
+            kinds: vec![PolicyKind::Swap, PolicyKind::TtftOverE2e],
+            rerun_job_count: 3,
+            marked_job_count: 1,
+        }),
+        json!({
+            "type": "group_policy",
+            "group_id": "group_0195c3e2",
+            "kinds": ["swap", "ttft_over_e2e"],
+            "rerun_job_count": 3,
+            "marked_job_count": 1,
+        }),
+        "user",
+        &[("user", USER)]
+    )]
     #[case::succeeded(
         Part::Outcome(AuditOutcome::Succeeded),
         json!("succeeded"),
@@ -613,6 +634,14 @@ mod tests {
         json!({"type": "campaign", "id": "campaign_0195c3e2"}),
         "user",
         &[("campaign", "campaign_0195c3e2"), ("user", USER)]
+    )]
+    #[case::campaign_group_target(
+        Part::Target(AuditTarget::CampaignGroup {
+            group_id: CampaignGroupId::try_new("group_0195c3e2")?,
+        }),
+        json!({"type": "campaign_group", "id": "group_0195c3e2"}),
+        "user",
+        &[("campaign_group", "group_0195c3e2"), ("user", USER)]
     )]
     #[case::plan_target(
         Part::Target(AuditTarget::Plan { plan_id: PlanId::try_new("plan-a")? }),

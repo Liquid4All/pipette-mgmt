@@ -32,7 +32,7 @@ pub async fn seed_avail(
 ) -> anyhow::Result<JobId> {
     let job = JobId::try_new(job_id).context("valid test job id")?;
     todo.write_tmp(&job, body).await?;
-    todo.promote_avail(&job, expires_at).await?;
+    todo.promote_avail(&job, expires_at, None).await?;
     Ok(job)
 }
 

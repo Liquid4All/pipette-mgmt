@@ -74,7 +74,7 @@ async fn reindex_collects_a_deleted_clients_tags() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn overlay_replaces_the_record_stores_only() -> anyhow::Result<()> {
+async fn overlay_replaces_the_record_stores_and_the_queue() -> anyhow::Result<()> {
     let test_db = crate::testing::test_db_or_skip!();
     let dir = tempfile::tempdir()?;
     let config = Config {
@@ -82,19 +82,23 @@ async fn overlay_replaces_the_record_stores_only() -> anyhow::Result<()> {
         auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
         ..Config::default()
     };
-    let object = pipette_store_fs::build_local_fs_stores(&config)?;
+    let object =
+        pipette_store_fs::build_local_fs_stores(&config, pipette_store_testkit::no_queue())?;
     let stores = crate::overlay(test_db.db(), object.clone());
 
     let kept = |a: &Stores| {
         [
-            Arc::as_ptr(&a.todo).cast::<()>(),
-            Arc::as_ptr(&a.warehouse).cast(),
+            Arc::as_ptr(&a.warehouse).cast::<()>(),
             Arc::as_ptr(&a.eval_sample_results).cast(),
             Arc::as_ptr(&a.dataset_cache).cast(),
             Arc::as_ptr(&a.eval_packages).cast(),
         ]
     };
     assert_eq!(kept(&stores), kept(&object));
+    assert_ne!(
+        Arc::as_ptr(&stores.todo).cast::<()>(),
+        Arc::as_ptr(&object.todo).cast::<()>()
+    );
 
     let client = a_client(ClientId::try_new("ev1_routed")?, public_key(0x04)?)?;
     stores.clients.put_client(&client).await?;

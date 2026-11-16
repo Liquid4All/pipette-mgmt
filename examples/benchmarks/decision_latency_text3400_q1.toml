@@ -1,0 +1,4 @@
+# One question over a long state, the d1 model card's 3.4k-token row.
+benchmark_type        = "decision_latency"
+parameter_text_tokens = 3400
+parameter_questions   = 1

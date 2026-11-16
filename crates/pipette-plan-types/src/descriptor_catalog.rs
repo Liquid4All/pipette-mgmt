@@ -398,9 +398,10 @@ impl ModelFormat {
 }
 
 /// The quantization of a model member, as the operator writes it, for example
-/// `q4_0` or `4bit`.
+/// `q4_0` or `4bit`. One `@` can name the source of the quantization, for
+/// example `q4_k_m@unsloth`.
 #[nutype(
-    validate(regex = r"^[a-z0-9_]+$"),
+    validate(regex = r"^[a-z0-9_]+(@[a-z0-9_]+)?$"),
     derive(
         Debug,
         Clone,

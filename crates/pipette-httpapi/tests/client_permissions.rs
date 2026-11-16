@@ -6,6 +6,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 
 use pipette_core::client_permission::ClientPermissionSet;
+use pipette_core::todo_filename::Lease;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{ClientId, ClientPermission, JobId, UserPermission};
 use pipette_store_testkit::TEST_LIST_LIMIT;
@@ -183,10 +184,10 @@ fn lacks(permission: ClientPermission) -> String {
 
 /// Every live lease, sorted — the value a test compares across a request to
 /// see whether one was renamed.
-async fn leased_keys(state: &AppState) -> anyhow::Result<Vec<String>> {
-    let mut keys = state.todo_store.list_leased().await?;
-    keys.sort();
-    Ok(keys)
+async fn leased_keys(state: &AppState) -> anyhow::Result<Vec<Lease>> {
+    let mut leases = state.todo_store.list_leases().await?;
+    leases.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    Ok(leases)
 }
 
 /// Lease a job to `client_id`, so a submission that echoes `job_id` has a claim to bind

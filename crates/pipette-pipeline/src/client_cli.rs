@@ -344,7 +344,7 @@ mod tests {
             auth_storage: StorageConfig::local_fs(dir.to_path_buf()),
             ..Config::default()
         };
-        build_local_fs_stores(&config)
+        build_local_fs_stores(&config, pipette_store_testkit::no_queue())
     }
 
     /// Use a distinct `pk_suffix` for each client: the public key identifies it too.

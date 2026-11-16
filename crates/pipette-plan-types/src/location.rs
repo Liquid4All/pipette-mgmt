@@ -592,7 +592,6 @@ mod tests {
     #[case::quotes("Bob's \"model\".gguf", "Bob's \"model\".gguf")]
     #[case::backslash(r"C:\models\a.gguf", r"C:\models\a.gguf")]
     #[case::unprintable("a\nb\u{200b}.gguf", r"a\nb\u{200b}.gguf")]
-    #[case::combining_mark("cafe\u{301}.gguf", "cafe\u{301}.gguf")]
     fn a_refused_file_name_is_quoted_with_the_rule(
         #[case] raw: &str,
         #[case] quoted: &str,

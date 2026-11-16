@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::jobs::{PlanJob, ResultsRead};
 use crate::{
-    CampaignId, DescriptorDisplay, FleetDetail, JobId, ListOrder, NonEmptyTrimmedString, PlanId,
-    UserId, UserPermission, VaultResourceId,
+    CampaignGroupId, CampaignId, DescriptorDisplay, FleetDetail, JobId, ListOrder,
+    NonEmptyTrimmedString, PlanId, PolicyKind, UserId, UserPermission, VaultResourceId,
 };
 
 /// One leased job, as `POST /plans/claim` answers it. `spec` stays JSON as
@@ -52,6 +52,34 @@ pub struct UndecodableClaim {
     pub client_versions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<Value>,
+}
+
+/// The optional `POST /plans/claim` request body. Unknown top-level fields
+/// are ignored, so a client that sends other fields can still claim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    /// The artifacts the device holds. When absent, the server assumes the
+    /// device holds the artifacts of the last job it was granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<CachedArtifacts>,
+}
+
+/// The model and runtime descriptors that a device holds. Each entry is
+/// `spec.model` or `spec.runtime` of a claimed job, as the claim carried it.
+/// The server compares the entries as JSON values, so the key order in an
+/// entry has no effect. Unknown fields are refused.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedArtifacts {
+    #[serde(default)]
+    pub models: Vec<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    pub runtimes: Vec<serde_json::Map<String, Value>>,
+}
+
+impl CachedArtifacts {
+    /// The most entries that one list may hold.
+    pub const MAX_ENTRIES: usize = 256;
 }
 
 /// A plan's lifecycle state.
@@ -845,6 +873,8 @@ pub enum RevisionChange {
         added_variant_count: usize,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        carry_across_limit: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -853,14 +883,25 @@ pub enum RevisionChange {
     Document {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        carry_across_limit: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
     },
-    /// `answered` is absent when the filer named the jobs.
+    /// `answered` is absent when the filer named the jobs. `marked_job_count`
+    /// counts the jobs it marked failed (`fail`). `group_id` and `policies`
+    /// name the campaign group whose policies filed it, and are absent when a
+    /// person did.
     Rerun {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered: Option<Answered>,
         job_count: usize,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        marked_job_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<CampaignGroupId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        policies: Vec<PolicyKind>,
     },
     Recalculate {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -872,6 +913,10 @@ pub enum RevisionChange {
     Revert { to_plan_id: PlanId },
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Return `n` and `noun`. Add an `s` to `noun` if `n` is not 1.
 fn counted(n: usize, noun: &str) -> String {
     match n {
@@ -880,15 +925,32 @@ fn counted(n: usize, noun: &str) -> String {
     }
 }
 
+fn filed_by_group(
+    f: &mut std::fmt::Formatter<'_>,
+    group_id: Option<&CampaignGroupId>,
+    policies: &[PolicyKind],
+) -> std::fmt::Result {
+    let Some(group_id) = group_id else {
+        return Ok(());
+    };
+    let kinds: Vec<&str> = policies.iter().map(|kind| kind.as_ref()).collect();
+    write!(
+        f,
+        " Campaign group {group_id} policies: {}.",
+        kinds.join(", ")
+    )
+}
+
 /// Format the change as one line of text for a terminal. The web app uses its
 /// own format.
 impl std::fmt::Display for RevisionChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (carry_earlier, inherit_from) = match self {
+        let (carry_earlier, carry_across_limit, inherit_from) = match self {
             Self::Variants {
                 removed_variant_count: removed,
                 added_variant_count: added,
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
                 restored,
             } => {
@@ -900,27 +962,46 @@ impl std::fmt::Display for RevisionChange {
                         variant.variant_index, variant.plan_id
                     )?;
                 }
-                (*carry_earlier, inherit_from.as_slice())
+                (*carry_earlier, *carry_across_limit, inherit_from.as_slice())
             }
             Self::Document {
                 carry_earlier,
+                carry_across_limit,
                 inherit_from,
             } => {
                 f.write_str("Document revised.")?;
-                (*carry_earlier, inherit_from.as_slice())
+                (*carry_earlier, *carry_across_limit, inherit_from.as_slice())
             }
             Self::Rerun {
                 answered: None,
-                job_count,
-            } => return write!(f, "Re-run of {}.", counted(*job_count, "job")),
+                job_count: 0,
+                marked_job_count,
+                group_id,
+                policies,
+            } if *marked_job_count > 0 => {
+                write!(f, "Marked {} failed.", counted(*marked_job_count, "job"))?;
+                return filed_by_group(f, group_id.as_ref(), policies);
+            }
             Self::Rerun {
-                answered: Some(Answered::Failed),
+                answered,
                 job_count,
-            } => return write!(f, "Re-run of all failed jobs ({job_count})."),
-            Self::Rerun {
-                answered: Some(Answered::All),
-                job_count,
-            } => return write!(f, "Re-run of all finished or failed jobs ({job_count})."),
+                marked_job_count,
+                group_id,
+                policies,
+            } => {
+                match answered {
+                    None => write!(f, "Re-run of {}", counted(*job_count, "job"))?,
+                    Some(Answered::Failed) => write!(f, "Re-run of all failed jobs ({job_count})")?,
+                    Some(Answered::All) => {
+                        write!(f, "Re-run of all finished or failed jobs ({job_count})")?;
+                    }
+                }
+                match marked_job_count {
+                    0 => f.write_str(".")?,
+                    marked => write!(f, "; {marked} marked failed.")?,
+                }
+                return filed_by_group(f, group_id.as_ref(), policies);
+            }
             Self::Recalculate {
                 all_evals: false,
                 job_count,
@@ -933,6 +1014,9 @@ impl std::fmt::Display for RevisionChange {
         };
         if carry_earlier {
             f.write_str(" Carries runs of earlier plans.")?;
+        }
+        if carry_across_limit {
+            f.write_str(" Carries runs across a changed attempt limit.")?;
         }
         if !inherit_from.is_empty() {
             let ids: Vec<&str> = inherit_from.iter().map(PlanId::as_str).collect();
@@ -1149,9 +1233,14 @@ mod revision_change_tests {
     enum SentenceCase {
         RerunOne,
         RerunFailed,
+        Marked,
+        RerunAndMarked,
+        MarkedByGroup,
+        RerunByGroup,
         Recalculate,
         VariantsCarry,
         VariantsRestored,
+        DocumentAcrossLimit,
         Revert,
     }
 
@@ -1159,6 +1248,16 @@ mod revision_change_tests {
     #[rstest::rstest]
     #[case::rerun_one(SentenceCase::RerunOne, "Re-run of 1 job.")]
     #[case::rerun_failed(SentenceCase::RerunFailed, "Re-run of all failed jobs (12).")]
+    #[case::marked(SentenceCase::Marked, "Marked 2 jobs failed.")]
+    #[case::rerun_and_marked(SentenceCase::RerunAndMarked, "Re-run of 3 jobs; 2 marked failed.")]
+    #[case::marked_by_group(
+        SentenceCase::MarkedByGroup,
+        "Marked 1 job failed. Campaign group group_a policies: swap."
+    )]
+    #[case::rerun_by_group(
+        SentenceCase::RerunByGroup,
+        "Re-run of 3 jobs; 1 marked failed. Campaign group group_a policies: swap, ttft_over_e2e."
+    )]
     #[case::recalculate(SentenceCase::Recalculate, "Recalculation of 2 evals.")]
     #[case::variants_carry(
         SentenceCase::VariantsCarry,
@@ -1170,6 +1269,11 @@ mod revision_change_tests {
         "Variant edit: 1 removed, 2 added. Restored variant 2 of plan-a. \
          Restored variant 0 of plan-a. Inherits runs of plan-a."
     )]
+    #[case::document_across_limit(
+        SentenceCase::DocumentAcrossLimit,
+        "Document revised. Carries runs of earlier plans. \
+         Carries runs across a changed attempt limit."
+    )]
     #[case::revert(SentenceCase::Revert, "Reverted to plan-a.")]
     fn a_revision_change_reads_as_a_sentence(
         #[case] case: SentenceCase,
@@ -1179,10 +1283,44 @@ mod revision_change_tests {
             SentenceCase::RerunOne => RevisionChange::Rerun {
                 answered: None,
                 job_count: 1,
+                marked_job_count: 0,
+                group_id: None,
+                policies: Vec::new(),
             },
             SentenceCase::RerunFailed => RevisionChange::Rerun {
                 answered: Some(Answered::Failed),
                 job_count: 12,
+                marked_job_count: 0,
+                group_id: None,
+                policies: Vec::new(),
+            },
+            SentenceCase::Marked => RevisionChange::Rerun {
+                answered: None,
+                job_count: 0,
+                marked_job_count: 2,
+                group_id: None,
+                policies: Vec::new(),
+            },
+            SentenceCase::RerunAndMarked => RevisionChange::Rerun {
+                answered: None,
+                job_count: 3,
+                marked_job_count: 2,
+                group_id: None,
+                policies: Vec::new(),
+            },
+            SentenceCase::MarkedByGroup => RevisionChange::Rerun {
+                answered: None,
+                job_count: 0,
+                marked_job_count: 1,
+                group_id: Some(CampaignGroupId::try_new("group_a")?),
+                policies: vec![PolicyKind::Swap],
+            },
+            SentenceCase::RerunByGroup => RevisionChange::Rerun {
+                answered: None,
+                job_count: 3,
+                marked_job_count: 1,
+                group_id: Some(CampaignGroupId::try_new("group_a")?),
+                policies: vec![PolicyKind::Swap, PolicyKind::TtftOverE2e],
             },
             SentenceCase::Recalculate => RevisionChange::Recalculate {
                 all_evals: false,
@@ -1192,6 +1330,7 @@ mod revision_change_tests {
                 removed_variant_count: 1,
                 added_variant_count: 0,
                 carry_earlier: true,
+                carry_across_limit: false,
                 inherit_from: vec![PlanId::try_new("plan-a")?, PlanId::try_new("plan-b")?],
                 restored: Vec::new(),
             },
@@ -1199,6 +1338,7 @@ mod revision_change_tests {
                 removed_variant_count: 1,
                 added_variant_count: 2,
                 carry_earlier: false,
+                carry_across_limit: false,
                 inherit_from: vec![PlanId::try_new("plan-a")?],
                 restored: vec![
                     RestoredVariant {
@@ -1210,6 +1350,11 @@ mod revision_change_tests {
                         variant_index: 0,
                     },
                 ],
+            },
+            SentenceCase::DocumentAcrossLimit => RevisionChange::Document {
+                carry_earlier: true,
+                carry_across_limit: true,
+                inherit_from: Vec::new(),
             },
             SentenceCase::Revert => RevisionChange::Revert {
                 to_plan_id: PlanId::try_new("plan-a")?,
@@ -1223,14 +1368,27 @@ mod revision_change_tests {
     /// SQL store keeps its own stored form.
     #[rstest::rstest]
     #[case::document(
-        RevisionChange::Document { carry_earlier: false, inherit_from: Vec::new() },
+        RevisionChange::Document {
+            carry_earlier: false,
+            carry_across_limit: false,
+            inherit_from: Vec::new()
+        },
         serde_json::json!({"type": "document"})
+    )]
+    #[case::document_across_limit(
+        RevisionChange::Document {
+            carry_earlier: false,
+            carry_across_limit: true,
+            inherit_from: Vec::new()
+        },
+        serde_json::json!({"type": "document", "carry_across_limit": true})
     )]
     #[case::variants(
         RevisionChange::Variants {
             removed_variant_count: 1,
             added_variant_count: 2,
             carry_earlier: false,
+            carry_across_limit: false,
             inherit_from: Vec::new(),
             restored: Vec::new()
         },
@@ -1243,6 +1401,7 @@ mod revision_change_tests {
             removed_variant_count: 0,
             added_variant_count: 1,
             carry_earlier: false,
+            carry_across_limit: false,
             inherit_from: Vec::new(),
             restored: vec![RestoredVariant {
                 plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(1)),
@@ -1257,8 +1416,37 @@ mod revision_change_tests {
         })
     )]
     #[case::rerun(
-        RevisionChange::Rerun { answered: None, job_count: 3 },
+        RevisionChange::Rerun {
+            answered: None,
+            job_count: 3,
+            marked_job_count: 0,
+            group_id: None,
+            policies: Vec::new()
+        },
         serde_json::json!({"type": "rerun", "job_count": 3})
+    )]
+    #[case::marked(
+        RevisionChange::Rerun {
+            answered: None,
+            job_count: 0,
+            marked_job_count: 2,
+            group_id: None,
+            policies: Vec::new()
+        },
+        serde_json::json!({"type": "rerun", "job_count": 0, "marked_job_count": 2})
+    )]
+    #[case::rerun_by_group(
+        RevisionChange::Rerun {
+            answered: None,
+            job_count: 3,
+            marked_job_count: 1,
+            group_id: Some(CampaignGroupId::try_new("group_a")?),
+            policies: vec![PolicyKind::Swap, PolicyKind::TtftOverE2e]
+        },
+        serde_json::json!({
+            "type": "rerun", "job_count": 3, "marked_job_count": 1,
+            "group_id": "group_a", "policies": ["swap", "ttft_over_e2e"]
+        })
     )]
     #[case::recalculate(
         RevisionChange::Recalculate { all_evals: false, job_count: 4 },

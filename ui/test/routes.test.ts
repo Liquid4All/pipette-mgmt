@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
-  benchmarkLink, campaignLink, campaignPlanLink, clientLink, href, inApp, legacyOwnerFilter, match,
+  benchmarkLink, campaignGroupLink, campaignLink, campaignPlanLink, clientLink, href, inApp, legacyOwnerFilter, match,
   matchIn, orgLink, pathOf, planLink, screenOf, table, userLink, vaultLink, type Route,
 } from "../src/lib/routes";
 
@@ -38,7 +38,10 @@ describe("routes", () => {
       { page: "campaign-plan-revisions", campaign_id: "cmp_1", plan_id: "plan-1" },
       { page: "campaign-plan-settings", campaign_id: "cmp_1", plan_id: "plan-1" },
       { page: "campaign-document", campaign_id: "cmp_1" },
-      { page: "me-campaigns" }, { page: "org-campaigns", org: "acme" },
+      { page: "me-campaigns" }, { page: "org-campaigns", org: "acme" }, { page: "campaign-group", group_id: "group_1" },
+      { page: "me-campaign-groups" }, { page: "org-campaign-groups", org: "acme" },
+      { page: "campaign-group-policies", group_id: "group_1" }, { page: "campaign-group-activity", group_id: "group_1" },
+      { page: "campaign-group-settings", group_id: "group_1" },
     ];
     for (const route of routes) expect(match(pathOf(route))).toEqual(route);
   });
@@ -112,6 +115,7 @@ describe("routes", () => {
     expect(orgLink({ org_id: "org_1", slug: "acme" }, "/devices?status=pending")).toBe("/app/orgs/acme/devices?status=pending");
     expect(orgLink({ org_id: "org_1", slug: "acme" }, "/vault")).toBe("/app/orgs/acme/vault");
     expect(campaignLink("cmp_a/b")).toBe("/app/campaigns/cmp_a%2Fb");
+    expect(campaignGroupLink("group_a/b")).toBe("/app/campaign-groups/group_a%2Fb");
     expect(userLink("usr_a/b")).toBe("/app/users/usr_a%2Fb");
     expect(clientLink("ev1_x")).toBe("/app/clients/ev1_x");
     expect(vaultLink("vault_1")).toBe("/app/vault/vault_1");
@@ -244,6 +248,10 @@ describe("routes", () => {
     expect(screenOf("/app/users/user_1/settings")).toBe("/app/users/user_1");
     expect(screenOf("/app/users/user_1/plans")).not.toBe(screenOf("/app/users/user_2/plans"));
     expect(screenOf("/app/account/keys")).toBe("/app/account");
+    expect(screenOf("/app/campaign-groups/group_1/settings")).toBe("/app/campaign-groups/group_1");
+    expect(screenOf("/app/campaign-groups/group_1/policies")).toBe("/app/campaign-groups/group_1");
+    expect(screenOf("/app/campaign-groups/group_1/activity")).toBe("/app/campaign-groups/group_1");
+    expect(screenOf("/app/campaign-groups/group_2/settings")).not.toBe(screenOf("/app/campaign-groups/group_1"));
   });
 
   test("an address with its query is built once, the empty pairs dropped unless kept", () => {

@@ -207,6 +207,20 @@ export const FILTERS_FROM = 10;
 /** A table kept in the page, before the reader sorts or filters it. */
 export const unsorted = <R>(spec: TableSpec<R>): TableState => tableState(spec, new URLSearchParams());
 
+/**
+ * A CSV field, quoted where it holds a comma, a quote or a line break; text led by
+ * `=`, `+`, `-`, `@`, a tab or a carriage return gets a `'`, so a spreadsheet reads no formula.
+ */
+const field = (value: Raw | undefined): string => {
+  let text = value === null || value === undefined ? "" : String(value);
+  if (typeof value === "string" && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+};
+
+/** `rows` as one CSV file, its header first. */
+export const csvOf = (rows: readonly (readonly Raw[])[]): string =>
+  rows.map((cells) => cells.map(field).join(",")).join("\r\n") + "\r\n";
+
 /** A cursor listing's page, as every listing route answers one. */
 export interface CursorPage<T> {
   items: T[];

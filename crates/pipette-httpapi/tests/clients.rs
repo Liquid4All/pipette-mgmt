@@ -12,9 +12,9 @@ use pipette_core::client::{Client, ClientStatus};
 use pipette_plan_types::{ClientId, ExpiresAt, NonEmptyTrimmedString, Tag, UserPermission};
 use pipette_store::{ClaimResult, drain_clients, purge_client_todo_state};
 use pipette_web_testkit::{
-    QueueBackend, approved_queue_client, auth_headers, authed_get, authed_patch, authed_post,
-    authed_user_get, body_json, denied_clients, job, json_str, make_state, raw_request,
-    register_and_approve, register_pending, registered_user, seed_avail, setup_benchmarks,
+    approved_queue_client, auth_headers, authed_get, authed_patch, authed_post, authed_user_get,
+    body_json, denied_clients, json_str, make_state, raw_request, register_and_approve,
+    register_pending, registered_user, seed_avail, seeded_queue_state, setup_benchmarks,
     signed_empty, signed_json, unauthed_post,
 };
 
@@ -300,15 +300,10 @@ async fn test_get_me_returns_every_field_registration_stored() -> anyhow::Result
     Ok(())
 }
 
-#[rstest]
-#[case::local_fs(QueueBackend::LocalFs)]
-#[case::database(QueueBackend::Database)]
 #[tokio::test]
-async fn test_patch_device_field_queues_reindex(
-    #[case] backend: QueueBackend,
-) -> anyhow::Result<()> {
+async fn test_patch_device_field_queues_reindex() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((queue, sk, client_id)) = approved_queue_client(dir.path(), backend).await? else {
+    let Some((queue, sk, client_id)) = approved_queue_client(dir.path()).await? else {
         return Ok(());
     };
     let state = &queue.state;
@@ -330,16 +325,19 @@ async fn test_patch_device_field_queues_reindex(
 
     // One flag before the lease relinquish (the gate), one after the record
     // persist, so a racing reindex cannot consume it against the old record.
-    let keys: Vec<_> = state
+    let requests: Vec<_> = state
         .todo_store
         .list_pending_reindex()
         .await?
         .into_iter()
-        .filter(|(flagged, _)| flagged == &client_id)
-        .map(|(_, key)| key)
+        .filter(|r| r.client_id == client_id)
         .collect();
-    assert_eq!(keys.len(), 2, "expected pre- and post-persist flag writes");
-    assert_ne!(keys[0], keys[1]);
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected pre- and post-persist flag writes"
+    );
+    assert_ne!(requests[0], requests[1]);
 
     // GET /clients/me surfaces the same signal while the flag is up.
     let resp = authed_get(state, &sk, &client_id, "/clients/me").await?;
@@ -353,9 +351,11 @@ async fn test_patch_device_field_queues_reindex(
 async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_record()
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (sk, client_id) = register_and_approve(&state).await?;
+    let Some(queue) = seeded_queue_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &queue.state;
+    let (sk, client_id) = register_and_approve(state).await?;
     let job = seed_avail(
         state.todo_store.as_ref(),
         "job-1",
@@ -374,13 +374,18 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
 
-    // A regular file at the flag directory path makes the `local_fs` flag write fail.
-    let flags = dir.path().join("todo").join("pending-reindex");
-    std::fs::remove_dir_all(&flags)?;
-    std::fs::write(&flags, b"not a directory")?;
+    // A trigger makes the flag write fail.
+    queue
+        .execute_sql(
+            "CREATE FUNCTION refuse_flag() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'flag write refused'; END $$; \
+         CREATE TRIGGER refuse_flag BEFORE INSERT ON queue_reindex_requests \
+         FOR EACH ROW EXECUTE FUNCTION refuse_flag();",
+        )
+        .await?;
 
     let patch = json!({"device_form_factor": "laptop"});
-    let resp = authed_patch(&state, &sk, &client_id, "/clients/me", &patch).await?;
+    let resp = authed_patch(state, &sk, &client_id, "/clients/me", &patch).await?;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         body_json(resp).await?,
@@ -398,19 +403,16 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
         "the old record stays durable"
     );
     assert_eq!(
-        state
-            .todo_store
-            .list_leased_for_client(&client_id)
-            .await?
-            .len(),
+        state.todo_store.leases_for_client(&client_id).await?.len(),
         1,
         "the flag goes first, so no lease was relinquished"
     );
 
     // Once the store recovers, the retry computes the same diff and repairs.
-    std::fs::remove_file(&flags)?;
-    std::fs::create_dir(&flags)?;
-    let resp = authed_patch(&state, &sk, &client_id, "/clients/me", &patch).await?;
+    queue
+        .execute_sql("DROP TRIGGER refuse_flag ON queue_reindex_requests")
+        .await?;
+    let resp = authed_patch(state, &sk, &client_id, "/clients/me", &patch).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
     assert_eq!(body["device_form_factor"], "laptop");
@@ -418,7 +420,7 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
     assert!(
         state
             .todo_store
-            .list_leased_for_client(&client_id)
+            .leases_for_client(&client_id)
             .await?
             .is_empty(),
         "the retry relinquishes the lease the failed PATCH kept"
@@ -1027,10 +1029,12 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
     let state = make_state(dir.path()).await?;
     let todo = &*state.todo_store;
 
-    let a = ClientId::try_new("client-a")?;
-    let b = ClientId::try_new("client-b")?;
-    let job1 = job("job-1")?;
-    let job2 = job("job-2")?;
+    // The database keeps a liveness stamp only for a stored client.
+    let (_, a) = register_and_approve(&state).await?;
+    let (_, b) = register_and_approve(&state).await?;
+    // The database keeps an eligibility row only for a queued job.
+    let job1 = seed_avail(todo, "job-1", ExpiresAt::Never, &json!({"job_id": "job-1"})).await?;
+    let job2 = seed_avail(todo, "job-2", ExpiresAt::Never, &json!({"job_id": "job-2"})).await?;
 
     todo.stamp_liveness(&a).await?;
     todo.write_eligible(&a, &job1, ExpiresAt::Never).await?;
@@ -1057,7 +1061,7 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
             .list_pending_reindex()
             .await?
             .iter()
-            .any(|(c, _)| c == &a)
+            .any(|r| r.client_id == a)
     );
 
     assert!(todo.read_liveness(&b).await?.is_some());
@@ -1071,7 +1075,7 @@ async fn test_purge_client_todo_state_removes_only_target() -> anyhow::Result<()
         todo.list_pending_reindex()
             .await?
             .iter()
-            .any(|(c, _)| c == &b)
+            .any(|r| r.client_id == b)
     );
 
     // A clean no-op, so `clients delete` re-runs to converge after a failure.
@@ -1181,7 +1185,7 @@ async fn test_patch_profile_relinquishes_leases(
     assert_eq!(
         !state
             .todo_store
-            .list_leased_for_client(&client_id)
+            .leases_for_client(&client_id)
             .await?
             .is_empty(),
         expect_leased
@@ -1231,8 +1235,8 @@ async fn test_patch_resending_the_stored_profile_keeps_leases_and_queues_nothing
     let resp = authed_patch(&state, &sk, &client_id, "/clients/me", &profile).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     // Clear the flags the first PATCH raised, as a reindex pass would.
-    for (_, key) in state.todo_store.list_pending_reindex().await? {
-        state.todo_store.delete_pending_reindex(&key).await?;
+    for request in state.todo_store.list_pending_reindex().await? {
+        state.todo_store.delete_pending_reindex(&request).await?;
     }
 
     let job = seed_avail(
@@ -1258,11 +1262,7 @@ async fn test_patch_resending_the_stored_profile_keeps_leases_and_queues_nothing
     assert_eq!(body_json(resp).await?["reindex_pending"], false);
 
     assert_eq!(
-        state
-            .todo_store
-            .list_leased_for_client(&client_id)
-            .await?
-            .len(),
+        state.todo_store.leases_for_client(&client_id).await?.len(),
         1,
         "the lease survives"
     );

@@ -4,12 +4,12 @@
 
 use std::num::NonZeroUsize;
 
-use pipette_core::campaign::Campaign;
+use pipette_core::campaign::{Campaign, CampaignGroup};
 use pipette_core::config::Config;
 use pipette_core::vault::VaultResource;
 use pipette_plan_types::{
-    CampaignId, ListOrder, ListPage, OrgId, OwnedListQuery, OwnerFilter, PrincipalOwner, UserId,
-    VaultResourceId,
+    CampaignGroupId, CampaignId, ListOrder, ListPage, OrgId, OwnedListQuery, OwnerFilter,
+    PrincipalOwner, UserId, VaultResourceId,
 };
 use pipette_store::Page;
 
@@ -140,6 +140,16 @@ impl Owned for Campaign {
     }
     fn key(&self) -> &CampaignId {
         &self.campaign_id
+    }
+}
+
+impl Owned for CampaignGroup {
+    type Key = CampaignGroupId;
+    fn owner(&self) -> &PrincipalOwner {
+        &self.owner
+    }
+    fn key(&self) -> &CampaignGroupId {
+        &self.group_id
     }
 }
 

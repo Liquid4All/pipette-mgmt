@@ -281,6 +281,8 @@ export const SWAPPED = "max_swap";
 export const VL_SWAPPED = "vl_max_swap";
 /** The ASR types' swap chart, over their clip's parameters. */
 export const ASR_SWAPPED = "asr_max_swap";
+/** The decision types' swap chart, over their state's parameters. */
+export const DECISION_SWAPPED = "decision_max_swap";
 const PREFILL = "prefill_throughput";
 const DECODE = "decode_throughput";
 const LATENCY = "end_to_end_latency";
@@ -298,16 +300,19 @@ const FAMILIES: [string, string, string][] = [
   ["asr_throughput", "ASR throughput", "ASR throughput"], ["asr_max_memory", "ASR peak memory", "ASR memory"],
   [TTFT_E2E, "time to first token vs E2E latency", "TTFT vs E2E latency"],
   ["eval", "eval accuracy", "Eval"], ["asr_eval", "ASR error rate", "ASR eval"],
+  ["decision_latency", "decision latency", "Decision latency"],
+  ["decision_max_memory", "decision peak memory", "Decision memory"],
   [SWAPPED, "swap", "Swap"], [VL_SWAPPED, "VL swap", "VL swap"],
-  [ASR_SWAPPED, "ASR swap", "ASR swap"],
+  [ASR_SWAPPED, "ASR swap", "ASR swap"], [DECISION_SWAPPED, "decision swap", "Decision swap"],
 ];
 /** The families derived across rows, not one benchmark type's: the checks and swap, in the page's order. */
-export const DERIVED_FAMILIES = [E2E, VL_E2E, TTFT_E2E, SWAPPED, VL_SWAPPED, ASR_SWAPPED];
+export const DERIVED_FAMILIES = [E2E, VL_E2E, TTFT_E2E, SWAPPED, VL_SWAPPED, ASR_SWAPPED, DECISION_SWAPPED];
 /** The swap charts, text first. */
-const SWAPS = [SWAPPED, VL_SWAPPED, ASR_SWAPPED];
-/** Each VL and ASR type's own swap chart: its prompt is not a text length, so it charts apart from Swap, over its own
- * parameters. */
-const OWN_SWAP = new Map([[VL, VL_SWAPPED], ["vl_max_memory", VL_SWAPPED], [ASR, ASR_SWAPPED], [ASR_MEMORY, ASR_SWAPPED]]);
+const SWAPS = [SWAPPED, VL_SWAPPED, ASR_SWAPPED, DECISION_SWAPPED];
+/** Each VL, ASR and decision type's own swap chart: its prompt is not a text length, so it charts apart from Swap, over
+ * its own parameters. */
+const OWN_SWAP = new Map([[VL, VL_SWAPPED], ["vl_max_memory", VL_SWAPPED], [ASR, ASR_SWAPPED], [ASR_MEMORY, ASR_SWAPPED],
+                          ["decision_latency", DECISION_SWAPPED], ["decision_max_memory", DECISION_SWAPPED]]);
 const FAMILY_LABEL = new Map(FAMILIES.map(([key, label]) => [key, label]));
 const SHORT_LABEL = new Map(FAMILIES.map(([key, , short]) => [key, short]));
 const FAMILY_RANK = new Map(FAMILIES.map(([key], i) => [key, i]));
@@ -401,7 +406,7 @@ export function effortOf(flags: ModelFlags | UnknownValue | null): string | null
   return said ? said[1]! : null;
 }
 
-const MEMORY = new Set(["max_memory_usage", "vl_max_memory", ASR_MEMORY]);
+const MEMORY = new Set(["max_memory_usage", "vl_max_memory", ASR_MEMORY, "decision_max_memory"]);
 /** The pools a memory job reports, in tie order. */
 const POOLS: [string, string][] = [["max_host_usage", "host"], ["max_gpu_usage", "GPU"], ["max_npu_usage", "NPU"]];
 
@@ -411,6 +416,7 @@ const OPENS_ON: Record<string, string[]> = {
   vl_max_memory: ["peak_memory"], [VL]: [LATENCY, PREFILL], [SPEC]: ["decode_speedup", DECODE], eval: ["accuracy"],
   [ASR_MEMORY]: ["peak_memory"], [ASR]: [LATENCY, PREFILL],
   asr_eval: ["wer", "error_rate"],
+  decision_latency: ["decision_latency"], decision_max_memory: ["peak_memory"],
 };
 
 /** A type's metrics in an order of its own, the rest after by name: VL and ASR throughput's as their text twins' tabs run. */
@@ -714,7 +720,8 @@ const swapOf = (row: ResultRow): number | null => {
   return finite(swap) ? swap : null;
 };
 
-/** Whether a measured row's swap draws on swap chart `key`: a VL or ASR type's on its own, one with a prefill length on Swap. */
+/** Whether a measured row's swap draws on swap chart `key`: a VL, ASR or decision type's on its own, one with a prefill
+ * length on Swap. */
 const swapReads = (key: string, e: Entry): boolean => {
   const own = OWN_SWAP.get(e.row.benchmark_type);
   return swapOf(e.row) !== null && (own ? key === own : key === SWAPPED && finite(e.params.prefill_tokens));
@@ -900,8 +907,8 @@ export function index(rows: readonly ResultRow[], fleet: FleetDetail, names: Rec
       columns, devices: devicesOf(columns), disabled: null,
     });
   }
-  // Swap, where any run held some: every benchmark type whose rows read it, a panel each, text, VL and ASR apart as
-  // their prompts are sized by different parameters.
+  // Swap, where any run held some: every benchmark type whose rows read it, a panel each, text, VL, ASR and decision
+  // apart as their prompts are sized by different parameters.
   for (const key of SWAPS) {
     const swapping = measured.filter((e) => swapReads(key, e));
     // An ASR swap counts only where its rule compares it, or the tab would offer a chart of nothing.

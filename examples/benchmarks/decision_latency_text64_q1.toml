@@ -1,0 +1,4 @@
+# One question over a short state: a decision model's single-decision latency.
+benchmark_type        = "decision_latency"
+parameter_text_tokens = 64
+parameter_questions   = 1

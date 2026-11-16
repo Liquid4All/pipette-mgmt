@@ -1,5 +1,5 @@
 //! Process-wide counters for the JSON bodies the S3 stores decode through
-//! `parse_json_blob` and `find_outcomes` (not plan manifests or `todo/` jobs);
+//! `parse_json_blob` and `find_outcomes` (not plan manifests or queued jobs);
 //! `queue-maintenance` logs them per phase.
 
 use std::sync::atomic::{AtomicU64, Ordering};
