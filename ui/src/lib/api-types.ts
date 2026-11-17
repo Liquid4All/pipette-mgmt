@@ -366,6 +366,9 @@ export type Runtime =
   | (OnnxGenaiIosPipette & {
       type: "onnx_genai_ios_pipette";
     })
+  | (OnnxGenaiApkPipette & {
+      type: "onnx_genai_apk_pipette";
+    })
   | (AppleFoundation & {
       type: "apple_foundation";
     })
@@ -512,6 +515,11 @@ export type Ovms1 =
  * via the `definition` "OnnxGenaiIosPipetteFlavor".
  */
 export type OnnxGenaiIosPipetteFlavor = "ios-arm64";
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "OnnxGenaiApkPipetteFlavor".
+ */
+export type OnnxGenaiApkPipetteFlavor = "android-arm64-v8";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "TrtEdgellm".
@@ -1221,7 +1229,28 @@ export type BenchmarkFlags =
     }
   | {
       attempt_timeout_seconds?: number | null;
+      benchmark_type: "prefill_throughput";
+      model_type: "onnx_genai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "onnx_genai_apk_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "decode_throughput";
+      model_type: "onnx_genai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "onnx_genai_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "decode_throughput";
+      model_type: "onnx_genai";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "onnx_genai_apk_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "end_to_end_latency";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
       runtime_type: "onnx_genai_ios_pipette";
@@ -1231,7 +1260,7 @@ export type BenchmarkFlags =
       benchmark_type: "end_to_end_latency";
       model_type: "onnx_genai";
       readiness?: ReadinessOverrides | null;
-      runtime_type: "onnx_genai_ios_pipette";
+      runtime_type: "onnx_genai_apk_pipette";
     }
   | {
       attempt_timeout_seconds?: number | null;
@@ -1313,6 +1342,12 @@ export type BenchmarkFlags =
       benchmark_type: "max_memory_usage";
       model_type: "onnx_genai";
       runtime_type: "onnx_genai_ios_pipette";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "max_memory_usage";
+      model_type: "onnx_genai";
+      runtime_type: "onnx_genai_apk_pipette";
     }
   | {
       attempt_timeout_seconds?: number | null;
@@ -2939,6 +2974,14 @@ export interface OnnxGenaiIosPipette {
 export interface OnnxGenaiStack {
   onnxruntime: SourceRepository;
   onnxruntime_genai: SourceRepository;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "OnnxGenaiApkPipette".
+ */
+export interface OnnxGenaiApkPipette {
+  flavor: OnnxGenaiApkPipetteFlavor;
+  packages: OnnxGenaiStack;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema

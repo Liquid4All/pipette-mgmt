@@ -1,4 +1,4 @@
-//! ONNX Runtime GenAI: the uv venv, and the in-process iOS app.
+//! ONNX Runtime GenAI: the uv venv, and the in-process iOS and Android apps.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,40 @@ pub struct OnnxGenaiIosPipette {
     pub private_apis: PrivateApis,
 }
 
-/// The two source trees the iOS ONNX Runtime GenAI build was compiled from;
+/// The Android pipette app's in-process ONNX Runtime GenAI:
+/// [`OnnxGenaiIosPipette`]'s counterpart, compiled from the same two submodules
+/// at the same pins, so its version is that pair too. No `private_apis`: those
+/// are the iOS app's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct OnnxGenaiApkPipette {
+    pub packages: OnnxGenaiStack,
+    pub flavor: OnnxGenaiApkPipetteFlavor,
+}
+
+/// Build targets for the ONNX Runtime GenAI APK, one ABI today, spelled as
+/// [`LlamacppApkPipetteFlavor`](crate::LlamacppApkPipetteFlavor) spells it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum OnnxGenaiApkPipetteFlavor {
+    AndroidArm64V8,
+}
+
+/// The two source trees an in-process ONNX Runtime GenAI build was compiled from;
 /// `onnxruntime-genai` links against `onnxruntime`, so a number depends on both.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -159,6 +192,12 @@ impl std::fmt::Display for OnnxGenaiIosPipette {
     }
 }
 
+impl std::fmt::Display for OnnxGenaiApkPipette {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.packages, self.flavor)
+    }
+}
+
 impl std::fmt::Display for OnnxGenaiStack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -276,6 +315,30 @@ onnxruntime_genai = { repository_url = "github.com/microsoft/onnxruntime-genai",
         );
         assert_eq!(rt.to_string(), format!("{}:ios-arm64", rt.packages));
         assert_eq!(rt.private_apis, PrivateApis::default());
+        Ok(())
+    }
+
+    #[test]
+    fn onnx_genai_apk_pipette_runtime_parses() -> anyhow::Result<()> {
+        let runtime: Runtime = toml::from_str(
+            r#"type = "onnx_genai_apk_pipette"
+flavor = "android-arm64-v8"
+
+[packages]
+onnxruntime = { repository_url = "github.com/microsoft/onnxruntime", repository_version = "v1.31.1" }
+onnxruntime_genai = { repository_url = "github.com/microsoft/onnxruntime-genai", repository_version = "533de8cc9" }"#,
+        )
+        .context("onnx genai apk pipette runtime should parse")?;
+        let Runtime::OnnxGenaiApkPipette(rt) = &runtime else {
+            anyhow::bail!("expected OnnxGenaiApkPipette, got {runtime:?}");
+        };
+        assert_eq!(rt.flavor, OnnxGenaiApkPipetteFlavor::AndroidArm64V8);
+        assert_eq!(
+            rt.packages.onnxruntime_genai.repository_version.as_ref(),
+            "533de8cc9"
+        );
+        assert_eq!(rt.to_string(), format!("{}:android-arm64-v8", rt.packages));
+        assert_eq!(runtime.headless_token(), "onnx_genai_apk_pipette");
         Ok(())
     }
 }

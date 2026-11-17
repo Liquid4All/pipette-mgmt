@@ -3829,7 +3829,127 @@
               ]
             },
             "benchmark_type": {
+              "const": "prefill_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "onnx_genai_apk_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
               "const": "decode_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "onnx_genai_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "decode_throughput",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "readiness": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReadinessOverrides"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runtime_type": {
+              "const": "onnx_genai_apk_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "end_to_end_latency",
               "type": "string"
             },
             "model_type": {
@@ -3887,7 +4007,7 @@
               ]
             },
             "runtime_type": {
-              "const": "onnx_genai_ios_pipette",
+              "const": "onnx_genai_apk_pipette",
               "type": "string"
             }
           },
@@ -4302,6 +4422,36 @@
             },
             "runtime_type": {
               "const": "onnx_genai_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "benchmark_type",
+            "model_type",
+            "runtime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_timeout_seconds": {
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "benchmark_type": {
+              "const": "max_memory_usage",
+              "type": "string"
+            },
+            "model_type": {
+              "const": "onnx_genai",
+              "type": "string"
+            },
+            "runtime_type": {
+              "const": "onnx_genai_apk_pipette",
               "type": "string"
             }
           },
@@ -10510,6 +10660,27 @@
       ],
       "type": "object"
     },
+    "OnnxGenaiApkPipette": {
+      "properties": {
+        "flavor": {
+          "$ref": "#/$defs/OnnxGenaiApkPipetteFlavor"
+        },
+        "packages": {
+          "$ref": "#/$defs/OnnxGenaiStack"
+        }
+      },
+      "required": [
+        "packages",
+        "flavor"
+      ],
+      "type": "object"
+    },
+    "OnnxGenaiApkPipetteFlavor": {
+      "enum": [
+        "android-arm64-v8"
+      ],
+      "type": "string"
+    },
     "OnnxGenaiIosPipette": {
       "properties": {
         "flavor": {
@@ -13493,6 +13664,23 @@
           "properties": {
             "type": {
               "const": "onnx_genai_ios_pipette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/OnnxGenaiApkPipette"
+            }
+          ],
+          "properties": {
+            "type": {
+              "const": "onnx_genai_apk_pipette",
               "type": "string"
             }
           },

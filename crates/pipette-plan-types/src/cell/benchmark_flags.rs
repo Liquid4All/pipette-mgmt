@@ -406,9 +406,14 @@ pub enum BenchmarkFlags {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // ONNX Runtime GenAI (iOS, in-process): as the other iOS cells. No `eval`:
-    // `OGATokenizer` applies no chat template, so the app cannot produce it.
+    // ONNX Runtime GenAI (iOS and Android, in-process): as the other in-app cells.
+    // No `eval`: the engine's tokenizer applies no chat template, so neither app
+    // can produce it. Each iOS variant is followed by its Android twin.
     PrefillThroughputOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    PrefillThroughputOnnxGenaiApkPipetteOnnxGenai {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
@@ -416,7 +421,15 @@ pub enum BenchmarkFlags {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
+    DecodeThroughputOnnxGenaiApkPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
     EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
@@ -463,6 +476,9 @@ pub enum BenchmarkFlags {
         attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai {
         attempt_timeout_seconds: Option<PositiveSeconds>,
     },
     MaxMemoryUsageLlamacppApkPipetteGgufText {
@@ -713,11 +729,20 @@ impl BenchmarkFlags {
             BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { .. } => {
                 (B::PrefillThroughput, R::OnnxGenaiIosPipette, M::OnnxGenai)
             }
+            BenchmarkFlags::PrefillThroughputOnnxGenaiApkPipetteOnnxGenai { .. } => {
+                (B::PrefillThroughput, R::OnnxGenaiApkPipette, M::OnnxGenai)
+            }
             BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { .. } => {
                 (B::DecodeThroughput, R::OnnxGenaiIosPipette, M::OnnxGenai)
             }
+            BenchmarkFlags::DecodeThroughputOnnxGenaiApkPipetteOnnxGenai { .. } => {
+                (B::DecodeThroughput, R::OnnxGenaiApkPipette, M::OnnxGenai)
+            }
             BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { .. } => {
                 (B::EndToEndLatency, R::OnnxGenaiIosPipette, M::OnnxGenai)
+            }
+            BenchmarkFlags::EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai { .. } => {
+                (B::EndToEndLatency, R::OnnxGenaiApkPipette, M::OnnxGenai)
             }
             BenchmarkFlags::VlThroughputTrtEdgellmGgufVision { .. } => {
                 (B::VlThroughput, R::TrtEdgellm, M::GgufVision)
@@ -757,6 +782,9 @@ impl BenchmarkFlags {
             }
             BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. } => {
                 (B::MaxMemoryUsage, R::OnnxGenaiIosPipette, M::OnnxGenai)
+            }
+            BenchmarkFlags::MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai { .. } => {
+                (B::MaxMemoryUsage, R::OnnxGenaiApkPipette, M::OnnxGenai)
             }
             BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. } => {
                 (B::MaxMemoryUsage, R::LlamacppApkPipette, M::GgufText)
@@ -1020,8 +1048,11 @@ impl BenchmarkFlags {
             | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai { .. }
             | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { .. }
             | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::PrefillThroughputOnnxGenaiApkPipetteOnnxGenai { .. }
             | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::DecodeThroughputOnnxGenaiApkPipetteOnnxGenai { .. }
             | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai { .. }
             | BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx { .. }
             | BenchmarkFlags::MaxMemoryUsageDockerVllmTorch { .. }
             | BenchmarkFlags::MaxMemoryUsageUvVllmTorch { .. }
@@ -1033,6 +1064,7 @@ impl BenchmarkFlags {
             | BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText { .. }
             | BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx { .. }
             | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai { .. }
             | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. }
             | BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi { .. }
             | BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx { .. }
@@ -1282,11 +1314,23 @@ impl BenchmarkFlags {
                 attempt_timeout_seconds,
                 ..
             }
+            | BenchmarkFlags::PrefillThroughputOnnxGenaiApkPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
             | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai {
                 attempt_timeout_seconds,
                 ..
             }
+            | BenchmarkFlags::DecodeThroughputOnnxGenaiApkPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
             | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai {
                 attempt_timeout_seconds,
                 ..
             }
@@ -1329,6 +1373,9 @@ impl BenchmarkFlags {
                 attempt_timeout_seconds,
             }
             | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+                attempt_timeout_seconds,
+            }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai {
                 attempt_timeout_seconds,
             }
             | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText {
@@ -1448,8 +1495,11 @@ impl BenchmarkFlags {
             | BenchmarkFlags::DecodeThroughputUvOnnxGenaiOnnxGenai { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyUvOnnxGenaiOnnxGenai { readiness, .. }
             | BenchmarkFlags::PrefillThroughputOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::PrefillThroughputOnnxGenaiApkPipetteOnnxGenai { readiness, .. }
             | BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::DecodeThroughputOnnxGenaiApkPipetteOnnxGenai { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai { readiness, .. }
+            | BenchmarkFlags::EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai { readiness, .. }
             | BenchmarkFlags::PrefillThroughputLlamacppApkPipetteGgufText { readiness, .. }
             | BenchmarkFlags::DecodeThroughputLlamacppApkPipetteGgufText { readiness, .. }
             | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText { readiness, .. }
@@ -1498,6 +1548,7 @@ impl BenchmarkFlags {
             | BenchmarkFlags::MaxMemoryUsageLlamacppIosPipetteGgufText { .. }
             | BenchmarkFlags::MaxMemoryUsageMlxIosPipetteMlx { .. }
             | BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai { .. }
+            | BenchmarkFlags::MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai { .. }
             | BenchmarkFlags::MaxMemoryUsageLlamacppApkPipetteGgufText { .. }
             | BenchmarkFlags::MaxMemoryUsageAppleCoreAiMacosPipetteAppleCoreAi { .. }
             | BenchmarkFlags::VlMaxMemoryMlxMacosPipetteMlx { .. }
@@ -1960,6 +2011,13 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                     readiness: r.readiness,
                 }
             }
+            (B::PrefillThroughput, R::OnnxGenaiApkPipette, M::OnnxGenai) => {
+                r.deny_http()?;
+                BenchmarkFlags::PrefillThroughputOnnxGenaiApkPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
             (B::DecodeThroughput, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
                 r.deny_http()?;
                 BenchmarkFlags::DecodeThroughputOnnxGenaiIosPipetteOnnxGenai {
@@ -1967,9 +2025,23 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                     readiness: r.readiness,
                 }
             }
+            (B::DecodeThroughput, R::OnnxGenaiApkPipette, M::OnnxGenai) => {
+                r.deny_http()?;
+                BenchmarkFlags::DecodeThroughputOnnxGenaiApkPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
             (B::EndToEndLatency, R::OnnxGenaiIosPipette, M::OnnxGenai) => {
                 r.deny_http()?;
                 BenchmarkFlags::EndToEndLatencyOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::EndToEndLatency, R::OnnxGenaiApkPipette, M::OnnxGenai) => {
+                r.deny_http()?;
+                BenchmarkFlags::EndToEndLatencyOnnxGenaiApkPipetteOnnxGenai {
                     attempt_timeout_seconds: r.attempt_timeout_seconds,
                     readiness: r.readiness,
                 }
@@ -2242,6 +2314,13 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
                 r.deny_http()?;
                 r.deny_readiness()?;
                 BenchmarkFlags::MaxMemoryUsageOnnxGenaiIosPipetteOnnxGenai {
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            (B::MaxMemoryUsage, R::OnnxGenaiApkPipette, M::OnnxGenai) => {
+                r.deny_http()?;
+                r.deny_readiness()?;
+                BenchmarkFlags::MaxMemoryUsageOnnxGenaiApkPipetteOnnxGenai {
                     attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
             }
@@ -2584,17 +2663,35 @@ mod tests {
         ModelType::OnnxGenai,
         "onnx_genai_ios_pipette"
     )]
+    #[case::onnx_genai_apk_prefill(
+        BenchmarkType::PrefillThroughput,
+        RuntimeType::OnnxGenaiApkPipette,
+        ModelType::OnnxGenai,
+        "onnx_genai_apk_pipette"
+    )]
     #[case::onnx_genai_ios_decode(
         BenchmarkType::DecodeThroughput,
         RuntimeType::OnnxGenaiIosPipette,
         ModelType::OnnxGenai,
         "onnx_genai_ios_pipette"
     )]
+    #[case::onnx_genai_apk_decode(
+        BenchmarkType::DecodeThroughput,
+        RuntimeType::OnnxGenaiApkPipette,
+        ModelType::OnnxGenai,
+        "onnx_genai_apk_pipette"
+    )]
     #[case::onnx_genai_ios_end_to_end(
         BenchmarkType::EndToEndLatency,
         RuntimeType::OnnxGenaiIosPipette,
         ModelType::OnnxGenai,
         "onnx_genai_ios_pipette"
+    )]
+    #[case::onnx_genai_apk_end_to_end(
+        BenchmarkType::EndToEndLatency,
+        RuntimeType::OnnxGenaiApkPipette,
+        ModelType::OnnxGenai,
+        "onnx_genai_apk_pipette"
     )]
     fn readiness_on_a_timing_cell_round_trips(
         #[case] benchmark: BenchmarkType,
@@ -2940,8 +3037,11 @@ mod tests {
         ("decode_throughput", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("end_to_end_latency", "uv_onnx_genai", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("prefill_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("prefill_throughput", "onnx_genai_apk_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("decode_throughput", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("decode_throughput", "onnx_genai_apk_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("end_to_end_latency", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
+        ("end_to_end_latency", "onnx_genai_apk_pipette", "onnx_genai", &["attempt_timeout_seconds", "readiness"]),
         ("vl_throughput", "llamacpp_cli_stock_tools", "gguf_vision",
          &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         // vlm-eval: an HTTP server run, same shape as vl_throughput — the
@@ -3004,6 +3104,7 @@ mod tests {
         ("max_memory_usage", "llamacpp_ios_pipette", "gguf_text", &["attempt_timeout_seconds"]),
         ("max_memory_usage", "mlx_ios_pipette", "mlx", &["attempt_timeout_seconds"]),
         ("max_memory_usage", "onnx_genai_ios_pipette", "onnx_genai", &["attempt_timeout_seconds"]),
+        ("max_memory_usage", "onnx_genai_apk_pipette", "onnx_genai", &["attempt_timeout_seconds"]),
         ("max_memory_usage", "llamacpp_apk_pipette", "gguf_text", &["attempt_timeout_seconds"]),
         ("max_memory_usage", "core_ai_macos_pipette", "core_ai", &["attempt_timeout_seconds"]),
         ("vl_max_memory", "mlx_macos_pipette", "mlx", &["attempt_timeout_seconds"]),

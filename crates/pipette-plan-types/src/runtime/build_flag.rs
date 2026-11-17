@@ -39,6 +39,7 @@ pub fn runtime_build_flag(
         }
         Runtime::LlamacppCliStockTools(_)
         | Runtime::LlamacppApkPipette(_)
+        | Runtime::OnnxGenaiApkPipette(_)
         | Runtime::MlxMacosPipette(_)
         | Runtime::AppleCoreAiMacosPipette(_)
         | Runtime::DockerVllm(_)
