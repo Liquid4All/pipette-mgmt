@@ -117,14 +117,15 @@ pub use runtime::{
     LlamacppCliStockTools, LlamacppCliStockToolsRelease, LlamacppCliStockToolsSource,
     LlamacppFlashAttention, LlamacppIosPipette, LlamacppIosPipetteFlavor, LlamacppLoadMode,
     MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
-    OnnxExecutionProvider, OnnxGenaiIosPipette, OnnxGenaiIosPipetteFlavor, OnnxGenaiStack,
-    OpenvinoDevice, OpenvinoGenerateHint, Ovms, OvmsFlavor, OvmsSource, OvmsSourceRepository,
-    PrivateApis, RepositoryUrl, Runtime, RuntimeBuildFlagError, RuntimeType, SemverWithBuild,
-    SemverWithBuildError, SglangFlavor, SourceRepository, TrtEdgellm, TrtEdgellmFlavor,
-    TrtEdgellmPrecision, TrtEdgellmSource, UvBuild, UvBuildError, UvOnnxGenai, UvOpenvino,
-    UvPythonVersion, UvPythonVersionError, UvRuntimeSource, UvServerVersion, UvServerVersionError,
-    UvSglang, UvVllm, VllmDtype, VllmFlavor, VllmRepetitionDetection, cli_ref_from_runtime_arg,
-    flavor_from_uv_build, runtime_build_flag, uv_runtime_version,
+    OnnxExecutionProvider, OnnxGenaiApkPipette, OnnxGenaiApkPipetteFlavor, OnnxGenaiIosPipette,
+    OnnxGenaiIosPipetteFlavor, OnnxGenaiStack, OpenvinoDevice, OpenvinoGenerateHint, Ovms,
+    OvmsFlavor, OvmsSource, OvmsSourceRepository, PrivateApis, RepositoryUrl, Runtime,
+    RuntimeBuildFlagError, RuntimeType, SemverWithBuild, SemverWithBuildError, SglangFlavor,
+    SourceRepository, TrtEdgellm, TrtEdgellmFlavor, TrtEdgellmPrecision, TrtEdgellmSource, UvBuild,
+    UvBuildError, UvOnnxGenai, UvOpenvino, UvPythonVersion, UvPythonVersionError, UvRuntimeSource,
+    UvServerVersion, UvServerVersionError, UvSglang, UvVllm, VllmDtype, VllmFlavor,
+    VllmRepetitionDetection, cli_ref_from_runtime_arg, flavor_from_uv_build, runtime_build_flag,
+    uv_runtime_version,
 };
 
 mod descriptor_catalog;

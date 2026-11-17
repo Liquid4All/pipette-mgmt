@@ -79,6 +79,7 @@ impl EvalBenchmark {
             | RuntimeType::UvOnnxGenai
             | RuntimeType::Ovms
             | RuntimeType::OnnxGenaiIosPipette
+            | RuntimeType::OnnxGenaiApkPipette
             | RuntimeType::AppleFoundation
             | RuntimeType::TrtEdgellm => Err(EvalContextError::RuntimeCannotBound {
                 runtime,

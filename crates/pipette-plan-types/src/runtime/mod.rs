@@ -22,8 +22,8 @@ pub use mlx::{
     MlxIosPipette, MlxIosPipetteFlavor, MlxMacosPipette, MlxMacosPipetteFlavor, MlxSwiftStack,
 };
 pub use onnx_genai::{
-    OnnxExecutionProvider, OnnxGenaiIosPipette, OnnxGenaiIosPipetteFlavor, OnnxGenaiStack,
-    UvOnnxGenai,
+    OnnxExecutionProvider, OnnxGenaiApkPipette, OnnxGenaiApkPipetteFlavor, OnnxGenaiIosPipette,
+    OnnxGenaiIosPipetteFlavor, OnnxGenaiStack, UvOnnxGenai,
 };
 pub use openvino::{OpenvinoDevice, OpenvinoGenerateHint, UvOpenvino};
 pub use ovms::{Ovms, OvmsFlavor, OvmsSource, OvmsSourceRepository};
@@ -74,6 +74,8 @@ pub enum Runtime {
     Ovms(Ovms),
     /// ONNX Runtime GenAI running in-process inside the iOS pipette app.
     OnnxGenaiIosPipette(OnnxGenaiIosPipette),
+    /// ONNX Runtime GenAI running in-process inside the Android pipette app.
+    OnnxGenaiApkPipette(OnnxGenaiApkPipette),
     /// Apple Foundation Models (iOS); loads only `Model::AppleFoundationText`,
     /// and its `runtime_version` is the OS version.
     AppleFoundation(AppleFoundation),
@@ -357,6 +359,7 @@ impl Runtime {
             Runtime::UvOnnxGenai(_) => "uv_onnx_genai",
             Runtime::Ovms(_) => "ovms",
             Runtime::OnnxGenaiIosPipette(_) => "onnx_genai_ios_pipette",
+            Runtime::OnnxGenaiApkPipette(_) => "onnx_genai_apk_pipette",
             Runtime::AppleFoundation(_) => "apple_foundation",
             Runtime::TrtEdgellm(_) => "trt_edgellm",
         }
@@ -388,6 +391,7 @@ impl Runtime {
             | Runtime::UvOnnxGenai(_)
             | Runtime::Ovms(_)
             | Runtime::OnnxGenaiIosPipette(_)
+            | Runtime::OnnxGenaiApkPipette(_)
             | Runtime::AppleFoundation(_)
             | Runtime::TrtEdgellm(_)) => other.to_string(),
         }
@@ -426,6 +430,7 @@ impl Runtime {
             | Runtime::LlamacppIosPipette(_)
             | Runtime::MlxIosPipette(_)
             | Runtime::OnnxGenaiIosPipette(_)
+            | Runtime::OnnxGenaiApkPipette(_)
             | Runtime::DockerVllm(_)
             | Runtime::DockerSglang(_)
             | Runtime::Ovms(_)
@@ -455,6 +460,7 @@ impl std::fmt::Display for Runtime {
             Runtime::UvOnnxGenai(rt) => rt.fmt(f),
             Runtime::Ovms(rt) => rt.fmt(f),
             Runtime::OnnxGenaiIosPipette(rt) => rt.fmt(f),
+            Runtime::OnnxGenaiApkPipette(rt) => rt.fmt(f),
             Runtime::AppleFoundation(_) => write!(f, "apple_foundation"),
             Runtime::TrtEdgellm(rt) => rt.fmt(f),
         }
@@ -495,6 +501,7 @@ pub enum RuntimeType {
     UvOnnxGenai,
     Ovms,
     OnnxGenaiIosPipette,
+    OnnxGenaiApkPipette,
     AppleFoundation,
     TrtEdgellm,
 }
@@ -517,6 +524,7 @@ impl RuntimeType {
             Runtime::UvOnnxGenai(_) => Self::UvOnnxGenai,
             Runtime::Ovms(_) => Self::Ovms,
             Runtime::OnnxGenaiIosPipette(_) => Self::OnnxGenaiIosPipette,
+            Runtime::OnnxGenaiApkPipette(_) => Self::OnnxGenaiApkPipette,
             Runtime::AppleFoundation(_) => Self::AppleFoundation,
             Runtime::TrtEdgellm(_) => Self::TrtEdgellm,
         }
@@ -1030,6 +1038,16 @@ mod tests {
                     memory: true,
                 },
             }),
+            Runtime::OnnxGenaiApkPipette(OnnxGenaiApkPipette {
+                packages: OnnxGenaiStack {
+                    onnxruntime: source_repo("github.com/microsoft/onnxruntime", "v1.31.1")?,
+                    onnxruntime_genai: source_repo(
+                        "github.com/microsoft/onnxruntime-genai",
+                        "533de8cc9",
+                    )?,
+                },
+                flavor: OnnxGenaiApkPipetteFlavor::AndroidArm64V8,
+            }),
             Runtime::AppleFoundation(Default::default()),
             Runtime::TrtEdgellm(TrtEdgellm {
                 source: TrtEdgellmSource::RelativeDir {
@@ -1097,6 +1115,7 @@ mod tests {
                 | RuntimeType::UvOnnxGenai
                 | RuntimeType::Ovms
                 | RuntimeType::OnnxGenaiIosPipette
+                | RuntimeType::OnnxGenaiApkPipette
                 | RuntimeType::AppleFoundation
                 | RuntimeType::TrtEdgellm => rt.to_string(),
             };

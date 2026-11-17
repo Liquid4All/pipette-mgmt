@@ -534,6 +534,7 @@ impl DescriptorCatalogConfig {
                     .collect(),
             ),
             RuntimeType::LlamacppApkPipette
+            | RuntimeType::OnnxGenaiApkPipette
             | RuntimeType::MlxMacosPipette
             | RuntimeType::AppleCoreAiMacosPipette
             | RuntimeType::DockerVllm

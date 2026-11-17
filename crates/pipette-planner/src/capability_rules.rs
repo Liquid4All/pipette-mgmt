@@ -519,6 +519,14 @@ fn policy_for(runtime: &Runtime) -> Policy {
             any_of: &[],
             when: &[],
         },
+        // Android alone, as for llama.cpp's APK, and as there no device floor:
+        // the engine runs on the CPU provider.
+        Runtime::OnnxGenaiApkPipette(_) => Policy {
+            requires: &["os:android"],
+            one_of: &[],
+            any_of: &[],
+            when: &[],
+        },
         // No single hardware floor across desktop platforms and flavors.
         Runtime::LlamacppCliStockTools(_) => Policy::EMPTY,
         // No device floor: llama.cpp runs on far older hardware than MLX or AFM.
@@ -1484,6 +1492,27 @@ packages = { onnxruntime = { repository_url = "github.com/microsoft/onnxruntime"
         )?)
     }
 
+    fn onnx_genai_apk_runtime() -> anyhow::Result<Runtime> {
+        Ok(toml::from_str(
+            r#"type = "onnx_genai_apk_pipette"
+flavor = "android-arm64-v8"
+packages = { onnxruntime = { repository_url = "github.com/microsoft/onnxruntime", repository_version = "v1.31.1" }, onnxruntime_genai = { repository_url = "github.com/microsoft/onnxruntime-genai", repository_version = "533de8cc9" } }"#,
+        )?)
+    }
+
+    /// Android alone, as for llama.cpp's APK: the policy adds the platform to
+    /// what the author wrote, and names no device floor.
+    #[test]
+    fn onnx_genai_apk_requires_android() -> anyhow::Result<()> {
+        let er = resolve_effective_requirement(
+            &flags(&["runtime:onnx_genai"])?,
+            &onnx_genai_apk_runtime()?,
+        )?;
+        assert_eq!(requires_of(&er), vec!["os:android", "runtime:onnx_genai"]);
+        assert!(er.any_of.is_empty(), "no device floor: {:?}", er.any_of);
+        Ok(())
+    }
+
     /// An iPad runs the same binary as an iPhone, so both platforms are
     /// authorable and neither carries a device floor.
     #[rstest]
@@ -2007,6 +2036,9 @@ flavor = "ios-arm64""#,
         r#"type = "onnx_genai_ios_pipette"
 flavor = "ios-arm64"
 packages = { onnxruntime = { repository_url = "github.com/microsoft/onnxruntime", repository_version = "v1.23.0" }, onnxruntime_genai = { repository_url = "github.com/microsoft/onnxruntime-genai", repository_version = "v0.15.2" } }"#,
+        r#"type = "onnx_genai_apk_pipette"
+flavor = "android-arm64-v8"
+packages = { onnxruntime = { repository_url = "github.com/microsoft/onnxruntime", repository_version = "v1.31.1" }, onnxruntime_genai = { repository_url = "github.com/microsoft/onnxruntime-genai", repository_version = "533de8cc9" } }"#,
     ];
 
     fn sample_runtimes() -> anyhow::Result<Vec<Runtime>> {

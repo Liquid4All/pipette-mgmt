@@ -172,6 +172,7 @@ impl TryFrom<ExtraRuntimeConfigurationRef> for ExtraRuntimeConfiguration {
             | R::LlamacppIosPipette
             | R::MlxIosPipette
             | R::OnnxGenaiIosPipette
+            | R::OnnxGenaiApkPipette
             | R::AppleFoundation => {
                 return Err(ExtraRuntimeConfigurationError::OnDeviceRuntime { runtime_type });
             }
@@ -613,6 +614,7 @@ envs = ["VLLM_WORKER_MULTIPROC_METHOD=spawn"]
     #[case::llamacpp_ios(RuntimeType::LlamacppIosPipette)]
     #[case::mlx_ios(RuntimeType::MlxIosPipette)]
     #[case::onnx_genai_ios(RuntimeType::OnnxGenaiIosPipette)]
+    #[case::onnx_genai_apk(RuntimeType::OnnxGenaiApkPipette)]
     #[case::apple_foundation(RuntimeType::AppleFoundation)]
     fn an_on_device_runtime_is_refused(#[case] runtime_type: RuntimeType) {
         assert_eq!(

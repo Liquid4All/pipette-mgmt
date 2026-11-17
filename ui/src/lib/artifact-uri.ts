@@ -176,6 +176,8 @@ function runtimePairs(r: Runtime): Pairs | null {
               ...privateApis(r)];
     case "onnx_genai_ios_pipette":
       return [...pinned(r.packages, ["onnxruntime", "onnxruntime_genai"]), ["flavor", r.flavor], ...privateApis(r)];
+    case "onnx_genai_apk_pipette":
+      return [...pinned(r.packages, ["onnxruntime", "onnxruntime_genai"]), ["flavor", r.flavor]];
     case "docker_vllm":
     case "docker_sglang":
       return [["image", r.image_name], ["tag", r.image_tag], ["flavor", r.flavor]];

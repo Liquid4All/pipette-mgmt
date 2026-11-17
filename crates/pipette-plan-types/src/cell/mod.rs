@@ -145,7 +145,7 @@ fn types_compatible(model: ModelType, runtime: RuntimeType) -> bool {
         (TorchSpeculative, DockerSglang | UvSglang) => true,
         (AppleFoundationText, AppleFoundation) => true,
         (Openvino, UvOpenvino | Ovms) => true,
-        (OnnxGenai, UvOnnxGenai | OnnxGenaiIosPipette) => true,
+        (OnnxGenai, UvOnnxGenai | OnnxGenaiIosPipette | OnnxGenaiApkPipette) => true,
         _ => false,
     }
 }
