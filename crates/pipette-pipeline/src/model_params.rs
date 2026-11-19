@@ -213,7 +213,7 @@ pub async fn import(
     dry_run: bool,
 ) -> anyhow::Result<ImportReport> {
     let rows = ModelParamTable::load(store).await?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let keyed = file
         .entries()
         .into_iter()

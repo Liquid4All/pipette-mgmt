@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::client_preauth;
 use pipette_core::client_preauth::{ClientPreauthKey, ClientPreauthParams};
@@ -66,7 +66,7 @@ async fn naming(state: &AppState, org_id: &OrgId) -> Result<Vec<ClientPreauthKey
 
 /// The keys naming `org_id`, newest first, the host's among them.
 pub async fn keys(state: &AppState, org_id: &OrgId) -> Result<Vec<ClientPreauthKeyView>, AppError> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut keys = naming(state, org_id).await?;
     keys.sort_by_key(|key| std::cmp::Reverse(key.created_at));
     Ok(keys
@@ -86,11 +86,11 @@ async fn mint(
     let usage = request.usage.unwrap_or(ClientPreauthUsage::SingleUse);
     let org = onboarding_org(state, caller, reference).await?;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut minted = client_preauth::mint(
         ClientPreauthParams {
             usage,
-            expires_at: Some(now + chrono::Duration::days(i64::from(days))),
+            expires_at: Some(now + jiff::SignedDuration::from_hours(24 * i64::from(days))),
             default_tags: BTreeSet::new(),
             default_organization: None,
             default_owner: Some(ClientOwner::Org {

@@ -5,7 +5,7 @@
 
 use axum::body::to_bytes;
 use axum::http::{StatusCode, header};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rstest::rstest;
 use sha2::{Digest, Sha256};
 
@@ -70,7 +70,7 @@ async fn seed_artifact(
     app: &AppState,
     dir: &std::path::Path,
     state: ProbeState,
-    checked_at: DateTime<Utc>,
+    checked_at: Timestamp,
 ) -> anyhow::Result<()> {
     let digest = pipette_plan_types::Sha256::try_new(digest())?;
     let source = dir.join("seed.tar");
@@ -84,7 +84,7 @@ async fn seed_artifact(
 async fn seed_verdict(
     app: &AppState,
     state: ProbeState,
-    checked_at: DateTime<Utc>,
+    checked_at: Timestamp,
 ) -> anyhow::Result<()> {
     let digest = pipette_plan_types::Sha256::try_new(digest())?;
     let fixture = pipette_core::benchmark::Benchmark::from_toml(BENCHMARK, &fixture_toml())?;
@@ -153,7 +153,7 @@ async fn a_private_corpus_follows_its_definition(
         };
         own_client_by_org(&state, &client_id, &org_id).await?;
     }
-    seed_artifact(&state, dir.path(), ProbeState::Ok, Utc::now()).await?;
+    seed_artifact(&state, dir.path(), ProbeState::Ok, Timestamp::now()).await?;
 
     let resp = authed_get(&state, &key, &client_id, &format!("/datasets/{BENCHMARK}")).await?;
     assert_eq!(resp.status(), status);
@@ -169,7 +169,7 @@ async fn a_private_corpus_follows_its_definition(
 #[tokio::test]
 async fn serves_the_tar_on_a_fresh_ok() -> anyhow::Result<()> {
     let (dir, state, key, client_id) = setup().await?;
-    seed_artifact(&state, dir.path(), ProbeState::Ok, Utc::now()).await?;
+    seed_artifact(&state, dir.path(), ProbeState::Ok, Timestamp::now()).await?;
 
     let resp = authed_get(&state, &key, &client_id, &format!("/datasets/{BENCHMARK}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -188,7 +188,7 @@ async fn serves_the_tar_on_a_fresh_ok() -> anyhow::Result<()> {
 #[tokio::test]
 async fn refuses_an_artifact_built_from_another_pin() -> anyhow::Result<()> {
     let (dir, state, key, client_id) = setup().await?;
-    seed_artifact(&state, dir.path(), ProbeState::Ok, Utc::now()).await?;
+    seed_artifact(&state, dir.path(), ProbeState::Ok, Timestamp::now()).await?;
     let digest = pipette_plan_types::Sha256::try_new(digest())?;
     let mut artifact = state
         .dataset_cache_store
@@ -225,7 +225,7 @@ async fn an_artifact_is_this_subsets(
     #[case] status: StatusCode,
 ) -> anyhow::Result<()> {
     let (dir, state, key, client_id) = setup().await?;
-    seed_artifact(&state, dir.path(), ProbeState::Ok, Utc::now()).await?;
+    seed_artifact(&state, dir.path(), ProbeState::Ok, Timestamp::now()).await?;
     let digest = pipette_plan_types::Sha256::try_new(digest())?;
     let mut artifact = state
         .dataset_cache_store
@@ -306,7 +306,7 @@ async fn an_asr_corpus_is_served_only_at_its_entrys_count(
     let packages = dir.path().join("scores-packages/tars");
     std::fs::create_dir_all(&packages)?;
     std::fs::write(packages.join(format!("{}.tar", dataset.digest)), TAR)?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     state
         .dataset_cache_store
         .put_artifact(&DatasetArtifact {
@@ -401,7 +401,7 @@ async fn refuses_anything_but_a_fresh_ok(
     #[case] message: &str,
 ) -> anyhow::Result<()> {
     let (dir, state, key, client_id) = setup().await?;
-    let checked_at = Utc::now() - chrono::Duration::seconds(age_secs);
+    let checked_at = Timestamp::now() - jiff::SignedDuration::from_secs(age_secs);
     seed_artifact(&state, dir.path(), probe, checked_at).await?;
 
     let resp = authed_get(&state, &key, &client_id, &format!("/datasets/{BENCHMARK}")).await?;
@@ -434,7 +434,7 @@ async fn refuses_an_artifact_never_built() -> anyhow::Result<()> {
 #[tokio::test]
 async fn refuses_a_fresh_ok_whose_tar_is_missing() -> anyhow::Result<()> {
     let (_dir, state, key, client_id) = setup().await?;
-    seed_verdict(&state, ProbeState::Ok, Utc::now()).await?;
+    seed_verdict(&state, ProbeState::Ok, Timestamp::now()).await?;
     let digest = pipette_plan_types::Sha256::try_new(digest())?;
     assert!(
         state
@@ -503,7 +503,7 @@ async fn refuses_a_malformed_id_after_authentication() -> anyhow::Result<()> {
 #[tokio::test]
 async fn requires_a_working_client() -> anyhow::Result<()> {
     let (dir, state, _, _) = setup().await?;
-    seed_artifact(&state, dir.path(), ProbeState::Ok, Utc::now()).await?;
+    seed_artifact(&state, dir.path(), ProbeState::Ok, Timestamp::now()).await?;
     let uri = format!("/datasets/{BENCHMARK}");
 
     assert_eq!(

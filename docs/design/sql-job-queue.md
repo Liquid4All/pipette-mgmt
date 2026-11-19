@@ -445,9 +445,7 @@ the config from before the switch to `backend = "database"`.
 - It copies every `todo/` keyspace, `leased/` included, through the two
   `TodoStore` implementations
   ([`crates/pipette-store/src/lib.rs`](../../crates/pipette-store/src/lib.rs)).
-- It follows the `CopyMode::Mirror` pattern of `db export`
-  ([`crates/pipette-pipeline/src/record_copy.rs`](../../crates/pipette-pipeline/src/record_copy.rs)).
-  It writes the rows that differ and deletes the rows that the object store
+- It writes the rows that differ and deletes the rows that the object store
   does not hold.
 - It is idempotent, so it runs twice. The **warm** pass runs with `serve` up,
   for the bulk. The **cold** pass runs with `serve` stopped, for the delta.

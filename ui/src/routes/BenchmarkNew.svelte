@@ -9,7 +9,7 @@
   import { Busy, Loader } from "../lib/components/work.svelte";
   import PageHead from "../lib/components/PageHead.svelte";
   import { readTextFile } from "../lib/document";
-  import type { OrgRef } from "../lib/orgs";
+  import { choiceName, type OrgRef } from "../lib/orgs";
   import { here, navigateFrom } from "../lib/route.svelte";
   import { benchmarkLink, type RouteOf } from "../lib/routes";
   import { session } from "../lib/session.svelte";
@@ -91,7 +91,7 @@
       <form onsubmit={(event) => create(event, offered)}>
         <label><span>organization</span>
           <select bind:value={slug}>
-            {#each offered as org (org.org_id)}<option value={org.slug}>{org.slug}</option>{/each}
+            {#each offered as org (org.org_id)}<option value={org.slug}>{choiceName(org, offered)}</option>{/each}
           </select>
         </label>
         <label><span>benchmark id</span>

@@ -9,18 +9,30 @@ import type { TableSpec } from "./table";
 import type { CreateOrgRequest, OrgView, OwnUserView, UpdateOrgRequest } from "./api-types";
 
 /** An organization as the tree and a page's branch name it. */
-export type OrgRef = Pick<OrgView, "org_id" | "slug">;
+export type OrgRef = Pick<OrgView, "org_id" | "slug"> & Partial<Pick<OrgView, "display_name">>;
 
 /** The reader's own organization, which `GET /api/v1/users/me` names. */
-export const ownOrg = (reader: Pick<OwnUserView, "org_id" | "org_slug">): OrgRef | null =>
-  reader.org_id && reader.org_slug ? { org_id: reader.org_id, slug: reader.org_slug } : null;
+export const ownOrg = (reader: Pick<OwnUserView, "org_id" | "org_slug" | "org_display_name">): OrgRef | null =>
+  reader.org_id && reader.org_slug
+    ? { org_id: reader.org_id, slug: reader.org_slug, display_name: reader.org_display_name ?? undefined }
+    : null;
+
+/** What to print for an organization: its display name, else its slug. */
+export const orgName = (org: { slug: string; display_name?: string }): string => org.display_name ?? org.slug;
+
+/** `org`'s name among the choices `all`: its display name, with its slug where another choice prints the same name. */
+export const choiceName = (org: OrgRef, all: readonly OrgRef[]): string => {
+  const name = orgName(org);
+  return all.some((other) => other.org_id !== org.org_id && orgName(other) === name) ? `${name} (${org.slug})` : name;
+};
 
 /** Whether the reader administers `org_id`'s roster. */
 export const administersOrg = (reader: OwnUserView, org_id: string | null | undefined) =>
   reaches(reader, reader.may.administer_roster, org_id);
 
-/** Organizations by slug, as Rust orders a `str`. */
-export const bySlug = (a: OrgRef, b: OrgRef): number => textOrder(a.slug, b.slug);
+/** Organizations by the name they print, then by slug, as Rust orders a `str`. */
+export const byName = (a: OrgRef, b: OrgRef): number => textOrder(orgName(a), orgName(b)) || textOrder(a.slug, b.slug);
+
 
 /** Whether `reference` names `org`. */
 export const names = (org: OrgRef, reference: string): boolean =>
@@ -93,6 +105,7 @@ export const createOrgRefusal = (reader: OwnUserView): string =>
 
 /** The organization listing's columns and filters. */
 export const ORG_TABLE: TableSpec<OrgView> = {
+  sort: "display_name",
   columns: [
     { key: "org_id", label: "org_id", raw: (row) => row.org_id, href: (row) => orgLink(row) },
     { key: "slug", label: "slug", raw: (row) => row.slug },

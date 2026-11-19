@@ -62,6 +62,7 @@ describe("the roster", () => {
   test("says why it is empty, as users.html words it", () => {
     const acme = { kind: "org", org_id: "org_acme", slug: "acme" } as const;
     expect(rosterEmpty(acme)).toBe("Nobody belongs to acme.");
+    expect(rosterEmpty({ ...acme, display_name: "Acme Corp" })).toBe("Nobody belongs to Acme Corp.");
     expect(rosterEmpty({ kind: "server" })).toBe("Every account belongs to an organization.");
     expect(rosterEmpty({ kind: "all" })).toBe("No accounts you may see.");
   });

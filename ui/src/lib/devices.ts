@@ -25,7 +25,7 @@ export function deviceBranch(record: ClientDetail, account: OwnUserView, owning:
   if (!owner) return { kind: "server" };
   if (owner.type === "user" && owner.user_id === account.user_id) return { kind: "me" };
   if (owning && owning.org_id === record.owning_org_id && reaches(account, account.may.read_roster, owning.org_id)) {
-    return { kind: "org", org_id: owning.org_id, slug: owning.slug, count: null };
+    return { kind: "org", ...owning, count: null };
   }
   return { kind: "all" };
 }

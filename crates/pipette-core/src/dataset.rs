@@ -2,7 +2,7 @@
 //! artifact it is packed into, and the probe verdict that gates serving
 //! (`docs/design/vl-spec-decode-dataset-delivery.md`).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{CorpusFormat, Dataset, DatasetAdapter, DatasetUpstream, GitOid, Sha256};
@@ -332,9 +332,9 @@ impl std::fmt::Display for UpstreamIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeVerdict {
     pub state: ProbeState,
-    pub checked_at: DateTime<Utc>,
+    pub checked_at: Timestamp,
     /// When `state` last changed: what an alert keys on.
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_identity: Option<UpstreamIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,7 +347,7 @@ impl ProbeVerdict {
     pub fn next(
         previous: &ProbeVerdict,
         state: ProbeState,
-        now: DateTime<Utc>,
+        now: Timestamp,
         observed_identity: Option<UpstreamIdentity>,
         detail: Option<String>,
     ) -> ProbeVerdict {
@@ -383,7 +383,7 @@ pub struct DatasetArtifact {
     /// count it states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samples: Option<u32>,
-    pub built_at: DateTime<Utc>,
+    pub built_at: Timestamp,
     pub probe: ProbeVerdict,
 }
 
@@ -392,14 +392,11 @@ pub struct DatasetArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeRefusal {
     /// The probe has not run within the allowed age: its verdict is not one.
-    Stale { checked_at: DateTime<Utc> },
+    Stale { checked_at: Timestamp },
     /// The upstream could not be reached; may clear on its own.
-    Unavailable { since: DateTime<Utc> },
+    Unavailable { since: Timestamp },
     /// The upstream no longer publishes the pin (`gone` or `moved`).
-    Broken {
-        state: ProbeState,
-        since: DateTime<Utc>,
-    },
+    Broken { state: ProbeState, since: Timestamp },
 }
 
 impl DatasetArtifact {
@@ -422,10 +419,10 @@ impl DatasetArtifact {
     /// nothing about the upstream now.
     pub fn serveable(
         &self,
-        now: DateTime<Utc>,
-        max_age: chrono::Duration,
+        now: Timestamp,
+        max_age: jiff::SignedDuration,
     ) -> Result<(), ServeRefusal> {
-        if now - self.probe.checked_at > max_age {
+        if now.duration_since(self.probe.checked_at) > max_age {
             return Err(ServeRefusal::Stale {
                 checked_at: self.probe.checked_at,
             });
@@ -695,7 +692,7 @@ license  = "Apache-2.0"
         assert_eq!(GitOid::try_new(value).is_ok(), ok, "{value:?}");
     }
 
-    fn artifact(state: ProbeState, checked_at: DateTime<Utc>) -> anyhow::Result<DatasetArtifact> {
+    fn artifact(state: ProbeState, checked_at: Timestamp) -> anyhow::Result<DatasetArtifact> {
         let dataset: Dataset = toml::from_str(ENTRY)?;
         Ok(DatasetArtifact {
             digest: dataset.digest,
@@ -728,10 +725,11 @@ license  = "Apache-2.0"
         #[case] age_secs: i64,
         #[case] served: bool,
     ) -> anyhow::Result<()> {
-        let now = Utc::now();
-        let a = artifact(state, now - chrono::Duration::seconds(age_secs))?;
+        let now = Timestamp::now();
+        let a = artifact(state, now - jiff::SignedDuration::from_secs(age_secs))?;
         assert_eq!(
-            a.serveable(now, chrono::Duration::seconds(180)).is_ok(),
+            a.serveable(now, jiff::SignedDuration::from_secs(180))
+                .is_ok(),
             served
         );
         Ok(())
@@ -741,9 +739,9 @@ license  = "Apache-2.0"
     /// per change rather than one per probe.
     #[test]
     fn since_moves_only_on_a_transition() -> anyhow::Result<()> {
-        let t0 = Utc::now() - chrono::Duration::minutes(10);
-        let t1 = t0 + chrono::Duration::minutes(1);
-        let t2 = t1 + chrono::Duration::minutes(1);
+        let t0 = Timestamp::now() - jiff::SignedDuration::from_mins(10);
+        let t1 = t0 + jiff::SignedDuration::from_mins(1);
+        let t2 = t1 + jiff::SignedDuration::from_mins(1);
         let first = artifact(ProbeState::Ok, t0)?.probe;
         let still_ok = ProbeVerdict::next(&first, ProbeState::Ok, t1, None, None);
         assert_eq!(still_ok.since, t0);

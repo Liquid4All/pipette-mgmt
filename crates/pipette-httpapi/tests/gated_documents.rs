@@ -370,7 +370,7 @@ async fn test_a_dry_run_resolves_for_the_campaign_owner() -> anyhow::Result<()> 
     .await?;
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     let org = seed_org(&state, "acme").await?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let campaign = Campaign {
         campaign_id: CampaignId::mint(),
         name: NonEmptyTrimmedString::try_new("Gated")?,
@@ -378,6 +378,7 @@ async fn test_a_dry_run_resolves_for_the_campaign_owner() -> anyhow::Result<()> 
         current_plan_id: None,
         labels: Default::default(),
         state: Default::default(),
+        state_note: None,
         created_at: now,
         updated_at: now,
     };

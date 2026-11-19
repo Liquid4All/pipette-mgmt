@@ -5,6 +5,7 @@
   import {
     benchmarkRows, benchmarkTable, benchmarksEmpty, type BenchmarkBranch, type BenchmarkCatalogs, type BenchmarkRow,
   } from "../benchmarks";
+  import { orgName } from "../orgs";
   import { orgLink } from "../routes";
   import DataTable from "./DataTable.svelte";
   import Loaded from "./Loaded.svelte";
@@ -19,11 +20,11 @@
   } = $props();
 
   // A branch's rows share one organization, so only everything's names it per row.
-  const spec = $derived(benchmarkTable(branch.kind === "all"));
+  const spec = $derived(benchmarkTable(branch.kind === "all" ? of.data?.read ?? [] : null));
   const listed = $derived(benchmarkRows(of.data?.catalogs ?? []));
 </script>
 
-{#snippet organization(row: BenchmarkRow)}<a href={orgLink(row.org)} title={row.org.org_id}>{row.org.slug}</a>{/snippet}
+{#snippet organization(row: BenchmarkRow)}<a href={orgLink(row.org)} title={row.org.org_id}>{orgName(row.org)}</a>{/snippet}
 {#snippet benchmark_type(row: BenchmarkRow)}
   {#if row.benchmark_type}{row.benchmark_type}{:else}<span class="err">unreadable</span>{/if}
 {/snippet}

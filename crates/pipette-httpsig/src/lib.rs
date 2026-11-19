@@ -9,10 +9,10 @@ mod profile;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName};
+use jiff::{SignedDuration, Timestamp};
 
 use pipette_plan_types::{Sha256, UserKeyId};
 
@@ -42,7 +42,7 @@ pub enum HttpSigError {
 /// A signature that fits the profile and is fresh, not yet verified.
 pub struct Verifiable {
     pub key_id: UserKeyId,
-    pub created: DateTime<Utc>,
+    pub created: Timestamp,
     pub nonce: Nonce,
     pub signature: Signature,
     /// The body digest the signature covers, `None` when it covers none.
@@ -73,8 +73,8 @@ pub fn authority(parts: &Parts) -> Option<String> {
 /// `created` no further than `max_skew` from `now`.
 pub fn parse(
     parts: &Parts,
-    now: DateTime<Utc>,
-    max_skew: TimeDelta,
+    now: Timestamp,
+    max_skew: SignedDuration,
 ) -> Result<Verifiable, HttpSigError> {
     let (label, list) =
         fields::signature_input(&fields::single(&parts.headers, &SIGNATURE_INPUT)?)?;
@@ -178,15 +178,15 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, TimeDelta, Utc};
     use http::Request;
     use http::request::Parts;
+    use jiff::{SignedDuration, Timestamp};
     use sha2::Digest;
 
     use crate::testing::rfc_key;
     use crate::*;
 
-    const SKEW: TimeDelta = TimeDelta::seconds(300);
+    const SKEW: SignedDuration = SignedDuration::from_secs(300);
 
     fn key_id() -> anyhow::Result<UserKeyId> {
         Ok(UserKeyId::try_new(
@@ -199,7 +199,7 @@ mod tests {
         method: &str,
         uri: &str,
         body: Option<&[u8]>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<Parts> {
         let request = Outgoing {
             method,
@@ -211,7 +211,7 @@ mod tests {
             &rfc_key()?,
             &key_id()?,
             &Nonce::try_new("n1")?,
-            now.timestamp(),
+            now.as_second(),
             &request,
         )?;
         let mut builder = Request::builder()
@@ -286,8 +286,7 @@ mod tests {
             .body(())?
             .into_parts()
             .0;
-        let now = DateTime::from_timestamp(1_760_000_010, 0)
-            .ok_or_else(|| anyhow::anyhow!("a valid instant"))?;
+        let now = jiff::Timestamp::from_second(1_760_000_010)?;
         let parsed = parse(&parts, now, SKEW)?;
         assert_eq!(parsed.nonce.as_ref(), "b7e1d9a04c2f");
         rfc_key()?
@@ -298,7 +297,7 @@ mod tests {
 
     #[test]
     fn a_signed_request_parses_and_verifies() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         for (method, uri, body) in [
             ("GET", "/api/v1/users/me", None),
             ("GET", "/api/v1/plans?limit=5&status=running", None),
@@ -325,7 +324,7 @@ mod tests {
     /// the two fields must name one signature.
     #[test]
     fn a_request_is_held_to_what_its_signature_covers() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let error = |parts: &Parts| {
             parse(parts, now, SKEW)
                 .err()

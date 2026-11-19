@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_plan_types::JobId;
@@ -32,7 +32,7 @@ fn eval_success(body: &Value) -> Option<Box<SuccessSubmission>> {
 pub(crate) async fn run_submitted_at(
     submissions: &dyn SubmissionStore,
     success: &SuccessSubmission,
-) -> anyhow::Result<Option<DateTime<Utc>>> {
+) -> anyhow::Result<Option<Timestamp>> {
     if let Some(at) = success.run_submitted_at {
         return Ok(Some(at));
     }
@@ -80,7 +80,7 @@ pub(crate) async fn answer_from(
     submissions: &dyn SubmissionStore,
     source: &JobId,
     job_id: &JobId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let record = submissions
         .find_job(source)
@@ -164,7 +164,7 @@ mod tests {
             .submissions
             .write_processed(&source, &recorded)
             .await?;
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         answer_from(stores.submissions.as_ref(), &source, &job_id, now).await?;
 
@@ -196,8 +196,8 @@ mod tests {
             .await?;
         let submissions = stores.submissions.as_ref();
 
-        answer_from(submissions, &device, &first, Utc::now()).await?;
-        answer_from(submissions, &first, &second, Utc::now()).await?;
+        answer_from(submissions, &device, &first, Timestamp::now()).await?;
+        answer_from(submissions, &first, &second, Timestamp::now()).await?;
 
         let copy = submissions.find_job(&second).await?.context("no copy")?;
         assert_eq!(copy.body["rescored_from"], "job-b");
@@ -270,7 +270,7 @@ mod tests {
 
         let at = run_submitted_at(stores.submissions.as_ref(), &success).await?;
 
-        let expected = expected.map(str::parse::<DateTime<Utc>>).transpose()?;
+        let expected = expected.map(str::parse::<Timestamp>).transpose()?;
         assert_eq!(at, expected);
         Ok(())
     }
@@ -285,7 +285,13 @@ mod tests {
             .write_processed(&source, &success_record(&source, "decode_throughput"))
             .await?;
 
-        let refused = answer_from(stores.submissions.as_ref(), &source, &job_id, Utc::now()).await;
+        let refused = answer_from(
+            stores.submissions.as_ref(),
+            &source,
+            &job_id,
+            Timestamp::now(),
+        )
+        .await;
 
         assert!(refused.is_err());
         assert!(stores.submissions.find_job(&job_id).await?.is_none());

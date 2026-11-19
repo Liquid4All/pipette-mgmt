@@ -1,7 +1,7 @@
 //! Model parameter counts kept in mgmt's own records, one per model: the
 //! model parameter table the scorer reads, edited through the API.
 
-use chrono::{DateTime, SubsecRound, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{ModelKey, NonEmptyTrimmedString, PositiveCount, UserId};
@@ -15,7 +15,7 @@ pub struct ModelParams {
     pub active_millions: PositiveCount,
     /// Where the counts come from, for a reader. Nothing keys on it.
     pub note: Option<NonEmptyTrimmedString>,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// `None` on a row no account wrote: a seeded or imported one.
     pub updated_by: Option<UserId>,
 }
@@ -41,7 +41,7 @@ impl ModelParams {
         active_millions: Option<PositiveCount>,
         note: Option<NonEmptyTrimmedString>,
         updated_by: UserId,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<Self, ModelParamsError> {
         Self::checked(
             key,
@@ -59,7 +59,7 @@ impl ModelParams {
         key: ModelKey,
         total_millions: i32,
         active_millions: i32,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<Self, ModelParamsError> {
         let total = PositiveCount::try_new(total_millions)
             .map_err(|_| ModelParamsError::Total(total_millions))?;
@@ -77,7 +77,7 @@ impl ModelParams {
         active_millions: Option<PositiveCount>,
         note: Option<NonEmptyTrimmedString>,
         updated_by: Option<UserId>,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<Self, ModelParamsError> {
         let active_millions = active_millions.unwrap_or(total_millions);
         if active_millions > total_millions {
@@ -98,7 +98,11 @@ impl ModelParams {
             total_millions,
             active_millions,
             note,
-            updated_at: updated_at.trunc_subsecs(6),
+            // Whole microseconds, what the SQL column keeps.
+            updated_at: updated_at
+                - jiff::SignedDuration::from_nanos(i64::from(
+                    updated_at.subsec_nanosecond() % 1_000,
+                )),
             updated_by,
         })
     }
@@ -134,7 +138,7 @@ mod tests {
     fn active_defaults_to_total() -> anyhow::Result<()> {
         let key = ModelKey::try_new("acmelm-4.5b-text")?;
         let total = PositiveCount::try_new(4512)?;
-        let dense = ModelParams::new(key, total, None, None, UserId::mint(), Utc::now())?;
+        let dense = ModelParams::new(key, total, None, None, UserId::mint(), Timestamp::now())?;
         assert_eq!(dense.active_millions, total);
         Ok(())
     }
@@ -176,7 +180,7 @@ mod tests {
         #[case] expected: Result<(), ModelParamsError>,
     ) -> anyhow::Result<()> {
         let key = ModelKey::try_new("lfm2-8b-a1b")?;
-        let imported = ModelParams::imported(key, total, active, Utc::now()).map(|_| ());
+        let imported = ModelParams::imported(key, total, active, Timestamp::now()).map(|_| ());
         assert_eq!(imported, expected);
         Ok(())
     }
@@ -197,7 +201,7 @@ mod tests {
             Some(PositiveCount::try_new(1500)?),
             Some(NonEmptyTrimmedString::try_new("é".repeat(chars))?),
             UserId::mint(),
-            Utc::now(),
+            Timestamp::now(),
         );
         assert_eq!(noted.map(|_| ()), expected);
         Ok(())

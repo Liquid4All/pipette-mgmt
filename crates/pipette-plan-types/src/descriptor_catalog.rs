@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, SubsecRound, Utc};
+use jiff::Timestamp;
 use nutype::nutype;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -467,6 +467,10 @@ pub enum MemberError {
     AuthToken,
 }
 
+fn whole_micros(at: Timestamp) -> Timestamp {
+    at - jiff::SignedDuration::from_nanos(i64::from(at.subsec_nanosecond() % 1_000))
+}
+
 /// One immutable descriptor at its position in the entry. `added_at` keeps
 /// whole microseconds, what a SQL timestamp holds, so a member round-trips
 /// equal.
@@ -477,7 +481,7 @@ pub struct DescriptorMember {
     body: MemberBody,
     digest: String,
     alias_digest: Option<String>,
-    added_at: DateTime<Utc>,
+    added_at: Timestamp,
 }
 
 /// A member's descriptor with the key that the descriptor gives.
@@ -502,7 +506,8 @@ enum MemberWire {
         runtime: Runtime,
         digest: String,
         flavor: Option<String>,
-        added_at: DateTime<Utc>,
+        #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+        added_at: Timestamp,
     },
     Model {
         model: Model,
@@ -510,7 +515,8 @@ enum MemberWire {
         #[cfg_attr(feature = "schemars", schemars(with = "String"))]
         quantization: QuantizationLabel,
         digest: String,
-        added_at: DateTime<Utc>,
+        #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+        added_at: Timestamp,
     },
 }
 
@@ -726,11 +732,11 @@ impl DescriptorMember {
             } => Some((*format, quantization)),
         }
     }
-    pub fn added_at(&self) -> DateTime<Utc> {
+    pub fn added_at(&self) -> Timestamp {
         self.added_at
     }
 
-    pub fn new(runtime: Runtime, added_at: DateTime<Utc>) -> Result<Self, MemberError> {
+    pub fn new(runtime: Runtime, added_at: Timestamp) -> Result<Self, MemberError> {
         let mut value = serde_json::to_value(&runtime)?;
         let flavor = value
             .get("flavor")
@@ -742,7 +748,7 @@ impl DescriptorMember {
             body: MemberBody::Runtime { runtime, flavor },
             digest,
             alias_digest: None,
-            added_at: added_at.trunc_subsecs(6),
+            added_at: whole_micros(added_at),
         })
     }
 
@@ -751,7 +757,7 @@ impl DescriptorMember {
     pub fn new_model(
         model: Model,
         quantization: QuantizationLabel,
-        added_at: DateTime<Utc>,
+        added_at: Timestamp,
     ) -> Result<Self, MemberError> {
         let model_type = ModelType::of(&model);
         let format = ModelFormat::of(model_type).ok_or(MemberError::NoFormat(model_type))?;
@@ -783,7 +789,7 @@ impl DescriptorMember {
             },
             digest,
             alias_digest: None,
-            added_at: added_at.trunc_subsecs(6),
+            added_at: whole_micros(added_at),
         })
     }
 
@@ -793,7 +799,7 @@ impl DescriptorMember {
         descriptor: DescriptorMemberDescriptor,
         digest: &str,
         key: &DescriptorMemberKey,
-        added_at: DateTime<Utc>,
+        added_at: Timestamp,
     ) -> Result<Self, MemberError> {
         let member = match (descriptor, key) {
             (DescriptorMemberDescriptor::Runtime(runtime), _) => Self::new(runtime, added_at)?,
@@ -960,8 +966,10 @@ pub struct DescriptorEntry {
     pub name: CatalogName,
     pub kind: DescriptorEntryKind,
     pub state: DescriptorEntryState,
-    pub release_time: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub release_time: Timestamp,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     pub created_by: DescriptorEntryCreator,
     pub members: NonEmptyVec<DescriptorMember>,
 }
@@ -974,8 +982,10 @@ struct EntryWire {
     name: CatalogName,
     kind: DescriptorEntryKind,
     state: DescriptorEntryState,
-    release_time: DateTime<Utc>,
-    created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    release_time: Timestamp,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    created_at: Timestamp,
     created_by: DescriptorEntryCreator,
     members: NonEmptyVec<DescriptorMember>,
 }
@@ -996,8 +1006,8 @@ impl TryFrom<EntryWire> for DescriptorEntry {
             name: wire.name,
             kind: wire.kind,
             state: wire.state,
-            release_time: wire.release_time.trunc_subsecs(6),
-            created_at: wire.created_at.trunc_subsecs(6),
+            release_time: whole_micros(wire.release_time),
+            created_at: whole_micros(wire.created_at),
             created_by: wire.created_by,
             members: wire.members,
         })
@@ -1014,8 +1024,8 @@ impl DescriptorEntry {
         name: CatalogName,
         kind: DescriptorEntryKind,
         state: DescriptorEntryState,
-        release_time: DateTime<Utc>,
-        created_at: DateTime<Utc>,
+        release_time: Timestamp,
+        created_at: Timestamp,
         created_by: DescriptorEntryCreator,
         members: NonEmptyVec<DescriptorMember>,
     ) -> Result<Self, EntryError> {
@@ -1030,8 +1040,8 @@ impl DescriptorEntry {
             name,
             kind,
             state,
-            release_time: release_time.trunc_subsecs(6),
-            created_at: created_at.trunc_subsecs(6),
+            release_time: whole_micros(release_time),
+            created_at: whole_micros(created_at),
             created_by,
             members,
         })
@@ -1244,7 +1254,7 @@ mod tests {
         value
     }
 
-    fn a_member(runtime: Value, at: DateTime<Utc>) -> anyhow::Result<DescriptorMember> {
+    fn a_member(runtime: Value, at: Timestamp) -> anyhow::Result<DescriptorMember> {
         Ok(DescriptorMember::new(serde_json::from_value(runtime)?, at)?)
     }
 
@@ -1285,7 +1295,7 @@ mod tests {
     fn a_model(
         model: Value,
         quantization: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<DescriptorMember> {
         Ok(DescriptorMember::new_model(
             serde_json::from_value(model)?,
@@ -1463,7 +1473,7 @@ mod tests {
 
     #[test]
     fn tombstoned_entry_round_trips_but_cannot_be_created() -> anyhow::Result<()> {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let name = CatalogName::try_new("retired-1")?;
         let members = NonEmptyVec::try_new(vec![a_member(apple(), at)?])?;
         let entry = |state| {
@@ -1506,7 +1516,8 @@ mod tests {
         }
     }))]
     fn vault_member_requires_org_scope(#[case] runtime: Value) -> anyhow::Result<()> {
-        let member = DescriptorMember::new(serde_json::from_value(runtime.clone())?, Utc::now())?;
+        let member =
+            DescriptorMember::new(serde_json::from_value(runtime.clone())?, Timestamp::now())?;
         let members = NonEmptyVec::try_new(vec![member.clone()])?;
         assert_eq!(
             DescriptorEntry::validate_scope_members(&CatalogScope::Global, &members),
@@ -1534,7 +1545,7 @@ mod tests {
             });
             Ok(DescriptorMember::new(
                 serde_json::from_value(runtime)?,
-                Utc::now(),
+                Timestamp::now(),
             )?)
         };
         let members = NonEmptyVec::try_new(vec![
@@ -1556,8 +1567,10 @@ mod tests {
         #[case] field: &str,
     ) -> anyhow::Result<()> {
         let member = match kind {
-            DescriptorKind::Runtime => a_member(llama(None), Utc::now())?,
-            DescriptorKind::Model => a_model(pinned("gguf_text", "AcmeLM-3B"), "q4_0", Utc::now())?,
+            DescriptorKind::Runtime => a_member(llama(None), Timestamp::now())?,
+            DescriptorKind::Model => {
+                a_model(pinned("gguf_text", "AcmeLM-3B"), "q4_0", Timestamp::now())?
+            }
         };
         let mut wire = serde_json::to_value(member)?;
         if let (Some(fields), Some(change)) = (wire.as_object_mut(), change.as_object()) {
@@ -1599,7 +1612,7 @@ mod tests {
         #[case] model_type: &str,
         #[case] format: &str,
     ) -> anyhow::Result<()> {
-        let member = a_model(pinned(model_type, "AcmeLM-3B"), "q4_0", Utc::now())?;
+        let member = a_model(pinned(model_type, "AcmeLM-3B"), "q4_0", Timestamp::now())?;
         assert_eq!(member.descriptor_kind(), DescriptorKind::Model);
         assert_eq!(member.descriptor_type(), model_type);
         assert_eq!(member.flavor(), None);
@@ -1706,7 +1719,7 @@ mod tests {
         let error = DescriptorMember::new_model(
             serde_json::from_value(model)?,
             QuantizationLabel::try_new("q4_0")?,
-            Utc::now(),
+            Timestamp::now(),
         )
         .err()
         .context("the model must be refused")?;
@@ -1716,7 +1729,7 @@ mod tests {
 
     #[test]
     fn model_entry_lists_one_type_per_format() -> anyhow::Result<()> {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let members = NonEmptyVec::try_new(vec![
             a_model(pinned("gguf_text", "AcmeLM-3B-GGUF"), "q4_0", at)?,
             a_model(pinned("gguf_text", "AcmeLM-3B-GGUF-Q8"), "q8_0", at)?,
@@ -1743,7 +1756,7 @@ mod tests {
 
     #[test]
     fn model_entry_must_be_hand_made() -> anyhow::Result<()> {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let members = NonEmptyVec::try_new(vec![a_model(pinned("mlx", "AcmeLM-3B"), "4bit", at)?])?;
         let refused = DescriptorEntry::new(
             CatalogScope::Global,
@@ -1763,7 +1776,7 @@ mod tests {
     /// quantization.
     fn a_case_member(
         (descriptor, quantization): (Value, Option<&str>),
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<DescriptorMember> {
         match quantization {
             None => a_member(descriptor, at),
@@ -1824,7 +1837,7 @@ mod tests {
         #[case] members: Vec<(Value, Option<&str>)>,
         #[case] expected: fn(&EntryError) -> bool,
     ) -> anyhow::Result<()> {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let members = members
             .into_iter()
             .map(|member| a_case_member(member, at))
@@ -1864,7 +1877,7 @@ mod tests {
         #[case] is_app: bool,
     ) -> anyhow::Result<()> {
         let runtime: Runtime = serde_json::from_value(runtime)?;
-        let member = DescriptorMember::new(runtime.clone(), chrono::Utc::now())?;
+        let member = DescriptorMember::new(runtime.clone(), jiff::Timestamp::now())?;
         let flag = crate::runtime_build_flag(&runtime)?.map(|flag| flag.into_inner());
         let expected = is_app.then(|| format!("runtime:descriptor:{}", member.digest()));
         assert_eq!(flag, expected);

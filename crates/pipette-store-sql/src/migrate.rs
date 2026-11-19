@@ -14,7 +14,8 @@ use crate::db::SqlDatabase;
 fn migrator() -> Migrator {
     let mut migrator = sqlx::migrate!("./migrations");
     // A rolled-back binary finds the migrations of the newer build applied.
-    // Those migrations only add to the schema, so the binary needs no action.
+    // Those migrations add to the schema, or drop what no supported rollback
+    // build uses, so the binary needs no action.
     migrator.set_ignore_missing(true);
     migrator
 }
@@ -165,8 +166,9 @@ fn ensure_embedded(migrator: &Migrator, to: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refuse a schema behind this build. A newer one passes: migrations only add,
-/// and after a rollback an older binary runs on a newer schema.
+/// Refuse a schema behind this build. A migration adds schema objects or drops
+/// objects that no supported rollback build uses. Older binaries therefore
+/// accept newer schemas after a rollback.
 pub(crate) async fn check(db: &SqlDatabase) -> anyhow::Result<()> {
     ensure_byte_order(db).await?;
     let applied = applied(db)

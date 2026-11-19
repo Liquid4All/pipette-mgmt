@@ -103,11 +103,11 @@ async fn test_a_clerk_token_registers_an_expiring_key() -> anyhow::Result<()> {
         .as_array()
         .and_then(|keys| keys.first())
         .ok_or_else(|| anyhow::anyhow!("the key is listed: {me}"))?;
-    let expires_at = chrono::DateTime::parse_from_rfc3339(json_str(key, "expires_at")?)?;
-    let lifetime = expires_at.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    let expires_at = json_str(key, "expires_at")?.parse::<jiff::Timestamp>()?;
+    let lifetime = expires_at.duration_since(jiff::Timestamp::now());
     let wanted = pipette_httpapi::api_v1::users::clerk::CLERK_KEY_LIFETIME;
     assert!(
-        lifetime <= wanted && lifetime > wanted - chrono::TimeDelta::minutes(1),
+        lifetime <= wanted && lifetime > wanted - jiff::SignedDuration::from_mins(1),
         "{lifetime}"
     );
     Ok(())
@@ -199,7 +199,7 @@ async fn test_a_clerk_token_registers_to_the_account_its_address_names() -> anyh
 #[rstest]
 #[case::verified_as_a_string("email_verified", json!("true"))]
 #[case::audience_as_a_list("aud", json!(["another-app", "pipette-mgmt"]))]
-#[case::issued_within_the_skew("iat", json!(chrono::Utc::now().timestamp() + 2))]
+#[case::issued_within_the_skew("iat", json!(jiff::Timestamp::now().as_second() + 2))]
 #[tokio::test]
 async fn test_a_clerk_claim_in_its_other_shape_registers(
     #[case] claim: &str,
@@ -342,7 +342,7 @@ async fn test_a_refused_clerk_token_registers_nothing(
     let clerk = ClerkInstance::new()?;
     let state = make_state_with_clerk(dir.path(), &clerk, &[("example.test", "acme")]).await?;
     seed_org(&state, "acme").await?;
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let mut claims = clerk.claims("new@example.test");
     let bearer = |token: String| vec![("Authorization", format!("Bearer {token}"))];
 
@@ -809,7 +809,7 @@ async fn test_the_first_sign_in_surfaces_the_keys_held_before_it(
             let key = UserKey::new(
                 PublicKeyHex::try_new(public_key)?,
                 NonEmptyTrimmedString::try_new("an administrator's laptop")?,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             );
             state.user_store.put_user_key(&user.user_id, &key).await?;
             vec![key.key_id]
@@ -829,6 +829,8 @@ async fn test_the_first_sign_in_surfaces_the_keys_held_before_it(
                 | AuditAction::Cli { .. }
                 | AuditAction::CatalogRename { .. }
                 | AuditAction::CatalogMerge { .. }
+                | AuditAction::CatalogRemoveMember { .. }
+                | AuditAction::CatalogMoveToGlobal { .. }
                 | AuditAction::GroupPolicy { .. } => None,
             })
             .collect()

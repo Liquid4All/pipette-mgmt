@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::warehouse::SYSTEM_CLIENT_ID;
@@ -250,9 +250,8 @@ fn number(value: Option<impl ToString>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
-fn time(at: Option<DateTime<Utc>>) -> String {
-    at.map(|at| at.to_rfc3339_opts(SecondsFormat::AutoSi, true))
-        .unwrap_or_default()
+fn time(at: Option<Timestamp>) -> String {
+    at.map(|at| at.to_string()).unwrap_or_default()
 }
 
 /// A string is text. A number or a flag keeps its JSON form, so a negative

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use pipette_plan_types::{ClientId, ExpiresAt, JobId, PlanId};
 
@@ -30,35 +30,32 @@ pub struct Lease {
     pub job_id: JobId,
     pub expires_at: ExpiresAt,
     pub client_id: ClientId,
-    pub lease_expiry: DateTime<Utc>,
+    pub lease_expiry: Timestamp,
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
     use rstest::rstest;
 
     use super::*;
 
-    fn dt(y: i32, mo: u32, d: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, mo, d, h, m, s).unwrap()
-    }
-
     /// A membership marker round-trips, including the `never` encoding, which
     /// occupies the same slot as a timestamp.
     #[rstest]
-    #[case("plan-abc", ExpiresAt::Never, "plan-abc.never")]
+    #[case("plan-abc", None, "plan-abc.never")]
     #[case(
         "plan-0199a1c2-3d4e-7f80-9abc-def012345678",
-        ExpiresAt::At(dt(2026, 9, 8, 0, 0, 0)),
+        Some("2026-09-08T00:00:00Z"),
         "plan-0199a1c2-3d4e-7f80-9abc-def012345678.20260908T000000Z"
     )]
     fn job_plan_marker_roundtrip(
         #[case] plan_id: &str,
-        #[case] expires_at: ExpiresAt,
+        #[case] expires_at: Option<&str>,
         #[case] want: &str,
     ) -> anyhow::Result<()> {
         let plan_id = PlanId::try_new(plan_id)?;
+        let expires_at =
+            expires_at.map_or(Ok(ExpiresAt::Never), |at| at.parse().map(ExpiresAt::At))?;
         let name = job_plan_marker_filename(&plan_id, expires_at);
         assert_eq!(name, want);
         assert_eq!(

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, benchmarkToml, putBenchmark, type Signer } from "../src/lib/api";
 import {
-  benchmarkRows, benchmarksEmpty, catalogOrg, createRefused, editRefused, entryOf, legacyCatalogFilter,
+  benchmarkRows, benchmarkTable, benchmarksEmpty, catalogOrg, createRefused, editRefused, entryOf, legacyCatalogFilter,
   newBenchmarkAction, pathBenchmarkId, typedBenchmarkId, writeOrgs,
 } from "../src/lib/benchmarks";
 import { administersOrg, ownOrg } from "../src/lib/orgs";
@@ -46,6 +46,13 @@ describe("benchmarks", () => {
     expect(dotted[0]?.href).toBe("/app/benchmarks/org_new/eval_ifbench_2026.06.1");
     expect(match(dotted[0]!.href)).toEqual(
       { page: "benchmark", org: "org_new", benchmark_id: "eval_ifbench_2026.06.1" });
+    // Rows order by display name, then slug, where the two orders disagree.
+    const named = benchmarkRows([
+      { org: { ...acme, display_name: "Zeta" }, catalog: catalog("org_acme", ["a_1"]) },
+      { org: { ...odd, display_name: "Alpha" }, catalog: catalog("org_new", ["n_1"]) },
+      { org: { ...beta, display_name: "Alpha" }, catalog: catalog("org_beta", ["b_1"]) },
+    ]);
+    expect(named.map((row) => row.org.slug)).toEqual(["beta", "new", "acme"]);
   });
 
   test("an empty listing says why, as benchmarks.html words it", () => {
@@ -131,6 +138,15 @@ describe("benchmarks", () => {
     expect(editRefused(failed, "eval_x"))
       .toBe("eval_x was deleted meanwhile, so nothing was written: create it again from New benchmark.");
     expect(editRefused(new ApiError(400, "bad"), "eval_x")).toBeNull();
+  });
+});
+
+describe("the organization filter", () => {
+  test("keeps the handle and prints the display name", () => {
+    const filter = benchmarkTable([{ org_id: "org_acme", slug: "acme", display_name: "Acme Corp" }])
+      .choices!.find((choice) => choice.key === "organization")!;
+    expect(filter.name!("acme")).toBe("Acme Corp");
+    expect(filter.name!("gone")).toBe("gone");
   });
 });
 

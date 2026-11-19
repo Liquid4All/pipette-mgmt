@@ -12,8 +12,9 @@ use pipette_pipeline::plan_results::ResultsDb;
 use pipette_store::{
     AuditStore, CampaignGroupStore, CampaignStore, CatalogImportRunStore, CatalogStore,
     ClientStore, DatasetCacheStore, DescriptorCatalogStore, EvalPackageStore,
-    EvalSampleResultStore, KeyIndexStore, ModelParamsStore, OrgStore, PlanStore, RunEvidenceStore,
-    Stores, SubmissionStore, TagStore, TodoStore, UserStore, VaultStore, WarehouseStore,
+    EvalSampleResultStore, KeyIndexStore, ModelParamsStore, OrgStore, PlanStore, PlanTagStore,
+    RunEvidenceStore, Stores, SubmissionStore, TagStore, TodoStore, UserStore, VaultStore,
+    WarehouseStore,
 };
 
 use crate::api_schema::openapi::OpenApi;
@@ -87,6 +88,8 @@ pub struct AppState {
     pub campaign_store: Arc<dyn CampaignStore>,
     /// `None` without a `[database]`, which alone keeps campaign groups.
     pub campaign_group_store: Option<Arc<dyn CampaignGroupStore>>,
+    /// `None` without a `[database]`, which alone keeps plan tags.
+    pub plan_tag_store: Option<Arc<dyn PlanTagStore>>,
     /// `model-params/`: the model parameter table, written by `/api/v1/model-params`
     /// and read for a filing's coverage warning and a result row's empty counts.
     pub model_params_store: Arc<dyn ModelParamsStore>,
@@ -186,6 +189,7 @@ impl AppState {
             plan_store: stores.plans,
             campaign_store: stores.campaigns,
             campaign_group_store: stores.campaign_groups,
+            plan_tag_store: stores.plan_tags,
             model_params_store: stores.model_params,
             audit_store: stores.audit,
             audit_writes: tokio_util::task::TaskTracker::new(),

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::benchmark::Benchmark;
@@ -316,7 +316,7 @@ pub async fn dry_run(
     source: PlanSource,
     jobs: Vec<Value>,
     plan_warnings: Vec<String>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DocumentDryRun, IngestError> {
     let jobs = index_labels(jobs);
     let cells = jobs.len();

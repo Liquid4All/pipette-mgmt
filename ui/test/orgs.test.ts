@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
-import { absentOrg, createBody, createOrgRefusal, knownOrg, names, renameBody, resolveOrg } from "../src/lib/orgs";
+import {
+  absentOrg, byName, choiceName, createBody, createOrgRefusal, knownOrg, names, orgName, ownOrg, renameBody, resolveOrg,
+} from "../src/lib/orgs";
 import type { OwnUserView, UserPermission } from "../src/lib/api-types";
 import { abilitiesOf } from "./abilities";
 
@@ -99,5 +101,30 @@ describe("the organization forms", () => {
   test("the create form is manage_any_orgs's", () => {
     expect(createOrgRefusal(reader(["manage_any_orgs", "manage_orgs"]))).toBe("");
     expect(createOrgRefusal(reader(["manage_orgs"]))).toBe("user lacks the manage_any_orgs permission");
+  });
+});
+
+describe("an organization's printed name", () => {
+  test("is its display name, else its slug, and orders the listings", () => {
+    const zeta = { org_id: "org_z", slug: "aaa", display_name: "Zeta" };
+    const alpha = { org_id: "org_a", slug: "zzz", display_name: "Alpha" };
+    const twin = { org_id: "org_t", slug: "bbb", display_name: "Alpha" };
+    expect(orgName(zeta)).toBe("Zeta");
+    expect(orgName(own)).toBe("acme");
+    // Display names may repeat; the slug breaks the tie.
+    expect([zeta, alpha, twin].sort(byName)).toEqual([twin, alpha, zeta]);
+  });
+
+  test("adds the slug in a choice only where another choice prints the same name", () => {
+    const acme = { org_id: "org_a", slug: "acme", display_name: "Acme" };
+    const eu = { org_id: "org_e", slug: "acme-eu", display_name: "Acme" };
+    const beta = { org_id: "org_b", slug: "beta", display_name: "Beta" };
+    const all = [acme, eu, beta];
+    expect(all.map((org) => choiceName(org, all))).toEqual(["Acme (acme)", "Acme (acme-eu)", "Beta"]);
+  });
+
+  test("of the reader's own organization comes from GET /api/v1/users/me", () => {
+    const named = ownOrg({ org_id: "org_own", org_slug: "acme", org_display_name: "Acme Corp" });
+    expect(named && orgName(named)).toBe("Acme Corp");
   });
 });

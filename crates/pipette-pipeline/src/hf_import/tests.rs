@@ -89,7 +89,7 @@ fn repos() -> HashMap<String, MockRepo> {
                 MockFile::lfs("model.safetensors", &[2; 100]),
             ],
         ),
-        repo("long", vec![MockFile::git(&"a".repeat(300), b"x")]),
+        repo("escape", vec![MockFile::git("a/../b", b"x")]),
         repo("held", vec![MockFile::lfs("h.gguf", b"GGUF held").held()]),
         repo(
             "limited",
@@ -226,7 +226,7 @@ impl Fixture {
             Err(failure) => return Ok(Err(failure.error)),
         };
         Ok(plan
-            .fetch(&importer, progress, Utc::now())
+            .fetch(&importer, progress, Timestamp::now())
             .await
             .map_err(|failure| failure.error))
     }
@@ -492,7 +492,7 @@ async fn each_token_is_checked() -> anyhow::Result<()> {
     |e: &HfImportError| matches!(e, HfImportError::EmptySnapshot { .. })
 )]
 #[case::unsupported_path(
-    typed("torch", hf("long", json!({}))),
+    typed("torch", hf("escape", json!({}))),
     u64::MAX,
     |e: &HfImportError| matches!(e, HfImportError::UnsupportedPathError(_))
 )]
@@ -572,8 +572,8 @@ async fn a_revision_with_a_slash_resolves() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A gguf blob the owner holds with no record reports zero bytes; a file over
-/// the limit and a path ustar cannot hold are refused while the plan resolves.
+/// A gguf blob that the owner holds without a record reports zero bytes.
+/// The plan rejects oversized files and paths with a `..` component.
 #[tokio::test]
 async fn a_plan_reports_what_the_import_does() -> anyhow::Result<()> {
     let fx = Fixture::start().await?;
@@ -590,7 +590,8 @@ async fn a_plan_reports_what_the_import_does() -> anyhow::Result<()> {
         bytes: WEIGHTS.len() as u64,
     };
     assert_eq!(plan.entries(), [entry(first)]);
-    plan.fetch(&importer, &Progress::Silent, Utc::now()).await?;
+    plan.fetch(&importer, &Progress::Silent, Timestamp::now())
+        .await?;
 
     let records = fx.records().await?;
     let resource_ids = records.iter().map(|r| r.resource_id.clone()).collect();
@@ -617,8 +618,8 @@ async fn a_plan_reports_what_the_import_does() -> anyhow::Result<()> {
         ),
         "{too_large:?}"
     );
-    let long: Model = hf_model("torch", "long", json!({}))?;
-    let unsupported = ImportPlan::resolve(&importer, &fx.owner, &[long]).await;
+    let escape: Model = hf_model("torch", "escape", json!({}))?;
+    let unsupported = ImportPlan::resolve(&importer, &fx.owner, &[escape]).await;
     assert!(
         matches!(
             unsupported,
@@ -653,7 +654,9 @@ async fn a_reuse_checks_its_records_again_when_it_fetches() -> anyhow::Result<()
     for record in &gone {
         fx.vault.delete_resource(&record.resource_id).await?;
     }
-    let rewrites = plan.fetch(&importer, &Progress::Silent, Utc::now()).await?;
+    let rewrites = plan
+        .fetch(&importer, &Progress::Silent, Timestamp::now())
+        .await?;
 
     let records = fx.records().await?;
     let [record] = records.as_slice() else {
@@ -798,7 +801,8 @@ async fn a_shared_source_is_handled_once(
         let models = [first.clone(), second.clone()];
         let plan = ImportPlan::resolve(&importer, &fx.owner, &models).await?;
         assert_eq!(fetch_bytes(&plan), [Some(first_bytes), Some(unshared)]);
-        plan.fetch(&importer, &Progress::Silent, Utc::now()).await?;
+        plan.fetch(&importer, &Progress::Silent, Timestamp::now())
+            .await?;
     }
 
     shared

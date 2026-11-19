@@ -12,6 +12,6 @@
 
 <OrgScope reference={route.org} title="Members" action={newAccountAction(session.account!)}>
   {#snippet children(org)}
-    <Roster branch={{ kind: "org", org_id: org.org_id, slug: org.slug }} path={pathOf(route)} />
+    <Roster branch={{ kind: "org", ...org }} path={pathOf(route)} />
   {/snippet}
 </OrgScope>

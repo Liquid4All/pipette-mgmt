@@ -13,7 +13,7 @@
   import PageHead from "../lib/components/PageHead.svelte";
   import { USERS } from "../lib/crumbs";
   import { carry } from "../lib/flash";
-  import { bySlug } from "../lib/orgs";
+  import { byName, choiceName, orgName, ownOrg } from "../lib/orgs";
   import { EXPIRY_DAYS, EXPIRY_DEFAULT, days } from "../lib/preauth";
   import { here, navigateFrom } from "../lib/route.svelte";
   import { pathOf, type RouteOf } from "../lib/routes";
@@ -23,13 +23,14 @@
   let { route: _ }: { route: RouteOf<"user-new"> } = $props();
 
   const reader = $derived(session.account!);
+  const own = $derived(ownOrg(reader));
   const refusal = $derived(createRefusal(reader));
   const fleet = $derived(reader.may.administer_roster === "every");
 
   const offered = new Loader<OrgView[]>();
   $effect(() => {
     if (!refusal && fleet) {
-      offered.run(async () => (await orgs(session.signer, { counts: false })).sort(bySlug));
+      offered.run(async () => (await orgs(session.signer, { counts: false })).sort(byName));
     }
   });
 
@@ -108,13 +109,13 @@
             <label><span>organization</span>
               <select bind:value={orgId}>
                 <option value="">no organization</option>
-                {#each listed as each (each.org_id)}<option value={each.org_id}>{each.slug}</option>{/each}
+                {#each listed as each (each.org_id)}<option value={each.org_id}>{choiceName(each, listed)}</option>{/each}
               </select>
             </label>
           {/snippet}
         </Loaded>
-      {:else if reader.org_slug}
-        <p>It joins <strong>{reader.org_slug}</strong>, the organization you administer.</p>
+      {:else if own}
+        <p>It joins <strong>{orgName(own)}</strong>, the organization you administer.</p>
       {/if}
 
       <fieldset class="choices">

@@ -17,7 +17,7 @@
 <OrgScope reference={route.org} title="Devices" fresh>
   {#snippet children(org)}
     <DeviceListing
-      branch={{ kind: "org", org_id: org.org_id, slug: org.slug,
+      branch={{ kind: "org", ...org,
                 count: "client_count" in org ? org.client_count ?? null : null }}
       path={pathOf(route)} />
     {#if session.account && mayMintFor(session.account, org.org_id)}

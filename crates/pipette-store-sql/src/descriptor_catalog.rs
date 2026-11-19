@@ -5,19 +5,21 @@ use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::{Connection, FromRow, PgConnection};
 
 use pipette_plan_types::{
-    CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind, DescriptorEntryState,
-    DescriptorMember, DescriptorMemberDescriptor, DescriptorMemberKey, ModelFormat, NonEmptyVec,
-    OrgId, QuantizationLabel,
+    AuditAction, AuditActor, AuditOutcome, AuditTarget, CatalogName, CatalogScope, DescriptorEntry,
+    DescriptorEntryKind, DescriptorEntryState, DescriptorMember, DescriptorMemberDescriptor,
+    DescriptorMemberKey, ModelFormat, NonEmptyVec, OrgId, QuantizationLabel,
 };
 use pipette_store::{
     AppendOutcome, CatalogEntryKey, CatalogEntryLock, CreateEntryOutcome, DescriptorCatalogStore,
-    DescriptorEntryFilter, DescriptorEntryPage, DigestHit, MergeOutcome, RelabelOutcome,
-    RenameOutcome, SetStateOutcome, TransitionOutcome, UnknownCursorError, UnreadableObjectError,
-    merge_outcome,
+    DescriptorEntryFilter, DescriptorEntryPage, DigestHit, MergeOutcome, MoveToGlobalOutcome,
+    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetStateOutcome, TransitionOutcome,
+    UnknownCursorError, UnreadableObjectError, merge_outcome, move_to_global_outcome,
+    remove_outcome,
 };
 
 use crate::db::SqlDatabase;
@@ -40,8 +42,9 @@ const LOCK_ENTRY: &str =
      release_time, created_at, created_by
      FROM descriptor_entries WHERE scope = $1 AND name_key = $2 FOR UPDATE";
 
-/// If another write takes the new name first, retry the rename. The new check
-/// then finds that entry. Each new conflict requires another concurrent write.
+/// If another write takes the new name first, retry the rename or the move to
+/// global scope. The new check then finds that entry. Each new conflict
+/// requires another concurrent write.
 const RENAME_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
@@ -179,8 +182,8 @@ struct EntryRow {
     state: String,
     descriptor_kind: String,
     descriptor_type: String,
-    release_time: DateTime<Utc>,
-    created_at: DateTime<Utc>,
+    release_time: jiff_sqlx::Timestamp,
+    created_at: jiff_sqlx::Timestamp,
     created_by: String,
 }
 
@@ -196,7 +199,7 @@ struct MemberRow {
     flavor: Option<String>,
     format: Option<String>,
     quantization: Option<String>,
-    added_at: DateTime<Utc>,
+    added_at: jiff_sqlx::Timestamp,
 }
 
 /// The key that a member row's columns record: a flavor for a runtime member,
@@ -227,8 +230,9 @@ impl MemberRow {
                 DescriptorMemberDescriptor::Model(serde_json::from_str(&self.descriptor)?)
             }
         };
-        let member = DescriptorMember::verified(descriptor, &self.digest, &key, self.added_at)?
-            .with_alias_digest(self.alias_digest);
+        let member =
+            DescriptorMember::verified(descriptor, &self.digest, &key, self.added_at.to_jiff())?
+                .with_alias_digest(self.alias_digest);
         anyhow::ensure!(
             member.descriptor_type() == self.descriptor_type,
             "member descriptor type mismatch"
@@ -252,8 +256,8 @@ impl EntryRow {
             name: CatalogName::try_new(self.name)?,
             kind: self.kind.parse()?,
             state: self.state.parse()?,
-            release_time: self.release_time,
-            created_at: self.created_at,
+            release_time: self.release_time.to_jiff(),
+            created_at: self.created_at.to_jiff(),
             created_by: self.created_by.parse()?,
             members,
         };
@@ -287,7 +291,7 @@ struct NewMember<'a> {
     digest: &'a str,
     alias_digest: Option<&'a str>,
     descriptor: String,
-    added_at: DateTime<Utc>,
+    added_at: jiff_sqlx::Timestamp,
 }
 
 fn new_members(members: &[DescriptorMember]) -> anyhow::Result<Vec<NewMember<'_>>> {
@@ -307,7 +311,7 @@ fn new_members(members: &[DescriptorMember]) -> anyhow::Result<Vec<NewMember<'_>
                 descriptor: pipette_plan_types::canonical_json(&serde_json::to_value(
                     member.descriptor(),
                 )?),
-                added_at: member.added_at(),
+                added_at: member.added_at().to_sqlx(),
             })
         })
         .collect()
@@ -343,6 +347,12 @@ async fn insert_members(
         .await?;
     }
     Ok(())
+}
+
+fn parse_holder(
+    (name, state): (String, String),
+) -> anyhow::Result<(CatalogName, DescriptorEntryState)> {
+    Ok((CatalogName::try_new(name)?, state.parse()?))
 }
 
 fn name_taken(name: String, state: String) -> anyhow::Result<RenameOutcome> {
@@ -416,8 +426,8 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 .bind(entry.state.as_ref())
                 .bind(descriptor_kind.as_ref())
                 .bind(&descriptor_type)
-                .bind(entry.release_time)
-                .bind(entry.created_at)
+                .bind(entry.release_time.to_sqlx())
+                .bind(entry.created_at.to_sqlx())
                 .bind(&created_by)
                 .execute(&mut *tx)
                 .await?
@@ -814,6 +824,166 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
         .await?
     }
 
+    async fn remove_member(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        key: &DescriptorMemberKey,
+    ) -> anyhow::Result<RemoveMemberOutcome> {
+        let keys = [name.key()];
+        let scopes = [scope.sql_key()];
+        retry("remove_descriptor_member", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                    .bind(scopes[0])
+                    .bind(&keys[0])
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                // The row lock above serializes this with appends and relabels.
+                let entry = match row {
+                    None => None,
+                    Some(row) => {
+                        let members: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                            .bind(&scopes[..])
+                            .bind(&keys[..])
+                            .fetch_all(&mut *tx)
+                            .await?;
+                        match row.parse(members) {
+                            Ok(entry) => Some(entry),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                };
+                let outcome = remove_outcome(entry, key);
+                let RemoveMemberOutcome::Removed { entry, member } = &outcome else {
+                    return Ok(Ok(outcome));
+                };
+                // Write the parent so overlapping repeatable-read transactions retry.
+                sqlx::query(
+                    "UPDATE descriptor_entries SET descriptor_type = $3
+                     WHERE scope = $1 AND name_key = $2",
+                )
+                .bind(scopes[0])
+                .bind(&keys[0])
+                .bind(entry.members.head().descriptor_type())
+                .execute(&mut *tx)
+                .await?;
+                // The digests of an entry's members are unique.
+                sqlx::query(
+                    "DELETE FROM descriptor_members
+                     WHERE scope = $1 AND name_key = $2 AND digest = $3",
+                )
+                .bind(scopes[0])
+                .bind(&keys[0])
+                .bind(member.digest())
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(Ok(outcome))
+            })
+        })
+        .await?
+    }
+
+    async fn move_entry_to_global(
+        &self,
+        org: &OrgId,
+        name: &CatalogName,
+        actor: &AuditActor,
+    ) -> anyhow::Result<MoveToGlobalOutcome> {
+        let scopes = [org.as_str()];
+        let keys = [name.key()];
+        let global = CatalogScope::Global.sql_key();
+        for _ in 0..RENAME_ATTEMPTS {
+            // `None` is a lost race for the global name.
+            let attempt: Option<MoveToGlobalOutcome> =
+                retry("move_descriptor_entry_to_global", || {
+                    Box::pin(async {
+                        let mut tx = self.db.begin().await?;
+                        let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                            .bind(scopes[0])
+                            .bind(&keys[0])
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        // The row lock above serializes this with appends and state changes.
+                        let entry = match row {
+                            None => None,
+                            Some(row) => {
+                                let members: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                                    .bind(&scopes[..])
+                                    .bind(&keys[..])
+                                    .fetch_all(&mut *tx)
+                                    .await?;
+                                match row.parse(members) {
+                                    Ok(entry) => Some(entry),
+                                    Err(error) => return Ok(Err(error)),
+                                }
+                            }
+                        };
+                        let holder: Option<(String, String)> = sqlx::query_as(
+                            "SELECT name, state FROM descriptor_entries
+                             WHERE scope = $1 AND name_key = $2",
+                        )
+                        .bind(global)
+                        .bind(&keys[0])
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        let holder = match holder.map(parse_holder).transpose() {
+                            Ok(holder) => holder,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let outcome = move_to_global_outcome(entry, holder);
+                        let MoveToGlobalOutcome::Moved {
+                            entry,
+                            original_creator,
+                        } = &outcome
+                        else {
+                            return Ok(Ok(Some(outcome)));
+                        };
+                        // The member foreign key cascades the new scope to the members.
+                        let moved = sqlx::query(
+                            "UPDATE descriptor_entries SET scope = $3, created_by = $4
+                             WHERE scope = $1 AND name_key = $2",
+                        )
+                        .bind(scopes[0])
+                        .bind(&keys[0])
+                        .bind(global)
+                        .bind(entry.created_by.to_string())
+                        .execute(&mut *tx)
+                        .await;
+                        match moved {
+                            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                                return Ok(Ok(None));
+                            }
+                            moved => moved?,
+                        };
+                        let mut event = pipette_core::audit::new_event(
+                            actor.clone(),
+                            AuditAction::CatalogMoveToGlobal {
+                                org_id: org.clone(),
+                                name: entry.name.clone(),
+                                original_created_by: original_creator.clone(),
+                            },
+                            AuditOutcome::Succeeded,
+                        );
+                        event.org_ids.insert(org.clone());
+                        event.targets.insert(AuditTarget::Org {
+                            org_id: org.clone(),
+                        });
+                        crate::audit::append_in_transaction(&mut tx, &event).await?;
+                        tx.commit().await?;
+                        Ok(Ok(Some(outcome)))
+                    })
+                })
+                .await??;
+            if let Some(outcome) = attempt {
+                return Ok(outcome);
+            }
+        }
+        anyhow::bail!("move_descriptor_entry_to_global: racing writes kept taking the global name")
+    }
+
     async fn get_entry(
         &self,
         scope: &CatalogScope,
@@ -861,11 +1031,11 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
             return Ok(DescriptorEntryPage::default());
         }
         // A release time never changes, so the cursor can come from its own snapshot.
-        let cursor: Option<(DateTime<Utc>, String, String)> = match after {
+        let cursor: Option<(Timestamp, String, String)> = match after {
             Some(after) => {
                 let key = after.name.key();
                 let scope = after.scope.sql_key().to_owned();
-                let (release_time,): (DateTime<Utc>,) = self
+                let (release_time,): (jiff_sqlx::Timestamp,) = self
                     .db
                     .fetch_optional("find_descriptor_catalog_cursor", || {
                         sqlx::query_as(
@@ -878,7 +1048,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                     .ok_or_else(|| UnknownCursorError {
                         cursor: after.clone(),
                     })?;
-                Some((release_time, scope, key))
+                Some((release_time.to_jiff(), scope, key))
             }
             None => None,
         };
@@ -927,7 +1097,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 .bind(&runtime_types)
                 .bind(&model_types)
                 .bind(&name_prefix)
-                .bind(cursor.as_ref().map(|c| c.0))
+                .bind(cursor.as_ref().map(|c| c.0.to_sqlx()))
                 .bind(cursor.as_ref().map(|c| &c.1))
                 .bind(cursor.as_ref().map(|c| &c.2))
                 .bind(fetch)
@@ -1094,6 +1264,8 @@ async fn importer_lock_serializes_operator_state_changes_with_one_pooled_connect
 
 #[cfg(test)]
 mod tests {
+    use pipette_plan_types::DescriptorKind;
+
     use super::*;
     use crate::testing::test_db_or_skip;
 
@@ -1159,7 +1331,7 @@ mod tests {
 
         let wrong = DescriptorMember::new(
             pipette_plan_types::Runtime::AppleFoundation(Default::default()),
-            Utc::now(),
+            Timestamp::now(),
         )?;
         assert_eq!(
             store
@@ -1192,6 +1364,461 @@ mod tests {
                 .members
                 .as_ref(),
             [replacement]
+        );
+        Ok(())
+    }
+
+    /// Seed the entries for the member removal tests. Include a hand-made model
+    /// entry with three members and one entry for each refusal.
+    async fn seed_removable(store: &SqlDescriptorCatalogStore) -> anyhow::Result<DescriptorEntry> {
+        use pipette_plan_types::DescriptorEntryKind as Kind;
+        use pipette_store_testkit::{a_descriptor_entry, a_member, a_model_member};
+        let gguf = a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?;
+        let model = DescriptorEntry {
+            members: NonEmptyVec::try_new(vec![
+                gguf.clone(),
+                a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?,
+                a_model_member("mlx", "AcmeLM-MLX", "4bit")?,
+            ])?,
+            ..a_descriptor_entry("AcmeLM", Kind::HandMade, 300, gguf)?
+        };
+        let dead = a_descriptor_entry(
+            "Dead",
+            Kind::HandMade,
+            200,
+            a_member("b1", "linux-x64-rocm")?,
+        )?;
+        let entries = [
+            model.clone(),
+            dead.clone(),
+            a_descriptor_entry(
+                "Fork",
+                Kind::HandMade,
+                190,
+                a_member("b1", "linux-x64-rocm")?,
+            )?,
+            a_descriptor_entry(
+                "llamacpp-v1",
+                Kind::Stable,
+                180,
+                a_member("b1", "linux-x64-rocm")?,
+            )?,
+        ];
+        for entry in &entries {
+            assert_eq!(
+                store.create_entry(entry).await?,
+                CreateEntryOutcome::Created
+            );
+        }
+        store
+            .set_state(&dead.scope, &dead.name, DescriptorEntryState::Tombstoned)
+            .await?;
+        Ok(model)
+    }
+
+    #[rstest::rstest]
+    #[case::missing("Missing", "linux-x64-rocm", RemoveMemberOutcome::NoSuchEntry)]
+    #[case::tombstoned("Dead", "linux-x64-rocm", RemoveMemberOutcome::Tombstoned)]
+    #[case::stable(
+        "llamacpp-v1",
+        "linux-x64-rocm",
+        RemoveMemberOutcome::ImporterKind(pipette_plan_types::DescriptorEntryKind::Stable)
+    )]
+    #[case::no_member("AcmeLM", "gguf::q2_k", RemoveMemberOutcome::NoSuchMember)]
+    #[case::last_member("Fork", "linux-x64-rocm", RemoveMemberOutcome::LastMember)]
+    #[tokio::test]
+    async fn a_refused_member_removal_changes_nothing(
+        #[case] entry: &str,
+        #[case] key: &str,
+        #[case] expected: RemoveMemberOutcome,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        seed_removable(&store).await?;
+        let kind = if key.contains("::") {
+            DescriptorKind::Model
+        } else {
+            DescriptorKind::Runtime
+        };
+        let key = DescriptorMemberKey::parse_for_kind(key, kind)?;
+        let scope = CatalogScope::Global;
+        let name = CatalogName::try_new(entry)?;
+        let before = store.get_entry(&scope, &name).await?;
+        assert_eq!(store.remove_member(&scope, &name, &key).await?, expected);
+        assert_eq!(store.get_entry(&scope, &name).await?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_member_removal_keeps_the_other_positions() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let model = seed_removable(&store).await?;
+        let scope = CatalogScope::Global;
+        let [gguf, q8_0, mlx] = model.members.as_ref() else {
+            anyhow::bail!("the fixture has three members");
+        };
+
+        let outcome = store
+            .remove_member(
+                &scope,
+                &model.name,
+                &DescriptorMemberKey::parse_for_kind("gguf::q8_0", DescriptorKind::Model)?,
+            )
+            .await?;
+        let kept = DescriptorEntry {
+            members: NonEmptyVec::try_new(vec![gguf.clone(), mlx.clone()])?,
+            ..model.clone()
+        };
+        assert_eq!(
+            outcome,
+            RemoveMemberOutcome::Removed {
+                entry: kept.clone(),
+                member: Box::new(q8_0.clone()),
+            }
+        );
+        assert_eq!(store.get_entry(&scope, &model.name).await?, Some(kept));
+        assert!(
+            store
+                .find_by_digests(&[q8_0.digest().to_owned()])
+                .await?
+                .is_empty(),
+            "the removed digest still names an entry"
+        );
+
+        let appended =
+            pipette_store_testkit::a_model_member("gguf_text", "AcmeLM-Q5-GGUF", "q5_0")?;
+        store
+            .append_members(&scope, &model.name, NonEmptyVec::try_new(vec![appended])?)
+            .await?;
+        let positions: Vec<i32> = sqlx::query_scalar(
+            "SELECT position FROM descriptor_members WHERE name_key = $1 ORDER BY position",
+        )
+        .bind(model.name.key())
+        .fetch_all(test_db.db().pool())
+        .await?;
+        assert_eq!(positions, [0, 2, 3]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_the_leading_type_keeps_the_entry_readable() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let model = seed_removable(&store).await?;
+        let scope = CatalogScope::Global;
+        let q8 = DescriptorMemberKey::parse_for_kind("gguf::q8_0", DescriptorKind::Model)?;
+        let q4 = DescriptorMemberKey::parse_for_kind("gguf::q4_0", DescriptorKind::Model)?;
+        store.remove_member(&scope, &model.name, &q8).await?;
+        let RemoveMemberOutcome::Removed { entry, .. } =
+            store.remove_member(&scope, &model.name, &q4).await?
+        else {
+            anyhow::bail!("the leading member was not removed");
+        };
+        assert_eq!(entry.members.head().descriptor_type(), "mlx");
+        assert_eq!(
+            store.get_entry(&scope, &model.name).await?,
+            Some(entry.clone())
+        );
+        let page = store
+            .list_entries(
+                &DescriptorEntryFilter {
+                    scopes: [scope].into(),
+                    ..Default::default()
+                },
+                None,
+                NonZeroUsize::new(100).context("limit")?,
+            )
+            .await?;
+        assert!(page.items.contains(&entry));
+        assert!(page.unreadable.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn racing_removals_keep_the_last_member() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let model = seed_removable(&store).await?;
+        let scope = CatalogScope::Global;
+        let q8 = DescriptorMemberKey::parse_for_kind("gguf::q8_0", DescriptorKind::Model)?;
+        store.remove_member(&scope, &model.name, &q8).await?;
+        let outcomes = crate::testing::race(|n| {
+            let store = store.clone();
+            let name = model.name.clone();
+            let scope = scope.clone();
+            async move {
+                let key = DescriptorMemberKey::parse_for_kind(
+                    if n % 2 == 0 {
+                        "gguf::q4_0"
+                    } else {
+                        "mlx::4bit"
+                    },
+                    DescriptorKind::Model,
+                )?;
+                store.remove_member(&scope, &name, &key).await
+            }
+        })
+        .await?;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RemoveMemberOutcome::Removed { .. }))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let entry = store
+            .get_entry(&scope, &model.name)
+            .await?
+            .context("raced entry")?;
+        assert_eq!(entry.members.len(), 1);
+        Ok(())
+    }
+
+    /// An entry of `org` with `members`, created by an account.
+    fn an_org_entry(
+        org: &str,
+        name: &str,
+        members: Vec<DescriptorMember>,
+    ) -> anyhow::Result<DescriptorEntry> {
+        let at = jiff::Timestamp::from_second(100).context("valid time")?;
+        Ok(DescriptorEntry::new(
+            CatalogScope::Org(OrgId::try_new(org)?),
+            CatalogName::try_new(name)?,
+            DescriptorEntryKind::HandMade,
+            DescriptorEntryState::Active,
+            at,
+            at,
+            pipette_plan_types::DescriptorEntryCreator::Account(
+                pipette_plan_types::UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
+            ),
+            NonEmptyVec::try_new(members)?,
+        )?)
+    }
+
+    /// Seed the entries that the move tests use: a pinned model entry of
+    /// `org_acme` with two members, one `org_acme` entry for each refusal, and
+    /// the global entries that hold two of the names.
+    async fn seed_movable(store: &SqlDescriptorCatalogStore) -> anyhow::Result<DescriptorEntry> {
+        use pipette_store_testkit::{a_descriptor_entry, a_member, a_model_member};
+        let runtime = || a_member("b1", "linux-x64-rocm");
+        let vault = DescriptorMember::new(
+            serde_json::from_value(serde_json::json!({
+                "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
+                "url": "/vault/resources/vault_1/content", "principal_id": "org_acme",
+                "flavor": "linux-x64-rocm"
+            }))?,
+            Timestamp::now(),
+        )?;
+        let model = an_org_entry(
+            "org_acme",
+            "AcmeLM",
+            vec![
+                a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?,
+                a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?,
+            ],
+        )?;
+        let dead = an_org_entry("org_acme", "Dead", vec![runtime()?])?;
+        let gone = a_descriptor_entry("Gone", DescriptorEntryKind::HandMade, 1, runtime()?)?;
+        let entries = [
+            model.clone(),
+            dead.clone(),
+            an_org_entry("org_acme", "VaultFork", vec![vault])?,
+            an_org_entry("org_acme", "Held", vec![runtime()?])?,
+            an_org_entry("org_acme", "Gone", vec![runtime()?])?,
+            a_descriptor_entry("Held", DescriptorEntryKind::HandMade, 1, runtime()?)?,
+            gone.clone(),
+        ];
+        for entry in &entries {
+            assert_eq!(
+                store.create_entry(entry).await?,
+                CreateEntryOutcome::Created
+            );
+        }
+        for (entry, state) in [
+            (&model, DescriptorEntryState::Pinned),
+            (&dead, DescriptorEntryState::Tombstoned),
+            (&gone, DescriptorEntryState::Tombstoned),
+        ] {
+            store.set_state(&entry.scope, &entry.name, state).await?;
+        }
+        Ok(DescriptorEntry {
+            state: DescriptorEntryState::Pinned,
+            ..model
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::missing("Missing", MoveToGlobalOutcome::NoSuchEntry)]
+    #[case::tombstoned("Dead", MoveToGlobalOutcome::Tombstoned)]
+    #[case::live_holder(
+        "Held",
+        MoveToGlobalOutcome::GlobalNameTaken {
+            name: CatalogName::try_new("Held")?,
+            state: DescriptorEntryState::Active,
+        }
+    )]
+    #[case::tombstoned_holder(
+        "Gone",
+        MoveToGlobalOutcome::GlobalNameTaken {
+            name: CatalogName::try_new("Gone")?,
+            state: DescriptorEntryState::Tombstoned,
+        }
+    )]
+    #[case::vault_member(
+        "VaultFork",
+        MoveToGlobalOutcome::GlobalScope(pipette_plan_types::EntryError::GlobalVaultSource)
+    )]
+    #[tokio::test]
+    async fn a_refused_move_to_global_changes_nothing(
+        #[case] entry: &str,
+        #[case] expected: MoveToGlobalOutcome,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        seed_movable(&store).await?;
+        let org_id = OrgId::try_new("org_acme")?;
+        let org = CatalogScope::Org(org_id.clone());
+        let name = CatalogName::try_new(entry)?;
+        let before = (
+            store.get_entry(&org, &name).await?,
+            store.get_entry(&CatalogScope::Global, &name).await?,
+        );
+        assert_eq!(
+            store
+                .move_entry_to_global(
+                    &org_id,
+                    &name,
+                    &pipette_plan_types::AuditActor::Unverified { claimed_id: None }
+                )
+                .await?,
+            expected
+        );
+        let after = (
+            store.get_entry(&org, &name).await?,
+            store.get_entry(&CatalogScope::Global, &name).await?,
+        );
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_move_to_global_keeps_the_members_and_frees_the_org_name() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let model = seed_movable(&store).await?;
+        let org_id = OrgId::try_new("org_acme")?;
+        let positions = || async {
+            sqlx::query_as::<_, (String, i32, String)>(
+                "SELECT scope, position, digest FROM descriptor_members
+                 WHERE name_key = $1 ORDER BY scope, position",
+            )
+            .bind(model.name.key())
+            .fetch_all(test_db.db().pool())
+            .await
+        };
+        let before = positions().await?;
+        assert!(before.iter().all(|(scope, ..)| scope == "org_acme"));
+
+        let outcome = store
+            .move_entry_to_global(
+                &org_id,
+                &model.name,
+                &pipette_plan_types::AuditActor::Unverified { claimed_id: None },
+            )
+            .await?;
+
+        let expected = DescriptorEntry {
+            scope: CatalogScope::Global,
+            created_by: pipette_plan_types::DescriptorEntryCreator::Operator,
+            ..model.clone()
+        };
+        assert_eq!(
+            outcome,
+            MoveToGlobalOutcome::Moved {
+                entry: expected.clone(),
+                original_creator: model.created_by.clone(),
+            }
+        );
+        assert_eq!(
+            store.get_entry(&CatalogScope::Global, &model.name).await?,
+            Some(expected)
+        );
+        assert_eq!(store.get_entry(&model.scope, &model.name).await?, None);
+        let moved: Vec<_> = before
+            .into_iter()
+            .map(|(_, position, digest)| (String::new(), position, digest))
+            .collect();
+        assert_eq!(positions().await?, moved);
+        let again = an_org_entry(
+            "org_acme",
+            "AcmeLM",
+            vec![pipette_store_testkit::a_member("b1", "linux-x64-rocm")?],
+        )?;
+        assert_eq!(
+            store.create_entry(&again).await?,
+            CreateEntryOutcome::Created
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn racing_moves_to_global_give_the_name_to_one_org() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let orgs = ["org_a", "org_b"];
+        for org in orgs {
+            let member = pipette_store_testkit::a_member("b1", "linux-x64-rocm")?;
+            store
+                .create_entry(&an_org_entry(org, "Shared", vec![member])?)
+                .await?;
+        }
+        let name = CatalogName::try_new("Shared")?;
+        let outcomes = crate::testing::race(|n| {
+            let store = store.clone();
+            let name = name.clone();
+            async move {
+                let org_id = OrgId::try_new(orgs[n % 2])?;
+                store
+                    .move_entry_to_global(
+                        &org_id,
+                        &name,
+                        &pipette_plan_types::AuditActor::Unverified { claimed_id: None },
+                    )
+                    .await
+            }
+        })
+        .await?;
+        let moved = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, MoveToGlobalOutcome::Moved { .. }))
+            .count();
+        assert_eq!(moved, 1, "{outcomes:?}");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                MoveToGlobalOutcome::Moved { .. }
+                    | MoveToGlobalOutcome::NoSuchEntry
+                    | MoveToGlobalOutcome::GlobalNameTaken { .. }
+            )),
+            "{outcomes:?}"
+        );
+        let held: Vec<_> = futures::future::try_join_all(orgs.map(|org| {
+            let store = store.clone();
+            let name = name.clone();
+            async move {
+                let scope = CatalogScope::Org(OrgId::try_new(org)?);
+                anyhow::Ok(store.get_entry(&scope, &name).await?.is_some())
+            }
+        }))
+        .await?;
+        assert_eq!(held.iter().filter(|held| **held).count(), 1, "{held:?}");
+        assert!(
+            store
+                .get_entry(&CatalogScope::Global, &name)
+                .await?
+                .is_some()
         );
         Ok(())
     }
@@ -1386,13 +2013,13 @@ mod tests {
         sqlx::query("INSERT INTO descriptor_entries (name_key, name, kind, state, runtime_type, release_time, created_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
             .bind(legacy.name.key()).bind(legacy.name.as_str()).bind(legacy.kind.to_string())
             .bind(legacy.state.to_string()).bind(member.descriptor_type())
-            .bind(legacy.release_time).bind(legacy.created_at).bind(legacy.created_by.to_string())
+            .bind(legacy.release_time.to_sqlx()).bind(legacy.created_at.to_sqlx()).bind(legacy.created_by.to_string())
             .execute(db.pool()).await?;
         let descriptor =
             pipette_plan_types::canonical_json(&serde_json::to_value(member.descriptor())?);
         sqlx::query("INSERT INTO descriptor_members (name_key, position, flavor, digest, descriptor, added_at) VALUES ($1,0,$2,$3,$4,$5)")
             .bind(legacy.name.key()).bind(member.flavor()).bind(member.digest())
-            .bind(descriptor).bind(member.added_at()).execute(db.pool()).await?;
+            .bind(descriptor).bind(member.added_at().to_sqlx()).execute(db.pool()).await?;
         Ok(legacy)
     }
 

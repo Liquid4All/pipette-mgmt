@@ -2,7 +2,7 @@
 //! is an index entry plus a gate, never the bytes, and is immutable: a plan
 //! carries its id in a URL, so it must never come to mean something else.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
@@ -199,7 +199,7 @@ pub struct VaultResource {
     /// from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<VaultOrigin>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl From<VaultResource> for pipette_plan_types::VaultResource {
@@ -280,7 +280,7 @@ impl VaultResource {
         name: NonEmptyTrimmedString,
         owner: VaultOwner,
         artifact: VaultArtifact<FoundBlob>,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Vec<Self>, VaultObjectKeyError> {
         let files = artifact.map(|_, blob| NewFile {
             filename: blob.file.filename,
@@ -298,7 +298,7 @@ impl VaultResource {
     pub fn from_import(
         owner: VaultOwner,
         artifact: VaultArtifact<ImportedBlob>,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Vec<Self>, ImportRecordError> {
         let files = artifact.try_map(|_, blob| {
             Ok::<_, ImportRecordError>(NewFile {
@@ -318,7 +318,7 @@ impl VaultResource {
     fn mint(
         owner: VaultOwner,
         artifact: VaultArtifact<NewFile>,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Vec<Self>, VaultObjectKeyError> {
         let minted = artifact.map(|_, new| {
             let file = VaultStoredFile {
@@ -426,7 +426,7 @@ mod tests {
             NonEmptyTrimmedString::try_new("acme LFM2-VL-3B q4")?,
             owner,
             artifact,
-            Utc::now(),
+            Timestamp::now(),
         )?)
     }
 
@@ -642,7 +642,7 @@ mod tests {
             model: blob("m.gguf", 'a')?,
             mmproj: blob("p.gguf", 'b')?,
         });
-        let records = VaultResource::from_import(owner.clone(), artifact, Utc::now())?;
+        let records = VaultResource::from_import(owner.clone(), artifact, Timestamp::now())?;
         let [model, mmproj] = records.as_slice() else {
             anyhow::bail!("expected two records, got {records:?}");
         };
@@ -713,7 +713,7 @@ mod tests {
             bytes: 9,
             artifact: None,
             origin: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let mut stored = serde_json::to_value(&resource)?;
         if let Some(fields) = stored.as_object_mut() {

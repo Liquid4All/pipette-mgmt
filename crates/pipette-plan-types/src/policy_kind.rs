@@ -28,7 +28,7 @@ pub enum PolicyKind {
     /// A run that swapped; a cell still flagged is marked failed.
     Swap,
     /// A result whose standard deviation is more than `percent` of its value;
-    /// a cell still flagged keeps its result.
+    /// a cell still flagged is marked failed.
     Spread,
     /// A run its device reported failed with one of the policy's `codes`; a
     /// cell still flagged keeps its result.

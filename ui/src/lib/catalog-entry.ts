@@ -35,18 +35,18 @@ export function stateActions(state: DescriptorEntryState):
 /** The organization where a campaign page's reader may name runtimes. */
 export interface CatalogOrg {
   id: string;
-  /** The organization as the reader knows it: its slug, else its name in the overview, else its id. */
+  /** The display name of the organization, else its name in the overview, else its id. */
   label: string;
 }
 
 /**
  * The campaign's catalog organization (`catalog_org_id`) with its label, or null where the reader may name nothing.
- * `slugOf` gives the slug of an organization that the reader knows already.
+ * `nameOf` gives the display name of an organization that the reader knows already.
  */
 export function catalogOrgOf(detail: Pick<NamedCampaignOverview, "catalog_org_id" | "names">,
-                             slugOf: (org_id: string) => string | null): CatalogOrg | null {
+                             nameOf: (org_id: string) => string | null): CatalogOrg | null {
   const id = detail.catalog_org_id;
-  return id ? { id, label: slugOf(id) ?? detail.names?.[id] ?? id } : null;
+  return id ? { id, label: nameOf(id) ?? detail.names?.[id] ?? id } : null;
 }
 
 /** Each digest's ranked live names, as `/by-digest` gives them for the reader. */

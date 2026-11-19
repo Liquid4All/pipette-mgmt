@@ -12,42 +12,35 @@ use pipette_plan_types::{
 use pipette_store::{DescriptorCatalogStore, DigestHit, OrgStore};
 
 /// The catalog scopes that one reader can read. Every reader reads the global
-/// scope. A member of an organization reads the entries of that organization
-/// and of no other. A holder of `edit_any_catalog` reads the entries of every
-/// organization.
+/// scope and its own organization. A holder of `edit_any_catalog` also reads
+/// the entries of every other organization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CatalogReadScope {
-    /// A reader that belongs to no organization reads the global scope only.
-    Unaffiliated,
-    /// A member reads the global scope and its own organization.
-    Org(OrgId),
-    /// A reader that reads every organization. `own_org` is the organization
-    /// that the reader belongs to, if any.
-    EveryOrg { own_org: Option<OrgId> },
+pub struct CatalogReadScope {
+    /// The organization that the reader belongs to, if any.
+    pub own_org: Option<OrgId>,
+    /// Whether the reader reads every organization.
+    pub every_org: bool,
 }
 
 impl CatalogReadScope {
-    pub fn can_read(&self, scope: &CatalogScope) -> bool {
-        match (self, scope) {
-            (_, CatalogScope::Global) | (Self::EveryOrg { .. }, CatalogScope::Org(_)) => true,
-            (Self::Org(own), CatalogScope::Org(id)) => own == id,
-            (Self::Unaffiliated, CatalogScope::Org(_)) => false,
+    /// A reader of the global scope and of `own_org` only.
+    pub fn own(own_org: Option<OrgId>) -> Self {
+        Self {
+            own_org,
+            every_org: false,
         }
     }
 
-    /// The organization that the reader belongs to, or `None` for a reader in
-    /// no organization.
-    pub fn own_org(&self) -> Option<&OrgId> {
-        match self {
-            Self::Org(id) => Some(id),
-            Self::EveryOrg { own_org } => own_org.as_ref(),
-            Self::Unaffiliated => None,
+    pub fn can_read(&self, scope: &CatalogScope) -> bool {
+        match scope {
+            CatalogScope::Global => true,
+            CatalogScope::Org(id) => self.every_org || self.is_own(id),
         }
     }
 
     /// Whether `id` is the reader's own organization.
     fn is_own(&self, id: &OrgId) -> bool {
-        self.own_org() == Some(id)
+        self.own_org.as_ref() == Some(id)
     }
 
     /// Every scope that this reader can read, for a list filter.
@@ -55,21 +48,17 @@ impl CatalogReadScope {
         &self,
         orgs: &dyn OrgStore,
     ) -> anyhow::Result<BTreeSet<CatalogScope>> {
-        let mut scopes = BTreeSet::from([CatalogScope::Global]);
-        match self {
-            Self::Unaffiliated => {}
-            Self::Org(id) => {
-                scopes.insert(CatalogScope::Org(id.clone()));
-            }
-            Self::EveryOrg { own_org } => {
-                scopes.extend(own_org.clone().map(CatalogScope::Org));
-                scopes.extend(
-                    orgs.list_orgs()
-                        .await?
-                        .into_iter()
-                        .map(|org| CatalogScope::Org(org.org_id)),
-                );
-            }
+        let mut scopes: BTreeSet<CatalogScope> = [CatalogScope::Global]
+            .into_iter()
+            .chain(self.own_org.clone().map(CatalogScope::Org))
+            .collect();
+        if self.every_org {
+            scopes.extend(
+                orgs.list_orgs()
+                    .await?
+                    .into_iter()
+                    .map(|org| CatalogScope::Org(org.org_id)),
+            );
         }
         Ok(scopes)
     }
@@ -119,7 +108,7 @@ impl NameView {
         read: CatalogReadScope,
         scopes: impl IntoIterator<Item = &'a CatalogScope>,
     ) -> anyhow::Result<Self> {
-        let shadowing = match read.own_org() {
+        let shadowing = match &read.own_org {
             Some(org_id) => catalog.live_entries_in_org(org_id).await?,
             None => Vec::new(),
         };
@@ -140,6 +129,22 @@ impl NameView {
                 .collect()
         };
         Ok(Self::new(read, shadowing, slugs))
+    }
+
+    /// Preserve shadowing by live own-org entries already read for a response,
+    /// even if they were tombstoned before the live names were loaded.
+    pub fn with_entries<'a>(
+        mut self,
+        entries: impl IntoIterator<Item = &'a DescriptorEntry>,
+    ) -> Self {
+        self.shadowing.extend(
+            entries
+                .into_iter()
+                .filter(|entry| entry.state != DescriptorEntryState::Tombstoned)
+                .filter(|entry| entry.scope.org_id().is_some_and(|id| self.read.is_own(id)))
+                .map(|entry| entry.name.key()),
+        );
+        self
     }
 
     /// The name of an entry as this reader sees it, or `None` when the reader
@@ -284,8 +289,8 @@ pub async fn resolve(
 /// tombstone in an earlier scope, so a tombstoned org name falls back to a
 /// live global name. If no live entry exists, return the tombstone so plan
 /// resolution can give a distinct refusal instead of "unknown name".
-/// The plan caller supplies `CatalogReadScope::Org(plan_org)` or
-/// `Unaffiliated`, rather than the filer's broader read permissions.
+/// The plan caller supplies `CatalogReadScope::own(plan_org)`, rather than
+/// the filer's broader read permissions.
 pub async fn resolve_for_plan(
     catalog: &dyn DescriptorCatalogStore,
     orgs: &dyn OrgStore,
@@ -294,8 +299,9 @@ pub async fn resolve_for_plan(
 ) -> anyhow::Result<Option<DescriptorEntry>> {
     let scopes = match &name.qualifier {
         None => read
-            .own_org()
-            .map(|id| CatalogScope::Org(id.clone()))
+            .own_org
+            .clone()
+            .map(CatalogScope::Org)
             .into_iter()
             .chain([CatalogScope::Global])
             .collect(),
@@ -332,6 +338,7 @@ fn consider_for_plan(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use rstest::rstest;
 
     use pipette_core::{
@@ -354,7 +361,7 @@ mod tests {
     fn plan_lookup_entry(scope: CatalogScope, state: State) -> anyhow::Result<DescriptorEntry> {
         use pipette_plan_types::{DescriptorEntryCreator, DescriptorMember, NonEmptyVec};
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let member = DescriptorMember::new(
             serde_json::from_value(serde_json::json!({"type": "apple_foundation"}))?,
             now,
@@ -445,7 +452,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new("acme")?,
             pipette_plan_types::NonEmptyTrimmedString::try_new("Acme")?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         stores.orgs.put_org(&org).await?;
         stores
@@ -464,7 +471,7 @@ mod tests {
         let beta = Organization::new(
             OrgSlug::try_new("beta")?,
             pipette_plan_types::NonEmptyTrimmedString::try_new("Beta")?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         stores.orgs.put_org(&beta).await?;
         stores
@@ -481,6 +488,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collected_entries_keep_shadowing_after_an_org_tombstone() -> anyhow::Result<()> {
+        let Some((_db, _dir, stores, org_id)) = plan_lookup_stores().await? else {
+            return Ok(());
+        };
+        let catalog = stores
+            .descriptor_catalog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
+        let read = CatalogReadScope::own(Some(org_id.clone()));
+        let scopes = read.readable_scopes(&*stores.orgs).await?;
+        let page = catalog
+            .list_entries(
+                &pipette_store::DescriptorEntryFilter {
+                    scopes: scopes.clone(),
+                    states: BTreeSet::from([State::Pinned, State::Active]),
+                    ..Default::default()
+                },
+                None,
+                std::num::NonZeroUsize::new(10).context("nonzero page limit")?,
+            )
+            .await?;
+        assert_eq!(page.items.len(), 2);
+        catalog
+            .set_state(
+                &CatalogScope::Org(org_id),
+                &CatalogName::try_new("x")?,
+                State::Tombstoned,
+            )
+            .await?;
+        let view = NameView::load(&**catalog, &*stores.orgs, read, &scopes).await?;
+        let global = page
+            .items
+            .iter()
+            .find(|entry| entry.scope == CatalogScope::Global)
+            .ok_or_else(|| anyhow::anyhow!("global entry missing"))?;
+        assert_eq!(
+            view.display_name(&global.scope, &global.name)
+                .map(|name| name.to_string()),
+            Some("x".into())
+        );
+        let view = view.with_entries(&page.items);
+        let mut shown: Vec<_> = page
+            .items
+            .iter()
+            .filter_map(|entry| view.display_name(&entry.scope, &entry.name))
+            .map(|name| name.to_string())
+            .collect();
+        shown.sort();
+        assert_eq!(shown, ["global/x", "x"]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unaffiliated_plan_uses_global_names_only() -> anyhow::Result<()> {
         let Some((_db, _dir, stores, _org_id)) = plan_lookup_stores().await? else {
             return Ok(());
@@ -489,7 +549,7 @@ mod tests {
             .descriptor_catalog
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
-        let read = CatalogReadScope::Unaffiliated;
+        let read = CatalogReadScope::own(None);
         let bare = "x".parse()?;
         let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &bare).await?;
         assert_eq!(
@@ -515,7 +575,7 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("catalog store unavailable"))?;
         let name = "x".parse()?;
-        let read = CatalogReadScope::Org(org_id.clone());
+        let read = CatalogReadScope::own(Some(org_id.clone()));
         let found = resolve_for_plan(&**catalog, &*stores.orgs, &read, &name).await?;
         assert_eq!(
             found.as_ref().map(|entry| &entry.scope),
@@ -570,12 +630,16 @@ mod tests {
     /// (`none`), or a reader of every organization (`every`).
     fn reader(word: &str) -> anyhow::Result<CatalogReadScope> {
         match word {
-            "acme" => Ok(CatalogReadScope::Org(OrgId::try_new(ACME)?)),
-            "beta" => Ok(CatalogReadScope::Org(OrgId::try_new(BETA)?)),
-            "none" => Ok(CatalogReadScope::Unaffiliated),
-            "every" => Ok(CatalogReadScope::EveryOrg { own_org: None }),
-            "every_acme" => Ok(CatalogReadScope::EveryOrg {
+            "acme" => Ok(CatalogReadScope::own(Some(OrgId::try_new(ACME)?))),
+            "beta" => Ok(CatalogReadScope::own(Some(OrgId::try_new(BETA)?))),
+            "none" => Ok(CatalogReadScope::own(None)),
+            "every" => Ok(CatalogReadScope {
+                own_org: None,
+                every_org: true,
+            }),
+            "every_acme" => Ok(CatalogReadScope {
                 own_org: Some(OrgId::try_new(ACME)?),
+                every_org: true,
             }),
             other => anyhow::bail!("unknown test reader {other}"),
         }
@@ -817,7 +881,7 @@ mod tests {
         let beta = pipette_core::organization::Organization::new(
             OrgSlug::try_new("beta")?,
             pipette_plan_types::NonEmptyTrimmedString::try_new("beta")?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         orgs.put_org(&beta).await?;
         let scopes = reader("every_acme")?.readable_scopes(&orgs).await?;
@@ -837,7 +901,10 @@ mod tests {
     #[test]
     fn other_org_hits_sort_by_slug_then_name() -> anyhow::Result<()> {
         let view = NameView::new(
-            CatalogReadScope::EveryOrg { own_org: None },
+            CatalogReadScope {
+                own_org: None,
+                every_org: true,
+            },
             Vec::new(),
             HashMap::from([
                 (OrgId::try_new(ACME)?, OrgSlug::try_new("a")?),

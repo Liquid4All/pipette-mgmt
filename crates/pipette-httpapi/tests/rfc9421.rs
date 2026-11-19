@@ -347,7 +347,7 @@ async fn a_small_order_key_cannot_be_signed_for() -> anyhow::Result<()> {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let key_id = json_str(&body_json(resp).await?, "key_id")?.to_string();
 
-    let created = chrono::Utc::now().timestamp();
+    let created = jiff::Timestamp::now().as_second();
     let headers = vec![
         ("Host", TEST_AUTHORITY.to_string()),
         (
@@ -392,7 +392,7 @@ async fn a_signature_for_another_authority_is_refused(
         "GET",
         "/api/v1/users/me",
         None,
-        chrono::Utc::now().timestamp(),
+        jiff::Timestamp::now().as_second(),
     )?;
     let resp = request_with_headers(&state, "GET", "/api/v1/users/me", &headers).await?;
     assert_eq!(resp.status(), expected);

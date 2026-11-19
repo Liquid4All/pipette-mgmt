@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use chrono::{DateTime, Duration, SubsecRound, Utc};
+use jiff::{SignedDuration, Timestamp};
 use rstest::rstest;
 
 use pipette_plan_types::{CatalogImportRuns, CatalogName, UserPermission};
@@ -42,7 +42,7 @@ impl CatalogImportRunStore for EmptyRuns {
         _id: &str,
         _command: &str,
         _target: Option<&CatalogName>,
-        _at: DateTime<Utc>,
+        _at: Timestamp,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -50,7 +50,7 @@ impl CatalogImportRunStore for EmptyRuns {
     async fn finish_run(
         &self,
         _id: &str,
-        _at: DateTime<Utc>,
+        _at: Timestamp,
         _finish: &CatalogImportRunFinish,
     ) -> anyhow::Result<()> {
         Ok(())
@@ -123,13 +123,17 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
         .catalog_import_runs
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("the SQL state has no catalog import run store"))?;
-    let now = Utc::now().trunc_subsecs(6);
-    let old = now - Duration::days(3);
+    let now = Timestamp::now().round(
+        jiff::TimestampRound::new()
+            .smallest(jiff::Unit::Microsecond)
+            .mode(jiff::RoundMode::Trunc),
+    )?;
+    let old = now - SignedDuration::from_hours(3 * 24);
     store.start_run("old-success", "import", None, old).await?;
     store
         .finish_run(
             "old-success",
-            old + Duration::minutes(1),
+            old + SignedDuration::from_mins(1),
             &CatalogImportRunFinish::default(),
         )
         .await?;
@@ -138,7 +142,7 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
         store
             .finish_run(
                 id,
-                now + Duration::minutes(1),
+                now + SignedDuration::from_mins(1),
                 &CatalogImportRunFinish {
                     entries_hidden: 2,
                     unclassified_assets: vec!["b1/unknown.tar.gz".into()],
@@ -149,12 +153,17 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
             .await?;
     }
     store
-        .start_run("refresh", "refresh", None, now + Duration::minutes(2))
+        .start_run(
+            "refresh",
+            "refresh",
+            None,
+            now + SignedDuration::from_mins(2),
+        )
         .await?;
     store
         .finish_run(
             "refresh",
-            now + Duration::minutes(3),
+            now + SignedDuration::from_mins(3),
             &CatalogImportRunFinish::default(),
         )
         .await?;
@@ -172,10 +181,15 @@ async fn recent_runs_include_refreshes_but_freshness_uses_only_import_successes(
     );
     assert_eq!(
         body["last_successful_import_at"],
-        serde_json::json!(old + Duration::minutes(1))
+        serde_json::json!(old + SignedDuration::from_mins(1))
     );
     store
-        .start_run("running", "import", None, now + Duration::minutes(4))
+        .start_run(
+            "running",
+            "import",
+            None,
+            now + SignedDuration::from_mins(4),
+        )
         .await?;
     let running =
         body_json(signed_empty(state, &reader, "GET", &format!("{ROUTE}?limit=1")).await?).await?;

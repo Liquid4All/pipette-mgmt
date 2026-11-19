@@ -4,8 +4,6 @@
 
 use std::collections::HashSet;
 
-use chrono::DateTime;
-
 use pipette_core::warehouse::{MetricRow, is_system_client};
 use pipette_plan_types::{
     AnyClientRunEvidence, ClientId, ClientRunEvidence, DescriptorMemberEvidence, RunMark,
@@ -20,7 +18,7 @@ use pipette_store::{RunEvidenceFold, RunEvidenceRow, RunEvidenceStore, Warehouse
 /// file older than the `failed` column reads as a success, as
 /// `failed IS NOT TRUE` does in a warehouse query.
 pub fn rows_of(row: &MetricRow) -> Vec<RunEvidenceRow> {
-    let Some(at) = DateTime::from_timestamp_micros(row.submitted_at) else {
+    let Ok(at) = jiff::Timestamp::from_microsecond(row.submitted_at) else {
         return Vec::new();
     };
     if is_system_client(&row.client_id) || row.rescored_from.is_some() {
@@ -153,7 +151,7 @@ mod tests {
 
     use anyhow::Context;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use rstest::rstest;
 
     use pipette_core::warehouse::SYSTEM_CLIENT_ID;
@@ -165,8 +163,8 @@ mod tests {
         Ok(ClientId::try_new(id)?)
     }
 
-    fn at(micros: i64) -> anyhow::Result<DateTime<Utc>> {
-        DateTime::from_timestamp_micros(micros).context("a valid time")
+    fn at(micros: i64) -> anyhow::Result<Timestamp> {
+        jiff::Timestamp::from_microsecond(micros).context("a valid time")
     }
 
     fn mark(micros: i64, version: &str) -> anyhow::Result<Option<RunMark>> {

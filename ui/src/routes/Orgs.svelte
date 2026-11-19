@@ -6,7 +6,7 @@
   import Loaded from "../lib/components/Loaded.svelte";
   import PageHead from "../lib/components/PageHead.svelte";
   import { Loader } from "../lib/components/work.svelte";
-  import { ORG_TABLE, bySlug } from "../lib/orgs";
+  import { ORG_TABLE, byName } from "../lib/orgs";
   import { pathOf, type RouteOf } from "../lib/routes";
   import { session } from "../lib/session.svelte";
   import type { OrgView } from "../lib/api-types";
@@ -14,7 +14,7 @@
   let { route }: { route: RouteOf<"orgs"> } = $props();
 
   const read = new Loader<OrgView[]>();
-  read.run(async () => (await orgs(session.signer)).sort(bySlug));
+  read.run(async () => (await orgs(session.signer)).sort(byName));
 </script>
 
 <PageHead title="Organizations" action={session.account?.may.create_orgs

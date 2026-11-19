@@ -1,7 +1,7 @@
 //! `/api/v1/model-params`: the model parameter table, one editable row of parameter
 //! counts per model.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{ModelKey, NonEmptyTrimmedString, PositiveCount, UserId};
@@ -18,7 +18,8 @@ pub struct ModelParams {
     pub active_millions: PositiveCount,
     /// Where the counts come from, as whoever wrote the row put it.
     pub note: Option<NonEmptyTrimmedString>,
-    pub updated_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub updated_at: Timestamp,
     /// `null` on a row no account wrote: a seeded or imported one.
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub updated_by: Option<UserId>,

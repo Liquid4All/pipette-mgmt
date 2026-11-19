@@ -7,7 +7,7 @@ use anyhow::Context;
 use aws_lc_rs::signature::{ParsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD_INDIFFERENT, URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha512};
@@ -219,7 +219,7 @@ impl ClerkSignIn {
         &self,
         jwt: &str,
         spent: &ReplayCache,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<ContactEmail, AppError> {
         let malformed = || refuse("the token is not a JWT");
         let (signed, signature) = jwt.rsplit_once('.').ok_or_else(malformed)?;
@@ -243,7 +243,7 @@ impl ClerkSignIn {
         if claims.iss != format!("https://{}", self.frontend_api) {
             return Err(refuse("the token is from another Clerk instance"));
         }
-        let now_secs = now.timestamp();
+        let now_secs = now.as_second();
         if now_secs >= claims.exp.saturating_add(CLOCK_SKEW_SECS) {
             return Err(refuse("the token has expired"));
         }
@@ -286,7 +286,7 @@ impl ClerkSignIn {
         let email = ContactEmail::try_new(email.to_lowercase())
             .map_err(|_| refuse("the token's email address is not one an account can hold"))?;
 
-        let issued = DateTime::from_timestamp(claims.iat, 0).ok_or_else(malformed)?;
+        let issued = jiff::Timestamp::from_second(claims.iat).map_err(|_| malformed())?;
         match spent.claim(&Sha512::digest(&signature).into(), issued, now) {
             SignatureClaim::Fresh => Ok(email),
             SignatureClaim::Replayed => Err(refuse("the token was already used")),

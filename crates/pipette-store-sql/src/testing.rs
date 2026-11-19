@@ -5,8 +5,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::Utc;
 use futures::future::Either;
+use jiff::Timestamp;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::sync::Barrier;
@@ -197,7 +197,7 @@ pub(crate) fn a_client(client_id: ClientId, public_key: PublicKeyHex) -> anyhow:
         client_details: NonEmptyTrimmedString::try_new("details")?,
         contact_email: ContactEmail::try_new("a@b.com")?,
         status: ClientStatus::Approved,
-        registered_at: Utc::now(),
+        registered_at: Timestamp::now(),
         device_profile: Default::default(),
         capabilities: Default::default(),
     })
@@ -467,6 +467,47 @@ mod tests {
             )
         };
         assert!(has_failed_codes().await?);
+        let has_job_states = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = current_schema() AND table_name = 'campaign_group_job_states')",
+            )
+        };
+        assert!(has_job_states().await?);
+        let has_spans = || {
+            exists(
+                "SELECT to_regclass('plan_job_spans') IS NOT NULL
+                     AND to_regclass('plan_lineages') IS NOT NULL",
+            )
+        };
+        assert!(has_spans().await?);
+        let has_plan_job_rows = || exists("SELECT to_regclass('plan_job_rows') IS NOT NULL");
+        assert!(has_plan_job_rows().await?);
+        let has_plan_tags = || exists("SELECT to_regclass('plan_tags') IS NOT NULL");
+        assert!(has_plan_tags().await?);
+        let moved = crate::migrate::migrate(db, Some(44), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(44), vec![45]));
+        assert!(!has_plan_tags().await?);
+        let has_plan_jobs = || exists("SELECT to_regclass('plan_jobs') IS NOT NULL");
+        assert!(!has_plan_jobs().await?);
+        let moved = crate::migrate::migrate(db, Some(43), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(43), vec![44]));
+        assert!(has_plan_jobs().await?);
+        assert!(has_plan_job_rows().await?);
+        let moved = crate::migrate::migrate(db, Some(42), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(42), vec![43]));
+        assert!(!has_plan_job_rows().await?);
+        assert!(has_spans().await?);
+        let moved = crate::migrate::migrate(db, Some(41), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(41), vec![42]));
+        assert!(!has_spans().await?);
+        let moved = crate::migrate::migrate(db, Some(40), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(40), vec![41]));
+        assert!(has_job_states().await?);
+        let moved = crate::migrate::migrate(db, Some(39), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(39), vec![40]));
+        assert!(!has_job_states().await?);
+        assert!(has_failed_codes().await?);
         let moved = crate::migrate::migrate(db, Some(38), false).await?;
         assert_eq!((moved.to, moved.reverted), (Some(38), vec![39]));
         assert!(!has_failed_codes().await?);
@@ -638,10 +679,11 @@ mod tests {
         assert_eq!(
             (moved.to, moved.applied),
             (
-                Some(39),
+                Some(45),
                 vec![
                     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+                    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+                    44, 45
                 ]
             )
         );
@@ -674,7 +716,78 @@ mod tests {
         assert!(has_policy_state().await?);
         assert!(has_rerun_results().await?);
         assert!(has_failed_codes().await?);
+        assert!(has_plan_job_rows().await?);
+        assert!(!has_plan_jobs().await?);
         crate::migrate::check(db).await
+    }
+
+    /// Migration `0041` gives a member state an older binary kept, which has no
+    /// `triggered`, an empty one, so it reads; a state that has one keeps it.
+    #[tokio::test]
+    async fn the_triggered_migration_makes_older_member_states_read() -> anyhow::Result<()> {
+        use jiff::Timestamp;
+
+        use pipette_core::campaign::{CampaignGroup, CampaignOwner, GroupPolicyState, NewCampaign};
+        use pipette_core::types::Mint;
+        use pipette_plan_types::{CampaignId, PlanId, PolicyKind, UserId};
+        use pipette_store::{CampaignGroupStore, CampaignStore};
+
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        crate::migrate::migrate(db, Some(40), false).await?;
+        let store = crate::campaign_groups::SqlCampaignGroupStore::new(db.clone());
+        let owner = CampaignOwner::User {
+            user_id: UserId::mint(),
+        };
+        let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Timestamp::now());
+        store.create_group(&group).await?;
+        let campaigns = crate::campaigns::SqlCampaignStore::new(db.clone());
+        let mut ids = Vec::new();
+        for name in ["older", "newer"] {
+            let campaign = NewCampaign::new(name.parse()?, owner.clone())
+                .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
+            campaigns.put_campaign(&campaign).await?;
+            ids.push(campaign.campaign_id);
+        }
+        ids.sort();
+        store.add_members(&group.group_id, &ids).await?;
+        let written = [
+            r#"{"policies": [], "decided": ["job-1"], "filed": null, "refusal": null}"#,
+            r#"{"policies": [], "triggered": ["spread"], "filed": null, "refusal": null}"#,
+        ];
+        for (campaign_id, state) in ids.iter().zip(written) {
+            sqlx::query(
+                "UPDATE campaign_group_members SET policy_state = $2 WHERE campaign_id = $1",
+            )
+            .bind(campaign_id.as_str())
+            .bind(state)
+            .execute(db.pool())
+            .await?;
+        }
+        let read = || async {
+            let states: Vec<(CampaignId, Result<Option<GroupPolicyState>, String>)> = store
+                .policy_states(&group.group_id)
+                .await?
+                .into_iter()
+                .map(|member| (member.campaign_id, member.policy_state.map_err(|e| e.key)))
+                .collect();
+            anyhow::Ok(states)
+        };
+        assert!(read().await?[0].1.is_err());
+
+        crate::migrate::migrate(db, None, false).await?;
+        let newer = GroupPolicyState {
+            triggered: [PolicyKind::Spread].into(),
+            ..GroupPolicyState::default()
+        };
+        assert_eq!(
+            read().await?,
+            [
+                (ids[0].clone(), Ok(Some(GroupPolicyState::default()))),
+                (ids[1].clone(), Ok(Some(newer)))
+            ]
+        );
+        Ok(())
     }
 
     /// Migration `0039` gives a stored failed policy and a member state's
@@ -685,7 +798,7 @@ mod tests {
     /// takes the codes off.
     #[tokio::test]
     async fn the_failed_codes_migration_keeps_what_failed_re_ran() -> anyhow::Result<()> {
-        use chrono::Utc;
+        use jiff::Timestamp;
 
         use pipette_core::campaign::{CampaignGroup, CampaignOwner, GroupPolicyState, NewCampaign};
         use pipette_core::types::Mint;
@@ -693,7 +806,7 @@ mod tests {
             CampaignGroupId, CampaignGroupPolicy, CampaignId, FailureCode, PlanId, PolicyKind,
             PolicySettings, UserId,
         };
-        use pipette_store::{CampaignGroupStore, CampaignStore};
+        use pipette_store::{CampaignGroupStore, CampaignStore, JobStateChanges};
 
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
@@ -701,13 +814,13 @@ mod tests {
         let owner = CampaignOwner::User {
             user_id: UserId::mint(),
         };
-        let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Utc::now());
-        let listing = CampaignGroup::new("aa-listed".parse()?, owner.clone(), Utc::now());
+        let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Timestamp::now());
+        let listing = CampaignGroup::new("aa-listed".parse()?, owner.clone(), Timestamp::now());
         store.create_group(&group).await?;
         store.create_group(&listing).await?;
         let (group_id, listing_id) = (group.group_id, listing.group_id);
         let campaign = NewCampaign::new("nightly".parse()?, owner)
-            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
         crate::campaigns::SqlCampaignStore::new(db.clone())
             .put_campaign(&campaign)
             .await?;
@@ -768,7 +881,8 @@ mod tests {
                 .set_policy_state(
                     &group_id,
                     &campaign_id,
-                    &state(&[&stored, &spread, &smaller])
+                    &state(&[&stored, &spread, &smaller]),
+                    &JobStateChanges::default(),
                 )
                 .await?
         );
@@ -828,7 +942,8 @@ mod tests {
                 .set_policy_state(
                     &group_id,
                     &campaign_id,
-                    &state(&[&mixed, &spread, &smaller])
+                    &state(&[&mixed, &spread, &smaller]),
+                    &JobStateChanges::default(),
                 )
                 .await?
         );
@@ -948,6 +1063,9 @@ mod tests {
 
         crate::migrate::migrate(db, None, false).await?;
         assert_eq!(body().await?, before);
+        // A migration below 0042 drops the spans. Write the fixture again
+        // through the current writer.
+        store.put_plan(&manifest).await?;
         assert_eq!(store.get_plan(&plan_id).await?, Some(manifest));
         assert_eq!(store.get_plan_notes(&plan_id).await?.note.as_deref(), note);
         Ok(())
@@ -1115,11 +1233,14 @@ mod tests {
             .fetch_all(db.pool())
             .await?;
         assert_eq!(flagged, ["job-held"]);
-        let deadline: Option<chrono::DateTime<chrono::Utc>> =
+        let deadline: Option<jiff_sqlx::Timestamp> =
             sqlx::query_scalar("SELECT expires_at FROM queue_eligibility")
                 .fetch_one(db.pool())
                 .await?;
-        assert_eq!(deadline, Some("2026-12-01T00:00:00Z".parse()?));
+        assert_eq!(
+            deadline.map(jiff_sqlx::Timestamp::to_jiff),
+            Some("2026-12-01T00:00:00Z".parse()?)
+        );
         Ok(())
     }
 

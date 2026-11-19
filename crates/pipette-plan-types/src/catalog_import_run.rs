@@ -1,6 +1,6 @@
 //! The recorded results of catalog imports and refreshes.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// The catalog command that a run executed.
@@ -54,8 +54,10 @@ impl From<CatalogImportResult> for CatalogImportOutcome {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CatalogImportRun {
     pub id: String,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub started_at: Timestamp,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub finished_at: Option<Timestamp>,
     pub command: CatalogImportCommand,
     pub source: String,
     pub target_name: Option<String>,
@@ -74,7 +76,8 @@ pub struct CatalogImportRun {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CatalogImportRuns {
     pub items: Vec<CatalogImportRun>,
-    pub last_successful_import_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub last_successful_import_at: Option<Timestamp>,
 }
 
 /// The number of newest catalog runs to read.

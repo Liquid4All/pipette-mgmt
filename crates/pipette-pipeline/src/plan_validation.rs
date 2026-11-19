@@ -6,7 +6,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroUsize;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use toml::de::{DeTable, DeValue};
@@ -199,7 +199,7 @@ pub async fn check(
     ctx: &IngestContext<'_>,
     submission: Submission,
     expansion: Expansion,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<PlanValidation, IngestError> {
     let Expansion { bodies, warnings } = expansion;
     let warnings: Vec<_> = warnings.into_iter().chain(submission.warnings).collect();
@@ -505,7 +505,7 @@ mod tests {
         else {
             anyhow::bail!("the document was refused");
         };
-        Ok(check(&ctx, submission, expansion, Utc::now()).await?)
+        Ok(check(&ctx, submission, expansion, Timestamp::now()).await?)
     }
 
     #[test]

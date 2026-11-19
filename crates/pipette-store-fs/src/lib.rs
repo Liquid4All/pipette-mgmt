@@ -141,6 +141,7 @@ pub fn build_local_fs_stores(config: &Config, todo: Arc<dyn TodoStore>) -> anyho
         plans: Arc::new(LocalFsPlanStore::new(data_dir)),
         campaigns: Arc::new(LocalFsCampaignStore::new(data_dir)),
         campaign_groups: None,
+        plan_tags: None,
         model_params: Arc::new(LocalFsModelParamsStore::new(data_dir)),
         audit: None,
         descriptor_catalog: None,
@@ -995,7 +996,7 @@ impl PlanStore for LocalFsPlanStore {
                         job_id: job_id.clone(),
                         plan_id,
                         expires_at,
-                        written_at: written_at.into(),
+                        written_at: jiff::Timestamp::try_from(written_at)?,
                     });
                 }
             }
@@ -1095,7 +1096,7 @@ impl PlanStore for LocalFsPlanStore {
                     };
                     Ok(Some(PendingSourceMarker {
                         plan_id,
-                        written_at: written_at.into(),
+                        written_at: jiff::Timestamp::try_from(written_at)?,
                     }))
                 })
                 .filter_map(Result::transpose)
@@ -1789,7 +1790,7 @@ impl EvalSampleResultStore for LocalFsEvalSampleResultStore {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::client::Client;
     use pipette_core::types::{DeriveFromKey, Mint};
@@ -2264,10 +2265,7 @@ mod tests {
         assert_eq!(job_metrics.metrics[0].metric, "ttft");
         assert_eq!(job_metrics.metrics[0].value_stddev, Some(1.2));
         assert_eq!(job_metrics.metrics[1].value_stddev, None);
-        assert_eq!(
-            job_metrics.scored_at.to_rfc3339(),
-            "2025-03-10T12:02:00+00:00"
-        );
+        assert_eq!(job_metrics.scored_at.to_string(), "2025-03-10T12:02:00Z");
 
         Ok(())
     }
@@ -2578,7 +2576,7 @@ mod tests {
         let bid = BenchmarkId::try_new("prefill_throughput_256")?;
         let cid = ClientId::try_new("ev1_client1")?;
 
-        let today_key = warehouse::day_key_from_timestamp(chrono::Utc::now().timestamp_micros())?;
+        let today_key = warehouse::day_key_from_timestamp(jiff::Timestamp::now().as_microsecond())?;
         store
             .write_partition_metrics(
                 &bid,
@@ -3081,7 +3079,7 @@ parameter_prefill_tokens = 256"#,
         let record = ContentKeyRecord {
             job_id: JobId::from_uuid(uuid::Uuid::from_u128(1)),
             plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(1)),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
 
         assert!(matches!(
@@ -3489,7 +3487,7 @@ parameter_prefill_tokens = 256"#,
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("d")?,
             contact_email: pipette_plan_types::ContactEmail::try_new("t@t.com")?,
             status: pipette_core::client::ClientStatus::Pending,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         };
@@ -3522,7 +3520,7 @@ parameter_prefill_tokens = 256"#,
         // beside the client records rather than back in `[storage]`.
         let user = pipette_core::user::User::try_new(
             pipette_plan_types::ContactEmail::try_new("op@example.com")?,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         stores.users.put_user(&user).await?;
         assert!(

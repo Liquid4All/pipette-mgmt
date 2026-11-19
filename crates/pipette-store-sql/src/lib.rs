@@ -17,6 +17,8 @@ mod migrate;
 mod model_params;
 mod orgs;
 mod permissions;
+mod plan_job_spans;
+mod plan_tags;
 mod plans;
 mod queue;
 mod retry;
@@ -66,6 +68,7 @@ pub fn overlay(db: &SqlDatabase, stores: Stores) -> Stores {
         campaign_groups: Some(Arc::new(campaign_groups::SqlCampaignGroupStore::new(
             db.clone(),
         ))),
+        plan_tags: Some(Arc::new(plan_tags::SqlPlanTagStore::new(db.clone()))),
         model_params: Arc::new(model_params::SqlModelParamsStore::new(db.clone())),
         audit: Some(Arc::new(audit::SqlAuditStore::new(db.clone()))),
         descriptor_catalog: Some(Arc::new(

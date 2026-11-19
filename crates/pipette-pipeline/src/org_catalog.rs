@@ -1214,7 +1214,7 @@ sources = ["https://huggingface.co/org/repo"]
     /// an unreadable vault source counts as unknown.
     #[tokio::test]
     async fn a_run_places_vault_resources_and_counts_what_it_cannot() -> anyhow::Result<()> {
-        use chrono::Utc;
+        use jiff::Timestamp;
         use serde_json::json;
 
         use pipette_core::campaign::{CampaignOwner, NewCampaign};
@@ -1260,7 +1260,7 @@ sources = ["https://huggingface.co/org/repo"]
             .put_plan(&PlanManifest {
                 plan_id: plan_id.clone(),
                 status: PlanStatus::Active,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 submitted_by: None,
                 campaign_id: None,
                 previous_plan_id: None,
@@ -1283,7 +1283,7 @@ sources = ["https://huggingface.co/org/repo"]
             NonEmptyTrimmedString::try_new("Nightly")?,
             CampaignOwner::User { user_id: owner },
         )
-        .around(plan_id, Utc::now());
+        .around(plan_id, Timestamp::now());
         let public: HashMap<BenchmarkId, Benchmark> = [entry("prefill_throughput_256")?]
             .into_iter()
             .map(|benchmark| (benchmark.benchmark_id().clone(), benchmark))

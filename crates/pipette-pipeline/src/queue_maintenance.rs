@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use futures::stream;
 use futures::stream::StreamExt;
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::benchmark::Benchmark;
@@ -55,7 +55,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let bodies_before = todo.queue_body_reads();
     let at_start = PhaseMark::now();
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Cleared at once, so a failed run leaves no sightings a later run would
     // mistake as consecutive; GC is then delayed one interval, the safe side.
     let prior_gc_candidates = plans.read_gc_candidates().await?;
@@ -342,7 +342,7 @@ pub async fn run(
     cleanup_stale_tmp(todo, settings.tmp_max).await?;
     // Last: the passes above act on the deadlines they listed. A fresh clock, so
     // no row moves onto a horizon that passed during the run.
-    let deadlines_restamped = todo.restamp_avail_deadlines(Utc::now()).await?;
+    let deadlines_restamped = todo.restamp_avail_deadlines(Timestamp::now()).await?;
 
     [
         ("queue_passes", &at_start, &after_queue_passes),
@@ -492,7 +492,7 @@ async fn settle_expired_leases(
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     lost_lease_limit: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<(HashSet<JobId>, HashSet<JobId>, usize)> {
     let mut seen = HashSet::new();
     let mut resolved = HashSet::new();
@@ -579,7 +579,7 @@ pub async fn settle_expired_lease(
     catalog: &HashMap<BenchmarkId, Benchmark>,
     lease: &Lease,
     lost_lease_limit: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<ExpiredLease> {
     let Lease {
         job_id,
@@ -629,7 +629,7 @@ pub async fn settle_expired_lease(
 }
 
 /// The `failed_reason` of a `lease_lost` retirement.
-fn lost_lease_reason(losses: &[(ClientId, DateTime<Utc>)]) -> String {
+fn lost_lease_reason(losses: &[(ClientId, Timestamp)]) -> String {
     let mut clients: Vec<&str> = losses.iter().map(|(c, _)| c.as_str()).collect();
     clients.sort_unstable();
     clients.dedup();
@@ -660,7 +660,7 @@ pub async fn resolve_or_recycle_lease(
     job_id: &JobId,
     expires_at: ExpiresAt,
     client_id: &ClientId,
-    lease_expiry: DateTime<Utc>,
+    lease_expiry: Timestamp,
 ) -> anyhow::Result<LeaseResolution> {
     if submissions.has_record(job_id).await? {
         todo.delete_lease(job_id, expires_at, client_id, lease_expiry)
@@ -691,7 +691,7 @@ async fn expire_overdue_jobs(
     plans: &dyn PlanStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     all_keys: Vec<AvailEntry>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, usize)> {
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
@@ -746,8 +746,8 @@ async fn settle_overdue_job(
     plans: &dyn PlanStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     avail: &AvailEntry,
-    deadline: DateTime<Utc>,
-    now: DateTime<Utc>,
+    deadline: Timestamp,
+    now: Timestamp,
 ) -> anyhow::Result<Overdue> {
     // Fresh, since the lapse pass just deleted markers. An error must propagate:
     // read as "no member", it would retire a job another plan still waits on.
@@ -807,7 +807,7 @@ async fn retire_unmatchable_jobs(
     all_keys: Vec<AvailEntry>,
     flagged: &HashSet<JobId>,
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, HashSet<JobId>)> {
     let mut survivors = Vec::with_capacity(all_keys.len());
     let mut removed = HashSet::new();
@@ -849,7 +849,7 @@ async fn retire_one_if_unmatchable(
     catalog: &HashMap<BenchmarkId, Benchmark>,
     avail: &AvailEntry,
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
     let Some(body) = cached_body(todo, avail, bodies).await? else {
         return Ok(false);
@@ -913,7 +913,7 @@ async fn escalate_all_denied_jobs(
     all_keys: Vec<AvailEntry>,
     flagged: &HashSet<JobId>,
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<(Vec<AvailEntry>, HashSet<JobId>, HashSet<JobId>)> {
     let denied_by: HashMap<JobId, HashSet<ClientId>> = todo
         .list_all_denied()
@@ -985,7 +985,7 @@ async fn escalate_one_if_all_denied(
     avail: &AvailEntry,
     denied: &HashSet<ClientId>,
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
     let Some(body) = cached_body(todo, avail, bodies).await? else {
         return Ok(false);
@@ -1107,7 +1107,7 @@ async fn resolve_job_terminal(
     failure: impl Future<Output = (String, FailureCode)>,
     cause: &str,
     failure_source: FailureSource,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
     if submissions.has_record(entry.job_id()).await? {
         entry.delete(todo).await?;
@@ -1177,8 +1177,8 @@ async fn expire_one_job(
     submissions: &dyn SubmissionStore,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     avail: &AvailEntry,
-    deadline: DateTime<Utc>,
-    now: DateTime<Utc>,
+    deadline: Timestamp,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
     let Some(body) = todo.get_avail(&avail.job_id, avail.expires_at).await? else {
         return Ok(false);
@@ -1192,7 +1192,7 @@ async fn expire_one_job(
         std::future::ready((
             format!(
                 "Job expired at {} before any client completed it",
-                deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
+                deadline.strftime("%Y-%m-%dT%H:%M:%SZ")
             ),
             FailureCode::Unspecified,
         )),
@@ -1220,7 +1220,7 @@ pub async fn fail_larger_run(
     smaller: &JobId,
     benchmark_id: &BenchmarkId,
     code: FailureCode,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
     resolve_job_terminal(
         todo,
@@ -1522,7 +1522,7 @@ fn claimable_markers<'a>(
     eligible: &'a [(ClientId, JobId, ExpiresAt)],
     avail_expiries: &HashMap<JobId, ExpiresAt>,
     denied: &[(JobId, ClientId)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<&'a (ClientId, JobId, ExpiresAt)> {
     let denied: HashSet<(&JobId, &ClientId)> = denied.iter().map(|(j, c)| (j, c)).collect();
     eligible
@@ -1605,7 +1605,7 @@ mod tests {
             todo.replace_eligibility(&flagged.job_id, flagged.revision, &[])
                 .await?;
         }
-        let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+        let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         todo.claim_job(
             &job,
             ExpiresAt::Never,
@@ -1658,7 +1658,7 @@ mod tests {
             &body("sql-available"),
         )
         .await?;
-        let past = Utc::now() - chrono::Duration::hours(1);
+        let past = Timestamp::now() - jiff::SignedDuration::from_hours(1);
         let recycled = seed_leased_until(
             todo,
             "sql-recycled",
@@ -1709,7 +1709,7 @@ mod tests {
                 assert!(todo.get_avail_by_job(&overdue).await?.is_none());
                 assert_eq!(todo.backlog().await?.get(client), Some(&2));
                 assert_eq!(
-                    todo.campaign_backlog(client, Utc::now())
+                    todo.campaign_backlog(client, Timestamp::now())
                         .await?
                         .outside_campaigns,
                     2
@@ -1730,7 +1730,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let submissions = LocalFsSubmissionStore::new(dir.path().join("submissions"));
 
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let client = ClientId::try_new("client1")?;
         let todo_ref = &*todo;
         let client_ref = &client;
@@ -1787,7 +1787,7 @@ mod tests {
         };
         let submissions = pipette_store_s3::in_memory_submission_store();
 
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let client = ClientId::try_new("client1")?;
         let todo_ref = &*todo;
         let client_ref = &client;
@@ -1859,7 +1859,7 @@ mod tests {
             &JobId::try_new("job-smaller")?,
             &benchmark,
             FailureCode::AttemptTimeout,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
 
@@ -1883,7 +1883,7 @@ mod tests {
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
             contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
             status: pipette_core::client::ClientStatus::Approved,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: pipette_plan_types::DeviceProfile {
                 device_chip_model: Some(pipette_plan_types::NonEmptyTrimmedString::try_new(chip)?),
                 ..Default::default()
@@ -2069,7 +2069,7 @@ mod tests {
             &fallback,
             &denied_rows,
             &mut bodies,
-            Utc::now(),
+            Timestamp::now(),
             Duration::from_secs(60),
         )
         .await?;
@@ -2137,7 +2137,7 @@ mod tests {
                         &fixture.job,
                         ExpiresAt::Never,
                         &fixture.client.client_id,
-                        Utc::now() + chrono::Duration::hours(1)
+                        Timestamp::now() + jiff::SignedDuration::from_hours(1)
                     )
                     .await?,
                 pipette_store::ClaimResult::Claimed(_)
@@ -2172,7 +2172,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &mut bodies,
-            Utc::now(),
+            Timestamp::now(),
             Duration::from_secs(60),
         )
         .await?;
@@ -2297,7 +2297,7 @@ mod tests {
         async fn record_signature_migration(
             &self,
             _client_id: &ClientId,
-            _at: DateTime<Utc>,
+            _at: Timestamp,
         ) -> anyhow::Result<pipette_core::client::MigrationRecord> {
             Err(self.unexpected.record("record_signature_migration"))
         }
@@ -2909,12 +2909,12 @@ mod tests {
 
     // ── claimable markers ──────────────────────────────────────────────────
 
-    fn claim_now() -> DateTime<Utc> {
-        DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(1_800_000_000)
+    fn claim_now() -> Timestamp {
+        jiff::Timestamp::UNIX_EPOCH + jiff::SignedDuration::from_secs(1_800_000_000)
     }
 
     fn deadline(offset: i64) -> ExpiresAt {
-        ExpiresAt::At(claim_now() + chrono::Duration::seconds(offset))
+        ExpiresAt::At(claim_now() + jiff::SignedDuration::from_secs(offset))
     }
 
     /// The claimable markers of each client at [`claim_now`].
@@ -2970,7 +2970,7 @@ mod tests {
         todo: &dyn TodoStore,
         job: &JobId,
         client: &ClientId,
-        expiry: DateTime<Utc>,
+        expiry: Timestamp,
     ) -> anyhow::Result<()> {
         seed_leased_until(
             todo,
@@ -3204,7 +3204,7 @@ mod tests {
         let creating = PlanManifest {
             plan_id: plan_id.clone(),
             status: PlanStatus::Creating,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             submitted_by: None,
             campaign_id: None,
             previous_plan_id: None,

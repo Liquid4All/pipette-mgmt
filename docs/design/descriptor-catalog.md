@@ -115,8 +115,9 @@ members after it is created, with three limits:
 - **The end of the precedence.** A new member goes after every member that the
   entry has. A device that resolved the name before resolves it to the same
   member after.
-- **No other change.** Nothing removes or reorders a member. The only change
-  to a member is a new quantization label for a model member
+- **No reorder.** The members keep their order. An operator can remove a
+  wrong member from a hand-made entry ([below](#member-removal)). The only
+  change to a member is a new quantization label for a model member
   ([below](#renames)).
 
 A merge of two entries adds members in the same way: at the end of the target
@@ -262,6 +263,16 @@ them. They are a separate set of rules: they do not change the planner's
 capability rules, and they never reach a job. The configuration is kept in git with the rest
 of the deployment, so a rule change has a review and a history. A rule
 describes hardware, and new hardware arrives faster than server releases.
+
+Desktop MLX rules use runtime type `mlx_macos_pipette` and flavor `macos-arm64`.
+The recommended rule requires `os:macos` and `runtime:mlx`.
+MLX runs only on Apple silicon, so `runtime:mlx` also selects the architecture.
+The catalog offers the member to a Mac that reports `runtime:mlx`, with any
+MLX build. [client-integration.md](../client-integration.md) defines when a
+client reports that flag. Before you enable this rule, check that the desktop
+clients in the deployment report `runtime:mlx`. The iOS proxy reports
+descriptor build flags. These flags describe iOS app builds, and the rule does
+not test them.
 
 **A member with no rule is not offered.** The catalog offers a member to a
 device only if a rule exists and the device satisfies its clauses. So no
@@ -882,6 +893,70 @@ host CLI do it, with the permissions of the other writes
 merge, and each label change. Each one also logs the change at `info`, with the old and the new
 value.
 
+## Member removal
+
+**An operator can remove one member from a hand-made entry.** This corrects a
+wrong member without a new name for the entry. The operator gives the member
+key in the form that `catalog list` prints.
+
+**The importer owns the members of a stable or daily entry.** The catalog
+refuses a removal from those entries, and from a tombstoned entry.
+
+**An entry keeps at least one member.** The catalog refuses to remove the last
+member. To retire the whole entry, tombstone it.
+
+**The other members keep their positions and digests.** A device that resolved
+the name to another member resolves it to the same member after. A member that
+the entry gets later goes to the end.
+
+**A removal changes no stored record:**
+
+- A stored plan holds descriptors, not names, so it stays the same.
+- A job row or a result row finds its name by the descriptor digest. A row
+  that only the removed member named loses that name at once.
+- After the removal, the selector for the member does not resolve.
+
+**The audit log records each removal.** The `catalog_remove_member` event
+holds the scope, the entry name, and the key and the digest of the removed
+member.
+
+## Moves to global scope
+
+**An operator can move an org entry to global scope.** This publishes an entry
+that an organization made, with its name, to every account. The move uses the
+host CLI only, because only the host CLI writes global entries
+([below](#who-changes-the-catalog)).
+
+**The entry stays the same in one atomic step.** The entry keeps its name,
+kind, state, release time and creation time. Each member keeps its position,
+digest and added time. A device that resolved the name inside the organization
+resolves it to the same member after the move.
+
+**The catalog refuses a move in these conditions:**
+
+- The organization has no entry with the name, or its entry is tombstoned.
+- A live or tombstoned global entry holds the name.
+- The name starts with a prefix that an importer reserves in the global scope.
+- A member names a vault source. A global entry names only public artifacts
+  ([above](#scopes)).
+
+**The creator becomes `operator`.** A global entry cannot have an account as
+its creator. The `catalog_move_to_global` audit event holds the organization,
+the entry name, and the creator of the org entry.
+The move and this audit event commit in one transaction. An audit write failure
+rolls back the move, including its members and the creator change.
+
+**The org name is free after the move.** The organization has no tombstone
+for the name, so it can create a new entry with the name later. That new entry
+shadows the global entry inside the organization. An entry of another
+organization with the same name also keeps the name inside that organization.
+
+**A move changes no stored record.** A stored plan holds descriptors, not
+names. A job row or a result row finds its name by the descriptor digest, so it
+shows the global name at once.
+
+**No move goes from global scope into an organization.**
+
 ## Who changes the catalog
 
 **Who changes an entry depends on its scope.**
@@ -934,6 +1009,7 @@ the global entry:
 | `alias --scan` | adds the verified aliases for the result rows in the warehouse; `--dry-run` writes nothing |
 | `coverage` | reports how many recent result rows get a name, and why the others do not |
 | `list`, `show` | read the catalog from storage |
+| `find` | lists each live entry, in every scope, that holds a digest or the digest of a `--model` value |
 
 The file for `create` gives the name, the members and, as an option, the
 release time. Each member is the inline
@@ -1112,8 +1188,9 @@ usually come from different repositories, for example `…-GGUF` and
 `…-MLX-4bit`, each at its own commit. No check can show that they hold the same
 model. For a runtime, the same-build check compares the repository and the tag.
 For a model, the operator who creates the entry or adds a member is
-responsible. Members are append-only, as for runtimes. Only the quantization
-label of a member can change ([below](#renames)).
+responsible. New members go to the end, as for runtimes. An operator can
+remove a wrong member ([below](#member-removal)). Only the quantization label
+of a member can change ([below](#renames)).
 
 ### Public and private models
 

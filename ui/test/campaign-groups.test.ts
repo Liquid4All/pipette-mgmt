@@ -20,7 +20,7 @@ import { tableView, unsorted } from "../src/lib/table";
 import type {
   CampaignGroupPolicy, CampaignGroupPolicyPreview, CampaignGroupRerunResults, CampaignView, FailureCode,
   MemberPolicyPreview, ModelParamsGap, OwnUserView, PolicyCheckCounts, PolicyFiling, PolicyKind, PolicyMemberState,
-  PolicyRerun, PolicyRerunSummary, PrincipalOwner, SmallerFailure, UserPermission,
+  PolicyCheck, PolicyRerun, PolicyRerunSummary, PrincipalOwner, SmallerFailure, UserPermission,
 } from "../src/lib/api-types";
 import { abilitiesOf } from "./abilities";
 
@@ -130,37 +130,31 @@ describe("a group's members", () => {
 });
 
 describe("the group page", () => {
-  const draw = (who: OwnUserView, owner: PrincipalOwner, previewed: MemberPolicyPreview[] | null = null) => {
-    const preview = new Loader<CampaignGroupPolicyPreview>();
-    preview.data = previewed && { members: previewed };
-    return render(CampaignGroupBody, {
-      props: {
-        group: {
-          group_id: "group_1", name: "S26 study", owner, created_at: "2026-11-01T00:00:00Z", updated_at: "2026-11-01T00:00:00Z",
-          members: [campaign("campaign_1", owner, { name: "listed member" }), campaign("campaign_2", owner, { name: "unlisted member" })],
-        },
-        listed: [campaign("campaign_1", owner, { name: "listed member" }), campaign("campaign_3", owner, { name: "outsider" })],
-        preview, lacks: [], reader: who, names: {}, add: async () => {}, remove: async () => {},
+  const draw = (who: OwnUserView, owner: PrincipalOwner, listed?: CampaignView[]) => render(CampaignGroupBody, {
+    props: {
+      group: {
+        group_id: "group_1", name: "S26 study", owner, created_at: "2026-11-01T00:00:00Z", updated_at: "2026-11-01T00:00:00Z",
+        members: listed ?? [campaign("campaign_1", owner, { name: "listed member" }), campaign("campaign_2", owner, { name: "unlisted member" })],
       },
-    }).body;
-  };
+      listed: listed ?? [campaign("campaign_1", owner, { name: "listed member" }), campaign("campaign_3", owner, { name: "outsider" })],
+      reader: who, names: {}, add: async () => {}, remove: async () => {},
+    },
+  }).body;
 
   test("marks each policy that is on cleared or triggered per member, and counts the members every one cleared", () => {
-    const off = { ...counts("failed", 3), on: false };
+    const checks = (triggered: boolean): PolicyCheck[] => [{ kind: "swap", triggered: false }, { kind: "spread", triggered }];
     const body = draw(reader([]), mine, [
-      member("campaign_1", { checks: [counts("swap", 0), counts("spread", 6, 0, 0, 6), off], triggered: ["spread"] }),
-      member("campaign_2", { checks: [counts("swap", 0), counts("spread", 0), off] }),
-    ]);
+      campaign("campaign_1", mine, { name: "flagged", policy_checks: checks(true) }),
+      campaign("campaign_2", mine, { name: "clean", policy_checks: checks(false) }),
+      campaign("campaign_3", mine, { name: "not read yet" }),
+    ]).replace(/<!--.*?-->/g, "");
     expect(body).toContain("1 of 2 campaigns cleared on every policy that is on.");
     expect(body).toContain('<span data-state="cleared">swap cleared</span> <span data-state="triggered">spread triggered</span>');
     expect(body).toContain('<span data-state="cleared">swap cleared</span> <span data-state="cleared">spread cleared</span>');
-    // A policy that is off is not marked, whatever it flags.
-    expect(body).not.toContain("failed cleared");
-    expect(body).not.toContain("failed triggered");
   });
 
-  test("says the policy checks are being read until the preview is", () => {
-    expect(draw(reader([]), mine)).toContain("Reading the policy checks…");
+  test("counts nothing while queue-maintenance has read no member", () => {
+    expect(draw(reader([]), mine)).not.toContain("cleared on every policy");
   });
 
   test("links each member to its campaign and offers only the owner's other campaigns", () => {
@@ -206,7 +200,7 @@ describe("a group's policies", () => {
         "Re-runs a job whose device swapped memory during the run, up to 5 times. If it still swaps, the job is "
           + "marked failed.",
         "Re-runs a job whose standard deviation is over 5% of its result, up to 3 times. If it is still over, the job "
-          + "keeps its last result.",
+          + "is marked failed.",
         "Re-runs a job whose device reported a failure coded unspecified up to 2 times, runtime_error up to 2 times or "
           + "device_error up to 2 times. Its runs in a row that failed with any of these codes count toward the limit "
           + "of its last one. If it still fails, the job keeps the failure.",
@@ -238,7 +232,7 @@ describe("a group's policies", () => {
     const spread = policy("spread", 3, { settings: rule });
     expect(policyTitle(spread)).toBe("Stddev over 5% (10% under 1000 ms)");
     expect(policyText(spread)).toBe("Re-runs a job whose standard deviation is over 5% of its result, or 10% where its "
-      + "repetitions average under 1000 ms, up to 3 times. If it is still over, the job keeps its last result.");
+      + "repetitions average under 1000 ms, up to 3 times. If it is still over, the job is marked failed.");
   });
 
   test("failed reads the codes it re-runs, each with its re-runs, in its text, in the boxes' order", () => {
@@ -452,7 +446,7 @@ const counts = (kind: PolicyKind, flagged: number, rerun = 0, marked = 0, kept =
 
 const member = (campaign_id: string, fields: Partial<MemberPolicyPreview> = {}): MemberPolicyPreview => ({
   campaign_id, plan_id: null, state: "evaluated", answered_job_count: 0, waiting_job_count: 0, earliest_deadline: null,
-  deadline_passed: false, checks: [], triggered: [], rerun_job_ids: [], marked_job_ids: [], kept_job_count: 0, skipped: {},
+  deadline_passed: false, checks: [], rerun_job_ids: [], marked_job_ids: [], kept_job_count: 0, skipped: {},
   filing_plan_id: null, unclaimed_job_count: 0, missing_model_params: [], smaller_failed: [], last_filing: null,
   ...fields,
 });

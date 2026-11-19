@@ -15,7 +15,7 @@
 
 <OrgScope reference={route.org} title="Vault" action={{ href: "/app/vault/new", label: "Upload a resource" }}>
   {#snippet children(org)}
-    <VaultListing branch={{ kind: "org", org_id: org.org_id, slug: org.slug }} base={orgLink(org, "/vault")}
+    <VaultListing branch={{ kind: "org", ...org }} base={orgLink(org, "/vault")}
                   kind={kindOfPage(route.page)} />
   {/snippet}
 </OrgScope>

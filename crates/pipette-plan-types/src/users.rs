@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -90,7 +90,8 @@ pub struct User {
     #[serde(default)]
     pub account_type: UserAccountType,
     pub status: UserStatus,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// A campaign reader's campaigns, the only ones it reads, while its
     /// organization owns them; absent for every other account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,10 +107,12 @@ pub struct UserKey {
     pub public_key: PublicKeyHex,
     /// The machine the key lives on, e.g. `"work laptop"`.
     pub key_details: NonEmptyTrimmedString,
-    pub added_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub added_at: Timestamp,
     /// When the key stops signing, for a key made to sign in one browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub expires_at: Option<Timestamp>,
 }
 
 /// The `POST /api/v1/users/register` and `POST /api/v1/users/me/keys`
@@ -143,6 +146,10 @@ pub struct OwnUserView {
     /// `/api/v1/orgs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_slug: Option<OrgSlug>,
+    /// The organization's display name, which a member may not read off
+    /// `/api/v1/orgs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_display_name: Option<NonEmptyTrimmedString>,
     /// The resolved set: what the granted rights imply, expanded.
     pub permissions: UserPermissionSet,
     pub keys: Vec<UserKey>,
@@ -159,7 +166,8 @@ pub struct OwnUserView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FirstClerkSignIn {
-    pub at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub at: Timestamp,
     #[cfg_attr(feature = "schemars", schemars(with = "Vec<String>"))]
     pub prior_keys: Vec<UserKeyId>,
 }
@@ -353,13 +361,15 @@ pub struct UserPreauthKeyView {
     pub usage: UserPreauthUsage,
     /// When it stops registering keys; `null` on one the host minted without
     /// an expiry.
-    pub expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub expires_at: Option<Timestamp>,
     /// It registers nothing, and `users preauth prune` deletes it.
     pub expired: bool,
     /// Who it is for, as its minter wrote.
     pub note: Option<NonEmptyTrimmedString>,
     /// When it was minted.
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// Absent for a key the host minted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
@@ -474,7 +484,8 @@ pub struct AddUserKeyRequest {
     /// When the key stops signing, at most 30 days out: for a key made to sign
     /// in one browser. A machine's key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub expires_at: Option<Timestamp>,
 }
 
 /// `POST /api/v1/users/register/clerk` request body.

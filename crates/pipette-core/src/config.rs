@@ -8,7 +8,7 @@ use strum::IntoEnumIterator as _;
 
 use pipette_plan_types::{
     CapabilityFlag, LlamaCppFlavor, LlamacppIosPipetteFlavor, MlxIosPipetteFlavor,
-    OnnxGenaiIosPipetteFlavor, OvmsFlavor, RuntimeType,
+    MlxMacosPipetteFlavor, OnnxGenaiIosPipetteFlavor, OvmsFlavor, RuntimeType,
 };
 
 use crate::parquet_utils::WriterOpts;
@@ -435,9 +435,13 @@ impl Default for DescriptorCatalogConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfferRule {
-    /// Runtime type: `llamacpp_cli_stock_tools`, `ovms`, or a runtime that the
-    /// iOS app builds in (`llamacpp_ios_pipette`, `mlx_ios_pipette`,
-    /// `onnx_genai_ios_pipette`).
+    /// Runtime type. One of:
+    ///
+    /// - `llamacpp_cli_stock_tools`
+    /// - `ovms`
+    /// - `mlx_macos_pipette`
+    /// - a runtime that the iOS app builds in: `llamacpp_ios_pipette`,
+    ///   `mlx_ios_pipette`, or `onnx_genai_ios_pipette`
     pub runtime_type: RuntimeType,
     /// Known flavor of that runtime type.
     pub flavor: String,
@@ -518,6 +522,11 @@ impl DescriptorCatalogConfig {
                     .map(|flavor| flavor.as_str().to_owned())
                     .collect(),
             ),
+            RuntimeType::MlxMacosPipette => Some(
+                MlxMacosPipetteFlavor::iter()
+                    .map(|flavor| flavor.to_string())
+                    .collect(),
+            ),
             RuntimeType::LlamacppIosPipette => Some(
                 LlamacppIosPipetteFlavor::iter()
                     .map(|flavor| flavor.to_string())
@@ -534,7 +543,6 @@ impl DescriptorCatalogConfig {
                     .collect(),
             ),
             RuntimeType::LlamacppApkPipette
-            | RuntimeType::MlxMacosPipette
             | RuntimeType::AppleCoreAiMacosPipette
             | RuntimeType::DockerVllm
             | RuntimeType::DockerSglang
@@ -1152,7 +1160,7 @@ impl Config {
     }
 
     /// Bounds the field types cannot express. Each duration is capped at 10
-    /// years, far below where its `chrono` arithmetic breaks, so an oversized
+    /// years, far below where its `jiff` arithmetic breaks, so an oversized
     /// one fails at load rather than mid-pass. `hf_max_concurrent_requests` must
     /// exceed `hf_import_max_concurrent`, or the downloads could hold every
     /// permit, and `list_default_limit` must not exceed `list_max_limit`.
@@ -1234,11 +1242,8 @@ impl Config {
         clippy::cast_possible_wrap,
         reason = "`Config::validate` bounds the duration at 10 years, far below `i64::MAX`"
     )]
-    pub fn lease_expiry_from(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
-        now + chrono::Duration::seconds(self.plan_lease_duration_secs.get() as i64)
+    pub fn lease_expiry_from(&self, now: jiff::Timestamp) -> jiff::Timestamp {
+        now + jiff::SignedDuration::from_secs(self.plan_lease_duration_secs.get() as i64)
     }
 
     pub fn writer_opts(&self) -> WriterOpts {
@@ -1290,9 +1295,14 @@ backend = "local_fs"
         rule("llamacpp_ios_pipette", "ios-x64", IOS),
         Some("offer rule llamacpp_ios_pipette ios-x64: unknown flavor")
     )]
-    #[case::unsupported(
+    #[case::mlx_macos(rule("mlx_macos_pipette", "macos-arm64", MACOS), None)]
+    #[case::mlx_macos_unknown_flavor(
         rule("mlx_macos_pipette", "macos-x64", MACOS),
-        Some("offer rule mlx_macos_pipette macos-x64: unsupported runtime type")
+        Some("offer rule mlx_macos_pipette macos-x64: unknown flavor")
+    )]
+    #[case::unsupported(
+        rule("apple_foundation", "macos-arm64", MACOS),
+        Some("offer rule apple_foundation macos-arm64: unsupported runtime type")
     )]
     #[case::unknown_flavor(
         rule(LLAMA, "macos-riscv", MACOS),
@@ -1366,10 +1376,10 @@ backend = "local_fs"
             config.descriptor_catalog.llamacpp_min_build_age_secs,
             10_800
         );
-        // Each of the three iOS app runtimes has the one flavor `ios-arm64`.
+        // Each iOS app runtime has the flavor `ios-arm64`, and desktop MLX has `macos-arm64`.
         assert_eq!(
             config.descriptor_catalog.unruled_flavors().count(),
-            LlamaCppFlavor::known().count() + OvmsFlavor::known().count() + 3
+            LlamaCppFlavor::known().count() + OvmsFlavor::known().count() + 4
         );
         Ok(())
     }
@@ -1431,7 +1441,7 @@ backend = "local_fs"
             .join("\n");
         let config: Config = toml::from_str(&(minimal_toml("") + &block))?;
         config.validate()?;
-        assert_eq!(config.descriptor_catalog.offer_rules.len(), 2);
+        assert_eq!(config.descriptor_catalog.offer_rules.len(), 3);
         assert_eq!(
             config
                 .descriptor_catalog
@@ -1485,7 +1495,7 @@ backend = "local_fs"
         let config: Config = toml::from_str(&minimal_toml(""))?;
         assert!(config.validate().is_ok(), "default durations are valid");
 
-        // Oversized values would break chrono arithmetic downstream; validation
+        // Oversized values would break jiff arithmetic downstream; validation
         // rejects them at load.
         let config: Config =
             toml::from_str(&minimal_toml("plan_lease_duration_secs = 99999999999999"))?;

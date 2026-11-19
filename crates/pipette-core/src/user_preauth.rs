@@ -4,9 +4,9 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use getrandom::SysRng;
 use getrandom::rand_core::TryRng;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -105,10 +105,10 @@ pub struct UserPreauthKey {
     pub secret_hash: String,
     pub usage: UserPreauthUsage,
     #[serde(default)]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     #[serde(default)]
     pub note: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Who minted it over HTTP, whose authority registration checks again;
     /// `None`, and not written, for a host-minted key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,13 +116,13 @@ pub struct UserPreauthKey {
 }
 
 impl UserPreauthKey {
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_expired(&self, now: Timestamp) -> bool {
         self.expires_at.is_some_and(|at| at < now)
     }
 
     /// The key as the API lists it at `now`, without its secret: destructured,
     /// so the hash can never ride along into an answer.
-    pub fn view(self, now: DateTime<Utc>) -> pipette_plan_types::UserPreauthKeyView {
+    pub fn view(self, now: Timestamp) -> pipette_plan_types::UserPreauthKeyView {
         let expired = self.is_expired(now);
         let UserPreauthKey {
             key_id,
@@ -199,7 +199,7 @@ pub struct UserPreauthParams {
     /// The account the key admits a machine to.
     pub user_id: UserId,
     pub usage: UserPreauthUsage,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     pub note: Option<NonEmptyTrimmedString>,
 }
 
@@ -212,7 +212,7 @@ const SECRET_BYTES: usize = 32;
 /// Mint a new key against `params.user_id`: random `key_id` + high-entropy
 /// secret, hashed into the record. `MintError::IdError` is unreachable (a hex
 /// `key_id` is always valid) but propagated rather than unwrapped.
-pub fn mint(params: UserPreauthParams, now: DateTime<Utc>) -> Result<UserMintedKey, MintError> {
+pub fn mint(params: UserPreauthParams, now: Timestamp) -> Result<UserMintedKey, MintError> {
     let key_id = UserPreauthKeyId::try_new(random_hex(KEY_ID_BYTES)?)?;
     let secret = UserPreauthSecret::new(random_hex(SECRET_BYTES)?);
     let token = UserPreauthToken::new(format!("{TOKEN_PREFIX}{key_id}.{}", secret.expose()));
@@ -235,7 +235,7 @@ pub fn mint(params: UserPreauthParams, now: DateTime<Utc>) -> Result<UserMintedK
 pub fn validate(
     key: &UserPreauthKey,
     secret: &UserPreauthSecret,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<UserPreauthGrant, UserPreauthRejectionError> {
     if !secret.matches(&key.secret_hash) {
         return Err(UserPreauthRejectionError::BadSecret);
@@ -269,7 +269,7 @@ mod tests {
                 expires_at: None,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )
     }
 
@@ -359,9 +359,13 @@ mod tests {
         // An expired key with the WRONG secret reports BadSecret, not Expired —
         // status is never revealed to someone without the secret.
         let mut m = minted(UserPreauthUsage::SingleUse)?;
-        m.key.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        m.key.expires_at = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
         assert_eq!(
-            validate(&m.key, &UserPreauthSecret::new("wrong-secret"), Utc::now()),
+            validate(
+                &m.key,
+                &UserPreauthSecret::new("wrong-secret"),
+                Timestamp::now()
+            ),
             Err(UserPreauthRejectionError::BadSecret)
         );
         Ok(())
@@ -376,13 +380,13 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("parse"))?;
 
         // Valid path grants, and names the account the key was minted against.
-        let grant = validate(&m.key, &secret, Utc::now())?;
+        let grant = validate(&m.key, &secret, Timestamp::now())?;
         assert_eq!(grant.user_id, m.key.user_id);
 
         let mut expired = m.key.clone();
-        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        expired.expires_at = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
         assert_eq!(
-            validate(&expired, &secret, Utc::now()),
+            validate(&expired, &secret, Timestamp::now()),
             Err(UserPreauthRejectionError::Expired)
         );
         Ok(())
@@ -397,7 +401,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let mut key = minted(UserPreauthUsage::SingleUse)?.key;
         key.note = Some(stored.to_owned());
-        let view = key.view(Utc::now());
+        let view = key.view(Timestamp::now());
         assert_eq!(view.note.as_ref().map(NonEmptyTrimmedString::as_str), shown);
         Ok(())
     }
@@ -444,15 +448,15 @@ mod tests {
 
     #[test]
     fn is_expired_tracks_the_deadline() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut key = minted(UserPreauthUsage::SingleUse)?.key;
 
         assert!(!key.is_expired(now), "no deadline never expires");
 
-        key.expires_at = Some(now + chrono::Duration::seconds(1));
+        key.expires_at = Some(now + jiff::SignedDuration::from_secs(1));
         assert!(!key.is_expired(now));
 
-        key.expires_at = Some(now - chrono::Duration::seconds(1));
+        key.expires_at = Some(now - jiff::SignedDuration::from_secs(1));
         assert!(key.is_expired(now));
         Ok(())
     }

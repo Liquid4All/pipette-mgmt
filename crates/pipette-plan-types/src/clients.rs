@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::owners::ClientOwner;
@@ -336,7 +336,8 @@ pub struct Client {
     #[cfg_attr(feature = "schemars", schemars(with = "ContactEmail"))]
     pub contact_email: Option<ContactEmail>,
     pub status: ClientStatus,
-    pub registered_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub registered_at: Timestamp,
     #[serde(flatten)]
     pub device_profile: DeviceProfile,
     /// The flags the device reports itself, e.g. `runtime:llama_cpp`.
@@ -503,7 +504,8 @@ pub struct ClientListRow {
     /// The time of the device's last verified, signed request, accurate to
     /// the server's stamp interval. `null` when the server holds no stamp for
     /// the device.
-    pub last_seen_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub last_seen_at: Option<Timestamp>,
     /// The queued jobs the device could claim, counted for this response.
     /// `null` when the server cannot count them.
     pub backlog: Option<Backlog>,
@@ -517,7 +519,8 @@ pub struct Backlog {
     /// not past their deadline, and not denied by the device.
     pub job_count: u64,
     /// The time of the count: the time of the request.
-    pub counted_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub counted_at: Timestamp,
 }
 
 /// The `GET /api/v1/clients/{client_id}` body: the row, and what the reader may
@@ -555,7 +558,8 @@ pub struct BacklogByCampaign {
     pub unreadable_job_count: u64,
     /// The time of the count: the time of the request, the same as the
     /// `counted_at` of the device's backlog.
-    pub counted_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub counted_at: Timestamp,
 }
 
 /// One campaign's share of a device's backlog.

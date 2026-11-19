@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumString};
 use tabled::Tabled;
@@ -264,7 +264,7 @@ pub struct Client {
     #[tabled(rename = "Status")]
     pub status: ClientStatus,
     #[tabled(rename = "Registered")]
-    pub registered_at: DateTime<Utc>,
+    pub registered_at: Timestamp,
     /// Flattened to top-level `device_*` keys; absent on legacy records. Tags
     /// are deliberately not a field: they live in the `tags-index/` marker trees.
     #[tabled(skip)]
@@ -307,7 +307,7 @@ struct RepairableClient {
     #[serde(default)]
     contact_email: Option<String>,
     status: ClientStatus,
-    registered_at: DateTime<Utc>,
+    registered_at: Timestamp,
     /// Needs no repair: every field is optional, and the write path validates
     /// `device_form_factor` before persisting.
     #[serde(flatten, default)]
@@ -403,7 +403,7 @@ fn optional_non_empty_string(
 /// captured before it migrated authenticates nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureMigration {
-    pub first_seen: DateTime<Utc>,
+    pub first_seen: Timestamp,
 }
 
 /// Whether recording a migration was the client's first, so that the transition

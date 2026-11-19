@@ -8,9 +8,9 @@ use std::num::NonZeroUsize;
 use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
 use futures::stream;
 use futures::stream::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 
 use pipette_core::campaign::Campaign;
 use pipette_core::client::{Client, ClientStatus, normalized_flags};
@@ -255,7 +255,7 @@ async fn fleet_views(
         .into_iter()
         .map(|request| request.client_id)
         .collect();
-    let seen: HashMap<ClientId, DateTime<Utc>> = state
+    let seen: HashMap<ClientId, Timestamp> = state
         .todo_store
         .list_liveness()
         .await
@@ -329,7 +329,7 @@ async fn fleet_views(
 /// `None` when the store cannot count: the count serves the console only, so
 /// a failed count must not fail the request.
 async fn backlog_counts(state: &AppState) -> Option<BacklogCounts> {
-    let counted_at = Utc::now();
+    let counted_at = Timestamp::now();
     state
         .todo_store
         .backlog()
@@ -341,7 +341,7 @@ async fn backlog_counts(state: &AppState) -> Option<BacklogCounts> {
         .ok()
 }
 
-type BacklogCounts = (DateTime<Utc>, BTreeMap<ClientId, u64>);
+type BacklogCounts = (Timestamp, BTreeMap<ClientId, u64>);
 
 /// A device's backlog from the counts: `None` if the count failed, and zero
 /// for a device with no claimable job.
@@ -391,7 +391,7 @@ async fn record(
     let counted_at = row
         .backlog
         .as_ref()
-        .map_or_else(Utc::now, |backlog| backlog.counted_at);
+        .map_or_else(Timestamp::now, |backlog| backlog.counted_at);
     let (owning, reach, read, backlog_by_campaign) = futures::try_join!(
         async {
             org::owning_org(&*state.org_store, client_id)
@@ -425,7 +425,7 @@ async fn campaign_backlog(
     state: &AppState,
     caller: Caller<'_>,
     client_id: &ClientId,
-    counted_at: DateTime<Utc>,
+    counted_at: Timestamp,
 ) -> Option<BacklogByCampaign> {
     read_campaign_backlog(state, caller, client_id, counted_at)
         .await
@@ -441,9 +441,9 @@ async fn read_campaign_backlog(
     state: &AppState,
     caller: Caller<'_>,
     client_id: &ClientId,
-    counted_at: DateTime<Utc>,
+    counted_at: Timestamp,
 ) -> Result<BacklogByCampaign, AppError> {
-    let creating_max_age = chrono::Duration::from_std(std::time::Duration::from_secs(
+    let creating_max_age = jiff::SignedDuration::try_from(std::time::Duration::from_secs(
         state.config.plan_creating_max_age_secs.get(),
     ))
     .map_err(|error| AppError::internal(error.into()))?;
@@ -488,7 +488,7 @@ async fn read_campaign_backlog(
 /// the reach.
 fn by_campaign(
     entry: CampaignBacklog,
-    counted_at: DateTime<Utc>,
+    counted_at: Timestamp,
     campaigns: &HashMap<CampaignId, Campaign>,
 ) -> BacklogByCampaign {
     let (mut readable, unreadable) = entry.by_campaign.into_iter().fold(
@@ -594,7 +594,7 @@ pub(crate) struct FleetRow {
     tags: BTreeSet<Tag>,
     permissions: pipette_plan_types::ClientPermissionSet,
     reindex_pending: bool,
-    last_seen_at: Option<DateTime<Utc>>,
+    last_seen_at: Option<Timestamp>,
     backlog: Option<Backlog>,
 }
 

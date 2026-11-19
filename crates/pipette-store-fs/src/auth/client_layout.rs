@@ -5,7 +5,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use pipette_core::client::{
     Client, MigrationRecord, SignatureMigration, parse_client_or_self_heal,
@@ -31,7 +31,7 @@ pub(super) fn has_signature_migration(dir: &Path, client_id: &ClientId) -> anyho
 pub(super) fn record_signature_migration(
     dir: &Path,
     client_id: &ClientId,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> anyhow::Result<MigrationRecord> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{client_id}.json"));
@@ -291,7 +291,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("details")?,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Pending,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         })

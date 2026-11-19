@@ -19,6 +19,8 @@ Organization entry writes use these routes:
   gives a hand-made entry a new name.
 - [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/relabel`](descriptor-catalog/relabel_org_descriptor_member.md)
   changes the quantization label of a model member.
+- [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/remove`](descriptor-catalog/remove_org_descriptor_member.md)
+  removes a member from a hand-made entry.
 - [`POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/state`](descriptor-catalog/change_org_descriptor_entry_state.md)
   changes state or tombstones an entry with confirmation.
 
@@ -62,8 +64,9 @@ For each pinned or active runtime entry, it selects one offered member. For
 each model entry, it gives every member that an offered runtime member can
 load. It also reports every member that the device cannot use, and gives
 each offered member its run evidence on this device and on every device. This
-read needs `read_clients`. The short list contains global entries only. Its
-selectors use the bare name.
+read needs `read_clients`. The short list contains the global entries and the
+entries of the caller's organization. Each item and each withheld member gives
+its `scope` and its `display_name`, and its selectors use that name.
 
 The [import-run history](descriptor-catalog/list_catalog_import_runs.md) gives
 the newest import and refresh results and the last successful import time.

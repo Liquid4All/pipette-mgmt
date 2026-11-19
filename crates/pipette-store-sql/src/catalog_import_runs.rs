@@ -3,7 +3,8 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::FromRow;
 
 use pipette_plan_types::{CatalogImportOutcome, CatalogImportRun, CatalogImportRuns, CatalogName};
@@ -26,8 +27,8 @@ impl SqlCatalogImportRunStore {
 #[derive(FromRow)]
 struct RunRow {
     id: String,
-    started_at: DateTime<Utc>,
-    finished_at: Option<DateTime<Utc>>,
+    started_at: jiff_sqlx::Timestamp,
+    finished_at: Option<jiff_sqlx::Timestamp>,
     command: String,
     source: String,
     target_name: Option<String>,
@@ -45,8 +46,8 @@ impl RunRow {
         let unclassified_assets: Vec<String> = serde_json::from_value(self.unclassified_assets)?;
         Ok(CatalogImportRun {
             id: self.id,
-            started_at: self.started_at,
-            finished_at: self.finished_at,
+            started_at: self.started_at.to_jiff(),
+            finished_at: self.finished_at.map(jiff_sqlx::Timestamp::to_jiff),
             command: self.command.parse()?,
             source: self.source,
             target_name: self.target_name,
@@ -76,7 +77,7 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
             .into_iter()
             .map(RunRow::parse)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (last_successful_import_at,): (Option<DateTime<Utc>>,) = sqlx::query_as(
+        let (last_successful_import_at,): (Option<jiff_sqlx::Timestamp>,) = sqlx::query_as(
             "SELECT MAX(finished_at) FROM catalog_import_runs \
              WHERE command = 'import' AND result = 'success'",
         )
@@ -84,7 +85,7 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
         .await?;
         Ok(CatalogImportRuns {
             items,
-            last_successful_import_at,
+            last_successful_import_at: last_successful_import_at.map(jiff_sqlx::Timestamp::to_jiff),
         })
     }
 
@@ -93,12 +94,12 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
         id: &str,
         command: &str,
         target_name: Option<&CatalogName>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<()> {
         let name = target_name.map(CatalogName::as_str);
         self.db.execute("start catalog import run", || {
             sqlx::query("INSERT INTO catalog_import_runs (id, started_at, command, target_name, result) VALUES ($1, $2, $3, $4, 'running')")
-                .bind(id).bind(at).bind(command).bind(name)
+                .bind(id).bind(at.to_sqlx()).bind(command).bind(name)
         }).await?;
         Ok(())
     }
@@ -106,7 +107,7 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
     async fn finish_run(
         &self,
         id: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
         finish: &CatalogImportRunFinish,
     ) -> anyhow::Result<()> {
         let result = if finish.error_summary.is_some() {
@@ -117,7 +118,7 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
         let assets = serde_json::to_value(&finish.unclassified_assets)?;
         let changed = self.db.execute("finish catalog import run", || {
             sqlx::query("UPDATE catalog_import_runs SET finished_at = $2, result = $3, entries_created = $4, members_added = $5, unclassified_assets = $6, error_summary = $7, entries_hidden = $8 WHERE id = $1 AND result = 'running'")
-                .bind(id).bind(at).bind(result).bind(finish.entries_created)
+                .bind(id).bind(at.to_sqlx()).bind(result).bind(finish.entries_created)
                 .bind(finish.members_added).bind(&assets).bind(&finish.error_summary)
                 .bind(finish.entries_hidden)
         }).await?;
@@ -129,7 +130,6 @@ impl CatalogImportRunStore for SqlCatalogImportRunStore {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use chrono::SubsecRound;
 
     use super::*;
 
@@ -137,14 +137,18 @@ mod tests {
     async fn a_run_keeps_its_result_and_an_interrupted_run_stays_running() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = SqlCatalogImportRunStore::new(test_db.db().clone());
-        let at = Utc::now().trunc_subsecs(6);
+        let at = Timestamp::now().round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )?;
         store.start_run("finished", "import", None, at).await?;
         store.start_run("interrupted", "refresh", None, at).await?;
         store.start_run("succeeded", "import", None, at).await?;
         store
             .finish_run(
                 "finished",
-                at + chrono::Duration::minutes(1),
+                at + jiff::SignedDuration::from_mins(1),
                 &CatalogImportRunFinish {
                     entries_created: 2,
                     members_added: 4,
@@ -168,7 +172,7 @@ mod tests {
                 Some("one asset is unknown".into())
             )
         );
-        let running: (String, Option<DateTime<Utc>>) = sqlx::query_as(
+        let running: (String, Option<jiff_sqlx::Timestamp>) = sqlx::query_as(
             "SELECT result, finished_at FROM catalog_import_runs WHERE id = 'interrupted'",
         )
         .fetch_one(test_db.db().pool())

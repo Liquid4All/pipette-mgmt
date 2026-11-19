@@ -26,7 +26,7 @@ pub async fn commit_job(state: &AppState, job_id: &JobId) -> anyhow::Result<Plan
         .put_plan(&PlanManifest {
             plan_id: plan_id.clone(),
             status: PlanStatus::Active,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             submitted_by: None,
             campaign_id: None,
             previous_plan_id: None,

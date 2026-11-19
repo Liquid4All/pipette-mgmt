@@ -1,6 +1,6 @@
 //! Request bodies for an organization's descriptor catalog writes.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use crate::{CatalogName, Model, ModelFormat, NonEmptyVec, QuantizationLabel, Runtime};
@@ -11,7 +11,8 @@ use crate::{CatalogName, Model, ModelFormat, NonEmptyVec, QuantizationLabel, Run
 #[serde(deny_unknown_fields)]
 pub struct CreateDescriptorEntryRequest {
     pub name: CatalogName,
-    pub release_time: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub release_time: Option<Timestamp>,
     pub runtimes: Option<NonEmptyVec<Runtime>>,
     pub models: Option<NonEmptyVec<ModelMemberRequest>>,
 }
@@ -76,4 +77,14 @@ pub struct RelabelDescriptorMemberRequest {
     pub from: QuantizationLabel,
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub to: QuantizationLabel,
+}
+
+/// The member to remove from a hand-made entry.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RemoveDescriptorMemberRequest {
+    /// The member key: a runtime member's flavor, `-` for a runtime member
+    /// without a flavor, or a model member's `format::quantization`.
+    pub member: String,
 }

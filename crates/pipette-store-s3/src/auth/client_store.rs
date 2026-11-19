@@ -77,7 +77,7 @@ impl ClientStore for S3ClientStore {
     async fn record_signature_migration(
         &self,
         client_id: &ClientId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: jiff::Timestamp,
     ) -> anyhow::Result<pipette_core::client::MigrationRecord> {
         client_layout::record_signature_migration(&self.store, &self.prefix, client_id, at).await
     }
@@ -164,7 +164,7 @@ impl ClientStore for S3ClientStore {
                 ClientPreauthRejectionError::NotFound,
             ));
         };
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let grant = match validate(&key, secret, now) {
             Ok(grant) => grant,
             Err(rejection) => return Ok(ClientPreauthConsumeOutcome::Rejected(rejection)),
@@ -452,7 +452,7 @@ mod tests {
                 default_permissions: None,
                 note: None,
             },
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         clients.put_client_preauth_key(&minted.key).await?;

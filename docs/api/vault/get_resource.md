@@ -21,7 +21,7 @@ An account may ask for two more fields, which a device's read ignores:
 
 | Query parameter | Adds |
 |---|---|
-| `names=true` | `names`, the owner's address or handle ([names](../../httpapi.md#14-names)) |
+| `names=true` | `names`, the owner's address or display name ([names](../../httpapi.md#14-names)) |
 | `object=true` | `object`, whether the file is still stored, from a stat of it: `{"state": "present"}`, `{"state": "resized", "bytes": …}` for a file of another size than `bytes` (replaced behind the record), or `{"state": "missing"}`. A store that does not answer is a `500` |
 
 ## Statuses

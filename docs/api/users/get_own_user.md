@@ -1,7 +1,7 @@
 # `GET /api/v1/users/me`
 
-The account, its status, its organization (`org_id` and its handle, `org_slug`,
-both absent outside one), its expanded permission set, its registered keys, and
+The account, its status, its organization (`org_id`, its handle `org_slug`,
+and its display name `org_display_name`, all absent outside one), its expanded permission set, its registered keys, and
 `may`: how far each of its authorities reaches (`none`, `own` for its
 organization and itself, or `every`), with the names it may grant, and the ones
 among them a service account may hold, as its routes judge them, so a client

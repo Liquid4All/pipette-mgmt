@@ -4,7 +4,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::PrincipalIdError;
@@ -303,7 +303,7 @@ fn check_id(
 /// `Never` last; the claim handler relies on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExpiresAt {
-    At(DateTime<Utc>),
+    At(Timestamp),
     Never,
 }
 
@@ -330,7 +330,7 @@ impl ExpiresAt {
     /// Whether this expiry lies strictly before `now`. The strict `<` matches
     /// the `queue-maintenance` sweep, so `claim` refuses exactly what it
     /// expires.
-    pub fn is_expired(self, now: DateTime<Utc>) -> bool {
+    pub fn is_expired(self, now: Timestamp) -> bool {
         match self {
             ExpiresAt::At(dt) => dt < now,
             ExpiresAt::Never => false,
@@ -338,7 +338,7 @@ impl ExpiresAt {
     }
 
     /// The instant, `None` for never: a deadline as an API body writes it.
-    pub fn instant(self) -> Option<DateTime<Utc>> {
+    pub fn instant(self) -> Option<Timestamp> {
         match self {
             ExpiresAt::At(dt) => Some(dt),
             ExpiresAt::Never => None,
@@ -349,7 +349,7 @@ impl ExpiresAt {
 impl fmt::Display for ExpiresAt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExpiresAt::At(dt) => write!(f, "{}", dt.format("%Y%m%dT%H%M%SZ")),
+            ExpiresAt::At(dt) => write!(f, "{}", dt.strftime("%Y%m%dT%H%M%SZ")),
             ExpiresAt::Never => write!(f, "never"),
         }
     }
@@ -366,8 +366,9 @@ impl FromStr for ExpiresAt {
         if s == "never" {
             return Ok(ExpiresAt::Never);
         }
-        chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")
-            .map(|ndt| ExpiresAt::At(ndt.and_utc()))
+        jiff::civil::DateTime::strptime("%Y%m%dT%H%M%SZ", s)
+            .and_then(|dt| jiff::tz::Offset::UTC.to_timestamp(dt))
+            .map(ExpiresAt::At)
             .map_err(|_| ExpiresAtError(s.to_string()))
     }
 }
@@ -670,8 +671,7 @@ mod tests {
 
     #[test]
     fn expires_at_at_roundtrip() -> anyhow::Result<()> {
-        use chrono::TimeZone;
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let dt = "2026-01-01T12:00:00Z".parse::<jiff::Timestamp>()?;
         let v = ExpiresAt::At(dt);
         let s = v.to_string();
         assert_eq!(s, "20260101T120000Z");
@@ -681,8 +681,7 @@ mod tests {
 
     #[test]
     fn expires_at_epoch_boundary() -> anyhow::Result<()> {
-        use chrono::TimeZone;
-        let dt = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
+        let dt = "1970-01-01T00:00:00Z".parse::<jiff::Timestamp>()?;
         let s = ExpiresAt::At(dt).to_string();
         assert_eq!(s, "19700101T000000Z");
         assert_eq!(s.parse::<ExpiresAt>()?, ExpiresAt::At(dt));
@@ -696,10 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn expires_at_orders_by_urgency() {
-        use chrono::TimeZone;
-        let earlier = ExpiresAt::At(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
-        let later = ExpiresAt::At(Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap());
+    fn expires_at_orders_by_urgency() -> anyhow::Result<()> {
+        let earlier = ExpiresAt::At("2026-01-01T12:00:00Z".parse::<jiff::Timestamp>()?);
+        let later = ExpiresAt::At("2026-01-02T12:00:00Z".parse::<jiff::Timestamp>()?);
         assert!(earlier < later);
         assert!(later < ExpiresAt::Never);
         assert!(earlier < ExpiresAt::Never);
@@ -707,19 +705,20 @@ mod tests {
         let mut v = vec![ExpiresAt::Never, later, earlier];
         v.sort();
         assert_eq!(v, vec![earlier, later, ExpiresAt::Never]);
+        Ok(())
     }
 
     #[test]
-    fn expires_at_is_expired() {
-        use chrono::TimeZone;
-        let now = Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap();
-        let past = ExpiresAt::At(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
-        let future = ExpiresAt::At(Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap());
+    fn expires_at_is_expired() -> anyhow::Result<()> {
+        let now = "2026-01-02T12:00:00Z".parse::<jiff::Timestamp>()?;
+        let past = ExpiresAt::At("2026-01-01T12:00:00Z".parse::<jiff::Timestamp>()?);
+        let future = ExpiresAt::At("2026-01-03T12:00:00Z".parse::<jiff::Timestamp>()?);
 
         assert!(past.is_expired(now));
         assert!(!future.is_expired(now));
         assert!(!ExpiresAt::Never.is_expired(now));
         // Strict `<`: a job expiring at exactly `now` is still claimable.
         assert!(!ExpiresAt::At(now).is_expired(now));
+        Ok(())
     }
 }

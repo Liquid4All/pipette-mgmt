@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use reqwest::Url;
 use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc};
@@ -461,7 +461,7 @@ impl ImportPlan {
         self,
         importer: &Importer<'_>,
         progress: &Progress,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<HashMap<Model, Model>, ModelImportError> {
         let owner = &self.owner;
         let mut done: HashMap<Sha256, Model> = HashMap::new();
@@ -902,7 +902,7 @@ async fn fetch_one(
     owner: &VaultOwner,
     planned: &ResolvedImport,
     progress: &Progress,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<Model, HfImportError> {
     // A record can appear or go between the two phases, so the fetch checks
     // again.

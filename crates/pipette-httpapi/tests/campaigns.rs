@@ -705,7 +705,7 @@ fn with_head_move(inner: Arc<dyn CampaignStore>) -> Arc<dyn CampaignStore> {
         inner,
         1,
         |mut stored: Campaign| {
-            stored.advance(a_plan_id(), chrono::Utc::now());
+            stored.advance(a_plan_id(), jiff::Timestamp::now());
             Some(stored)
         },
     ))
@@ -3344,6 +3344,165 @@ async fn an_archived_campaign_files_no_plan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A lock needs a note and keeps the head: every filing, a cancel of the head
+/// and a delete are a `409` that quotes the note, while a rename still lands.
+/// An archive is a `409` too: only an unlock leaves the lock. The default
+/// listing filter `active,locked` keeps it. Back to `active`, the
+/// note is gone and the head cancels.
+#[tokio::test]
+async fn a_locked_campaign_keeps_its_head() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = editor(&state).await?;
+    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let job = manifest(&state, &first).await?.job_ids[0].clone();
+    let uri = format!("/api/v1/campaigns/{campaign_id}");
+
+    for body in [
+        json!({ "state": "locked" }),
+        json!({ "state": "archived", "state_note": "why" }),
+        json!({ "state_note": "why" }),
+    ] {
+        let resp = signed_json(&state, &owner, "PATCH", &uri, &body).await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let locked = patch_campaign(
+        &state,
+        &owner,
+        &uri,
+        json!({ "state": "locked", "state_note": "release 2026.11" }),
+    )
+    .await?;
+    assert_eq!(
+        (&locked["state"], &locked["state_note"]),
+        (&json!("locked"), &json!("release 2026.11"))
+    );
+    let (_, overview) = get_as(&state, &owner, &format!("{uri}/overview")).await?;
+    assert_eq!(
+        (
+            &overview["state_note"],
+            &overview["may_edit_variants"],
+            &overview["may_rerun"]
+        ),
+        (&json!("release 2026.11"), &json!(false), &json!(false)),
+        "{overview}"
+    );
+    let (_, listed) = get_as(&state, &owner, "/api/v1/campaigns?state=active,locked").await?;
+    assert_eq!(campaign_ids(&listed)?, vec![campaign_id.clone()]);
+
+    let filings = writes_to(&campaign_id, &first, job.as_str(), &owner.1)
+        .into_iter()
+        .filter(|write| write.method == "POST");
+    for write in filings {
+        let resp = send_write_as(&state, &owner, &write).await?;
+        let answered = resp.status();
+        let error = json_str(&body_json(resp).await?, "error")?.to_owned();
+        assert_eq!(answered, StatusCode::CONFLICT, "{}", write.uri);
+        assert!(error.contains("is locked (release 2026.11)"), "{error}");
+    }
+    let (status, error) = cancel_plan(&state, &owner, &first).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert!(error.contains("is locked"), "{error}");
+    let resp = signed_empty(&state, &owner, "DELETE", &uri).await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_still_on(&state, &campaign_id, &first).await?;
+    let renamed = patch_campaign(&state, &owner, &uri, json!({ "name": "Nightly v2" })).await?;
+    assert_eq!(renamed["state"], json!("locked"));
+    let archive = json!({ "state": "archived" });
+    let resp = signed_json(&state, &owner, "PATCH", &uri, &archive).await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let unlocked = patch_campaign(&state, &owner, &uri, json!({ "state": "active" })).await?;
+    assert!(unlocked.get("state_note").is_none(), "{unlocked}");
+    let (status, error) = cancel_plan(&state, &owner, &first).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{error}");
+    Ok(())
+}
+
+/// A tag names one plan the campaign filed, current or superseded, once per
+/// name, also on a locked campaign. It shows on the tag listing, the plans
+/// route and its overview history row; only the current plan's tags show on the
+/// listing row. A bad name is a
+/// `400`, another campaign's plan a `404`, a taken name a `409`, and a caller
+/// who may not file into the campaign a `403`.
+#[tokio::test]
+async fn a_plan_is_tagged_once_per_name() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(sql) = seeded_sql_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &sql.state;
+    let owner = editor(state).await?;
+    let (campaign_id, first) = created_campaign(state, &owner, &[("name", "Nightly")]).await?;
+    let (_, other) = created_campaign(state, &owner, &[("name", "Other")]).await?;
+    let (_, client_id) = register_and_approve(state).await?;
+    let head = filed_plan(state, &owner, &campaign_id, &client_id, "second").await?;
+    let uri = format!("/api/v1/campaigns/{campaign_id}");
+    let tags = format!("{uri}/tags");
+    patch_campaign(
+        state,
+        &owner,
+        &uri,
+        json!({ "state": "locked", "state_note": "release" }),
+    )
+    .await?;
+    let tag = |plan_id: &PlanId, name: &str| json!({ "plan_id": plan_id.as_str(), "name": name, "message": "shipped" });
+
+    for (body, status) in [
+        (tag(&first, "../v1"), StatusCode::BAD_REQUEST),
+        (tag(&first, "v 1"), StatusCode::BAD_REQUEST),
+        (tag(&other, "v1"), StatusCode::NOT_FOUND),
+    ] {
+        let resp = signed_json(state, &owner, "POST", &tags, &body).await?;
+        assert_eq!(resp.status(), status, "{body}");
+    }
+    let body = tag(&first, "release/2026.11");
+    crate::api_schema::assert_conforms("CreatePlanTagRequest", &body)?;
+    let resp = signed_json(state, &owner, "POST", &tags, &body).await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let made = body_json(resp).await?;
+    assert_eq!(
+        (&made["name"], &made["plan_id"], &made["tagger"]),
+        (
+            &json!("release/2026.11"),
+            &json!(first.as_str()),
+            &json!(owner.1.as_str())
+        )
+    );
+    let resp = signed_json(state, &owner, "POST", &tags, &body).await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let stranger = editor(state).await?;
+    let resp = signed_json(state, &stranger, "POST", &tags, &tag(&first, "theirs")).await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = signed_json(state, &owner, "POST", &tags, &tag(&head, "current")).await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let current = body_json(resp).await?;
+
+    let (_, listed) = get_as(state, &owner, &tags).await?;
+    assert_eq!(listed["tags"], json!([current, made]));
+    let (_, plans) = get_as(state, &owner, &format!("{uri}/plans")).await?;
+    assert_eq!(plans["tags"], json!([current, made]));
+    let (_, overview) = get_as(state, &owner, &format!("{uri}/overview")).await?;
+    assert_eq!(
+        (
+            &overview["history"][0]["tags"],
+            &overview["history"][1]["tags"],
+            &overview["may_tag"]
+        ),
+        (&json!([current]), &json!([made]), &json!(true)),
+        "{overview}"
+    );
+    let (_, page) = get_as(state, &owner, "/api/v1/campaigns?plan=true").await?;
+    let row = page["items"]
+        .as_array()
+        .context("a page of items")?
+        .iter()
+        .find(|row| row["campaign_id"] == json!(campaign_id))
+        .context("the campaign is listed")?;
+    assert_eq!(row["current_plan_tags"], json!([current]), "{row}");
+    Ok(())
+}
+
 /// Labels outside the rules are a `400` naming the key, and the record keeps
 /// the labels it had.
 #[rstest]
@@ -3435,7 +3594,7 @@ async fn a_campaign_running_nothing_has_an_empty_chain() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({ "current_plan_id": null, "superseded_plan_ids": [], "history_truncated": false })
+        json!({ "current_plan_id": null, "superseded_plan_ids": [], "history_truncated": false, "tags": [] })
     );
     Ok(())
 }
@@ -3626,6 +3785,7 @@ async fn an_org_admin_without_read_plans_reads_the_team_campaign_s_chain() -> an
             "current_plan_id": second.as_str(),
             "superseded_plan_ids": [first.as_str()],
             "history_truncated": false,
+            "tags": [],
         })
     );
 

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, SubsecRound, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 
 use pipette_core::denial::DenialRecord;
 use pipette_core::todo_filename::Lease;
@@ -52,16 +53,16 @@ fn valid_client(raw: &str) -> Option<ClientId> {
         .ok()
 }
 
-fn to_second(at: DateTime<Utc>) -> DateTime<Utc> {
-    at.trunc_subsecs(0)
+fn to_second(at: Timestamp) -> Timestamp {
+    at - jiff::SignedDuration::from_nanos(i64::from(at.subsec_nanosecond()))
 }
 
-fn expiry(at: ExpiresAt) -> Option<DateTime<Utc>> {
+fn expiry(at: ExpiresAt) -> Option<Timestamp> {
     at.instant().map(to_second)
 }
 
-fn deadline(at: Option<DateTime<Utc>>) -> ExpiresAt {
-    at.map_or(ExpiresAt::Never, ExpiresAt::At)
+fn deadline(at: Option<jiff_sqlx::Timestamp>) -> ExpiresAt {
+    at.map_or(ExpiresAt::Never, |at| ExpiresAt::At(at.to_jiff()))
 }
 
 fn parse_body(job: &JobId, body: &str) -> anyhow::Result<serde_json::Value> {
@@ -147,9 +148,9 @@ async fn settle_lapsed_in_transaction(
     client: &str,
     except: Option<&str>,
     lost_lease_limit: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<bool> {
-    let mut lapsed: Vec<(String, DateTime<Utc>, bool, bool)> = sqlx::query_as(
+    let mut lapsed: Vec<(String, jiff_sqlx::Timestamp, bool, bool)> = sqlx::query_as(
         "SELECT j.job_id, j.lease_expiry, \
          EXISTS (SELECT 1 FROM submission_outcomes s WHERE s.job_id = j.job_id), \
          EXISTS (SELECT 1 FROM submission_outcome_repairs r \
@@ -158,7 +159,7 @@ async fn settle_lapsed_in_transaction(
          AND ($3::text IS NULL OR j.job_id <> $3) ORDER BY j.job_id FOR UPDATE OF j",
     )
     .bind(client)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(except)
     .fetch_all(&mut **tx)
     .await?;
@@ -227,9 +228,9 @@ fn valid_job(raw: &str) -> Option<JobId> {
 #[derive(sqlx::FromRow)]
 struct LeaseRow {
     job_id: String,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<jiff_sqlx::Timestamp>,
     leased_by: String,
-    lease_expiry: DateTime<Utc>,
+    lease_expiry: jiff_sqlx::Timestamp,
 }
 
 impl LeaseRow {
@@ -249,7 +250,7 @@ impl LeaseRow {
             job_id: job,
             expires_at: deadline(self.expires_at),
             client_id: client,
-            lease_expiry: self.lease_expiry,
+            lease_expiry: self.lease_expiry.to_jiff(),
         })
     }
 }
@@ -265,7 +266,7 @@ impl TodoStore for SqlTodoStore {
             return Ok(Vec::new());
         }
         let ids: Vec<_> = jobs.iter().map(JobId::as_str).collect();
-        let rows: Vec<(String, Option<DateTime<Utc>>)> = self
+        let rows: Vec<(String, Option<jiff_sqlx::Timestamp>)> = self
             .db
             .fetch_all("avail_for_jobs", || {
                 sqlx::query_as(
@@ -337,7 +338,7 @@ impl TodoStore for SqlTodoStore {
     }
 
     async fn list_avail_entries(&self) -> anyhow::Result<Vec<AvailEntry>> {
-        let rows: Vec<(String, Option<DateTime<Utc>>)> = self
+        let rows: Vec<(String, Option<jiff_sqlx::Timestamp>)> = self
             .db
             .fetch_all("list_avail_entries", || {
                 sqlx::query_as(
@@ -370,7 +371,7 @@ impl TodoStore for SqlTodoStore {
                      NULL AND expires_at IS NOT DISTINCT FROM $2",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
             })
             .await?;
         self.record_body_reads(usize::from(row.is_some()));
@@ -385,7 +386,7 @@ impl TodoStore for SqlTodoStore {
                      AND expires_at IS NOT DISTINCT FROM $2",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
             })
             .await?;
         Ok(())
@@ -434,7 +435,7 @@ impl TodoStore for SqlTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let row: Option<(String,)> = self
             .db
@@ -444,9 +445,9 @@ impl TodoStore for SqlTodoStore {
                      NOT DISTINCT FROM $2 AND leased_by = $3 AND lease_expiry = $4",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
                 .bind(client_id.to_string())
-                .bind(to_second(lease_expiry))
+                .bind(to_second(lease_expiry).to_sqlx())
             })
             .await?;
         self.record_body_reads(usize::from(row.is_some()));
@@ -457,10 +458,10 @@ impl TodoStore for SqlTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        new_expiry: DateTime<Utc>,
+        new_expiry: Timestamp,
     ) -> anyhow::Result<RenewLeaseResult> {
         // The outer read sees the pre-statement holder, including on a zero-row update.
-        let (changed, exp, holder): (bool, Option<DateTime<Utc>>, Option<String>) = self
+        let (changed, exp, holder): (bool, Option<jiff_sqlx::Timestamp>, Option<String>) = self
             .db
             .fetch_one("renew queue lease", || {
                 sqlx::query_as(
@@ -472,7 +473,7 @@ impl TodoStore for SqlTodoStore {
                 )
                 .bind(job_id.as_str())
                 .bind(client_id.as_str())
-                .bind(to_second(new_expiry))
+                .bind(to_second(new_expiry).to_sqlx())
             })
             .await?;
         Ok(if changed {
@@ -489,7 +490,7 @@ impl TodoStore for SqlTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<()> {
         self.db
             .execute("delete_lease", || {
@@ -498,9 +499,9 @@ impl TodoStore for SqlTodoStore {
                      DISTINCT FROM $2 AND leased_by = $3 AND lease_expiry = $4",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
                 .bind(client_id.to_string())
-                .bind(to_second(lease_expiry))
+                .bind(to_second(lease_expiry).to_sqlx())
             })
             .await?;
         Ok(())
@@ -511,7 +512,7 @@ impl TodoStore for SqlTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<ClaimResult> {
         // A repeat of a committed claim by the same client and lease succeeds, as the
         // S3 rename does.
@@ -525,9 +526,9 @@ impl TodoStore for SqlTodoStore {
                      lease_expiry = $4)) RETURNING body",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
                 .bind(client_id.to_string())
-                .bind(to_second(lease_expiry))
+                .bind(to_second(lease_expiry).to_sqlx())
             })
             .await?;
         self.record_body_reads(usize::from(row.is_some()));
@@ -542,12 +543,12 @@ impl TodoStore for SqlTodoStore {
     async fn claim_for_client(
         &self,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&Lease>,
         cached: Option<&CachedArtifacts>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ClaimOutcome> {
         let client = client_id.as_str();
         let passed_over: Vec<&str> = passed_over.iter().map(JobId::as_str).collect();
@@ -560,12 +561,17 @@ impl TodoStore for SqlTodoStore {
             return Ok(ClaimOutcome::SettlementRequired);
         }
 
-        let held: Option<(String, String, Option<DateTime<Utc>>, DateTime<Utc>)> = sqlx::query_as(
+        let held: Option<(
+            String,
+            String,
+            Option<jiff_sqlx::Timestamp>,
+            jiff_sqlx::Timestamp,
+        )> = sqlx::query_as(
             "SELECT job_id, body, expires_at, lease_expiry FROM queue_jobs WHERE leased_by \
                  = $1 AND lease_expiry > $2 ORDER BY lease_expiry DESC LIMIT 1",
         )
         .bind(client)
-        .bind(now)
+        .bind(now.to_sqlx())
         .fetch_optional(&mut *tx)
         .await?;
         self.record_body_reads(usize::from(held.is_some()));
@@ -576,7 +582,7 @@ impl TodoStore for SqlTodoStore {
                 job_id,
                 expires_at: deadline(expires_at),
                 client_id: client_id.clone(),
-                lease_expiry: held_until,
+                lease_expiry: held_until.to_jiff(),
             };
             if checked_lease != Some(&lease) {
                 tx.commit().await?;
@@ -612,8 +618,9 @@ impl TodoStore for SqlTodoStore {
             // lease, so devices spread across the models. Then a job whose model and
             // runtime the client holds, then one whose model it holds, then one whose
             // runtime it holds, then any job.
-            let pick: Option<(String, String, Option<DateTime<Utc>>, bool, bool)> = sqlx::query_as(
-                "WITH busy AS (SELECT l.model_key, count(*) AS leases FROM queue_jobs l WHERE \
+            let pick: Option<(String, String, Option<jiff_sqlx::Timestamp>, bool, bool)> =
+                sqlx::query_as(
+                    "WITH busy AS (SELECT l.model_key, count(*) AS leases FROM queue_jobs l WHERE \
                      l.leased_by IS NOT NULL AND l.leased_by <> $1 AND l.lease_expiry > $2 AND \
                      EXISTS (SELECT 1 FROM queue_eligibility e WHERE e.client_id = $1 AND \
                      e.job_id = l.job_id) GROUP BY l.model_key) SELECT j.job_id, j.body, \
@@ -628,14 +635,14 @@ impl TodoStore for SqlTodoStore {
                      WHERE s.family_key = j.family_key AND queue_sizes_below(s.sizes, j.sizes)) \
                      ASC, COALESCE(b.leases, 0) ASC, model_held DESC, runtime_held DESC, \
                      random() LIMIT 1 FOR UPDATE OF j SKIP LOCKED",
-            )
-            .bind(client)
-            .bind(now)
-            .bind(&passed_over)
-            .bind(&models)
-            .bind(&runtimes)
-            .fetch_optional(&mut *tx)
-            .await?;
+                )
+                .bind(client)
+                .bind(now.to_sqlx())
+                .bind(&passed_over)
+                .bind(&models)
+                .bind(&runtimes)
+                .fetch_optional(&mut *tx)
+                .await?;
             self.record_body_reads(usize::from(pick.is_some()));
             match pick {
                 Some((job, body, expires_at, model_held, runtime_held)) => {
@@ -645,13 +652,13 @@ impl TodoStore for SqlTodoStore {
                     )
                     .bind(&job)
                     .bind(client)
-                    .bind(lease_expiry)
+                    .bind(lease_expiry.to_sqlx())
                     .execute(&mut *tx)
                     .await?;
                     sqlx::query(RECORD_LAST_GRANT)
                         .bind(&job)
                         .bind(client)
-                        .bind(now)
+                        .bind(now.to_sqlx())
                         .execute(&mut *tx)
                         .await?;
                     let job_id =
@@ -681,9 +688,9 @@ impl TodoStore for SqlTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ReclaimOutcome> {
         let job = job_id.as_str();
         let client = client_id.as_str();
@@ -702,7 +709,7 @@ impl TodoStore for SqlTodoStore {
         )
         .bind(job)
         .bind(client)
-        .bind(lease_expiry)
+        .bind(lease_expiry.to_sqlx())
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -718,7 +725,7 @@ impl TodoStore for SqlTodoStore {
             if holder.flatten().is_some() {
                 ReclaimOutcome::LeasedElsewhere
             } else {
-                let granted: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+                let granted: Option<(String, Option<jiff_sqlx::Timestamp>)> = sqlx::query_as(
                     "UPDATE queue_jobs j SET leased_by = $2, lease_expiry = $3, revision = \
                      revision + 1 WHERE j.job_id = $1 AND j.leased_by IS NULL AND (j.expires_at \
                      IS NULL OR j.expires_at >= $4) AND EXISTS (SELECT 1 FROM queue_eligibility \
@@ -729,8 +736,8 @@ impl TodoStore for SqlTodoStore {
                 )
                 .bind(job)
                 .bind(client)
-                .bind(lease_expiry)
-                .bind(now)
+                .bind(lease_expiry.to_sqlx())
+                .bind(now.to_sqlx())
                 .fetch_optional(&mut *tx)
                 .await?;
                 self.record_body_reads(usize::from(granted.is_some()));
@@ -755,7 +762,7 @@ impl TodoStore for SqlTodoStore {
             sqlx::query(RECORD_LAST_GRANT)
                 .bind(job)
                 .bind(client)
-                .bind(now)
+                .bind(now.to_sqlx())
                 .execute(&mut *tx)
                 .await?;
         }
@@ -778,8 +785,8 @@ impl TodoStore for SqlTodoStore {
                      NOT DISTINCT FROM $2",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(from))
-                .bind(expiry(to))
+                .bind(expiry(from).map(ToSqlx::to_sqlx))
+                .bind(expiry(to).map(ToSqlx::to_sqlx))
             })
             .await?;
         Ok(if rows == 0 {
@@ -789,7 +796,7 @@ impl TodoStore for SqlTodoStore {
         })
     }
 
-    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn restamp_avail_deadlines(&self, now: Timestamp) -> anyhow::Result<u64> {
         // `infinity` stands for `never`, so it ranks after every date. Unlike a
         // re-date, no reindex flag: an eligibility row holds no deadline. Only
         // rows `marker_of` parses count, so a bad row cannot fail the cast. The
@@ -810,7 +817,7 @@ impl TodoStore for SqlTodoStore {
                      FROM earliest e WHERE j.job_id = e.job_id AND j.leased_by IS NULL AND \
                      j.expires_at IS DISTINCT FROM e.deadline",
                 )
-                .bind(now)
+                .bind(now.to_sqlx())
             })
             .await
     }
@@ -820,7 +827,7 @@ impl TodoStore for SqlTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<RecycleResult> {
         // A lost recycle race succeeds only when the exact available key exists.
         let (changed, available): (bool, bool) = self
@@ -835,9 +842,9 @@ impl TodoStore for SqlTodoStore {
                      leased_by IS NULL AND expires_at IS NOT DISTINCT FROM $2)",
                 )
                 .bind(job_id.to_string())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
                 .bind(client_id.to_string())
-                .bind(to_second(lease_expiry))
+                .bind(to_second(lease_expiry).to_sqlx())
             })
             .await?;
         Ok(if changed || available {
@@ -881,7 +888,7 @@ impl TodoStore for SqlTodoStore {
                 )
                 .bind(job_id.as_str())
                 .bind(client_id.as_str())
-                .bind(record.denied_at)
+                .bind(record.denied_at.map(ToSqlx::to_sqlx))
                 .bind(record.failure_reason.as_deref())
                 .bind(record.failure_code.as_ref())
                 .bind(record.client_version.as_deref())
@@ -897,7 +904,7 @@ impl TodoStore for SqlTodoStore {
         client_id: &ClientId,
     ) -> anyhow::Result<Option<DenialRecord>> {
         let row: Option<(
-            Option<DateTime<Utc>>,
+            Option<jiff_sqlx::Timestamp>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -916,7 +923,7 @@ impl TodoStore for SqlTodoStore {
         row.map(
             |(denied_at, failure_reason, failure_code, client_version, runtime_version)| {
                 Ok(DenialRecord {
-                    denied_at,
+                    denied_at: denied_at.map(jiff_sqlx::Timestamp::to_jiff),
                     failure_reason,
                     // A row written before the column holds NULL.
                     failure_code: failure_code
@@ -978,7 +985,7 @@ impl TodoStore for SqlTodoStore {
         &self,
         client_id: &ClientId,
     ) -> anyhow::Result<Vec<(JobId, ExpiresAt)>> {
-        let rows: Vec<(String, Option<DateTime<Utc>>)> = self
+        let rows: Vec<(String, Option<jiff_sqlx::Timestamp>)> = self
             .db
             .fetch_all("list_eligible_for_client", || {
                 sqlx::query_as(
@@ -1040,7 +1047,7 @@ impl TodoStore for SqlTodoStore {
     }
 
     async fn list_all_eligible(&self) -> anyhow::Result<Vec<(ClientId, JobId, ExpiresAt)>> {
-        let rows: Vec<(String, String, Option<DateTime<Utc>>)> = self
+        let rows: Vec<(String, String, Option<jiff_sqlx::Timestamp>)> = self
             .db
             .fetch_all("list_all_eligible", || {
                 sqlx::query_as(
@@ -1118,24 +1125,21 @@ impl TodoStore for SqlTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<()> {
         self.db
             .execute("write_lost_lease", || {
                 sqlx::query(RECORD_LOST_LEASE)
                     .bind(job_id.as_str())
                     .bind(client_id.as_str())
-                    .bind(to_second(lease_expiry))
+                    .bind(to_second(lease_expiry).to_sqlx())
             })
             .await?;
         Ok(())
     }
 
-    async fn list_lost_leases(
-        &self,
-        job_id: &JobId,
-    ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
-        let rows: Vec<(String, DateTime<Utc>)> = self
+    async fn list_lost_leases(&self, job_id: &JobId) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
+        let rows: Vec<(String, jiff_sqlx::Timestamp)> = self
             .db
             .fetch_all("list_lost_leases", || {
                 sqlx::query_as(
@@ -1147,7 +1151,7 @@ impl TodoStore for SqlTodoStore {
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(c, e)| Some((valid_client(&c)?, e)))
+            .filter_map(|(c, e)| Some((valid_client(&c)?, e.to_jiff())))
             .collect())
     }
 
@@ -1204,7 +1208,7 @@ impl TodoStore for SqlTodoStore {
                      queue_jobs WHERE job_id = $1 AND expires_at IS NOT DISTINCT FROM $2)",
                 )
                 .bind(job_id.as_str())
-                .bind(expiry(expires_at))
+                .bind(expiry(expires_at).map(ToSqlx::to_sqlx))
                 .bind(revision)
                 .bind(family.map(|(key, _)| key))
                 .bind(family.map(|(_, sizes)| sizes))
@@ -1224,7 +1228,7 @@ impl TodoStore for SqlTodoStore {
         &self,
         job_id: &JobId,
     ) -> anyhow::Result<Vec<(AvailEntry, serde_json::Value)>> {
-        let rows: Vec<(String, String, Option<DateTime<Utc>>)> = self
+        let rows: Vec<(String, String, Option<jiff_sqlx::Timestamp>)> = self
             .db
             .fetch_all("queued_larger_runs", || {
                 sqlx::query_as(
@@ -1285,10 +1289,10 @@ impl TodoStore for SqlTodoStore {
     async fn campaign_backlog(
         &self,
         client_id: &ClientId,
-        creating_before: DateTime<Utc>,
+        creating_before: Timestamp,
     ) -> anyhow::Result<CampaignBacklog> {
         // A membership's deadline is stored as text, accurate to the second.
-        let now = ExpiresAt::At(Utc::now()).to_string();
+        let now = ExpiresAt::At(Timestamp::now()).to_string();
         let ended = [
             PlanStatus::Cancelling.label(),
             PlanStatus::Cancelled.label(),
@@ -1321,7 +1325,7 @@ impl TodoStore for SqlTodoStore {
                 .bind(ended)
                 .bind(now.as_str())
                 .bind(PlanStatus::Creating.label())
-                .bind(creating_before)
+                .bind(creating_before.to_sqlx())
             })
             .await?;
         Ok(rows.into_iter().fold(
@@ -1345,7 +1349,7 @@ impl TodoStore for SqlTodoStore {
             return Ok(ReindexBatch::default());
         }
         let jobs: Vec<&str> = jobs.iter().map(JobId::as_str).collect();
-        let rows: Vec<(String, String, Option<DateTime<Utc>>, i64)> = self
+        let rows: Vec<(String, String, Option<jiff_sqlx::Timestamp>, i64)> = self
             .db
             .fetch_all("jobs_needing_reindex", || {
                 sqlx::query_as(
@@ -1552,19 +1556,19 @@ impl TodoStore for SqlTodoStore {
         Ok(())
     }
 
-    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>> {
-        let row: Option<(DateTime<Utc>,)> = self
+    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<Timestamp>> {
+        let row: Option<(jiff_sqlx::Timestamp,)> = self
             .db
             .fetch_optional("read_liveness", || {
                 sqlx::query_as("SELECT last_seen_at FROM client_liveness WHERE client_id = $1")
                     .bind(client_id.as_str())
             })
             .await?;
-        Ok(row.map(|(at,)| at))
+        Ok(row.map(|(at,)| at.to_jiff()))
     }
 
-    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
-        let rows: Vec<(String, DateTime<Utc>)> = self
+    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
+        let rows: Vec<(String, jiff_sqlx::Timestamp)> = self
             .db
             .fetch_all("list_liveness", || {
                 sqlx::query_as(
@@ -1574,7 +1578,7 @@ impl TodoStore for SqlTodoStore {
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(c, e)| Some((valid_client(&c)?, e)))
+            .filter_map(|(c, e)| Some((valid_client(&c)?, e.to_jiff())))
             .collect())
     }
 
@@ -1600,7 +1604,7 @@ mod tests {
     use crate::scratch::TestDb;
     use crate::testing::{RACERS, a_client, public_key, race, test_db_or_skip};
 
-    fn now() -> anyhow::Result<DateTime<Utc>> {
+    fn now() -> anyhow::Result<Timestamp> {
         Ok("2026-11-01T08:30:00.250Z".parse()?)
     }
 
@@ -1651,7 +1655,7 @@ mod tests {
             "metadata and matcher projections do not read bodies"
         );
         let client = ClientId::try_new("reader")?;
-        let until = now()? + chrono::Duration::hours(1);
+        let until = now()? + jiff::SignedDuration::from_hours(1);
         store
             .claim_job(&healthy, ExpiresAt::Never, &client, until)
             .await?;
@@ -1936,7 +1940,7 @@ mod tests {
                 &leased,
                 ExpiresAt::Never,
                 &client,
-                now()? + chrono::Duration::hours(1),
+                now()? + jiff::SignedDuration::from_hours(1),
             )
             .await?;
         let groups = store
@@ -2028,8 +2032,11 @@ mod tests {
         job: &JobId,
         state: Seeded,
     ) -> anyhow::Result<()> {
-        let at =
-            |minutes| ExpiresAt::At(to_second(Utc::now() + chrono::Duration::minutes(minutes)));
+        let at = |minutes| {
+            ExpiresAt::At(to_second(
+                Timestamp::now() + jiff::SignedDuration::from_mins(minutes),
+            ))
+        };
         let deadline = match state {
             Seeded::NoDeadline => ExpiresAt::Never,
             Seeded::Expired => at(-5),
@@ -2118,7 +2125,10 @@ mod tests {
         let store = SqlTodoStore::new(test_db.db().clone());
         let client = ClientId::try_new("ev1_campaigns")?;
         let campaign = |n: u8| format!("campaign_00000000-0000-0000-0000-00000000000{n}");
-        let past = ExpiresAt::At(to_second(Utc::now() - chrono::Duration::minutes(5))).to_string();
+        let past = ExpiresAt::At(to_second(
+            Timestamp::now() - jiff::SignedDuration::from_mins(5),
+        ))
+        .to_string();
         // (plan, status, campaign, cancel marker)
         let plans: [(&str, &str, Option<String>, bool); 7] = [
             ("plan-a", "active", Some(campaign(1)), false),
@@ -2628,7 +2638,7 @@ mod tests {
             }
         }
         let at = now()?;
-        let lease_expiry = at + chrono::Duration::hours(1);
+        let lease_expiry = at + jiff::SignedDuration::from_hours(1);
         let outcomes = race(|n| {
             let store = store.clone();
             let client = clients[n % clients.len()].clone();
@@ -2670,7 +2680,7 @@ mod tests {
         let old = JobId::try_new("old-job")?;
         let next = JobId::try_new("next-job")?;
         let at = now()?;
-        let lapsed_at = at - chrono::Duration::seconds(1);
+        let lapsed_at = at - jiff::SignedDuration::from_secs(1);
         enqueue(&store, &old).await?;
         store
             .claim_job(&old, ExpiresAt::Never, &client, lapsed_at)
@@ -2679,7 +2689,7 @@ mod tests {
         store
             .write_eligible(&client, &next, ExpiresAt::Never)
             .await?;
-        let until = at + chrono::Duration::minutes(5);
+        let until = at + jiff::SignedDuration::from_mins(5);
         if reclaim {
             assert!(matches!(
                 store
@@ -2728,7 +2738,7 @@ mod tests {
             store
                 .claim_for_client(
                     &client,
-                    at + chrono::Duration::minutes(5),
+                    at + jiff::SignedDuration::from_mins(5),
                     3,
                     &[],
                     None,
@@ -2753,7 +2763,7 @@ mod tests {
         let client = ClientId::try_new("checked-client")?;
         let job = JobId::try_new("checked-job")?;
         let at = now()?;
-        let until = at + chrono::Duration::minutes(5);
+        let until = at + jiff::SignedDuration::from_mins(5);
         enqueue(&store, &job).await?;
         store
             .claim_job(&job, ExpiresAt::Never, &client, until)
@@ -2772,7 +2782,7 @@ mod tests {
         assert_eq!(store.list_lost_leases(&job).await?.len(), 1);
 
         // A heartbeat changes the lease while its access check is in flight.
-        let renewed = until + chrono::Duration::minutes(1);
+        let renewed = until + jiff::SignedDuration::from_mins(1);
         store.renew_lease(&job, &client, renewed).await?;
         let result = store
             .claim_for_client(&client, renewed, 2, &[], Some(&lease), None, at)
@@ -2826,7 +2836,7 @@ mod tests {
         let result = store
             .claim_for_client(
                 &client,
-                at + chrono::Duration::minutes(5),
+                at + jiff::SignedDuration::from_mins(5),
                 limit,
                 &[],
                 None,
@@ -2879,9 +2889,9 @@ mod tests {
         let rival = JobId::try_new("rival")?;
         let plain = JobId::try_new("plain")?;
         let rival_deadline = if matches!(rival_kind, Rival::Expired) {
-            ExpiresAt::At(to_second(at) - chrono::Duration::hours(1))
+            ExpiresAt::At(to_second(at) - jiff::SignedDuration::from_hours(1))
         } else {
-            ExpiresAt::At(to_second(at) + chrono::Duration::days(1))
+            ExpiresAt::At(to_second(at) + jiff::SignedDuration::from_hours(24))
         };
         for (job, deadline) in [(&rival, rival_deadline), (&plain, ExpiresAt::Never)] {
             store
@@ -2903,7 +2913,7 @@ mod tests {
                         &rival,
                         rival_deadline,
                         &other,
-                        at + chrono::Duration::hours(1),
+                        at + jiff::SignedDuration::from_hours(1),
                     )
                     .await?;
             }
@@ -2918,7 +2928,7 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 &client,
-                at + chrono::Duration::hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 0,
                 &passed_over,
                 None,
@@ -2943,7 +2953,7 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 client,
-                at + chrono::Duration::hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 0,
                 passed_over,
                 None,
@@ -3079,7 +3089,7 @@ mod tests {
         })
         .await?;
         let client = ClientId::try_new("ev1_runner")?;
-        let until = now()? + chrono::Duration::hours(1);
+        let until = now()? + jiff::SignedDuration::from_hours(1);
         let leased = JobId::try_new("leased")?;
         store
             .claim_job(&leased, ExpiresAt::Never, &client, until)
@@ -3180,7 +3190,7 @@ mod tests {
         let at = now()?;
         let client = ClientId::try_new("picker")?;
         register_client(&test_db, client.clone()).await?;
-        let lease_expiry = to_second(at) + chrono::Duration::hours(1);
+        let lease_expiry = to_second(at) + jiff::SignedDuration::from_hours(1);
 
         for (index, (model, runtime)) in prior.iter().enumerate() {
             let job = JobId::try_new(format!("prior-{index}"))?;
@@ -3188,7 +3198,7 @@ mod tests {
             let last = index + 1 == prior.len();
             // A lease that lapses before the next claim is a lost lease.
             let expiry = if last && matches!(end, PriorEnd::LeaseLost) {
-                to_second(at) - chrono::Duration::minutes(1)
+                to_second(at) - jiff::SignedDuration::from_mins(1)
             } else {
                 lease_expiry
             };
@@ -3236,7 +3246,7 @@ mod tests {
                 .await?;
         }
 
-        let sooner = ExpiresAt::At(to_second(at) + chrono::Duration::days(1));
+        let sooner = ExpiresAt::At(to_second(at) + jiff::SignedDuration::from_hours(24));
         for (name, model, runtime) in [
             ("model-job", "A", "R9"),
             ("runtime-job", "Z", "R1"),
@@ -3288,7 +3298,7 @@ mod tests {
         let store = SqlTodoStore::new(test_db.db().clone());
         let at = now()?;
         let client = ClientId::try_new("picker")?;
-        let lease_expiry = to_second(at) + chrono::Duration::hours(1);
+        let lease_expiry = to_second(at) + jiff::SignedDuration::from_hours(1);
         for (name, model, runtime) in [
             ("neither-job", "C", "R3"),
             ("runtime-job", "Z", "R1"),
@@ -3344,7 +3354,7 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 client,
-                at + chrono::Duration::hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 0,
                 &[],
                 None,
@@ -3427,9 +3437,9 @@ mod tests {
                         store.write_eligible(picker, &job, ExpiresAt::Never).await?;
                     }
                     let lease_expiry = if matches!(lease, Leased::Lapsed) {
-                        at - chrono::Duration::minutes(1)
+                        at - jiff::SignedDuration::from_mins(1)
                     } else {
-                        at + chrono::Duration::hours(1)
+                        at + jiff::SignedDuration::from_hours(1)
                     };
                     store
                         .claim_job(&job, ExpiresAt::Never, &holder, lease_expiry)
@@ -3439,7 +3449,7 @@ mod tests {
             })
             .await?;
 
-        let soon = ExpiresAt::At(to_second(at) + chrono::Duration::days(1));
+        let soon = ExpiresAt::At(to_second(at) + jiff::SignedDuration::from_hours(24));
         seed_artifact_job(&store, &picker, &JobId::try_new("a-job")?, "A", "R", soon).await?;
         let b_deadline = if matches!(b_job, BJob::Later) {
             ExpiresAt::Never
@@ -3597,7 +3607,7 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 &client,
-                at + chrono::Duration::hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 0,
                 &[],
                 None,
@@ -3641,7 +3651,7 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 &client,
-                at + chrono::Duration::hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 0,
                 &[],
                 None,
@@ -3680,7 +3690,7 @@ mod tests {
         reclaim: bool,
     ) -> anyhow::Result<()> {
         let at = now()?;
-        let until = at + chrono::Duration::hours(1);
+        let until = at + jiff::SignedDuration::from_hours(1);
         if reclaim {
             let outcome = store.reclaim_for_client(job, client, until, 0, at).await?;
             anyhow::ensure!(
@@ -3720,12 +3730,12 @@ mod tests {
         let outcome = store
             .claim_for_client(
                 &client,
-                at - chrono::Duration::minutes(1),
+                at - jiff::SignedDuration::from_mins(1),
                 0,
                 &[],
                 None,
                 None,
-                at - chrono::Duration::minutes(2),
+                at - jiff::SignedDuration::from_mins(2),
             )
             .await?;
         anyhow::ensure!(
@@ -3813,7 +3823,7 @@ mod tests {
                                 job,
                                 ExpiresAt::Never,
                                 client,
-                                now()? + chrono::Duration::hours(1),
+                                now()? + jiff::SignedDuration::from_hours(1),
                             )
                             .await?;
                     }
@@ -3841,7 +3851,7 @@ mod tests {
                 job,
                 ExpiresAt::Never,
                 client,
-                now()? + chrono::Duration::hours(1),
+                now()? + jiff::SignedDuration::from_hours(1),
             )
             .await?;
         grant_for_deletion_race(&store, client, job, reclaim).await?;
@@ -3967,7 +3977,7 @@ mod tests {
             store.claim_job(&job, ExpiresAt::Never, &other, at).await?,
             ClaimResult::Gone
         ));
-        let renewed = at + chrono::TimeDelta::seconds(60);
+        let renewed = at + jiff::SignedDuration::from_secs(60);
         assert_eq!(
             store.renew_lease(&job, &client, renewed).await?,
             RenewLeaseResult::Renewed(ExpiresAt::Never)
@@ -4001,7 +4011,13 @@ mod tests {
             store.avail_for_jobs(std::slice::from_ref(&job)).await?,
             vec![AvailEntry {
                 job_id: job.clone(),
-                expires_at: ExpiresAt::At(at.trunc_subsecs(0))
+                expires_at: ExpiresAt::At(
+                    at.round(
+                        jiff::TimestampRound::new()
+                            .smallest(jiff::Unit::Second)
+                            .mode(jiff::RoundMode::Trunc)
+                    )?
+                )
             }]
         );
         assert!(store.get_avail(&job, exp).await?.is_some());
@@ -4133,7 +4149,7 @@ mod tests {
         let row: ExpiresAt = "20270210T000000Z".parse()?;
         let member: ExpiresAt = "20261210T000000Z".parse()?;
         enqueue_held(&test_db, &store, &job, row, &[("a", "20261210T000000Z")]).await?;
-        let lease_expiry = now()? + chrono::Duration::hours(1);
+        let lease_expiry = now()? + jiff::SignedDuration::from_hours(1);
         assert!(matches!(
             store.claim_job(&job, row, &client, lease_expiry).await?,
             ClaimResult::Claimed(_)
@@ -4228,7 +4244,7 @@ mod tests {
                 }
                 Step::Renew => assert_eq!(
                     store
-                        .renew_lease(&job, &client, at + chrono::TimeDelta::seconds(60))
+                        .renew_lease(&job, &client, at + jiff::SignedDuration::from_secs(60))
                         .await?,
                     RenewLeaseResult::Renewed(ExpiresAt::Never)
                 ),
@@ -4238,7 +4254,7 @@ mod tests {
                             &job,
                             ExpiresAt::Never,
                             &client,
-                            at + chrono::TimeDelta::seconds(60)
+                            at + jiff::SignedDuration::from_secs(60)
                         )
                         .await?,
                     RecycleResult::Recycled

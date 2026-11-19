@@ -3,6 +3,7 @@
 //! between owners. The pointer moves only by filing work, so a plan never has two campaigns.
 
 pub mod reads;
+pub mod tags;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,7 +11,7 @@ use axum::Json;
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use jiff::Timestamp;
 use tracing::Instrument;
 
 use pipette_core::campaign::{Campaign, CampaignOwner, NewCampaign};
@@ -442,15 +443,22 @@ pub async fn update_campaign(
         name,
         labels,
         state: new_state,
+        state_note,
     } = body;
     if let Some(name) = &name {
         check_name(name)?;
     }
+    if new_state.is_none() && state_note.is_some() {
+        return Err(campaign_admin::CampaignAdminError::NoteWithoutLock.into());
+    }
     let mut campaign = read.clone();
-    let now = Utc::now();
+    let now = Timestamp::now();
+    let restated = new_state
+        .map(|new_state| campaign_admin::restate(&mut campaign, new_state, state_note, now))
+        .transpose()?
+        .unwrap_or(false);
     let renamed = name.is_some_and(|name| campaign.rename(name, now));
     let relabelled = labels.is_some_and(|labels| campaign.set_labels(labels, now));
-    let restated = new_state.is_some_and(|new_state| campaign.set_state(new_state, now));
     let changed = renamed || relabelled || restated;
     if changed {
         // The caller was checked on `read`, so a record changed since is a `409`.
@@ -522,7 +530,7 @@ async fn hand_over(
     }
 
     let read = campaign.clone();
-    let changed = campaign.set_owner(owner, Utc::now());
+    let changed = campaign.set_owner(owner, Timestamp::now());
     if changed {
         // The checks above passed on `read`, so a record changed since is a `409`.
         campaign_admin::replace(state.campaign_store.as_ref(), &read, &campaign).await?;
@@ -809,10 +817,10 @@ async fn offer(
 /// The `200` answer of a document revision that files nothing, as a rename to
 /// the same name answers.
 fn unchanged(campaign: &Campaign) -> RevisionAnswer {
-    RevisionAnswer::Unchanged(Changed {
+    RevisionAnswer::Unchanged(Box::new(Changed {
         record: view(campaign.clone()),
         changed: false,
-    })
+    }))
 }
 
 /// A write's answer: the record alone, as an unasked read answers it.
@@ -821,6 +829,8 @@ pub(crate) fn view(campaign: Campaign) -> CampaignView {
         campaign: campaign.into(),
         plan: None,
         models: None,
+        policy_checks: None,
+        current_plan_tags: Vec::new(),
     }
 }
 

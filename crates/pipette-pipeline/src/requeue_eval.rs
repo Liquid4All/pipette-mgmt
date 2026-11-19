@@ -120,7 +120,7 @@ async fn restage_one(
     let mut resubmission = SubmissionInput::Success(Box::new(success.wire)).into_submission(
         success.client_id,
         new_job_id.clone(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         benchmark_type,
     );
     // The copy answers the job the original did, so it keeps the flags that

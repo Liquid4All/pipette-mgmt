@@ -98,7 +98,7 @@ impl OrgStore for S3OrgStore {
 mod tests {
     use std::sync::Arc;
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;
     use object_store::{ObjectStore, ObjectStoreExt};
@@ -134,7 +134,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new(" ACME ")?,
             NonEmptyTrimmedString::try_new("Acme Corp., Inc.")?,
-            Utc::now(),
+            Timestamp::now(),
         );
         let org_id = org.org_id.clone();
         store.claim_org_slug(org.slug.as_str(), &org_id).await?;

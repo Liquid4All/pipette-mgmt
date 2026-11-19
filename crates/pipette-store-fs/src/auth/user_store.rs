@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_permission::UserPermissionSet;
@@ -186,7 +186,7 @@ impl UserStore for LocalFsUserStore {
                     UserPreauthRejectionError::NotFound,
                 ));
             };
-            let now = Utc::now();
+            let now = Timestamp::now();
             let grant = match pipette_core::user_preauth::validate(&key, &secret, now) {
                 Ok(grant) => grant,
                 Err(rejection) => return Ok(UserPreauthConsumeOutcome::Rejected(rejection)),
@@ -282,7 +282,7 @@ mod tests {
     //! The user store, over a tempdir.
 
     use anyhow::Context;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::types::Mint;
     use pipette_plan_types::UserId;
@@ -371,7 +371,7 @@ mod tests {
         let store = user_store(&dir);
 
         let email = pipette_plan_types::ContactEmail::try_new("Operator@Example.com")?;
-        let user = pipette_core::user::User::try_new(email, Utc::now())?;
+        let user = pipette_core::user::User::try_new(email, Timestamp::now())?;
         let user_id = user.user_id.clone();
         store
             .claim_user_email(user.contact_email.as_str(), &user_id)
@@ -411,7 +411,7 @@ mod tests {
                 expires_at: None,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         store.put_user_preauth_key(&minted.key).await?;
@@ -465,7 +465,7 @@ mod tests {
                 expires_at: None,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         store.put_user_preauth_key(&minted.key).await?;
@@ -502,10 +502,10 @@ mod tests {
             pipette_core::user_preauth::UserPreauthParams {
                 user_id: UserId::mint(),
                 usage: pipette_plan_types::UserPreauthUsage::SingleUse,
-                expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                expires_at: Some(Timestamp::now() - jiff::SignedDuration::from_secs(1)),
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         store.put_user_preauth_key(&minted.key).await?;

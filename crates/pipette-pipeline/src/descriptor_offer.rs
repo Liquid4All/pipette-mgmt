@@ -138,7 +138,7 @@ pub fn resolve<'a>(
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rstest::rstest;
     use serde_json::json;
 
@@ -152,13 +152,14 @@ mod tests {
     use super::*;
 
     /// A member's runtime: llama.cpp or OVMS with a flavor, Apple Foundation,
-    /// or the iOS app's llama.cpp at a build version.
+    /// desktop MLX, or the iOS app's llama.cpp at a build version.
     #[derive(Debug, Clone, Copy)]
     enum Runtime {
         Llamacpp(&'static str),
         Ovms(&'static str),
         AppleFoundation,
         IosLlamacpp(&'static str),
+        MlxMacos,
     }
 
     /// The expected result of `resolve`: the offered flavor, or each reason.
@@ -180,6 +181,10 @@ mod tests {
                 "repository_url": "github.com/openvinotoolkit/model_server",
                 "repository_version": "v2026.4.0", "flavor": flavor
             }),
+            Runtime::MlxMacos => json!({
+                "type": "mlx_macos_pipette", "version": "0.31.3", "flavor": "macos-arm64",
+                "source": { "type": "pip_requirements_text", "contents": "mlx-lm==0.31.3" }
+            }),
             Runtime::AppleFoundation => json!({"type": "apple_foundation"}),
             Runtime::IosLlamacpp(version) => json!({
                 "type": "llamacpp_ios_pipette",
@@ -189,7 +194,7 @@ mod tests {
         };
         Ok(DescriptorMember::new(
             serde_json::from_value(runtime)?,
-            Utc::now(),
+            Timestamp::now(),
         )?)
     }
 
@@ -200,7 +205,7 @@ mod tests {
                 .map(|runtime| member(*runtime))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         )?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         Ok(DescriptorEntry::new(
             pipette_plan_types::CatalogScope::Global,
             CatalogName::try_new("llama")?,
@@ -222,7 +227,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("rig")?,
             contact_email: ContactEmail::try_new("ops@example.test")?,
             status: ClientStatus::Approved,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: DeviceProfile {
                 device_os_name: Some(NonEmptyTrimmedString::try_new(os)?),
                 device_chip_model: chip.map(NonEmptyTrimmedString::try_new).transpose()?,
@@ -252,6 +257,10 @@ requires = ["os:macos"]
 runtime_type = "ovms"
 flavor = "windows-x64"
 requires = ["os:windows"]
+[[offer_rules]]
+runtime_type = "mlx_macos_pipette"
+flavor = "macos-arm64"
+requires = ["os:macos", "runtime:mlx"]
 [[offer_rules]]
 runtime_type = "llamacpp_ios_pipette"
 flavor = "ios-arm64"
@@ -325,6 +334,34 @@ requires = ["os:ios"]
         let member = member(runtime)?;
         let result = coverage(&rules()?, &member).map(|_| ()).map_err(code);
         assert_eq!(result, expected);
+        Ok(())
+    }
+
+    /// Desktop MLX needs the flag for any installed MLX version.
+    #[rstest]
+    #[case::available(&["os:macos", "arch:arm64", "runtime:mlx"], true)]
+    #[case::other_version(&["os:macos", "arch:arm64", "runtime:mlx", "runtime:mlx:0.30.0"], true)]
+    #[case::no_os(&["arch:arm64", "runtime:mlx"], false)]
+    #[case::no_arch(&["os:macos", "runtime:mlx"], true)]
+    #[case::not_installed(&["os:macos", "arch:arm64"], false)]
+    #[case::version_only(&["os:macos", "arch:arm64", "runtime:mlx:0.31.3"], false)]
+    fn desktop_mlx_requires_availability(
+        #[case] flags: &[&str],
+        #[case] offered: bool,
+    ) -> anyhow::Result<()> {
+        let entry = entry(&[Runtime::MlxMacos])?;
+        let member = entry.members.head();
+        assert_eq!(member.app_build_flag(), None);
+        let mut device = client("macOS", None)?;
+        device.capabilities = flags.iter().map(|flag| (*flag).to_owned()).collect();
+        // Supply all flags explicitly so the missing-OS case has no profile fallback.
+        device.device_profile = DeviceProfile::default();
+        let rules = rules()?;
+        let tags = FleetTags::default();
+        assert_eq!(
+            offer(&rules, member, &device, &tags).map_err(code),
+            if offered { Ok(()) } else { Err("not_met") }
+        );
         Ok(())
     }
 
@@ -450,7 +487,7 @@ requires = ["os:ios"]
         let member = DescriptorMember::new_model(
             model,
             pipette_plan_types::QuantizationLabel::try_new("4bit")?,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         assert_eq!(
             coverage(&rules()?, &member).err(),

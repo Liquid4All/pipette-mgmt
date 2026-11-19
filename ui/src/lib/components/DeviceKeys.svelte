@@ -6,7 +6,7 @@
   import { clientPreauthKeys, mintClientPreauthKey, revokeClientPreauthKey } from "../api";
   import { handOver, mintRequest, usage } from "../devices";
   import { when } from "../format";
-  import type { OrgRef } from "../orgs";
+  import { orgName, type OrgRef } from "../orgs";
   import { session } from "../session.svelte";
   import type { ClientPreauthKeyMinted, ClientPreauthKeyView, OrgView } from "../api-types";
   import Loaded from "./Loaded.svelte";
@@ -48,7 +48,7 @@
     <MintedToken token={shown.token} ondone={() => (minted = null)}>
       {#snippet facts()}
         <dt>organization</dt>
-        <dd>{"display_name" in org ? org.display_name : org.slug} <span class="muted id">{org.org_id}</span></dd>
+        <dd>{orgName(org)} <span class="muted id">{org.org_id}</span></dd>
         <dt>key_id</dt><dd class="id">{shown.key_id}</dd>
         <dt>usage</dt><dd>{usage(shown.usage)}</dd>
         <dt>expires</dt><dd>{when(shown.expires_at)}</dd>

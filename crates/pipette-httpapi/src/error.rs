@@ -241,17 +241,26 @@ impl From<pipette_pipeline::campaign_admin::CampaignAdminError> for AppError {
         match error {
             CampaignAdminError::NotFound(_)
             | CampaignAdminError::NoSuchPlan(_)
-            | CampaignAdminError::NotInCampaign { .. } => AppError::NotFound(message),
+            | CampaignAdminError::NotInCampaign { .. }
+            | CampaignAdminError::NoTagStore => AppError::NotFound(message),
             CampaignAdminError::NoSuchUser(_)
             | CampaignAdminError::NoSuchOrg(_)
             | CampaignAdminError::NoOwnerNamed
             | CampaignAdminError::NothingToRerun
             | CampaignAdminError::RerunAndFail(_)
-            | CampaignAdminError::NoSuchSourceVariant { .. } => AppError::BadRequest(message),
+            | CampaignAdminError::NoSuchSourceVariant { .. }
+            | CampaignAdminError::TextTooLong(_)
+            | CampaignAdminError::TextHasNul(_)
+            | CampaignAdminError::LockNeedsNote
+            | CampaignAdminError::NoteWithoutLock
+            | CampaignAdminError::BadTagName(_) => AppError::BadRequest(message),
             CampaignAdminError::Edit(e) if e.is_caller_fault() => AppError::BadRequest(message),
             CampaignAdminError::Edit(e) => AppError::internal(anyhow::Error::new(e)),
             CampaignAdminError::NoPlan(_)
             | CampaignAdminError::Archived(_)
+            | CampaignAdminError::Locked { .. }
+            | CampaignAdminError::LockedArchive(_)
+            | CampaignAdminError::TagTaken { .. }
             | CampaignAdminError::NotOnPlan { .. }
             | CampaignAdminError::NoDocument(_)
             | CampaignAdminError::NotInPlan { .. }

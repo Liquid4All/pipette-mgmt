@@ -626,6 +626,19 @@ export type AuditAction =
       type: "catalog_merge";
     }
   | {
+      digest: string;
+      member: string;
+      name: string;
+      scope: string;
+      type: "catalog_remove_member";
+    }
+  | {
+      name: string;
+      org_id: string;
+      original_created_by: string;
+      type: "catalog_move_to_global";
+    }
+  | {
       prior_keys: UserKey[];
       type: "first_clerk_sign_in";
     }
@@ -1464,7 +1477,7 @@ export type WarningKind = "fleet" | "uncatalogued_model" | string;
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CampaignState".
  */
-export type CampaignState = "active" | "archived";
+export type CampaignState = "active" | "locked" | "archived";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PolicySkipReason".
@@ -3057,6 +3070,7 @@ export interface CampaignCreated {
   owner: PrincipalOwner;
   plan: PlanFiled;
   state?: CampaignState;
+  state_note?: string | null;
   updated_at: string;
 }
 /**
@@ -3192,7 +3206,6 @@ export interface MemberPolicyPreview {
   };
   smaller_failed: SmallerFailure[];
   state: PolicyMemberState;
-  triggered: PolicyKind[];
   unclaimed_job_count: number;
   waiting_job_count: number;
 }
@@ -3310,6 +3323,7 @@ export interface CampaignView {
   campaign_id: string;
   created_at: string;
   current_plan_id?: string | null;
+  current_plan_tags?: PlanTag[];
   labels?: {
     [k: string]: string;
   };
@@ -3317,8 +3331,22 @@ export interface CampaignView {
   name: string;
   owner: PrincipalOwner;
   plan?: PlanSummary | null;
+  policy_checks?: PolicyCheck[] | null;
   state?: CampaignState;
+  state_note?: string | null;
   updated_at: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PlanTag".
+ */
+export interface PlanTag {
+  campaign_id: string;
+  created_at: string;
+  message: string;
+  name: string;
+  plan_id: string;
+  tagger?: string | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3349,11 +3377,20 @@ export interface Counts {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyCheck".
+ */
+export interface PolicyCheck {
+  kind: PolicyKind;
+  triggered: boolean;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CampaignPlanRow".
  */
 export interface CampaignPlanRow {
   plan: PlanSummary | null;
   plan_id: string;
+  tags?: PlanTag[];
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3779,6 +3816,15 @@ export interface CreateOrgRequest {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "CreatePlanTagRequest".
+ */
+export interface CreatePlanTagRequest {
+  message: string;
+  name: string;
+  plan_id: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "CreateUserRequest".
  */
 export interface CreateUserRequest {
@@ -3804,9 +3850,11 @@ export interface DescriptorCatalogShortList {
  */
 export interface DescriptorCatalogShortListItem {
   descriptor_kind: DescriptorKind;
+  display_name: string;
   members: DescriptorMemberView[];
   name: string;
   release_time: string;
+  scope: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3855,10 +3903,12 @@ export interface DescriptorWithheldReport {
  * via the `definition` "DescriptorWithheldMember".
  */
 export interface DescriptorWithheldMember {
+  display_name: string;
   member_key: DescriptorMemberKey;
   name: string;
   reason: string;
   reason_code: DescriptorWithheldReasonCode;
+  scope: string;
   selector: string;
 }
 /**
@@ -4198,12 +4248,14 @@ export interface NamedCampaignOverview {
   may_administer: boolean;
   may_edit_variants: boolean;
   may_rerun: boolean;
+  may_tag: boolean;
   name: string;
   names?: {
     [k: string]: string;
   } | null;
   owner: PrincipalOwner;
   state?: CampaignState;
+  state_note?: string | null;
   updated_at: string;
 }
 /**
@@ -4214,6 +4266,7 @@ export interface NamedCampaignView {
   campaign_id: string;
   created_at: string;
   current_plan_id?: string | null;
+  current_plan_tags?: PlanTag[];
   labels?: {
     [k: string]: string;
   };
@@ -4224,7 +4277,9 @@ export interface NamedCampaignView {
   } | null;
   owner: PrincipalOwner;
   plan?: PlanSummary | null;
+  policy_checks?: PolicyCheck[] | null;
   state?: CampaignState;
+  state_note?: string | null;
   updated_at: string;
 }
 /**
@@ -4527,6 +4582,7 @@ export interface OwnUserView {
   first_clerk_sign_in?: FirstClerkSignIn | null;
   keys: UserKey[];
   may: UserAbilities;
+  org_display_name?: string | null;
   org_id?: string | null;
   org_slug?: string | null;
   permissions: UserPermissionSet;
@@ -4667,6 +4723,13 @@ export interface RelabelDescriptorMemberRequest {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "RemoveDescriptorMemberRequest".
+ */
+export interface RemoveDescriptorMemberRequest {
+  member: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "RenameDescriptorEntryRequest".
  */
 export interface RenameDescriptorEntryRequest {
@@ -4770,6 +4833,7 @@ export interface UpdateCampaignRequest {
   } | null;
   name?: string | null;
   state?: CampaignState | null;
+  state_note?: string | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema

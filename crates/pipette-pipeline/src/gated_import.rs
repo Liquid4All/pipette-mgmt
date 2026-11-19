@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::vault::VaultOwner;
@@ -117,7 +117,7 @@ pub(crate) async fn import(
     vault: &dyn VaultStore,
     owner: &VaultOwner,
     jobs: Vec<(String, Value)>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<Gated, IngestError> {
     let Some(Found { models, imports }) = find(imports, &jobs)? else {
         return Ok(Gated {
@@ -249,7 +249,7 @@ async fn run(
     owner: &VaultOwner,
     jobs: &[(String, Value)],
     found: &[Option<Model>],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<HashMap<Model, Model>, IngestError> {
     let models = found.iter().flatten().count();
     let distinct = found.iter().flatten().collect::<HashSet<_>>().len();

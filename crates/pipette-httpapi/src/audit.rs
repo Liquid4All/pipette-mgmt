@@ -555,6 +555,8 @@ mod tests {
                 | AuditAction::FirstClerkSignIn { .. }
                 | AuditAction::CatalogRename { .. }
                 | AuditAction::CatalogMerge { .. }
+                | AuditAction::CatalogRemoveMember { .. }
+                | AuditAction::CatalogMoveToGlobal { .. }
                 | AuditAction::GroupPolicy { .. } => (event.outcome, 0),
             })
             .collect();

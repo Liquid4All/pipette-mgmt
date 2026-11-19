@@ -749,6 +749,10 @@ model against its recommended sampling without disturbing the reference id. The
 three differ only by `parameter_temperature`, so one methodology article covers
 all of them.
 
+MATH-500's dataset `2026.10.1` changes the prompt and the grader, so its entry,
+[`eval_math_500_2026.10.1_ctx32768`](methodology/math_500-2026.10.1.md), has an
+article of its own. It is defined only in the production catalog.
+
 #### Submission fields
 
 | Field | Type | Description |

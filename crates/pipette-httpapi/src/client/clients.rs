@@ -5,8 +5,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 
 use pipette_core::client::{Client, ClientStatus};
 use pipette_core::client_permission::ClientPermissionSet;
@@ -280,7 +280,7 @@ pub async fn register_client(
             let key = stored
                 .ok_or(ClientPreauthRejectionError::NotFound)
                 .and_then(|key| {
-                    client_preauth::validate(&key, &secret, Utc::now()).map(|_| key)
+                    client_preauth::validate(&key, &secret, Timestamp::now()).map(|_| key)
                 })
                 .map_err(|rejection| {
                     tracing::warn!(%key_id, reason = %rejection, "pre-auth key rejected at registration");
@@ -403,7 +403,7 @@ pub async fn register_client(
         client_details: body.client_details,
         contact_email: body.contact_email,
         status,
-        registered_at: Utc::now(),
+        registered_at: Timestamp::now(),
         device_profile,
         capabilities: body.capabilities,
     };

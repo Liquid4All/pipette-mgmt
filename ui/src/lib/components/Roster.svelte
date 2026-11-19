@@ -4,6 +4,7 @@
   // filters, sorts and pages it here.
   import { users } from "../api";
   import { rosterEmpty, rosterRows, rosterTable, type RosterBranch } from "../accounts";
+  import { orgName } from "../orgs";
   import { orgLink } from "../routes";
   import { session } from "../session.svelte";
   import type { UserView } from "../api-types";
@@ -22,13 +23,13 @@
 
   // Every account's listing names a row's organization from those the tree lists.
   const orgOf = (org_id: string) => session.knownOrg(org_id);
-  const spec = $derived(rosterTable(branch, (org_id) => orgOf(org_id)?.slug ?? null));
+  const spec = $derived(rosterTable(branch, (org_id) => { const org = orgOf(org_id); return org ? orgName(org) : null; }));
   const listed = $derived(rosterRows(roster.data ?? [], branch));
 </script>
 
 {#snippet organization(row: UserView)}
   {@const org = row.org_id ? orgOf(row.org_id) : null}
-  {#if org}<a href={orgLink(org)} title={org.org_id}>{org.slug}</a>
+  {#if org}<a href={orgLink(org)} title={org.org_id}>{orgName(org)}</a>
   {:else if row.org_id}<span class="id">{row.org_id}</span>
   {:else}<span class="muted">none</span>{/if}
 {/snippet}

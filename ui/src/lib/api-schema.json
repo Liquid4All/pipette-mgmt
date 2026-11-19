@@ -529,6 +529,62 @@
         },
         {
           "properties": {
+            "digest": {
+              "type": "string"
+            },
+            "member": {
+              "type": "string"
+            },
+            "name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "type": {
+              "const": "catalog_remove_member",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "scope",
+            "name",
+            "member",
+            "digest"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "name": {
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$",
+              "type": "string"
+            },
+            "org_id": {
+              "type": "string"
+            },
+            "original_created_by": {
+              "type": "string"
+            },
+            "type": {
+              "const": "catalog_move_to_global",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "org_id",
+            "name",
+            "original_created_by"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
             "prior_keys": {
               "items": {
                 "$ref": "#/$defs/UserKey"
@@ -4747,6 +4803,12 @@
         "state": {
           "$ref": "#/$defs/CampaignState"
         },
+        "state_note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "updated_at": {
           "format": "date-time",
           "type": "string"
@@ -4995,6 +5057,12 @@
         },
         "plan_id": {
           "type": "string"
+        },
+        "tags": {
+          "items": {
+            "$ref": "#/$defs/PlanTag"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -5055,6 +5123,7 @@
     "CampaignState": {
       "enum": [
         "active",
+        "locked",
         "archived"
       ],
       "type": "string"
@@ -5091,6 +5160,12 @@
             "string",
             "null"
           ]
+        },
+        "current_plan_tags": {
+          "items": {
+            "$ref": "#/$defs/PlanTag"
+          },
+          "type": "array"
         },
         "labels": {
           "additionalProperties": {
@@ -5129,8 +5204,23 @@
             }
           ]
         },
+        "policy_checks": {
+          "items": {
+            "$ref": "#/$defs/PolicyCheck"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "state": {
           "$ref": "#/$defs/CampaignState"
+        },
+        "state_note": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "updated_at": {
           "format": "date-time",
@@ -6707,6 +6797,26 @@
       ],
       "type": "object"
     },
+    "CreatePlanTagRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "plan_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_id",
+        "name",
+        "message"
+      ],
+      "type": "object"
+    },
     "CreateUserRequest": {
       "additionalProperties": false,
       "properties": {
@@ -6786,6 +6896,9 @@
         "descriptor_kind": {
           "$ref": "#/$defs/DescriptorKind"
         },
+        "display_name": {
+          "type": "string"
+        },
         "members": {
           "items": {
             "$ref": "#/$defs/DescriptorMemberView"
@@ -6798,10 +6911,15 @@
         "release_time": {
           "format": "date-time",
           "type": "string"
+        },
+        "scope": {
+          "type": "string"
         }
       },
       "required": [
         "name",
+        "scope",
+        "display_name",
         "release_time",
         "descriptor_kind",
         "members"
@@ -7350,6 +7468,9 @@
     },
     "DescriptorWithheldMember": {
       "properties": {
+        "display_name": {
+          "type": "string"
+        },
         "member_key": {
           "$ref": "#/$defs/DescriptorMemberKey"
         },
@@ -7362,12 +7483,17 @@
         "reason_code": {
           "$ref": "#/$defs/DescriptorWithheldReasonCode"
         },
+        "scope": {
+          "type": "string"
+        },
         "selector": {
           "type": "string"
         }
       },
       "required": [
         "name",
+        "scope",
+        "display_name",
         "selector",
         "member_key",
         "reason_code",
@@ -8769,13 +8895,6 @@
         "state": {
           "$ref": "#/$defs/PolicyMemberState"
         },
-        "triggered": {
-          "items": {
-            "$ref": "#/$defs/PolicyKind"
-          },
-          "type": "array",
-          "uniqueItems": true
-        },
         "unclaimed_job_count": {
           "format": "uint",
           "minimum": 0,
@@ -8796,7 +8915,6 @@
         "earliest_deadline",
         "deadline_passed",
         "checks",
-        "triggered",
         "rerun_job_ids",
         "marked_job_ids",
         "kept_job_count",
@@ -9798,6 +9916,9 @@
         "may_rerun": {
           "type": "boolean"
         },
+        "may_tag": {
+          "type": "boolean"
+        },
         "name": {
           "type": "string"
         },
@@ -9816,6 +9937,12 @@
         "state": {
           "$ref": "#/$defs/CampaignState"
         },
+        "state_note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "updated_at": {
           "format": "date-time",
           "type": "string"
@@ -9831,6 +9958,7 @@
         "may_administer",
         "may_edit_variants",
         "may_rerun",
+        "may_tag",
         "catalog_org_id",
         "history",
         "history_truncated",
@@ -9853,6 +9981,12 @@
             "string",
             "null"
           ]
+        },
+        "current_plan_tags": {
+          "items": {
+            "$ref": "#/$defs/PlanTag"
+          },
+          "type": "array"
         },
         "labels": {
           "additionalProperties": {
@@ -9900,8 +10034,23 @@
             }
           ]
         },
+        "policy_checks": {
+          "items": {
+            "$ref": "#/$defs/PolicyCheck"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "state": {
           "$ref": "#/$defs/CampaignState"
+        },
+        "state_note": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "updated_at": {
           "format": "date-time",
@@ -11076,6 +11225,12 @@
         "may": {
           "$ref": "#/$defs/UserAbilities"
         },
+        "org_display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "org_id": {
           "type": [
             "string",
@@ -11558,6 +11713,40 @@
       ],
       "type": "object"
     },
+    "PlanTag": {
+      "properties": {
+        "campaign_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "plan_id": {
+          "type": "string"
+        },
+        "tagger": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "campaign_id",
+        "name",
+        "plan_id",
+        "message",
+        "created_at"
+      ],
+      "type": "object"
+    },
     "PlanValidation": {
       "properties": {
         "document": {
@@ -11813,6 +12002,21 @@
         "enabled",
         "max_reruns",
         "settings"
+      ],
+      "type": "object"
+    },
+    "PolicyCheck": {
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PolicyKind"
+        },
+        "triggered": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "triggered"
       ],
       "type": "object"
     },
@@ -12395,6 +12599,18 @@
         "format",
         "from",
         "to"
+      ],
+      "type": "object"
+    },
+    "RemoveDescriptorMemberRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "member": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "member"
       ],
       "type": "object"
     },
@@ -19351,6 +19567,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "state_note": {
+          "type": [
+            "string",
+            "null"
           ]
         }
       },

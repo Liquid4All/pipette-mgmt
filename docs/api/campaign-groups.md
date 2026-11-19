@@ -36,21 +36,28 @@ writes nothing.
 A group keeps one policy per check. A policy re-runs a cell the check flags
 up to `max_reruns` times; `failed` up to the re-runs its `codes` give the
 failure's code. What becomes of a cell still flagged after that is
-the check's own: a swap is marked failed, and the others keep their result. A
-check that keeps the result takes at least 1 re-run, `failed` for each code it
-lists, as with none it would do nothing. `model_params` and `smaller_failed` only flag: they re-run and mark
-nothing, so they take no re-run. Every `queue-maintenance` run applies the
-policies that are on ([when a policy acts](#when-a-policy-acts)), and reads no
-`smaller_failed`.
+the check's own: `swap` and `spread` mark it failed, and the others keep their
+result. A check that keeps the result takes at least 1 re-run, `failed` for
+each code it lists, as with none it would do nothing; `spread` takes at least 1
+too, so a cell is re-run before it is marked. `model_params` and `smaller_failed`
+only flag: they re-run and mark nothing, so they take no re-run. Every
+`queue-maintenance` run applies the policies that are on
+([when a policy acts](#when-a-policy-acts)), and reads no `smaller_failed`.
 [`GET …/policy-preview`](campaign-groups/preview_campaign_group_policies.md)
 shows what they would re-run and mark in each member campaign now, the result
 rows that lack model params, and the failed jobs below a clean larger run.
 
+The policies judge performance results alone. A cell of an eval, whose
+benchmark the plan typed `eval`, `vlm_eval` or `asr_eval` when it was filed,
+is never flagged, re-run or marked by any policy, and the preview, the job
+states and the re-run results leave its jobs out. Every other benchmark type is
+judged.
+
 | `kind` | Flags a cell when | `max_reruns` | Then the cell | `settings` |
 |---|---|---|---|---|
 | `swap` | its run swapped | 5, from 0 to 15 | is marked failed | `{}` |
-| `spread` | its result's standard deviation is more than `percent` of its value | 3, from 1 to 15 | keeps its result | `{ "percent": 5, "short_repetition_ms": 1000, "short_repetition_percent": 10 }` |
-| `failed` | its device reported the run failed with one of `codes` | 0, only 0: `codes` holds each code's re-runs | keeps its result | `{ "codes": { "runtime_error": 2, "device_error": 2, "unspecified": 2 } }` |
+| `spread` | its result's standard deviation is more than `percent` of its value | 3, from 1 to 15 | is marked failed | `{ "percent": 5, "short_repetition_ms": 1000, "short_repetition_percent": 10 }` |
+| `failed` | its device reported the run failed with one of `codes` | 0, only 0: `codes` holds each code's re-runs | keeps its result | `{ "codes": { "runtime_error": 2, "device_error": 2, "unspecified": 2, "device_not_ready": 1, "harness_error": 1, "out_of_memory": 1 } }` |
 | `ttft_over_e2e` | its time to first token is over its end-to-end latency | 3, from 1 to 15 | keeps its result | `{}` |
 | `model_params` | a result row's model has no entry in the [model params table](model-params.md), so the pages show the row without a total or active parameter count | 0, only 0 | keeps its result | `{}` |
 | `smaller_failed` | it failed, for any reason, while a cell of its family at larger sizes has rows and no failure | 0, only 0 | keeps its result | `{}` |
@@ -92,9 +99,9 @@ re-run while that count is within the re-runs of its own code. With `{ "codes":
 out is re-run; if the re-run crashes, that is 2 attempts, within
 `runtime_error`'s 2, so it is re-run again; if that one times out on readiness,
 3 attempts are over `device_not_ready`'s 1, and the cell keeps the failure. An
-`out_of_memory` failure is never re-run. Until the pipette worker and
-pipette-ios-proxy send `device_not_ready`, they send that timeout as
-`harness_error`, so list `harness_error` too.
+`out_of_memory` failure is not re-run there. The defaults re-run
+`out_of_memory` once, as another process may have held the memory, and leave
+out `attempt_timeout`, since every device has the same limit.
 
 [`GET …/policies`](campaign-groups/list_campaign_group_policies.md) reads every
 check's policy, and
@@ -113,15 +120,27 @@ are in pipette-duckdb, and a job that finished before the policy was turned on
 counts too. So a policy acts on the plan a campaign runs when it is turned on,
 and on every later one.
 
+- **A re-run does not wait for the rows.** If a job has a recorded outcome but
+  no rows in pipette-duckdb, the run reads its submission body. It builds rows
+  as the scorer does.
+  If those rows give a re-run, the run reads the body again before filing.
+  If the body changed or cannot be read, the job waits for the next run.
+  Otherwise, the re-run records the value that the body gives. Any other
+  outcome waits for the rows in
+  pipette-duckdb: a mark, a kept result, a job left as it is, and the outcome
+  of a re-run. The earlier runs of a re-run chain are read from
+  pipette-duckdb only, so a job whose earlier run has no rows yet waits. The
+  run does not read the body of an eval's job or of a held submission.
+
 - **One revision per campaign per run.** It re-runs each flagged job that a
   policy flagging it has re-runs left for, and marks failed each other flagged
-  job that swap flags. Jobs still queued or running carry over with their ids
-  and leases.
+  job that swap or spread flags. Jobs still queued or running carry over with
+  their ids and leases.
 - **One at a time.** A campaign gets no new revision while a job that the
   policies' last revision of it queued still waits for a device.
 - **16 runs at most.** A job whose re-run chain holds 16 runs, itself and 15
-  earlier, is not re-run again: swap marks it failed, and the others keep its
-  result.
+  earlier, is not re-run again: swap and spread mark it failed, and the others
+  keep its result.
 - **Left as they are.** A member of another owner than the group's, and a
   campaign that is archived or runs no plan with a document. A plan still
   `creating` is read once it is filed.
@@ -136,18 +155,31 @@ and on every later one.
   the cause.
 - **A kept job is read once.** It is not read again until a policy changes.
   Turning a policy on or off, or saving changes to one that is on, makes the
-  next run read every answered job again under the new values. A Turn off stops
-  every later revision, and one being filed as it lands still goes through.
+  next run read every answered job again under the new values, and so does the
+  first run of a release that changes what a policy does with a job it flags,
+  once per campaign. A Turn off stops every later revision, and one being filed
+  as it lands still goes through.
 - **Missing model params are logged.** While `model_params` is on, each run
   logs the result rows it reads that lack model params, by the key an entry
   for their model would take, with the row and job counts. It files nothing.
   Turning it on makes the next run read every answered job's rows once, so it
   logs every key; later runs read only the jobs answered since.
+- **Each policy is kept as cleared or triggered.** A run keeps, for each job
+  it reads, which checks of the policies that are on flag it. A policy is
+  triggered while it flags a job of the campaign's plan, or while a re-run it
+  filed into the campaign waits for its rows, and cleared otherwise. A kept
+  job's `model_params` flag is checked against the model params table on each
+  run, so adding the entry clears it without reading the rows again, and
+  `smaller_failed` is taken over every kept job of the plan. The campaign
+  listing shows them as each row's `policy_checks`
+  ([`GET /api/v1/campaigns`](campaigns/list_campaigns.md)), as of the last run
+  that read the campaign.
 
 Each revision names its group and policies. Its `change` carries `group_id`
 and `policies`, its note reads `Campaign group {group_id} policies {kinds}:
-re-run {n}, marked {m} failed.`, and each mark's reason names the swap policy
-and the group. Each revision also adds a `group_policy` event to
+re-run {n}, marked {m} failed.`, and each mark's reason names the policy that
+marked it, the first of swap and spread that flags the job, and the group. Each
+revision also adds a `group_policy` event to
 [the audit log](orgs.md#the-audit-log).
 
 ### Re-run results

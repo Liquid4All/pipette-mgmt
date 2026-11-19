@@ -434,6 +434,13 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             )),
         )
         .route(
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/remove",
+            post(gate(
+                EDIT_ORG_CATALOG,
+                api_v1::descriptor_catalog::remove_org_descriptor_member,
+            )),
+        )
+        .route(
             "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/state",
             post(gate(
                 EDIT_ORG_CATALOG,
@@ -525,6 +532,12 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             ))
             .post(gate(FILE_PLANS, api_v1::campaigns::file_plan))
             .layer(DefaultBodyLimit::max(plan_body_limit)),
+        )
+        // Tags name plans; they never move the pointer, so a lock allows them.
+        .route(
+            "/api/v1/campaigns/{campaign_id}/tags",
+            get(gate(READ_CAMPAIGN, api_v1::campaigns::tags::list_plan_tags))
+                .post(gate(FILE_PLANS, api_v1::campaigns::tags::create_plan_tag)),
         )
         // A variant edit files a revision of the head and cancels the head.
         .route(

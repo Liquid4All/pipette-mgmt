@@ -175,6 +175,12 @@ impl TestDb {
         &self.db
     }
 
+    /// Connection settings for a child process that must use this test's schema.
+    /// Keep the test database alive until the child exits.
+    pub fn connect_options(&self) -> std::sync::Arc<PgConnectOptions> {
+        self.db.pool().connect_options()
+    }
+
     /// Run `sql` in this schema. Tests use it to create otherwise unreachable
     /// states or install triggers that inject faults.
     pub async fn execute(&self, sql: &'static str) -> anyhow::Result<()> {

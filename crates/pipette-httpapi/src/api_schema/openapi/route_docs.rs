@@ -220,6 +220,10 @@ const OPERATIONS: &[Doc] = &[
         "descriptor-catalog/relabel_org_descriptor_member.md"
     ),
     doc!(
+        "remove_org_descriptor_member",
+        "descriptor-catalog/remove_org_descriptor_member.md"
+    ),
+    doc!(
         "change_org_descriptor_entry_state",
         "descriptor-catalog/change_org_descriptor_entry_state.md"
     ),
@@ -279,6 +283,8 @@ const OPERATIONS: &[Doc] = &[
     doc!("get_campaign_plan", "campaigns/get_campaign_plan.md"),
     doc!("list_campaign_owners", "campaigns/list_campaign_owners.md"),
     doc!("list_campaign_plans", "campaigns/list_campaign_plans.md"),
+    doc!("list_plan_tags", "campaigns/list_plan_tags.md"),
+    doc!("create_plan_tag", "campaigns/create_plan_tag.md"),
     doc!("list_campaigns", "campaigns/list_campaigns.md"),
     doc!("list_variants", "campaigns/list_variants.md"),
     doc!("read_document", "campaigns/read_document.md"),
@@ -998,7 +1004,7 @@ mod tests {
     fn failed_row(
         source: pipette_plan_types::FailureSource,
     ) -> anyhow::Result<pipette_pipeline::plan_results::ResultRow> {
-        let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>();
+        let at = |s: &str| s.parse::<jiff::Timestamp>();
         let text = |s: &str| Some(s.to_owned());
         let map = |k: &str, v: serde_json::Value| BTreeMap::from([(k.to_owned(), v)]);
         // A struct literal, so a field added to ResultRow must be set here

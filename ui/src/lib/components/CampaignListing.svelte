@@ -1,6 +1,6 @@
 <script module lang="ts">
   // A campaign group's page draws its members with these cells too.
-  export { name, status, progress, progressHead };
+  export { name, status, policies, progress, progressHead };
 </script>
 
 <script lang="ts">
@@ -10,7 +10,7 @@
   // filtered, sorted and paged in `DataTable`, the plan id and the state by the server,
   // a job id by the campaigns of the plans that asked for it.
   import { campaigns, jobPlans } from "../api";
-  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, mayLabel, outsideCount, phaseOf, progressFill,
+  import { campaignQuery, campaignTable, jobCampaigns, labelVocabulary, checkState, mayLabel, outsideCount, phaseOf, progressFill,
     progressText, soughtEmpty } from "../campaigns";
   import { ownedEmpty, type OwnedBranch } from "../owned";
   import { here, href } from "../route.svelte";
@@ -20,6 +20,7 @@
   import type { CampaignView } from "../api-types";
   import DataTable from "./DataTable.svelte";
   import LabelsInline from "./LabelsInline.svelte";
+  import PlanTagChips from "./PlanTagChips.svelte";
   import Loaded from "./Loaded.svelte";
   import OwnerCell from "./OwnerCell.svelte";
   import StatusPill from "./StatusPill.svelte";
@@ -35,12 +36,12 @@
   const jobId = $derived(here.query.get("job_id")?.trim() ?? "");
   const sought = $derived([planId, jobId].filter(Boolean).join(" and "));
 
-  // `""` for the active campaigns, `archived` or `all`; any other value is the default.
-  const stateAsked = $derived((["archived", "all"] as const).find((value) => value === here.query.get("state")) ?? "");
+  // `""` for the active and locked campaigns, `locked`, `archived` or `all`; any other value is the default.
+  const stateAsked = $derived((["locked", "archived", "all"] as const).find((value) => value === here.query.get("state")) ?? "");
 
   // Read again whenever what it sends changes, not on a filter, which applies here. A job id, as a plan id does,
   // finds its campaigns in any state.
-  const asked = $derived(campaignQuery(branch, null, ROUTE_PAGE_MAX, planId, jobId ? "all" : stateAsked || "active"));
+  const asked = $derived(campaignQuery(branch, null, ROUTE_PAGE_MAX, planId, jobId ? "all" : stateAsked || undefined));
   const read = new Loader<CursorPage<CampaignView> & { ran?: { job: string; campaigns: Set<string> } }>();
   const load = (query: string, job: string, keep = false) => read.run(async () => {
     // A label edit (`keep`) reads the listing again but not the job's plans, which no label changes.
@@ -64,13 +65,20 @@
 </script>
 
 <!-- The name opens the campaign, as its id does where the reader shows that column. -->
-{#snippet name(row: CampaignView)}<a href={campaignLink(row.campaign_id)}>{row.name}</a>{/snippet}
+{#snippet name(row: CampaignView)}<a href={campaignLink(row.campaign_id)}>{row.name}</a>{#if row.current_plan_tags?.length}{" "}<PlanTagChips tags={row.current_plan_tags} />{/if}{/snippet}
 {#snippet owner(row: CampaignView)}<OwnerCell owner={row.owner} names={read.data?.names ?? {}} />{/snippet}
 <!-- A plan the reader may not read is its id alone, as in the campaign's history. -->
 {#snippet status(row: CampaignView)}
   {#if row.state === "archived"}<StatusPill status="archived" />
+  {:else if row.state === "locked"}<StatusPill status="locked" />{#if row.plan}{" "}<StatusPill status={phaseOf(row.plan.status)} />{/if}
+    <span class="note">{row.state_note}</span>
   {:else if row.plan}<StatusPill status={phaseOf(row.plan.status)} />{#if row.plan.cancel_requested}{" "}(cancel requested){/if}
   {:else}—{/if}
+{/snippet}
+<!-- Each policy of the campaign's group that is on, as queue-maintenance last found it. -->
+{#snippet policies(row: CampaignView)}
+  {#each row.policy_checks ?? [] as check (check.kind)}<span data-state={checkState(check)}>{check.kind} {checkState(check)}</span>{" "}
+  {:else}—{/each}
 {/snippet}
 <!-- A bar fills the cell behind the text: the finished jobs, then the failed ones, in the colors of the plan's phase,
      then the running ones. -->
@@ -105,8 +113,8 @@
     {/if}
     <DataTable {spec} rows={listed.items} id={(row) => row.campaign_id} noun="campaigns" {path}
                empty={sought ? soughtEmpty(branch, sought)
-                 : ownedEmpty(branch, stateAsked === "all" ? "campaigns" : `${stateAsked || "active"} campaigns`)}
-               columnsKey="pipette.campaigns.columns" cells={{ name, owner, status, progress, labels }}
+                 : ownedEmpty(branch, stateAsked === "all" ? "campaigns" : `${stateAsked || "active or locked"} campaigns`)}
+               columnsKey="pipette.campaigns.columns" cells={{ name, owner, status, policies, progress, labels }}
                heads={{ progress: progressHead }} />
   {/snippet}
 </Loaded>

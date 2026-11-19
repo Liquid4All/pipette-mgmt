@@ -5,9 +5,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use getrandom::SysRng;
 use getrandom::rand_core::TryRng;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -112,7 +112,7 @@ pub struct ClientPreauthKey {
     pub secret_hash: String,
     pub usage: ClientPreauthUsage,
     #[serde(default)]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Tags applied to any client registering with this key.
     #[serde(default)]
     pub default_tags: BTreeSet<Tag>,
@@ -133,7 +133,7 @@ pub struct ClientPreauthKey {
     pub default_permissions: Option<ClientPermissionSet>,
     #[serde(default)]
     pub note: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Who minted it over HTTP, whose authority registration checks again;
     /// `None`, and not written, for a host-minted key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,17 +141,13 @@ pub struct ClientPreauthKey {
 }
 
 impl ClientPreauthKey {
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_expired(&self, now: Timestamp) -> bool {
         self.expires_at.is_some_and(|at| at < now)
     }
 
     /// The key as `org_id`'s listing shows it at `now`, without its secret:
     /// destructured, so the hash can never ride along into an answer.
-    pub fn view(
-        self,
-        org_id: OrgId,
-        now: DateTime<Utc>,
-    ) -> pipette_plan_types::ClientPreauthKeyView {
+    pub fn view(self, org_id: OrgId, now: Timestamp) -> pipette_plan_types::ClientPreauthKeyView {
         let expired = self.is_expired(now);
         let ClientPreauthKey {
             key_id,
@@ -240,7 +236,7 @@ pub struct ClientMintedKey {
 /// Parameters for [`mint`].
 pub struct ClientPreauthParams {
     pub usage: ClientPreauthUsage,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     pub default_tags: BTreeSet<Tag>,
     pub default_organization: Option<NonEmptyTrimmedString>,
     /// Resolved against the rosters by the caller, so a key names only an owner
@@ -261,7 +257,7 @@ const SECRET_BYTES: usize = 32;
 /// Mint a new key: random `key_id` + high-entropy secret, hashed into the
 /// record. `MintError::IdError` is unreachable (a hex `key_id` is always valid)
 /// but propagated rather than unwrapped.
-pub fn mint(params: ClientPreauthParams, now: DateTime<Utc>) -> Result<ClientMintedKey, MintError> {
+pub fn mint(params: ClientPreauthParams, now: Timestamp) -> Result<ClientMintedKey, MintError> {
     let key_id = ClientPreauthKeyId::try_new(random_hex(KEY_ID_BYTES)?)?;
     let secret = ClientPreauthSecret::new(random_hex(SECRET_BYTES)?);
     let token = ClientPreauthToken::new(format!("{TOKEN_PREFIX}{key_id}.{}", secret.expose()));
@@ -289,7 +285,7 @@ pub fn mint(params: ClientPreauthParams, now: DateTime<Utc>) -> Result<ClientMin
 pub fn validate(
     key: &ClientPreauthKey,
     secret: &ClientPreauthSecret,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<ClientPreauthGrant, ClientPreauthRejectionError> {
     if !secret.matches(&key.secret_hash) {
         return Err(ClientPreauthRejectionError::BadSecret);
@@ -328,7 +324,7 @@ mod tests {
                 default_permissions: None,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )
     }
 
@@ -437,12 +433,12 @@ mod tests {
         // An expired key with the WRONG secret reports BadSecret, not Expired —
         // status is never revealed to someone without the secret.
         let mut m = minted(ClientPreauthUsage::SingleUse)?;
-        m.key.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        m.key.expires_at = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
         assert_eq!(
             validate(
                 &m.key,
                 &ClientPreauthSecret::new("wrong-secret"),
-                Utc::now()
+                Timestamp::now()
             ),
             Err(ClientPreauthRejectionError::BadSecret)
         );
@@ -458,12 +454,12 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("parse"))?;
 
         // Valid path grants.
-        assert!(validate(&m.key, &secret, Utc::now()).is_ok());
+        assert!(validate(&m.key, &secret, Timestamp::now()).is_ok());
 
         let mut expired = m.key.clone();
-        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        expired.expires_at = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
         assert_eq!(
-            validate(&expired, &secret, Utc::now()),
+            validate(&expired, &secret, Timestamp::now()),
             Err(ClientPreauthRejectionError::Expired)
         );
         Ok(())
@@ -525,22 +521,22 @@ mod tests {
     ) -> anyhow::Result<()> {
         let mut key = minted(ClientPreauthUsage::SingleUse)?.key;
         key.note = Some(stored.to_owned());
-        let view = key.view(OrgId::mint(), Utc::now());
+        let view = key.view(OrgId::mint(), Timestamp::now());
         assert_eq!(view.note.as_ref().map(NonEmptyTrimmedString::as_str), shown);
         Ok(())
     }
 
     #[test]
     fn is_expired_tracks_the_deadline() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut key = minted(ClientPreauthUsage::SingleUse)?.key;
 
         assert!(!key.is_expired(now), "no deadline never expires");
 
-        key.expires_at = Some(now + chrono::Duration::seconds(1));
+        key.expires_at = Some(now + jiff::SignedDuration::from_secs(1));
         assert!(!key.is_expired(now));
 
-        key.expires_at = Some(now - chrono::Duration::seconds(1));
+        key.expires_at = Some(now - jiff::SignedDuration::from_secs(1));
         assert!(key.is_expired(now));
         Ok(())
     }

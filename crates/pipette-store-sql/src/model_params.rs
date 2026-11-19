@@ -4,7 +4,7 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff_sqlx::ToSqlx;
 
 use pipette_core::model_params::ModelParams;
 use pipette_plan_types::{ModelKey, NonEmptyTrimmedString, PositiveCount, UserId};
@@ -22,7 +22,13 @@ const MODEL_PARAMS: Keyspace = Keyspace {
 const COLUMNS: &str = "key, total_millions, active_millions, note, updated_at, updated_by";
 
 /// The columns after the key.
-type Row = (i32, i32, Option<String>, DateTime<Utc>, Option<String>);
+type Row = (
+    i32,
+    i32,
+    Option<String>,
+    jiff_sqlx::Timestamp,
+    Option<String>,
+);
 
 /// A row as a record; the table's checks keep the counts positive.
 fn record(
@@ -34,7 +40,7 @@ fn record(
         total_millions: PositiveCount::try_new(total)?,
         active_millions: PositiveCount::try_new(active)?,
         note: note.map(NonEmptyTrimmedString::try_new).transpose()?,
-        updated_at,
+        updated_at: updated_at.to_jiff(),
         updated_by: updated_by.map(UserId::try_new).transpose()?,
     })
 }
@@ -65,7 +71,7 @@ impl Rows for SqlModelParamsStore {
             i32,
             i32,
             Option<String>,
-            DateTime<Utc>,
+            jiff_sqlx::Timestamp,
             Option<String>,
         )> = fetch_after(&self.db, MODEL_PARAMS, COLUMNS, after, limit).await?;
         Ok(rows
@@ -114,7 +120,7 @@ impl ModelParamsStore for SqlModelParamsStore {
                 .bind(params.total_millions.into_inner())
                 .bind(params.active_millions.into_inner())
                 .bind(params.note.as_ref().map(AsRef::<str>::as_ref))
-                .bind(params.updated_at)
+                .bind(params.updated_at.to_sqlx())
                 .bind(params.updated_by.as_ref().map(UserId::as_str))
             })
             .await?;

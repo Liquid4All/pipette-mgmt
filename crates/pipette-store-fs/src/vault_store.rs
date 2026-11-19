@@ -176,7 +176,7 @@ impl VaultStore for LocalFsVaultStore {
                     blobs.push(VaultBlob {
                         key,
                         bytes: meta.len(),
-                        modified: meta.modified()?.into(),
+                        modified: jiff::Timestamp::try_from(meta.modified()?)?,
                     });
                 }
             }

@@ -1,6 +1,6 @@
 //! Automatic expiry: the active importer entries that move to hidden.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 use pipette_core::config::ExpiryConfig;
 use pipette_plan_types::{DescriptorEntry, DescriptorEntryKind, DescriptorEntryState};
@@ -16,7 +16,7 @@ use pipette_plan_types::{DescriptorEntry, DescriptorEntryKind, DescriptorEntrySt
 pub(crate) fn expired<'a>(
     entries: &'a [DescriptorEntry],
     config: &ExpiryConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<&'a DescriptorEntry> {
     let mut newest = entries
         .iter()
@@ -52,16 +52,15 @@ pub(crate) fn expired<'a>(
 
 /// The newest release time that is at least `days` before `now`. A threshold
 /// beyond the range of a date gives the earliest date, so nothing expires.
-fn cutoff(now: DateTime<Utc>, days: u32) -> DateTime<Utc> {
-    TimeDelta::try_days(i64::from(days))
-        .and_then(|age| now.checked_sub_signed(age))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+fn cutoff(now: Timestamp, days: u32) -> Timestamp {
+    SignedDuration::try_from_hours(i64::from(days) * 24)
+        .and_then(|age| now.checked_sub(age).ok())
+        .unwrap_or(Timestamp::MIN)
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use chrono::TimeZone;
     use rstest::rstest;
 
     use pipette_plan_types::DescriptorEntryKind::{Daily, HandMade, Stable};
@@ -74,9 +73,9 @@ mod tests {
 
     use super::*;
 
-    fn now() -> anyhow::Result<DateTime<Utc>> {
-        Utc.with_ymd_and_hms(2026, 10, 21, 3, 0, 0)
-            .single()
+    fn now() -> anyhow::Result<Timestamp> {
+        "2026-10-21T03:00:00Z"
+            .parse::<jiff::Timestamp>()
             .context("test time is invalid")
     }
 
@@ -87,7 +86,7 @@ mod tests {
         age_days: i64,
     ) -> anyhow::Result<DescriptorEntry> {
         let now = now()?;
-        let released = now - TimeDelta::days(age_days);
+        let released = now - jiff::SignedDuration::from_hours(24 * age_days);
         let runtime = Runtime::LlamacppCliStockTools(LlamacppCliStockTools {
             source: LlamacppCliStockToolsSource::GithubRelease(LlamacppCliStockToolsRelease {
                 repository_url: RepositoryUrl::new("github.com/ggml-org/llama.cpp".to_owned()),

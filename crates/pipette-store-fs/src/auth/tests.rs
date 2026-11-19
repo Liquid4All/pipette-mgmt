@@ -1,7 +1,7 @@
 //! Fixtures shared by both stores' tests, and the assertions that span them:
 //! what the two stores owe each other.
 
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::client::Client;
 use pipette_core::client_permission::ClientPermissionSet;
@@ -37,7 +37,7 @@ pub(super) fn auth_test_client(id: &str, pk_suffix: &str, org: &str) -> anyhow::
         client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
         contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
         status: pipette_core::client::ClientStatus::Approved,
-        registered_at: Utc::now(),
+        registered_at: Timestamp::now(),
         device_profile: Default::default(),
         capabilities: Default::default(),
     })
@@ -204,7 +204,7 @@ async fn test_localfs_preauth_keyspaces_do_not_cross() -> anyhow::Result<()> {
             default_permissions: None,
             note: None,
         },
-        Utc::now(),
+        Timestamp::now(),
     )?;
     let user_key = pipette_core::user_preauth::mint(
         pipette_core::user_preauth::UserPreauthParams {
@@ -213,7 +213,7 @@ async fn test_localfs_preauth_keyspaces_do_not_cross() -> anyhow::Result<()> {
             expires_at: None,
             note: None,
         },
-        Utc::now(),
+        Timestamp::now(),
     )?;
     clients.put_client_preauth_key(&client_key.key).await?;
     users.put_user_preauth_key(&user_key.key).await?;
@@ -287,7 +287,7 @@ async fn test_localfs_user_key_and_claim_paths() -> anyhow::Result<()> {
     let key = pipette_core::user::UserKey::new(
         public_key.clone(),
         NonEmptyTrimmedString::try_new("laptop")?,
-        Utc::now(),
+        Timestamp::now(),
     );
     users.put_user_key(&user_id, &key).await?;
 

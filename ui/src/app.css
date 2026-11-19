@@ -269,7 +269,7 @@ textarea.code { white-space: pre; overflow-wrap: normal; overflow-x: auto; tab-s
 [data-state=failed], [data-state=expired],
 [data-state=refused] { background: var(--red-soft); color: var(--red); }
 [data-state^=pending], [data-state=creating], [data-state=triggered],
-[data-state=cancelling] { background: var(--amber-soft); color: var(--amber); }
+[data-state=cancelling], [data-state=locked] { background: var(--amber-soft); color: var(--amber); }
 /* Which of a campaign's plans a value is: the one it runs, or one before it. */
 .tag.current { background: var(--accent-soft); color: var(--accent); }
 .tag.earlier { background: var(--amber-soft); color: var(--amber); }

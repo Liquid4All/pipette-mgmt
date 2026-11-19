@@ -1158,10 +1158,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1656,7 +1654,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2380,6 +2378,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cc767b5763de45e810109520123bb2829a653f3a7ed9be40b2bc4f81158f595"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894f7ac42105f584100691b3bf6e6b92dd12fcfa225f6c397f95c8a94b47b68f"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-sqlx"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4996ad290ff7f7081becdda47e28556fbebb81618c599eac5d09182b5a60e38"
+dependencies = [
+ "jiff",
+ "sqlx",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "955491488dc99b572ea6d67b172dcd98787d00744b1fb44a5689b4e6413695a6"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3067,9 +3110,9 @@ dependencies = [
  "anyhow",
  "arrow",
  "bytes",
- "chrono",
  "getrandom 0.4.3",
  "hex",
+ "jiff",
  "nutype",
  "parquet",
  "pipette-plan-types",
@@ -3098,7 +3141,6 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.23.1",
- "chrono",
  "csv",
  "ed25519-dalek",
  "flate2",
@@ -3109,6 +3151,7 @@ dependencies = [
  "httpmock",
  "hyper",
  "hyper-util",
+ "jiff",
  "jsonschema",
  "parquet",
  "percent-encoding",
@@ -3149,10 +3192,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "chrono",
  "ed25519-dalek",
  "hex",
  "http 1.5.0",
+ "jiff",
  "nutype",
  "pipette-plan-types",
  "sfv",
@@ -3181,11 +3224,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "chrono",
  "clap",
  "dirs",
  "futures",
  "hex",
+ "jiff",
+ "percent-encoding",
  "pipette-core",
  "pipette-httpapi",
  "pipette-hub-testkit",
@@ -3201,6 +3245,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "sqlx",
  "strum",
  "tabled",
  "tempfile",
@@ -3219,10 +3264,10 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
- "chrono",
  "futures",
  "hex",
  "httpmock",
+ "jiff",
  "libc",
  "pipette-core",
  "pipette-hub-testkit",
@@ -3258,10 +3303,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "chrono",
  "clap",
  "email_address",
  "hex",
+ "jiff",
  "log",
  "nutype",
  "regex",
@@ -3302,8 +3347,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "chrono",
  "futures",
+ "jiff",
  "pipette-core",
  "pipette-plan-types",
  "serde",
@@ -3320,10 +3365,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "chrono",
  "flate2",
  "futures",
  "hex",
+ "jiff",
  "pipette-core",
  "pipette-plan-types",
  "pipette-store",
@@ -3344,8 +3389,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "futures",
+ "jiff",
  "libc",
  "object_store",
  "pipette-core",
@@ -3376,10 +3421,10 @@ dependencies = [
  "aws-smithy-mocks",
  "aws-smithy-types",
  "bytes",
- "chrono",
  "flate2",
  "futures",
  "hex",
+ "jiff",
  "object_store",
  "pipette-core",
  "pipette-plan-types",
@@ -3402,8 +3447,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "futures",
+ "jiff",
+ "jiff-sqlx",
  "pipette-core",
  "pipette-plan-types",
  "pipette-store",
@@ -3427,9 +3473,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "chrono",
  "futures",
  "hex",
+ "jiff",
  "pipette-core",
  "pipette-plan-types",
  "pipette-store",
@@ -3449,11 +3495,11 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.23.1",
- "chrono",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
  "http-body-util",
+ "jiff",
  "pipette-core",
  "pipette-httpapi",
  "pipette-httpsig",
@@ -3482,6 +3528,21 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "potential_utf"
@@ -3599,7 +3660,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3863,7 +3924,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3920,7 +3981,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3977,7 +4038,6 @@ version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
- "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -4327,7 +4387,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cfg-if",
- "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -4385,9 +4444,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
- "sqlx-mysql",
  "sqlx-postgres",
- "sqlx-sqlite",
  "syn 2.0.119",
  "thiserror",
  "tokio",
@@ -4403,7 +4460,6 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
- "chrono",
  "crc",
  "digest 0.11.3",
  "dotenvy",
@@ -4431,7 +4487,6 @@ dependencies = [
  "base64 0.22.1",
  "bitflags",
  "byteorder",
- "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -4464,7 +4519,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi 2.0.0",
- "chrono",
  "flume",
  "form_urlencoded",
  "futures-channel",
@@ -4638,7 +4692,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5280,7 +5334,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

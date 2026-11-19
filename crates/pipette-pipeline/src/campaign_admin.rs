@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_core::campaign::{Campaign, CampaignOwner, NewCampaign};
@@ -15,13 +15,13 @@ use pipette_core::canonical_json::sha256_hex;
 use pipette_core::plan::{PlanManifest, SettledOutcome};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
-    Answered, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId, ClientRunSpec,
-    FailureSource, JobId, NonEmptyTrimmedString, PlanId, PlanStatus, PolicyKind, RestoredVariant,
-    RevisionChange, UserId,
+    Answered, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId, CampaignState,
+    ClientRunSpec, CreatePlanTagRequest, FailureSource, JobId, NonEmptyTrimmedString, PlanId,
+    PlanStatus, PlanTag, PolicyKind, RestoredVariant, RevisionChange, UserId,
 };
 use pipette_store::{
     CampaignGroupStore, CampaignStore, Listing, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter,
-    PlanStore, Stores, SubmissionStore, TodoStore,
+    PlanStore, PlanTagStore, Stores, SubmissionStore, TodoStore,
 };
 
 use crate::campaign_chain;
@@ -117,6 +117,33 @@ pub enum CampaignAdminError {
     NoPlan(CampaignId),
     #[error("campaign {0} is archived: unarchive it to file a plan into it")]
     Archived(CampaignId),
+    #[error("campaign {campaign_id} is locked ({note}): unlock it to change its plans")]
+    Locked {
+        campaign_id: CampaignId,
+        note: String,
+    },
+    #[error("{0} is longer than {TEXT_MAX_CHARS} characters")]
+    TextTooLong(&'static str),
+    #[error("{0} must not contain a NUL character")]
+    TextHasNul(&'static str),
+    #[error("a lock needs a note saying why")]
+    LockNeedsNote,
+    #[error("a state note goes only with the locked state")]
+    NoteWithoutLock,
+    #[error("campaign {0} is locked: unlock it before archiving it")]
+    LockedArchive(CampaignId),
+    #[error(
+        "tag name `{0}` must be 1 to {TAG_NAME_MAX_CHARS} letters, digits, `.`, `_`, `-` or `/`, \
+         with no `..` or `//` and no `.` or `/` at either end"
+    )]
+    BadTagName(String),
+    #[error("campaign {campaign_id} already has a tag named {name}: a tag is never moved")]
+    TagTaken {
+        campaign_id: CampaignId,
+        name: String,
+    },
+    #[error("plan tags are kept only on a [database]")]
+    NoTagStore,
     /// The campaign moved off the plan the caller read its indices from.
     /// Nothing was filed.
     #[error(
@@ -350,7 +377,7 @@ pub async fn create_around(
     new: NewCampaign,
     plan_id: PlanId,
 ) -> Result<Campaign, CampaignAdminError> {
-    let campaign = new.around(plan_id.clone(), Utc::now());
+    let campaign = new.around(plan_id.clone(), Timestamp::now());
     if let Err(source) = campaigns.put_campaign(&campaign).await {
         match landed(campaigns, plans, &campaign.campaign_id, &plan_id).await {
             Ok(Some(stored)) => {
@@ -521,7 +548,7 @@ async fn write_head(
     let superseded = read.current_plan_id.clone();
 
     let mut campaign = read.clone();
-    let changed = campaign.advance(plan_id.clone(), Utc::now());
+    let changed = campaign.advance(plan_id.clone(), Timestamp::now());
     let written = if changed {
         campaigns.replace_campaign(&read, &campaign).await
     } else {
@@ -615,6 +642,7 @@ pub async fn delete(
     plans: &dyn PlanStore,
     campaign: &Campaign,
 ) -> Result<(), CampaignAdminError> {
+    require_unlocked(campaign)?;
     let mut running = running_plans(plans, &campaign.campaign_id).await?;
     // Only a filing moves the head, so a new head is a plan that the scan can
     // miss. It was filed a moment ago and counts as running.
@@ -1241,16 +1269,146 @@ pub fn changed_under(before: &Campaign, current: &Campaign) -> bool {
     current.owner != before.owner || current.current_plan_id != before.current_plan_id
 }
 
-/// Refuse `base` unless it is `current`, the plan `campaign` runs.
-/// Refuse to file a plan into an archived campaign, dry runs included. Checked
-/// before the filing, so an archive that lands during one does not stop it.
+/// Refuse to file a plan into a locked or archived campaign, dry runs included.
+/// Checked before the filing, so a lock or archive that lands during one does
+/// not stop it.
 pub fn require_active(campaign: &Campaign) -> Result<(), CampaignAdminError> {
+    require_unlocked(campaign)?;
     if campaign.state.is_active() {
         return Ok(());
     }
     Err(CampaignAdminError::Archived(campaign.campaign_id.clone()))
 }
 
+/// Refuse a write a lock holds back: a cancel of the plan the campaign runs, or
+/// its delete. An archived campaign allows both.
+pub fn require_unlocked(campaign: &Campaign) -> Result<(), CampaignAdminError> {
+    if campaign.state != CampaignState::Locked {
+        return Ok(());
+    }
+    Err(CampaignAdminError::Locked {
+        campaign_id: campaign.campaign_id.clone(),
+        note: campaign
+            .state_note
+            .as_ref()
+            .map_or("no note", NonEmptyTrimmedString::as_str)
+            .to_owned(),
+    })
+}
+
+/// Refuse a cancel of `plan_id` while it is the plan a locked `campaign` runs.
+pub fn require_cancellable(
+    campaign: &Campaign,
+    plan_id: &PlanId,
+) -> Result<(), CampaignAdminError> {
+    if campaign.current_plan_id.as_ref() == Some(plan_id) {
+        return require_unlocked(campaign);
+    }
+    Ok(())
+}
+
+/// Lock, archive or reactivate `campaign`, returning whether it changed. A lock
+/// needs `note`, no other state takes one, and a locked campaign is unlocked
+/// before it is archived: archiving would drop the note unseen.
+pub fn restate(
+    campaign: &mut Campaign,
+    state: CampaignState,
+    note: Option<NonEmptyTrimmedString>,
+    at: Timestamp,
+) -> Result<bool, CampaignAdminError> {
+    match (state, &note) {
+        (CampaignState::Locked, None) => return Err(CampaignAdminError::LockNeedsNote),
+        (CampaignState::Locked, Some(note)) => check_text("state_note", note)?,
+        (_, Some(_)) => return Err(CampaignAdminError::NoteWithoutLock),
+        (_, None) => {}
+    }
+    if campaign.state == CampaignState::Locked && state == CampaignState::Archived {
+        return Err(CampaignAdminError::LockedArchive(
+            campaign.campaign_id.clone(),
+        ));
+    }
+    Ok(campaign.set_state(state, note, at))
+}
+
+pub const TAG_NAME_MAX_CHARS: usize = 64;
+
+/// The longest note or message a campaign or a plan stores, in characters:
+/// every listing returns them, so the bound keeps the listings small.
+pub const TEXT_MAX_CHARS: usize = 4096;
+
+/// Refuse `text`, which `what` names, over [`TEXT_MAX_CHARS`] or holding a NUL
+/// character, which a PostgreSQL `text` column refuses.
+pub fn check_text(
+    what: &'static str,
+    text: &NonEmptyTrimmedString,
+) -> Result<(), CampaignAdminError> {
+    if text.chars().count() > TEXT_MAX_CHARS {
+        return Err(CampaignAdminError::TextTooLong(what));
+    }
+    if text.contains('\0') {
+        return Err(CampaignAdminError::TextHasNul(what));
+    }
+    Ok(())
+}
+
+/// Tag `plan_id`, a plan `campaign_id` filed, as `name`. `tagger` is `None` for
+/// a host command. Allowed in any campaign state: a tag moves no plan.
+pub async fn tag_plan(
+    tags: Option<&dyn PlanTagStore>,
+    plans: &dyn PlanStore,
+    campaign_id: &CampaignId,
+    request: CreatePlanTagRequest,
+    tagger: Option<UserId>,
+) -> Result<PlanTag, CampaignAdminError> {
+    let tags = tags.ok_or(CampaignAdminError::NoTagStore)?;
+    check_tag_name(&request.name)?;
+    check_text("message", &request.message)?;
+    let filed_into = plans
+        .get_plan(&request.plan_id)
+        .await?
+        .and_then(|manifest| manifest.campaign_id);
+    if filed_into.as_ref() != Some(campaign_id) {
+        return Err(CampaignAdminError::NotInCampaign {
+            campaign_id: campaign_id.clone(),
+            plan_id: request.plan_id,
+        });
+    }
+    let tag = PlanTag {
+        campaign_id: campaign_id.clone(),
+        name: request.name,
+        plan_id: request.plan_id,
+        message: request.message,
+        tagger,
+        created_at: Timestamp::now(),
+    };
+    if !tags.create_tag(&tag).await? {
+        return Err(CampaignAdminError::TagTaken {
+            campaign_id: tag.campaign_id,
+            name: tag.name.as_str().to_owned(),
+        });
+    }
+    tracing::info!(%campaign_id, name = %tag.name, plan_id = %tag.plan_id, "plan tagged");
+    Ok(tag)
+}
+
+/// A git ref name, narrowed: letters, digits, `.`, `_`, `-` and `/`, no `..` or
+/// `//`, and no `.` or `/` at either end.
+fn check_tag_name(name: &NonEmptyTrimmedString) -> Result<(), CampaignAdminError> {
+    let ok = name.chars().count() <= TAG_NAME_MAX_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.starts_with(['.', '/'])
+        && !name.ends_with(['.', '/']);
+    if ok {
+        return Ok(());
+    }
+    Err(CampaignAdminError::BadTagName(name.as_str().to_owned()))
+}
+
+/// Refuse `base` unless it is `current`, the plan `campaign` runs.
 fn on_base(campaign: &Campaign, current: &PlanId, base: &PlanId) -> Result<(), CampaignAdminError> {
     if base == current {
         return Ok(());
@@ -2522,7 +2680,8 @@ mod tests {
     /// A campaign created around `plan-seed`, the plan the first advance in
     /// each test supersedes.
     async fn seed(stores: &Stores, name: &str) -> anyhow::Result<Campaign> {
-        let campaign = a_new_campaign(name)?.around(PlanId::try_new("plan-seed")?, Utc::now());
+        let campaign =
+            a_new_campaign(name)?.around(PlanId::try_new("plan-seed")?, Timestamp::now());
         stores.campaigns.put_campaign(&campaign).await?;
         Ok(campaign)
     }
@@ -2782,7 +2941,7 @@ mod tests {
                     self.inner.put_campaign(campaign).await?;
                     let mut revised = campaign.clone();
                     let later = self.revised_to.clone().context("a later head to write")?;
-                    revised.advance(later, Utc::now());
+                    revised.advance(later, Timestamp::now());
                     self.inner.put_campaign(&revised).await?;
                 }
             }
@@ -3056,7 +3215,10 @@ mod tests {
         // The caller now holds `campaign`, fetched before the ingest. Someone
         // renames the campaign while those jobs are staged.
         let mut renamed = campaign.clone();
-        assert!(renamed.rename(NonEmptyTrimmedString::try_new("nightly-eu")?, Utc::now()));
+        assert!(renamed.rename(
+            NonEmptyTrimmedString::try_new("nightly-eu")?,
+            Timestamp::now()
+        ));
         stores.campaigns.put_campaign(&renamed).await?;
 
         let plan_id = PlanId::try_new("plan-first")?;
@@ -3132,7 +3294,10 @@ mod tests {
         let (_dir, stores) = stores().await?;
         let campaign = seed(&stores, "nightly").await?;
         let mut renamed = campaign.clone();
-        assert!(renamed.rename(NonEmptyTrimmedString::try_new("nightly-eu")?, Utc::now()));
+        assert!(renamed.rename(
+            NonEmptyTrimmedString::try_new("nightly-eu")?,
+            Timestamp::now()
+        ));
         stores
             .campaigns
             .delete_campaign(&campaign.campaign_id)
@@ -3162,12 +3327,12 @@ mod tests {
         #[case] expected: Expect,
     ) -> anyhow::Result<()> {
         let (_dir, stores) = stores().await?;
-        let known = User::try_new(ContactEmail::try_new("op@example.test")?, Utc::now())?;
+        let known = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
         stores.users.put_user(&known).await?;
         let org = Organization::new(
             OrgSlug::try_new("acme")?,
             NonEmptyTrimmedString::try_new("Acme")?,
-            Utc::now(),
+            Timestamp::now(),
         );
         if org_exists {
             stores
@@ -3596,7 +3761,7 @@ mod tests {
             stores.campaigns.clone(),
             1,
             move |mut stored: Campaign| {
-                stored.advance(moved_to.clone(), Utc::now());
+                stored.advance(moved_to.clone(), Timestamp::now());
                 Some(stored)
             },
         ));
@@ -5308,8 +5473,8 @@ benchmarks = ["decode_throughput_512_100"]
             .expired_jobs
             .extend(ran.iter().cloned().map(|job_id| {
                 let lapsed = pipette_core::plan::ExpiredJob {
-                    horizon: Utc::now() - chrono::Duration::days(1),
-                    recorded_at: Utc::now(),
+                    horizon: Timestamp::now() - jiff::SignedDuration::from_hours(24),
+                    recorded_at: Timestamp::now(),
                 };
                 (job_id, lapsed)
             }));
@@ -5910,8 +6075,8 @@ benchmarks = ["decode_throughput_512_100"]
                     .expired_jobs
                     .extend(ran.iter().cloned().map(|job_id| {
                         let lapsed = pipette_core::plan::ExpiredJob {
-                            horizon: Utc::now() - chrono::Duration::days(1),
-                            recorded_at: Utc::now(),
+                            horizon: Timestamp::now() - jiff::SignedDuration::from_hours(24),
+                            recorded_at: Timestamp::now(),
                         };
                         (job_id, lapsed)
                     }));
@@ -6299,14 +6464,14 @@ benchmarks = ["decode_throughput_512_100"]
             stores.campaigns.clone(),
             rivals,
             |mut stored: Campaign| {
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let last = writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == rivals;
                 let name = if stored.name == eu { &us } else { &eu };
                 match between {
                     _ if !last => stored.rename(name.clone(), now),
                     Between::Revision => stored.advance(winner.clone(), now),
                     Between::Rename => stored.rename(name.clone(), now),
-                    Between::Archive => stored.set_state(CampaignState::Archived, now),
+                    Between::Archive => stored.set_state(CampaignState::Archived, None, now),
                     Between::HandOver => stored.set_owner(heir.clone(), now),
                     Between::Delete => return None,
                 };
@@ -6469,7 +6634,7 @@ benchmarks = ["decode_throughput_512_100"]
             client_details: NonEmptyTrimmedString::try_new("mac mini")?,
             contact_email: ContactEmail::try_new("lab@example.test")?,
             status: pipette_core::client::ClientStatus::Approved,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         };
@@ -6480,7 +6645,7 @@ benchmarks = ["decode_throughput_512_100"]
                 job_id,
                 expires_at,
                 &holder.client_id,
-                Utc::now() + chrono::Duration::hours(1),
+                Timestamp::now() + jiff::SignedDuration::from_hours(1),
             )
             .await?;
         anyhow::ensure!(
@@ -6771,8 +6936,8 @@ benchmarks = ["decode_throughput_512_100"]
         manifest.expired_jobs.insert(
             queued.clone(),
             pipette_core::plan::ExpiredJob {
-                horizon: Utc::now() - chrono::Duration::days(1),
-                recorded_at: Utc::now(),
+                horizon: Timestamp::now() - jiff::SignedDuration::from_hours(24),
+                recorded_at: Timestamp::now(),
             },
         );
         stores.plans.put_plan(&manifest).await?;
@@ -7142,8 +7307,8 @@ benchmarks = ["decode_throughput_512_100"]
             manifest.expired_jobs.insert(
                 unrun.clone(),
                 pipette_core::plan::ExpiredJob {
-                    horizon: Utc::now() - chrono::Duration::days(1),
-                    recorded_at: Utc::now(),
+                    horizon: Timestamp::now() - jiff::SignedDuration::from_hours(24),
+                    recorded_at: Timestamp::now(),
                 },
             );
             stores.plans.put_plan(&manifest).await?;
@@ -7893,7 +8058,7 @@ benchmarks = ["decode_throughput_512_100"]
             .try_for_each(|job_id| finish(&stores, job_id, "eval"))
             .await?;
         let again = jobs[0].clone();
-        let before = Utc::now();
+        let before = Timestamp::now();
 
         let (report, revised) =
             recalculate(&stores, &campaign, BTreeSet::from([again.clone()])).await?;
@@ -7937,7 +8102,7 @@ benchmarks = ["decode_throughput_512_100"]
             copy.body["completions"],
             serde_json::json!([{"id": "s1", "completion": "@@@@"}])
         );
-        let submitted_at: chrono::DateTime<Utc> =
+        let submitted_at: jiff::Timestamp =
             serde_json::from_value(copy.body["submitted_at"].clone())?;
         assert!(submitted_at >= before, "{submitted_at}");
         // Filed now, the copy still records the time of the run it copies.

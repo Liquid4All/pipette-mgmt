@@ -427,7 +427,7 @@ pub async fn flag_reindex(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::types::Mint;
     use pipette_plan_types::{ClientOwner, ExpiresAt, OrgId};
@@ -455,7 +455,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("rig")?,
             contact_email: ContactEmail::try_new("ops@example.test")?,
             status: ClientStatus::Pending,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         };
@@ -659,7 +659,7 @@ mod tests {
             queue("job-held").await?,
             queue("job-done").await?,
         );
-        let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+        let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         stream::iter([&held, &done])
             .map(Ok::<_, anyhow::Error>)
             .try_for_each(|job| async move {

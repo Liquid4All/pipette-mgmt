@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::{TimeZone, Utc};
 use ed25519_dalek::SigningKey;
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -799,9 +798,8 @@ async fn an_expired_private_job_gets_a_synthetic_failure() -> anyhow::Result<()>
     let Some(world) = sql_world().await? else {
         return Ok(());
     };
-    let deadline = Utc
-        .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
-        .single()
+    let deadline = "2020-01-02T03:04:05Z"
+        .parse::<jiff::Timestamp>()
         .context("a valid date")?;
     let body = json!({"job_id": "job-1", "clients": ["ev1_member"], "spec": spec(PRIVATE)});
     let expired = seed_avail(

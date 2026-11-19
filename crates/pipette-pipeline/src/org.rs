@@ -479,7 +479,7 @@ pub async fn dependents(
         org_id: org_id.clone(),
     };
     // An expired key registers nothing, so it strands nothing either.
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     Ok(Dependents {
         benchmarks: catalog.list_benchmark_ids_of(org_id).await?,
         held: holdings_of(campaigns, vault, &owner).await?,
@@ -561,7 +561,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rstest::rstest;
 
     use pipette_core::benchmark::Benchmark;
@@ -628,7 +628,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new(slug)?,
             NonEmptyTrimmedString::try_new(slug)?,
-            Utc::now(),
+            Timestamp::now(),
         );
         fixture
             .orgs
@@ -643,7 +643,7 @@ mod tests {
         email: &str,
         org_id: Option<&OrgId>,
     ) -> anyhow::Result<User> {
-        let user = User::try_new(ContactEmail::try_new(email)?, Utc::now())?;
+        let user = User::try_new(ContactEmail::try_new(email)?, Timestamp::now())?;
         fixture.users.put_user(&user).await?;
         if let Some(org_id) = org_id {
             fixture
@@ -669,7 +669,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("details")?,
             contact_email: ContactEmail::try_new("device@example.com")?,
             status: pipette_core::client::ClientStatus::Approved,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         };
@@ -1153,7 +1153,7 @@ mod tests {
         for org in [&acme, &labs] {
             let campaign =
                 NewCampaign::new(NonEmptyTrimmedString::try_new("nightly")?, as_owner(org))
-                    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+                    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
             fixture.campaigns.put_campaign(&campaign).await?;
             let resource = pipette_store_testkit::vault_resource_for(
                 as_owner(org),
@@ -1165,7 +1165,9 @@ mod tests {
                 let key = mint(
                     ClientPreauthParams {
                         usage: ClientPreauthUsage::MultiUse,
-                        expires_at: Some(Utc::now() + chrono::Duration::days(expires_in)),
+                        expires_at: Some(
+                            Timestamp::now() + jiff::SignedDuration::from_hours(24 * expires_in),
+                        ),
                         default_tags: Default::default(),
                         default_organization: None,
                         default_owner: Some(ClientOwner::Org {
@@ -1174,7 +1176,7 @@ mod tests {
                         default_permissions: None,
                         note: None,
                     },
-                    Utc::now(),
+                    Timestamp::now(),
                 )?
                 .key;
                 fixture.clients.put_client_preauth_key(&key).await?;

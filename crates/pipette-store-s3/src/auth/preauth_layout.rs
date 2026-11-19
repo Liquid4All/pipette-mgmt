@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use futures::stream;
 use futures::stream::StreamExt;
+use jiff::Timestamp;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutMode, PutPayload};
 use serde::Serialize;
@@ -108,12 +108,12 @@ pub(super) async fn claim_spent(
     prefix: &str,
     keyspace: &str,
     key_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<Spend> {
     match store
         .put_opts(
             &marker_path(prefix, keyspace, key_id),
-            PutPayload::from(now.to_rfc3339().into_bytes()),
+            PutPayload::from(now.to_string().into_bytes()),
             PutMode::Create.into(),
         )
         .await

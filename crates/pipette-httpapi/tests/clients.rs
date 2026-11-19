@@ -369,7 +369,7 @@ async fn test_a_failed_reindex_flag_write_fails_the_patch_and_keeps_the_old_reco
             &job,
             ExpiresAt::Never,
             &client_id,
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
@@ -1162,7 +1162,7 @@ async fn test_patch_profile_relinquishes_leases(
             &job,
             ExpiresAt::Never,
             &client_id,
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
@@ -1252,7 +1252,7 @@ async fn test_patch_resending_the_stored_profile_keeps_leases_and_queues_nothing
             &job,
             ExpiresAt::Never,
             &client_id,
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));

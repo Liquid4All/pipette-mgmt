@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{SecretKey, Signature, SigningKey, VerifyingKey};
 use getrandom::SysRng;
 use getrandom::rand_core::TryRng;
+use jiff::{SignedDuration, Timestamp};
 use sha2::Digest;
 
 use pipette_core::client::{Client, ClientStatus, MigrationRecord};
@@ -35,8 +35,8 @@ pub(crate) const TIMESTAMP_TOLERANCE_SECS: i64 = 300;
 /// and nothing else.
 const SWEEP_INTERVAL_SECS: i64 = 60;
 
-fn within_tolerance(ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    (now - ts).num_seconds().abs() <= TIMESTAMP_TOLERANCE_SECS
+fn within_tolerance(ts: Timestamp, now: Timestamp) -> bool {
+    now.duration_since(ts).as_secs().abs() <= TIMESTAMP_TOLERANCE_SECS
 }
 
 /// Whether a signature had already been spent — see [`ReplayCache::claim`].
@@ -58,9 +58,9 @@ pub struct ReplayCache {
 
 struct Spent {
     /// Signature bytes → the timestamp of the request that spent them.
-    signatures: HashMap<[u8; 64], DateTime<Utc>>,
+    signatures: HashMap<[u8; 64], Timestamp>,
     /// Seeded by the first claim, so the cache reads only its caller's clock.
-    last_sweep: Option<DateTime<Utc>>,
+    last_sweep: Option<Timestamp>,
 }
 
 impl ReplayCache {
@@ -78,15 +78,15 @@ impl ReplayCache {
     pub(crate) fn claim(
         &self,
         signature: &[u8; 64],
-        timestamp: DateTime<Utc>,
-        now: DateTime<Utc>,
+        timestamp: Timestamp,
+        now: Timestamp,
     ) -> SignatureClaim {
         // Poison is harmless: a panic between `HashMap` calls cannot tear it.
         let mut spent = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         // The first claim starts the interval rather than sweeping an empty map.
         let last_sweep = *spent.last_sweep.get_or_insert(now);
-        let swept = if (now - last_sweep).num_seconds() >= SWEEP_INTERVAL_SECS {
+        let swept = if now.duration_since(last_sweep).as_secs() >= SWEEP_INTERVAL_SECS {
             spent.signatures.retain(|_, ts| within_tolerance(*ts, now));
             spent.last_sweep = Some(now);
             now
@@ -94,7 +94,7 @@ impl ReplayCache {
             last_sweep
         };
         // A sweep on a later clock than this request's freshness check may have dropped its entry.
-        if (swept - timestamp).num_seconds() > TIMESTAMP_TOLERANCE_SECS {
+        if swept.duration_since(timestamp).as_secs() > TIMESTAMP_TOLERANCE_SECS {
             return SignatureClaim::Expired;
         }
 
@@ -257,7 +257,7 @@ async fn has_migrated(state: &AppState, client_id: &ClientId) -> Result<bool, Ap
 
 /// Best-effort: the request already authenticated, and the next `v1` request
 /// retries an unwritten marker.
-async fn record_migration(state: &AppState, client_id: &ClientId, now: DateTime<Utc>) {
+async fn record_migration(state: &AppState, client_id: &ClientId, now: Timestamp) {
     if state.migrated_clients.contains(client_id) {
         return;
     }
@@ -348,13 +348,13 @@ async fn verify_client(parts: &Parts, state: &AppState) -> Result<AuthenticatedC
             AppError::Unauthorized("client not found".into())
         })?;
 
-    let ts = chrono::DateTime::parse_from_rfc3339(&timestamp)
-        .map_err(|_| AppError::Unauthorized("invalid timestamp format".into()))?
-        .with_timezone(&Utc);
-    let now = Utc::now();
+    let ts = timestamp
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| AppError::Unauthorized("invalid timestamp format".into()))?;
+    let now = Timestamp::now();
     if !within_tolerance(ts, now) {
         tracing::warn!(
-            skew_secs = (now - ts).num_seconds(),
+            skew_secs = now.duration_since(ts).as_secs(),
             "refused: request timestamp outside the tolerance window"
         );
         return Err(AppError::Unauthorized("timestamp expired".into()));
@@ -478,7 +478,7 @@ async fn verify_client(parts: &Parts, state: &AppState) -> Result<AuthenticatedC
             }
             SignatureClaim::Expired => {
                 tracing::warn!(
-                    skew_secs = (now - ts).num_seconds(),
+                    skew_secs = now.duration_since(ts).as_secs(),
                     "refused: request timestamp outside the tolerance window"
                 );
                 return Err(AppError::Unauthorized("timestamp expired".into()));
@@ -676,8 +676,8 @@ async fn verify_user(parts: &mut Parts, state: &AppState) -> Result<Authenticate
 struct UserSignature {
     key_id: UserKeyId,
     timestamp: String,
-    ts: DateTime<Utc>,
-    now: DateTime<Utc>,
+    ts: Timestamp,
+    now: Timestamp,
     signature_hex: String,
     nonce: String,
 }
@@ -694,14 +694,14 @@ impl UserSignature {
             return Err(AppError::Unauthorized("missing X-Nonce header".into()));
         }
 
-        let ts = chrono::DateTime::parse_from_rfc3339(&timestamp)
-            .map_err(|_| AppError::Unauthorized("invalid timestamp format".into()))?
-            .with_timezone(&Utc);
-        let now = Utc::now();
+        let ts = timestamp
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| AppError::Unauthorized("invalid timestamp format".into()))?;
+        let now = Timestamp::now();
         if !within_tolerance(ts, now) {
             tracing::warn!(
                 %key_id,
-                skew_secs = (now - ts).num_seconds(),
+                skew_secs = now.duration_since(ts).as_secs(),
                 "refused: request timestamp outside the tolerance window"
             );
             return Err(AppError::Unauthorized("timestamp expired".into()));
@@ -802,8 +802,8 @@ struct Verified {
     registration: pipette_core::user::UserKey,
     user: anyhow::Result<Option<User>>,
     signature: [u8; 64],
-    ts: DateTime<Utc>,
-    now: DateTime<Utc>,
+    ts: Timestamp,
+    now: Timestamp,
 }
 
 /// The checks after a user signature verifies, shared by both schemes: the
@@ -867,7 +867,7 @@ fn admit(
         SignatureClaim::Expired => {
             tracing::warn!(
                 %key_id,
-                skew_secs = (now - ts).num_seconds(),
+                skew_secs = now.duration_since(ts).as_secs(),
                 "refused: request timestamp outside the tolerance window"
             );
             Err(AppError::Unauthorized("timestamp expired".into()))
@@ -895,9 +895,13 @@ async fn verify_rfc9421(
             "a request signs one way: RFC 9421 or X-Signature, and this one carries {legacy}"
         )));
     }
-    let now = Utc::now();
-    let parsed = httpsig::parse(parts, now, TimeDelta::seconds(TIMESTAMP_TOLERANCE_SECS))
-        .map_err(refused_rfc9421)?;
+    let now = Timestamp::now();
+    let parsed = httpsig::parse(
+        parts,
+        now,
+        SignedDuration::from_secs(TIMESTAMP_TOLERANCE_SECS),
+    )
+    .map_err(refused_rfc9421)?;
     own_authority(state, &parsed.authority)?;
     let user_id = account_of_key(state, &parsed.key_id).await?;
     tracing::Span::current().record("client_id", tracing::field::display(&user_id));
@@ -1521,7 +1525,7 @@ mod tests {
     #[test]
     fn test_first_claim_is_fresh_and_the_second_is_a_replay() -> anyhow::Result<()> {
         let cache = ReplayCache::new();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         assert_eq!(cache.claim(&sig(1), now, now), SignatureClaim::Fresh);
         assert_eq!(cache.claim(&sig(1), now, now), SignatureClaim::Replayed);
@@ -1533,7 +1537,7 @@ mod tests {
     #[test]
     fn test_concurrent_claims_admit_exactly_one() -> anyhow::Result<()> {
         let cache = ReplayCache::new();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let fresh = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..16)
@@ -1553,8 +1557,8 @@ mod tests {
     #[test]
     fn test_sweep_drops_only_signatures_past_the_tolerance_window() -> anyhow::Result<()> {
         let cache = ReplayCache::new();
-        let start = Utc::now();
-        let tolerance = chrono::TimeDelta::seconds(TIMESTAMP_TOLERANCE_SECS);
+        let start = Timestamp::now();
+        let tolerance = jiff::SignedDuration::from_secs(TIMESTAMP_TOLERANCE_SECS);
 
         assert_eq!(cache.claim(&sig(1), start, start), SignatureClaim::Fresh);
         assert_eq!(cache.len(), 1);
@@ -1571,7 +1575,7 @@ mod tests {
 
         // Past the window and due for a sweep: the first entry goes, the second
         // stays.
-        let outside = inside + chrono::TimeDelta::seconds(SWEEP_INTERVAL_SECS);
+        let outside = inside + jiff::SignedDuration::from_secs(SWEEP_INTERVAL_SECS);
         assert_eq!(
             cache.claim(&sig(3), outside, outside),
             SignatureClaim::Fresh
@@ -1609,8 +1613,8 @@ mod tests {
         #[case] claims: &[(u8, i64, i64, SignatureClaim)],
     ) -> anyhow::Result<()> {
         let cache = ReplayCache::new();
-        let start = Utc::now();
-        let at = |secs| start + chrono::TimeDelta::seconds(secs);
+        let start = Timestamp::now();
+        let at = |secs| start + jiff::SignedDuration::from_secs(secs);
 
         claims
             .iter()

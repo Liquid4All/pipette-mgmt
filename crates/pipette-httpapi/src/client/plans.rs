@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use pipette_core::client::Client;
 use pipette_core::denial::DenialRecord;
@@ -86,7 +86,7 @@ async fn settle_lapsed_leases(
     state: &AppState,
     client_id: &ClientId,
     except: Option<&JobId>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), AppError> {
     let todo = state.todo_store.as_ref();
     let leases = todo
@@ -146,8 +146,8 @@ async fn revert_claim_if_out_of_vault_reach(
     job_id: &JobId,
     body: &serde_json::Value,
     expires_at: ExpiresAt,
-    lease_expiry: DateTime<Utc>,
-    now: DateTime<Utc>,
+    lease_expiry: Timestamp,
+    now: Timestamp,
 ) -> Result<bool, AppError> {
     let denied_at = match client_may_fetch_job(state, client_id, body).await {
         Ok(true) => return Ok(false),
@@ -176,8 +176,8 @@ async fn put_back_out_of_vault_reach(
     client_id: &ClientId,
     job_id: &JobId,
     expires_at: ExpiresAt,
-    lease_expiry: DateTime<Utc>,
-    denied_at: Option<DateTime<Utc>>,
+    lease_expiry: Timestamp,
+    denied_at: Option<Timestamp>,
 ) -> Result<(), AppError> {
     // Durable before the recycle, as a retriable failure's is.
     if let Some(now) = denied_at {
@@ -229,7 +229,7 @@ async fn refuse_renewal_out_of_vault_reach(
     state: &AppState,
     client_id: &ClientId,
     job_id: &JobId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), AppError> {
     let todo = state.todo_store.as_ref();
     // shortcut: an extra leased/ LIST and GET on every renewal, vault job or
@@ -407,7 +407,7 @@ async fn claim_timed(
     // Both refusals — status and permission — are the extractor's.
     let client_id = &client.client_id;
     let todo = state.todo_store.as_ref();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let gate = Instant::now();
 
     // The flag means the eligible markers are stale; no work until
@@ -546,7 +546,7 @@ async fn claim_timed(
                 job_id = %lease.job_id,
                 "idempotent claim: returned already-held lease to re-polling client"
             );
-            u64::try_from((lease.lease_expiry - now).num_seconds()).unwrap_or(0)
+            u64::try_from(lease.lease_expiry.duration_since(now).as_secs()).unwrap_or(0)
         } else {
             tracing::info!(
                 %lease_expiry,
@@ -574,7 +574,7 @@ pub async fn heartbeat(
 ) -> Result<Response, AppError> {
     let client_id = &client.client_id;
     let todo = state.todo_store.as_ref();
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let new_expiry = state.config.lease_expiry_from(now);
 
@@ -619,7 +619,7 @@ pub async fn reclaim(
 ) -> Result<Response, AppError> {
     let client_id = &client.client_id;
     let todo = state.todo_store.as_ref();
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let new_expiry = state.config.lease_expiry_from(now);
 
@@ -720,7 +720,7 @@ mod tests {
             job_id: job.clone(),
             expires_at: ExpiresAt::Never,
             client_id: client.clone(),
-            lease_expiry: Utc::now() + chrono::Duration::hours(1),
+            lease_expiry: Timestamp::now() + jiff::SignedDuration::from_hours(1),
         };
         seed_leased_until(
             &todo,
@@ -790,8 +790,8 @@ mod tests {
         )
         .await?;
         todo.write_eligible(&client, &job, ExpiresAt::Never).await?;
-        let now = Utc::now();
-        let until = now + chrono::Duration::hours(1);
+        let now = Timestamp::now();
+        let until = now + jiff::SignedDuration::from_hours(1);
         let outcome = todo
             .claim_for_client(&client, until, 0, &[], None, None, now)
             .await?;

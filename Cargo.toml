@@ -130,7 +130,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The JSON Schemas of the responses the console app generates its TypeScript
 # types from (`pipette_httpapi::api_schema`).
-schemars = { version = "1.2", features = ["chrono04"] }
+schemars = "1.2"
 # Checks response bodies against those schemas, in tests only.
 jsonschema = { version = "0.60", default-features = false }
 serde_ignored = "0.1"
@@ -138,7 +138,7 @@ serde_ignored = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.13", features = ["json"] }
 uuid = { version = "1", features = ["v4", "v7"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1.0", default-features = false, features = ["std", "serde"] }
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -197,15 +197,14 @@ sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",
     "tls-rustls-aws-lc-rs",
-    "chrono",
     "migrate",
     "macros",
 ] }
+jiff-sqlx = { version = "1.0", features = ["postgres"] }
 libc = "0.2"
 # `system::uname`: the host name the audit log records for a CLI command, on
 # every Unix without `unsafe`. Already in the graph through `tempfile`.
 rustix = { version = "1.1", features = ["system"] }
-derive_more = { version = "2", features = ["display", "from", "as_ref", "into"] }
 dirs = "7.0.0"
 strum = { version = "0.28", features = ["derive"] }
 # RFC 9651 structured fields, which RFC 9421 signatures are written in.
@@ -262,6 +261,11 @@ unreachable_pub = "deny"
 # ambiguous links stay denied — those are rot.
 [workspace.lints.rustdoc]
 private_intra_doc_links = "allow"
+
+# Checked per target on Rust 1.100 and newer; older toolchains ignore the keys.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+unused_workspace_dependencies = "deny"
 
 # Panicking constructs are banned. A reachable failure must return a typed
 # `Result` — tests included: they should be `-> anyhow::Result<()>` and use `?`

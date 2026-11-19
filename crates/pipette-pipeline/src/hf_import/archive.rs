@@ -1,6 +1,8 @@
 //! The deterministic tar an import packs a model directory into: one commit
 //! always gives one digest. A header needs only the listed size, so the archive
-//! streams; a file of 8 GiB or more takes the GNU base-256 size field.
+//! streams; a file of 8 GiB or more takes the GNU base-256 size field. A path
+//! that a ustar header cannot hold goes in a PAX `path` record before the header.
+//! Every other entry uses plain ustar.
 
 use std::future::{self, Future};
 use std::sync::Arc;
@@ -18,6 +20,12 @@ const BLOCK: u64 = 512;
 /// The two zero blocks that end an archive.
 const END: [u8; 1024] = [0; 1024];
 
+/// The name of the PAX header before an entry whose path ustar cannot hold.
+const PAX_NAME: &str = "@PaxHeader";
+
+/// The length of a ustar header's name field.
+const NAME_LEN: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TarEntry {
     /// The path in the archive, from the model directory.
@@ -29,13 +37,13 @@ pub(super) struct TarEntry {
     pub(super) sha256: Option<Sha256>,
 }
 
-/// A path that a ustar header cannot hold.
+/// A path with a NUL byte or an empty, `.` or `..` component, which the archive refuses.
 #[derive(Debug, thiserror::Error)]
-#[error("a tar archive cannot hold the path `{path}`: {reason}")]
+#[error(
+    "the archive refuses the path `{path}`: it has a NUL byte or an empty, `.` or `..` component"
+)]
 pub struct UnsupportedPathError {
     pub path: String,
-    #[source]
-    pub reason: std::io::Error,
 }
 
 /// A downloaded file whose bytes are not what the Hub listing says.
@@ -55,27 +63,67 @@ pub enum BodyMismatchError {
     },
 }
 
-/// The ustar header of a regular file, with every variable field fixed.
-fn header(name: &str, size: u64) -> Result<[u8; 512], UnsupportedPathError> {
-    let unsupported = |reason| UnsupportedPathError {
-        path: name.to_owned(),
-        reason,
-    };
+/// A ustar header of `kind` and `size` with no path, and with every other
+/// field fixed.
+fn fixed(kind: tar::EntryType, size: u64) -> tar::Header {
     let mut header = tar::Header::new_ustar();
-    header.set_path(name).map_err(unsupported)?;
     header.set_size(size);
     header.set_mode(0o644);
     header.set_mtime(0);
     header.set_uid(0);
     header.set_gid(0);
-    header.set_username("").map_err(unsupported)?;
-    header.set_groupname("").map_err(unsupported)?;
-    header.set_entry_type(tar::EntryType::Regular);
-    header.set_cksum();
-    Ok(*header.as_bytes())
+    header.set_entry_type(kind);
+    header
 }
 
-/// Refuse the first entry whose path a ustar header cannot hold.
+/// `header` with the first [`NAME_LEN`] bytes of `name`, cut at a character
+/// boundary so that the name field stays valid UTF-8.
+fn named(mut header: tar::Header, name: &str) -> [u8; 512] {
+    let end = name.floor_char_boundary(NAME_LEN);
+    header
+        .as_old_mut()
+        .name
+        .iter_mut()
+        .zip(name.bytes().take(end))
+        .for_each(|(field, byte)| *field = byte);
+    header.set_cksum();
+    *header.as_bytes()
+}
+
+/// The PAX record `<len> path=<path>\n`, where `<len>` counts its own digits.
+fn path_record(path: &str) -> String {
+    let rest = path.len() + " path=\n".len();
+    let mut len = rest;
+    while len != rest + len.to_string().len() {
+        len = rest + len.to_string().len();
+    }
+    format!("{len} path={path}\n")
+}
+
+/// The header blocks of a regular file. A path that ustar cannot hold gets a
+/// PAX header and its padded `path` record before the ustar header.
+fn header(name: &str, size: u64) -> Result<Vec<u8>, UnsupportedPathError> {
+    if name.contains('\0') || name.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return Err(UnsupportedPathError {
+            path: name.to_owned(),
+        });
+    }
+    let mut header = fixed(tar::EntryType::Regular, size);
+    if header.set_path(name).is_ok() {
+        header.set_cksum();
+        return Ok(header.as_bytes().to_vec());
+    }
+    let record = path_record(name);
+    let pax = fixed(tar::EntryType::XHeader, record.len() as u64);
+    let mut blocks = named(pax, PAX_NAME).to_vec();
+    blocks.extend_from_slice(record.as_bytes());
+    blocks.resize(blocks.len().next_multiple_of(512), 0);
+    let real = fixed(tar::EntryType::Regular, size);
+    blocks.extend_from_slice(&named(real, name));
+    Ok(blocks)
+}
+
+/// Refuse the first entry whose path the archive cannot hold.
 pub(super) fn check(entries: &[TarEntry]) -> Result<(), UnsupportedPathError> {
     entries
         .iter()
@@ -87,11 +135,13 @@ fn padding(size: u64) -> u64 {
     (BLOCK - size % BLOCK) % BLOCK
 }
 
+/// The length of the archive of `entries` that pass [`check`].
 pub(super) fn archive_size(entries: &[TarEntry]) -> u64 {
     entries
         .iter()
         .map(|entry| {
-            BLOCK
+            header(&entry.name, entry.size)
+                .map_or(BLOCK, |blocks| blocks.len() as u64)
                 .saturating_add(entry.size)
                 .saturating_add(padding(entry.size))
         })
@@ -99,8 +149,8 @@ pub(super) fn archive_size(entries: &[TarEntry]) -> u64 {
 }
 
 /// The archive of `entries`, sorted by name; `open` runs only when the archive
-/// reaches that entry. Every header is built first, so a path ustar cannot hold
-/// is refused before any download.
+/// reaches that entry. The function builds every header first and refuses
+/// unsupported paths before any download.
 pub(super) fn archive<F, Fut>(
     mut entries: Vec<TarEntry>,
     open: F,
@@ -123,7 +173,7 @@ where
             Ok::<_, anyhow::Error>(checked(entry, opened))
         })
         .try_flatten();
-        stream::once(async move { Ok(Bytes::copy_from_slice(&header)) })
+        stream::once(async move { Ok(Bytes::from(header)) })
             .chain(body)
             .chain(stream::once(async move {
                 Ok(Bytes::from(vec![0; usize::try_from(pad)?]))
@@ -218,11 +268,21 @@ mod tests {
         Ok(digest.finish()?.0)
     }
 
+    /// The first four paths fit a ustar header. The last two do not: one is
+    /// a 105-byte name, and the other has a 2-byte character across byte 100.
     const FILES: &[(&str, &[u8])] = &[
         ("config.json", b"{}"),
         ("tokenizer/vocab.txt", b"a b c"),
         ("model.safetensors", &[7; 1500]),
         ("empty", b""),
+        (
+            "Qwen3-1.7B_rai_1.8.0_npu_4K_Qwen3-1.7B_rai_1.8.0_npu_4K_Qwen3-1.7B_rai_1.8.0_npu_4K_xxxxxxxxxxxxxxxxxxxxx",
+            b"long",
+        ),
+        (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé.onnx",
+            &[9; 700],
+        ),
     ];
 
     fn entries(order: &[usize]) -> anyhow::Result<Vec<TarEntry>> {
@@ -258,14 +318,18 @@ mod tests {
         Ok(chunks.concat())
     }
 
-    /// The archive does not depend on the Hub's listing order, has the size
-    /// [`archive_size`] gives, and unpacks with fixed metadata.
+    /// The archive does not depend on the Hub's file order.
+    /// Its size matches [`archive_size`].
+    /// It unpacks with fixed metadata and full paths.
     #[tokio::test]
     async fn one_file_list_gives_one_archive() -> anyhow::Result<()> {
-        let first = packed(entries(&[0, 1, 2, 3])?).await?;
-        let second = packed(entries(&[3, 2, 1, 0])?).await?;
+        let first = packed(entries(&[0, 1, 2, 3, 4, 5])?).await?;
+        let second = packed(entries(&[5, 4, 3, 2, 1, 0])?).await?;
         assert_eq!(first, second);
-        assert_eq!(first.len() as u64, archive_size(&entries(&[0, 1, 2, 3])?));
+        assert_eq!(
+            first.len() as u64,
+            archive_size(&entries(&[0, 1, 2, 3, 4, 5])?)
+        );
 
         let mut tar = tar::Archive::new(first.as_slice());
         let unpacked = tar
@@ -277,6 +341,7 @@ mod tests {
                 assert_eq!(header.mtime()?, 0);
                 assert_eq!((header.uid()?, header.gid()?), (0, 0));
                 assert_eq!(header.username()?, Some(""));
+                std::str::from_utf8(&header.path_bytes())?;
                 let path = entry.path()?.to_string_lossy().into_owned();
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes)?;
@@ -298,18 +363,39 @@ mod tests {
         Ok(())
     }
 
+    /// The archive bytes are the vault digest of every stored import, so a
+    /// test pins them for paths that a ustar header holds.
+    #[tokio::test]
+    async fn the_archive_bytes_are_pinned() -> anyhow::Result<()> {
+        let bytes = packed(entries(&[0, 1, 2, 3])?).await?;
+        assert_eq!(
+            sha256_of(&bytes)?.as_ref(),
+            "06dfb68c317853e5e8dadbf54deb085d2ad3a7f65babef29a753f4cba1ec43f0"
+        );
+        Ok(())
+    }
+
     /// The refusal comes before any entry opens.
-    #[test]
-    fn a_path_that_ustar_cannot_hold_is_refused() {
+    #[rstest]
+    #[case::parent("a/../b")]
+    #[case::absolute("/a")]
+    #[case::current("./a")]
+    #[case::empty("a//b")]
+    #[case::nul("a\0b")]
+    fn a_path_with_an_unsafe_component_is_refused(#[case] name: &str) {
         let entry = TarEntry {
-            name: "a".repeat(300),
-            repo_path: "a".repeat(300),
+            name: name.to_owned(),
+            repo_path: name.to_owned(),
             size: 0,
             sha256: None,
         };
+        assert!(matches!(
+            check(std::slice::from_ref(&entry)),
+            Err(UnsupportedPathError { path }) if path == name
+        ));
         let refused = archive(vec![entry], open);
         assert!(
-            matches!(&refused, Err(UnsupportedPathError { path, .. }) if path.len() == 300),
+            matches!(&refused, Err(UnsupportedPathError { path }) if path == name),
             "{:?}",
             refused.err()
         );

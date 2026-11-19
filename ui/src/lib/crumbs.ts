@@ -2,6 +2,7 @@
 // without a page of its own, such as **Me**, is drawn as plain words.
 
 import { handle } from "./format";
+import { orgName, type OrgRef } from "./orgs";
 import { pathOf } from "./routes";
 
 export interface Crumb {
@@ -15,7 +16,7 @@ export const ORGS: Readonly<Crumb> = { label: "Organizations", href: pathOf({ pa
 export const USERS: Readonly<Crumb> = { label: "Users", href: pathOf({ page: "users" }) };
 
 /** An organization's steps, by its record or, before that resolves, the handle an address named. */
-export function orgTrail(org: { slug: string; org_id: string } | string): readonly Crumb[] {
-  const [label, reference] = typeof org === "string" ? [org, org] : [org.slug, handle(org)];
+export function orgTrail(org: OrgRef | string): readonly Crumb[] {
+  const [label, reference] = typeof org === "string" ? [org, org] : [orgName(org), handle(org)];
   return [ORGS, { label, href: pathOf({ page: "org", org: reference }) }];
 }

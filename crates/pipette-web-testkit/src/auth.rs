@@ -28,7 +28,9 @@ pub fn auth_headers(
     method: &str,
     path: &str,
 ) -> Result<Vec<(&'static str, String)>, getrandom::Error> {
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     auth_headers_at(signing_key, client_id, method, path, timestamp)
 }
 
@@ -38,7 +40,9 @@ pub fn legacy_auth_headers(
     signing_key: &SigningKey,
     client_id: &ClientId,
 ) -> Vec<(&'static str, String)> {
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let signature = signing_key.sign(timestamp.as_bytes());
     signed_headers(client_id, timestamp, signature)
 }

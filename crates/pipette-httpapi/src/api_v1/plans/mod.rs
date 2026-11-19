@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::State;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::benchmark::Benchmark;
 use pipette_core::plan::PlanSource;
@@ -40,9 +40,7 @@ use crate::error::AppError;
 use crate::extract::PlanDocument;
 use crate::state::AppState;
 
-/// The maximum length of the `note` of a plan, in characters. Every plan listing
-/// returns the note, so this limit keeps the listings small.
-pub(crate) const NOTE_MAX_CHARS: usize = 4096;
+pub(crate) const NOTE_MAX_CHARS: usize = pipette_pipeline::campaign_admin::TEXT_MAX_CHARS;
 
 /// Whose private benchmarks and vault resources a plan a user files may name.
 pub(crate) struct FilingScope {
@@ -119,7 +117,7 @@ pub async fn validate_plan(
                 &catalogs.context(&state, &state.hf_imports),
                 submission,
                 expansion,
-                Utc::now(),
+                Timestamp::now(),
             )
             .await?
         }
@@ -185,7 +183,7 @@ pub(crate) async fn dry_run_plan(
         plan.source,
         plan.jobs,
         plan.plan_warnings,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await?)
 }

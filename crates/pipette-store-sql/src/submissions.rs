@@ -773,13 +773,14 @@ mod tests {
     async fn repair_updated_at(
         db: &SqlDatabase,
         job_id: &JobId,
-    ) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-        Ok(sqlx::query_scalar(
+    ) -> anyhow::Result<jiff::Timestamp> {
+        Ok(sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT updated_at FROM submission_outcome_repairs WHERE job_id = $1",
         )
         .bind(job_id.as_str())
         .fetch_one(db.pool())
-        .await?)
+        .await?
+        .to_jiff())
     }
 
     /// One repair pass over at most one candidate, with no age limit.

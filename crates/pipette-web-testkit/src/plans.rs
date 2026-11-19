@@ -3,9 +3,9 @@
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use pipette_core::campaign::{Campaign, CampaignOwner};
@@ -451,7 +451,7 @@ pub async fn put_idle_campaign_of(
     owner: CampaignOwner,
     name: &str,
 ) -> anyhow::Result<Campaign> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let campaign = Campaign {
         campaign_id: CampaignId::mint(),
         name: NonEmptyTrimmedString::try_new(name)?,
@@ -459,6 +459,7 @@ pub async fn put_idle_campaign_of(
         current_plan_id: None,
         labels: Default::default(),
         state: Default::default(),
+        state_note: None,
         created_at: now,
         updated_at: now,
     };
@@ -505,7 +506,7 @@ pub async fn add_starved_snapshot(state: &AppState, plan_id: &PlanId) -> anyhow:
         job_ids: group.job_ids.clone(),
     }];
     manifest.progress_snapshot = Some(ProgressSnapshot {
-        computed_at: Utc::now(),
+        computed_at: Timestamp::now(),
         counts: Counts {
             total: group.job_ids.len() as u64,
             available: group.job_ids.len() as u64,

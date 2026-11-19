@@ -12,8 +12,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use strum::IntoEnumIterator as _;
 
 use pipette_core::campaign::{Campaign, CampaignGroup, CampaignOwner, GroupPolicyState};
@@ -26,8 +26,7 @@ use pipette_plan_types::{
     CampaignGroupPolicy, CampaignGroupPolicyPreview, CampaignGroupRerunResults, CampaignGroupView,
     CampaignId, CampaignView, Changed, CreateCampaignGroupRequest, ExpiresAt, ListPage,
     MemberPolicyPreview, OwnedListQuery, PolicyBase, PolicyFiling, PolicyKind, PolicyMemberState,
-    PolicyRerun, RerunResultsQuery, SetCampaignGroupPolicyRequest, UpdateCampaignGroupRequest,
-    UserPermission,
+    RerunResultsQuery, SetCampaignGroupPolicyRequest, UpdateCampaignGroupRequest, UserPermission,
 };
 use pipette_store::{CampaignGroupStore, CampaignInAnotherGroupError, STORAGE_CONCURRENCY};
 
@@ -174,7 +173,7 @@ pub async fn create_campaign_group(
     audit
         .involve(&state, [AuditTarget::from(owner.clone())])
         .await;
-    let group = CampaignGroup::new(body.name, owner, Utc::now());
+    let group = CampaignGroup::new(body.name, owner, Timestamp::now());
     store
         .create_group(&group)
         .await
@@ -279,7 +278,7 @@ pub async fn update_campaign_group(
     let store = groups(&state)?;
     let mut group = for_record_write(&state, store, active.caller(), &audit, &group_id).await?;
     check_name(&body.name)?;
-    let changed = group.rename(body.name, Utc::now());
+    let changed = group.rename(body.name, Timestamp::now());
     if changed {
         let written = store
             .update_group(&group)
@@ -507,8 +506,7 @@ pub async fn preview_campaign_group_policies(
     let catalog = load_server_catalog(state.catalog_store.as_ref())
         .await
         .map_err(|e| AppError::internal(e.context("failed to read the benchmark catalog")))?;
-    let (groups, plans, todo, submissions, group, stored, table, catalog, now) = (
-        store,
+    let (plans, todo, submissions, group, stored, table, catalog, now) = (
         &*state.plan_store,
         &*state.todo_store,
         &*state.submission_store,
@@ -516,7 +514,7 @@ pub async fn preview_campaign_group_policies(
         &stored,
         &table,
         &catalog,
-        Utc::now(),
+        Timestamp::now(),
     );
     let (_, members) = stream::iter(kept.iter().map(anyhow::Ok))
         .try_fold(
@@ -530,14 +528,13 @@ pub async fn preview_campaign_group_policies(
                     table: Some(table),
                     catalog: Some(catalog),
                     waiting: &[],
+                    job_states: &[],
+                    bodies: None,
                 };
                 let evaluation =
                     group_policies::evaluate(plans, results, group, campaign, stored, pass).await?;
                 let results = results.filter(|_| evaluation.state != PolicyMemberState::Unreadable);
-                let waiting = groups
-                    .waiting_reruns(&group.group_id, &campaign.campaign_id)
-                    .await?;
-                members.push(member_preview(campaign, kept, evaluation, &waiting, now));
+                members.push(member_preview(campaign, kept, evaluation, now));
                 anyhow::Ok((results, members))
             },
         )
@@ -550,8 +547,7 @@ fn member_preview(
     campaign: &Campaign,
     kept: &GroupPolicyState,
     evaluation: Evaluation,
-    waiting: &[PolicyRerun],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> MemberPolicyPreview {
     let Evaluation {
         plan_id,
@@ -571,8 +567,13 @@ fn member_preview(
         // none of it.
         kinds: _,
         reruns: _,
+        from_body: _,
+        body_reads: _,
         judged: _,
         decided: _,
+        flagged: _,
+        read: _,
+        job_states: _,
         record: _,
     } = evaluation;
     let earliest_deadline = earliest_deadline.and_then(ExpiresAt::instant);
@@ -581,14 +582,6 @@ fn member_preview(
         Some(Hold::NotAdvanced { plan_id, .. }) => (Some(plan_id), 0),
         Some(Hold::Refused(_)) | None => (None, 0),
     };
-    // A held member's checks read no rows, so its waiting re-runs tell.
-    let triggered = checks
-        .iter()
-        .filter(|check| {
-            check.on && (check.flagged > 0 || waiting.iter().any(|rerun| rerun.kind == check.kind))
-        })
-        .map(|check| check.kind)
-        .collect();
     MemberPolicyPreview {
         campaign_id: campaign.campaign_id.clone(),
         plan_id,
@@ -599,7 +592,6 @@ fn member_preview(
         // The ingest refuses a deadline at or before now.
         deadline_passed: earliest_deadline.is_some_and(|deadline| deadline <= now),
         checks,
-        triggered,
         rerun_job_ids,
         marked_job_ids: marked.into_keys().collect(),
         kept_job_count,
@@ -701,7 +693,7 @@ pub async fn set_campaign_group_policy(
             settings: stored.settings.clone(),
         };
         let (enabled_by, enabled_at) = match (enabled, stored.enabled) {
-            (true, false) => (Some(active.user.user_id.clone()), Some(Utc::now())),
+            (true, false) => (Some(active.user.user_id.clone()), Some(Timestamp::now())),
             (true, true) => (stored.enabled_by.clone(), stored.enabled_at),
             (false, _) => (None, None),
         };
@@ -790,9 +782,10 @@ mod tests {
 
     use anyhow::Context;
 
+    use pipette_core::campaign::JobPolicyState;
     use pipette_core::types::Mint;
     use pipette_plan_types::{PolicyRerun, PolicyRerunSummary, UserId};
-    use pipette_store::{CampaignGroupPage, EnabledPolicies, GroupMember};
+    use pipette_store::{CampaignGroupPage, EnabledPolicies, GroupMember, JobStateChanges};
 
     use super::*;
 
@@ -869,13 +862,24 @@ mod tests {
         async fn policy_states(&self, _: &CampaignGroupId) -> anyhow::Result<Vec<GroupMember>> {
             anyhow::bail!("policy_states: not implemented by this fake")
         }
+        async fn member_states(&self, _: &[CampaignId]) -> anyhow::Result<Vec<GroupMember>> {
+            anyhow::bail!("member_states: not implemented by this fake")
+        }
         async fn set_policy_state(
             &self,
             _: &CampaignGroupId,
             _: &CampaignId,
             _: &GroupPolicyState,
+            _: &JobStateChanges,
         ) -> anyhow::Result<bool> {
             anyhow::bail!("set_policy_state: not implemented by this fake")
+        }
+        async fn job_states(
+            &self,
+            _: &CampaignGroupId,
+            _: &CampaignId,
+        ) -> anyhow::Result<Vec<JobPolicyState>> {
+            anyhow::bail!("job_states: not implemented by this fake")
         }
         async fn record_reruns(
             &self,
@@ -918,7 +922,7 @@ mod tests {
         let on = CampaignGroupPolicy {
             enabled: true,
             enabled_by: Some(UserId::mint()),
-            enabled_at: Some(Utc::now()),
+            enabled_at: Some(Timestamp::now()),
             ..off.clone()
         };
 

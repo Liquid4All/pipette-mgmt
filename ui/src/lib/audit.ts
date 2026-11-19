@@ -3,7 +3,7 @@
 // what they did, and the records it named.
 
 import { ownOrg } from "./orgs";
-import { campaignGroupLink, campaignLink, clientLink, href, orgLink, planLink, userLink, vaultLink } from "./routes";
+import { campaignGroupLink, campaignLink, clientLink, href, orgLink, pathOf, planLink, userLink, vaultLink } from "./routes";
 import type { Choice } from "./table";
 import type { AuditActor, AuditEvent, AuditTarget, OwnUserView } from "./api-types";
 
@@ -145,6 +145,14 @@ export function actionShown(event: Pick<AuditEvent, "action" | "outcome" | "summ
     return { text: `Renamed catalog entry ${action.old_name} to ${action.new_name}`,
              title: `${action.scope}: ${action.old_name} → ${action.new_name}`, status: null };
   }
+  if (action.type === "catalog_remove_member") {
+    return { text: `Removed catalog member ${action.member} from ${action.name}`,
+             title: `${action.scope}: ${action.name}\n${action.member}: ${action.digest}`, status: null };
+  }
+  if (action.type === "catalog_move_to_global") {
+    return { text: `Moved catalog entry ${action.name} from ${action.org_id} to global scope`,
+             title: `${action.org_id}: ${action.name}\ncreated by ${action.original_created_by}`, status: null };
+  }
   if (action.type === "group_policy") {
     return { text: `Campaign group policies ${action.kinds.join(", ")}: re-run ${action.rerun_job_count}, `
                + `marked ${action.marked_job_count} failed`,
@@ -175,7 +183,7 @@ export function targetId(target: AuditTarget): string {
 }
 
 /**
- * A target's page, an organization by its handle. `names` covers every kind but groups, plans and jobs, so an
+ * A target's page, an organization by its id. `names` covers every kind but groups, plans and jobs, so an
  * unnamed one is out of the reader's reach or gone; a job has no page of its own.
  */
 export function targetHref(target: AuditTarget, names: Record<string, string>): string | null {
@@ -185,7 +193,7 @@ export function targetHref(target: AuditTarget, names: Record<string, string>): 
     case "campaign_group": return campaignGroupLink(id);
     case "plan": return planLink(id);
     case "job": return null;
-    case "org": return name ? orgLink({ slug: name, org_id: id }) : null;
+    case "org": return name ? pathOf({ page: "org", org: id }) : null;
     case "user": return name ? userLink(id) : null;
     case "client": return name ? clientLink(id) : null;
     case "campaign": return name ? campaignLink(id) : null;

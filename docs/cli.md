@@ -128,6 +128,10 @@ Each run of a command that changes records creates an
 audit event ([Organizations: The audit log](api/orgs.md#the-audit-log)).
 `catalog rename` also creates a separate event with the old and new names.
 A rename that merges two entries creates a `catalog_merge` event in its place.
+`catalog remove-member` also creates a `catalog_remove_member` event with the
+key and the digest of the removed member.
+`catalog move-to-global` also creates a `catalog_move_to_global` event with
+the organization, the entry name, and the creator of the org entry.
 The event contains the subcommand and its arguments, the operator and hostname
 of the host, and the outcome. The audit log keeps the arguments for two years.
 A reader with `manage_any_orgs` can read them. The audit log also records the
@@ -139,10 +143,10 @@ These commands make no audit event:
 - A `--dry-run`.
 - `serve`, because the server records its own requests.
 - `openapi`, which prints the binary's own document.
-- `unlock`, `db migrate`, `db check` and `db export`, because a storage lock,
-  the schema and an export change no records. `db import`,
-  `db backfill-job-cells`, `db backfill-run-evidence` and
-  `db backfill-rerun-results` change records, so they make an event.
+- `unlock`, `db migrate` and `db check`, because a storage lock and the schema
+  change no records. `db backfill-job-cells`, `db backfill-run-evidence`
+  and `db backfill-rerun-results` change records, so each of them makes an
+  audit event.
 
 An event is in the log of each organization that `--org` names. It is also in
 the log of each organization that owns a record the arguments name by id.
@@ -263,7 +267,9 @@ covers its cadence, why runs must not overlap, and its log lines;
 11. Applies the campaign group policies that are on
     ([when a policy acts](api/campaign-groups.md#when-a-policy-acts)): it reads
     each member campaign's current plan and its results in pipette-duckdb, and
-    files at most one revision per campaign. It fails the run while a policy is on and the config has no `[duckdb]`.
+    files at most one revision per campaign. For an answered job with no rows
+    in pipette-duckdb, it reads the submission body, and files a re-run that
+    the body's rows give. It fails the run while a policy is on and the config has no `[duckdb]`.
     It starts no member once the run is more than 60 s past its start
     ([operations.md §3.1](operations.md#31-job-queue-maintenance)).
 
@@ -272,14 +278,16 @@ It never deletes a plan manifest or the document a plan was filed from
 it writes only the job queue, `plans/`, and a synthetic failure under a job's own key
 in `submissions/incoming/`, and in pass 11 the policies' revisions, each mark's
 failure under its new job's key in `submissions/incoming/`, their audit events,
-each member's `policy_state` in `campaign_group_members`, and the re-runs and
-their outcomes in `campaign_group_rerun_results`
+each member's `policy_state` in `campaign_group_members` with its job states
+in `campaign_group_job_states`, and the re-runs and their outcomes in
+`campaign_group_rerun_results`
 ([re-run results](api/campaign-groups.md#re-run-results)).
 
 Passes 1 to 5 and 8 log a failed item, skip it and retry it on the next run.
 Pass 11 logs a failed item for each member or group it skips or cannot finish:
 a member whose rows pipette-duckdb did not answer or whose store read failed, a
-group with a policy or record that does not decode, and a revision that failed.
+group with a policy or record that does not decode or a policy on with settings
+its kind refuses (`failed` without codes), and a revision that failed.
 The next run tries most of them again, but not a plan it cannot file again,
 which fails only the run that first meets it, nor the cancel of a plan its
 revision replaced ([operations.md §3.1](operations.md#31-job-queue-maintenance)
@@ -1077,7 +1085,7 @@ pass recycles it. A plan holding a live lease beside a stranded one reads
 ```console
 $ pipette-mgmt --config config.toml plans status plan-018fce2a-… --explain
 Why these jobs are not scheduled
-  Snapshot  2026-08-19T17:55:00+00:00 (2h 14m old)
+  Snapshot  2026-08-19T17:55:00Z (2h 14m old)
   Verdict   all 4 claimable job(s) match no working client — read the starved groups below
   Jobs      4 in the plan: 4 available, 0 leased, 0 finished or retired
             4 claimable (0 past their deadline); 4 indexed; 0 denied
@@ -1268,7 +1276,19 @@ ones included, and `dropped_job_ids` lists their jobs.
 `campaigns show` walks the chain back from the head, one read per revision, and
 stops after 50. The id is the handle: there is no slug index, and a value
 without the `campaign_` prefix is refused at the argument boundary, so a plan
-id passed here is an error rather than a lookup that finds nothing.
+id passed here is an error rather than a lookup that finds nothing. It also
+prints the state, the lock note, the labels and the current plan's tags.
+
+`campaigns state <id> active|locked|archived [--note <why>]`,
+`campaigns labels <id> [KEY=VALUE…] [--clear]` and
+`campaigns tag <id> --plan <plan_id> --name <name> --message <why>` apply the
+rules of [`PATCH /api/v1/campaigns/{campaign_id}`](api/campaigns/update_campaign.md)
+and [`POST …/tags`](api/campaigns/create_plan_tag.md): a lock needs `--note`, a
+locked campaign is unlocked before it is archived, labels replace the whole
+set, and a tag name is taken once per campaign. A tag made here has no
+`tagger`. `campaigns labels <id>` alone prints the labels, and
+`campaigns tags <id>` lists the tags. `plans cancel` refuses the plan a locked
+campaign runs, as the API does.
 
 ### `pipette-mgmt catalog`
 
@@ -1409,6 +1429,16 @@ coverage line only if its digest is the digest on that line. The command
 refuses a descriptor that has a key that the typed descriptor does not know.
 The member cannot hold that key, so its digest would differ.
 
+`catalog create --dry-run` is the preflight check for a create. It makes every
+check that a create makes, with a file or with command-line values:
+
+- the name, and an entry in the scope that holds it
+- the members, and the vault owner of each vault member
+- the Hugging Face commit of each model member
+
+The dry run prints the entry and the commits, and it writes nothing. A create
+after the dry run can still fail if another command takes the name first.
+
 `catalog add-member NAME FILE [--dry-run]` appends one member. The optional
 `--org <org>` selects an existing organization. A runtime file has one
 `runtime = { ... }` inline table. The new runtime must differ from the existing
@@ -1430,7 +1460,8 @@ command-line value. `catalog add-member NAME --model QUANTIZATION=JSON` appends
 a model member. Both values have the same form as in `create`. Give one of
 these: FILE, `--runtime`, or `--model`.
 
-The CLI cannot remove or reorder members. An organization entry can name vault
+`remove-member` removes a member. The CLI cannot reorder members. An
+organization entry can name vault
 resources that the organization owns. A global entry cannot name a vault
 resource. A resource that a user owns does not count as a resource that the
 organization owns. The command refuses a resource outside the organization
@@ -1477,12 +1508,62 @@ with the same format can hold the new label. The old label is free at once.
 The label is not part of the digest, so the member keeps its digest, its
 position and its descriptor.
 
-A dry run of `rename` or `relabel` makes every check and prints the change. It
-writes nothing and makes no audit event.
+`catalog remove-member NAME --member <key> [--dry-run]` removes one member
+from a hand-made entry. The optional `--org <org>` selects an organization
+that exists. The key has the form that `catalog list` prints:
+
+- `format::quantization` for a model member.
+- The flavor for a runtime member.
+- `-` for a runtime member without a flavor.
+
+The importer owns the members of a stable or daily entry, so the command
+refuses them. The command also refuses to remove the last member. To retire
+the whole entry, use `tombstone`.
+
+The other members keep their positions and their digests. A member that the
+entry gets later goes to the end. A stored plan holds descriptors, so a removal
+does not change it. After the removal, the selector for the member does not resolve. A
+result that only the removed member named loses that name.
+
+To put the member back, use `add-member`. The member then goes to the end
+with a new added time.
+
+`catalog move-to-global NAME --org <org> [--dry-run]` moves an org entry and
+its members to the global namespace in one step. The entry keeps its name,
+kind, state, release time and creation time. Each member keeps its position,
+its digest and its added time.
+
+The command refuses the move in these conditions:
+
+- The organization has no entry with the name, or its entry is tombstoned.
+- A global entry holds the name. A tombstoned global entry also holds it.
+- The name starts with a prefix that the importer reserves in the global
+  namespace.
+- A member names a vault resource. A global entry cannot name a vault
+  resource.
+
+A global entry cannot have an account as its creator. So the global entry
+records `operator` as its creator, and the command prints the creator that it
+replaces. The audit event keeps the creator of the org entry.
+The move and this event commit in one transaction. If the audit write fails,
+the entry and its members stay in the organization, and the command fails.
+
+After the move, the namespace of the organization does not hold the name. The
+members of the organization see the global entry under the bare name. Every
+active account can read the global entry. Another organization can have an
+entry with the same name. That organization keeps its entry, and inside it the
+bare name selects its own entry. A stored plan holds descriptors, so a move
+does not change it.
+
+No command moves a global entry into an organization.
+
+A dry run of `rename`, `relabel`, `remove-member`, or `move-to-global` makes
+every check and prints the change. It writes nothing and makes no audit event.
 
 `catalog tombstone NAME` permanently removes a name from reads and resolution.
 The name stays unavailable for reuse. A tombstone is for a wrong descriptor.
 For a typo in a name or in a quantization label, use `rename` or `relabel`.
+For a wrong member of an entry with other members, use `remove-member`.
 For an entry that holds another flavor or quantization of an entry, rename it
 to the name of that entry.
 
@@ -1505,6 +1586,10 @@ these fields:
 - the release time
 - the member keys: a runtime member's flavor, or a model member's
   `format::quantization`
+
+`--json` prints each entry as one line of JSON, with the fields of
+`catalog show`. The command then writes the `next_cursor` line to stderr, so
+stdout holds only entries.
 
 `catalog show NAME` prints the full entry and its members in order as JSON.
 The JSON includes its scope. `--org <org>` selects an organization entry.
@@ -1549,6 +1634,28 @@ stored descriptor of a build, unchanged, as a `--runtime` value of
 `catalog create`. If the store
 cannot read a catalog entry, the report prints a warning. The results that the
 entry names then count as unnamed.
+
+`--json` prints the same report as one JSON document. For each kind, `top`
+holds the `--top` digests, in the same order. Each digest has these fields:
+
+- `digest`: the full stored digest
+- `results`: the number of results
+- `causes`: the result count for each cause
+- `alias_results` and `alias_member`: the results that an alias would name,
+  and the member that it would name
+- `newest`: the submission time of the newest result, in RFC 3339 format
+- `descriptor`: the stored descriptor, as the original string
+
+`catalog find --digest DIGEST` prints each live entry that holds the digest,
+in every scope. A model digest also matches the Hugging Face alias digest of a
+vault member. `catalog find --model QUANTIZATION=JSON` takes a model member as
+`create` takes it, and finds the digest of that member. Each Hugging Face
+`revision` in the JSON must be a commit. The label does not change the digest.
+The command does not read Hugging Face.
+
+Each row prints the digest, the scope, the name, the kind, the state and the
+member key. `--json` prints each row as one line of JSON. If no live entry
+holds the digest, the command writes a line to stderr and prints nothing.
 
 ### `pipette-mgmt vault list|show|delete|prune`
 
@@ -1655,55 +1762,6 @@ the rows the stopped one wrote just before it, duplicating them.
 holds every migration this binary has, unchanged. `serve` runs it before it
 binds; a newer schema passes, so an older binary runs after a rollback.
 
-### `pipette-mgmt db import [--dry-run]`
-
-Copies every record from the object-store sections into `[database]`: clients,
-users, organizations, tags, the key, address and slug claims, the
-organizations' benchmarks, plans with their sources and markers, campaigns,
-model params and vault records. Blobs, submissions, the warehouse, the
-public benchmark catalog and the dataset cache stay in the object stores.
-The descriptor catalog and the audit log exist only in `[database]`. `db import`
-and `db export` do not copy them. The copy goes
-through the store traits, so the server reads each copied record as any other.
-It requires `[database]` and runs `db check` first.
-
-A record the database holds unchanged counts as unchanged, so a second run
-writes nothing. A claim or write-once record the database holds differently is
-a conflict: reported, and the copy goes on. The command exits non-zero on a
-conflict or an unreadable source record. The copy omits:
-
-- A pre-auth key with a spent marker: no store method writes a marker, so the
-  key is skipped and the marker reported.
-- A plan document that names `auth_token`, even in a comment: no store keeps a
-  token, so the plan keeps its manifest and has no document on the target.
-- A claim no record names: the claim keyspaces have no listing.
-- `vault-imports/`, which lets a repeat import reuse its records and the
-  archive records of its sources. The next import of a model writes the entries
-  again.
-- The GC age of the pending-source and `job-plans/` markers, which restarts.
-
-It takes no lock, because no command that writes records takes one: stop `serve`
-and those commands first. The report has one row per keyspace, counting Read,
-Written (would write, on a dry run), Unchanged, Skipped, Unreadable and
-Conflicts, then each skip reason, unreadable record and conflict by id.
-
-### `pipette-mgmt db export [--dry-run]`
-
-Copies the records of `[database]` to the object-store sections, the keyspaces
-`db import` copies, the other way. It requires `[database]` and runs `db check`
-first. It makes the target equal to the database: it writes each record that
-differs, gives each claim to the holder the database names, replaces a differing
-plan source or content key, and deletes each record and marker the database
-does not hold, only after a read confirms it gone (one the database cannot read
-is reported and kept). It deletes a pre-auth key spent or absent in the
-database. Plan manifests, job sources, job-plan links and signature migrations
-have no delete method, so a target's extras of those stay.
-
-Conflicts and unreadable records are reported, and the command exits non-zero.
-A second run writes and deletes nothing. It takes no lock: stop `serve` and the
-commands that write records, and the copy is exact. The table adds a Deleted
-column to `db import`'s.
-
 ### `pipette-mgmt db backfill-job-cells [--dry-run]`
 
 The command fills the job-cell index for jobs that ingestion minted before the
@@ -1725,7 +1783,6 @@ Run the command at these times:
   ([storage.md §4.3](storage.md#43-the-outcome-index)). A job that has a
   record and no outcome row has no record for a read until the command writes
   its row.
-- Again after `db import`.
 - Again after ingestion logs the warning `failed to index the cell of a minted
   job`.
 - Again after a change to the flags that `recorded_run_flags` derives, once
@@ -1779,7 +1836,8 @@ The command records the re-runs that each named group's policies filed before
 
 For each member campaign of each group, it reads each plan of the campaign's
 history that the group's policies filed, and each job that plan minted to run
-another again, its marks left out. It records a row for each policy the plan's
+another again, its marks and an eval's jobs left out
+([policies](api/campaign-groups.md#policies)). It records a row for each policy the plan's
 change names that flags the replaced run, at the policy's threshold as stored
 now, and that has a re-run left, as the pass records only those. A row's
 `attempt` counts the runs in a row that its policy flags, back from the

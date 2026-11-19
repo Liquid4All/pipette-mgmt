@@ -40,8 +40,8 @@ pub fn build_audit_stores(config: &Config) -> AuditStores {
     pipette_store_sql::audit_stores(&SqlDatabase::connect(&config.database))
 }
 
-/// Like [`build_stores`] but returns the object-store record stores: what
-/// `db import` reads and `db export` writes. The queue is the database queue.
+/// Like [`build_stores`] but returns the object-store record stores. The queue
+/// is the database queue.
 pub async fn build_object_stores(config: &Config) -> anyhow::Result<Stores> {
     build_object_stores_with_db(config, &SqlDatabase::connect(&config.database)).await
 }
@@ -204,7 +204,7 @@ mod tests {
         let direct = pipette_store_sql::SqlTodoStore::new(db.db().clone());
         assert_eq!(direct.get_avail_by_job(&job).await?, Some(body.clone()));
         let client = ClientId::try_new("ev1_sql_queue")?;
-        let lease_expiry = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let lease_expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
         let claimed = stores
             .todo
             .claim_job(&job, ExpiresAt::Never, &client, lease_expiry)

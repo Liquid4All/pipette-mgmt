@@ -6,7 +6,9 @@ params, and its failed jobs below a clean larger run. It reads each member as
 [queue-maintenance](../campaign-groups.md#when-a-policy-acts) does, and from
 what queue-maintenance keeps of a member it takes only what holds it and its
 last filing: it reads every answered job of the plan, those queue-maintenance
-has already decided included. It files, writes, marks and cancels nothing.
+has already decided included, but an eval's, which no policy judges
+([policies](../campaign-groups.md#policies)). It files, writes, marks and
+cancels nothing.
 `members` holds one entry per member whose plans the caller may read, in
 member order:
 
@@ -26,8 +28,8 @@ member order:
   (`waiting_for_devices` or `filing_not_advanced`), else `null`, and
   `unclaimed_job_count`, its jobs that wait for a device.
 - `answered_job_count`, the plan's jobs whose outcome queue-maintenance
-  recorded, and `waiting_job_count`, those with no rows in pipette-duckdb yet,
-  which wait.
+  recorded, an eval's left out, and `waiting_job_count`, those with no rows in
+  pipette-duckdb yet, which wait.
 - `earliest_deadline`, the earliest deadline of the plan's jobs, and
   `deadline_passed`. If the plan's document sets a deadline that has passed,
   the server refuses a re-run of the plan.
@@ -38,10 +40,6 @@ member order:
   (`kept`) each; a skipped job counts in `flagged` only. `model_params` flags
   each job with a row in `missing_model_params`, and `smaller_failed` each job
   in `smaller_failed`, and both keep it.
-- `triggered`, in kind order, the policies that are on and either flag a job
-  of the plan or have a re-run they filed into the campaign that waits for its
-  rows; every other policy that is on is cleared. A held member reads no rows,
-  so only its waiting re-runs trigger its policies.
 - What the policies that are on would do together: `rerun_job_ids`,
   `marked_job_ids`, and `kept_job_count`, the answered jobs with rows they
   leave as they are, including those none of them flags. `skipped` maps each
@@ -75,14 +73,16 @@ except that an `unreadable`, `waiting_for_devices` or `refused` one keeps its
 A check's attempts on a job are its runs in a row that it flags, following
 each re-run back to the job it ran again. A job is re-run when a policy that
 flags it counts at most `max_reruns` attempts, for `failed` the re-runs of the
-job's failure code, and the job's re-run chain holds fewer than 16 runs. Otherwise `swap` marks it failed if it flags it, and the
+job's failure code, and the job's re-run chain holds fewer than 16 runs.
+Otherwise `swap` or `spread` marks it failed if one of them flags it, and the
 others keep its result.
 
 An evaluated member costs one pipette-duckdb read over its plan's answered
 jobs, and one more for each step back along the re-run chains of its flagged
 jobs, up to 15; the model params check reads no more, and the smaller failed
-check reads the answered jobs' sources from the plan store. Every member costs
-one database read of its waiting re-runs. A
+check reads the answered jobs' sources from the plan store. So does a plan
+with an eval cell, or one filed before plans recorded their benchmark types,
+to leave the eval's jobs out. A
 `waiting_for_devices` or `refused` member costs those first reads alone. Members are read one
 after another. The first pipette-duckdb failure or timeout ends the reads:
 each later member that would read rows is `unreadable`. The model params table

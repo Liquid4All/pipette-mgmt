@@ -24,6 +24,7 @@
   import TabBar from "../lib/components/TabBar.svelte";
   import { Loader } from "../lib/components/work.svelte";
   import { DELETES } from "../lib/danger";
+  import { orgName } from "../lib/orgs";
   import { ownedQuery, ownerBranch, underTrail } from "../lib/owned";
   import { here, navigateFrom } from "../lib/route.svelte";
   import type { RouteOf } from "../lib/routes";
@@ -83,13 +84,13 @@
       throw new Error("This policy changed since it was read, so nothing was written. It now shows as stored.");
     }
   };
-  // The preview reads every member's rows, so it is read on the Campaigns, Policies and Activity tabs alone, once one
-  // is drawn and not again on a step between them, and again after a policy write, which changes what it counts. A
-  // reader the route would refuse is not asked.
+  // The preview reads every member's rows, so it is read on the Policies and Activity tabs alone, once one is drawn
+  // and not again on a step between them, and again after a policy write, which changes what it counts. A reader the
+  // route would refuse is not asked.
   const preview = new Loader<CampaignGroupPolicyPreview>();
   const lacks = $derived(previewLacks(reader));
   const readPreview = (keep = false) => preview.run(() => campaignGroupPolicyPreview(session.signer, id), keep);
-  const previewed = $derived(tab !== "settings");
+  const previewed = $derived(tab === "policies" || tab === "activity");
   $effect(() => {
     if (page.data && previewed && !lacks.length) readPreview();
   });
@@ -125,7 +126,7 @@
   });
   // The reader and the organizations the session holds are named without a roster read.
   const names = $derived({ ...page.data?.names, ...Object.fromEntries([
-    ...session.known.flatMap((org) => (org ? [[org.org_id, org.slug]] : [])),
+    ...session.known.flatMap((org) => (org ? [[org.org_id, orgName(org)]] : [])),
     [reader.user_id, reader.contact_email],
   ]) });
 
@@ -144,15 +145,15 @@
     {@const admin = mayAdminister(reader, group.owner)}
     <TabBar label="Campaign group" items={groupTabs(group.group_id, tab, admin)} />
     {#if tab === "campaigns"}
-      <CampaignGroupBody {group} {listed} {preview} {lacks} {reader} {names} listing={under?.href}
+      <CampaignGroupBody {group} {listed} {reader} {names} listing={under?.href}
                          add={(campaign_ids) => addCampaignGroupMembers(session.signer, id, { campaign_ids }).then(reread)}
                          remove={(campaign_id) => removeCampaignGroupMember(session.signer, id, campaign_id).then(reread)} />
     {:else if tab === "policies"}
       {@const files = mayFile(reader, group.owner)}
       <p class="notice">
         Every queue-maintenance run applies the policies that are on to each campaign's current plan, jobs that
-        finished before a policy was turned on included: one revision per campaign re-runs or marks failed the jobs
-        they flag, as each policy says. A campaign gets no new one while devices have not taken the jobs of the last.
+        finished before a policy was turned on included, and leaves its eval jobs as they are: one revision per
+        campaign re-runs or marks failed the jobs they flag, as each policy says. A campaign gets no new one while devices have not taken the jobs of the last.
         Turn on first shows what the policy alone would do now, so it is offered once the preview, which the Activity
         tab shows, has loaded.
       </p>

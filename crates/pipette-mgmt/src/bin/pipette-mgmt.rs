@@ -51,19 +51,19 @@ use pipette_pipeline::plan_results::{ResultListView, ResultsDb};
 use pipette_pipeline::variant_edit::VariantEdit;
 use pipette_pipeline::{
     campaign_admin, campaign_chain, client_admin, dataset_cache, fix_canonical, fix_model_param,
-    fix_vault_labels, group_policies, model_audit, org_catalog, queue_maintenance, record_copy,
-    requeue_eval, score, user_admin, vault_admin,
+    fix_vault_labels, group_policies, model_audit, org_catalog, queue_maintenance, requeue_eval,
+    score, user_admin, vault_admin,
 };
 use pipette_plan_types::{
     AddDescriptorMemberRequest, AuditAction, AuditOutcome, AuditTarget, BenchmarkId,
-    CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId, ClientOwner,
+    CampaignGroupId, CampaignId, CampaignState, CatalogName, CatalogScope, ClientId, ClientOwner,
     ClientPermission, ClientPreauthKeyId, ClientPreauthUsage, ContactEmail, Counts,
-    CreateDescriptorEntryRequest, DescriptorEntryKind, DescriptorEntryState, ExpiresAt,
-    FleetDetail, JobCensus, JobId, ModelFormat, ModelKey, ModelMemberRequest,
-    NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug, OrgStatus, PlanId, PlanStatus,
-    PrincipalOwner, QuantizationLabel, RestoredVariant, Runtime, RuntimeType, SchedulingState, Tag,
-    UserAccountType, UserId, UserKeyId, UserPermission, UserPreauthKeyId, UserPreauthUsage,
-    UserStatus, VaultResourceId, Warning,
+    CreateDescriptorEntryRequest, CreatePlanTagRequest, DescriptorEntryKind, DescriptorEntryState,
+    DescriptorMember, DescriptorMemberKey, ExpiresAt, FleetDetail, JobCensus, JobId, Labels,
+    ModelFormat, ModelKey, ModelMemberRequest, NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug,
+    OrgStatus, PlanId, PlanStatus, PlanTag, PrincipalOwner, QuantizationLabel, RestoredVariant,
+    Runtime, RuntimeType, SchedulingState, Tag, UserAccountType, UserId, UserKeyId, UserPermission,
+    UserPreauthKeyId, UserPreauthUsage, UserStatus, VaultResourceId, Warning,
 };
 use pipette_store::{
     AuditStore, AuditStores, CatalogEntryKey, CatalogImportRunStore, ClientStore, CreateOutcome,
@@ -73,7 +73,7 @@ use pipette_store::{
 };
 use pipette_store_init::storage_lock;
 use pipette_store_init::storage_lock::StorageLock;
-use pipette_store_init::{build_object_stores, build_stores, conditional_put, database};
+use pipette_store_init::{build_stores, conditional_put, database};
 
 #[derive(Parser)]
 #[command(
@@ -408,35 +408,12 @@ enum DbAction {
     /// Exit non-zero unless the database answers with the schema version that
     /// this binary expects.
     Check,
-    /// Copy every record from the object-store sections into the database.
-    ///
-    /// A rerun writes only what differs. The command exits non-zero while a
-    /// conflict or an unreadable record remains. The command takes no storage
-    /// lock, because no record writer takes one. Before a cutover, stop `serve`
-    /// and the commands that write records.
-    Import {
-        /// Report what would be written, and write nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Copy the records of the database to the object-store sections.
-    ///
-    /// The command writes each record that differs. It gives each claim to the
-    /// holder that the database names. It deletes each record that the database
-    /// does not hold. It exits non-zero while a conflict or an unreadable record
-    /// remains. The command takes no storage lock. Stop `serve` and the commands
-    /// that write records before you run it.
-    Export {
-        /// Report what would be written and deleted, and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Index the cell of each job that has no index row, and the flags of each
     /// finished run that has none.
     ///
     /// The command reads the job sources and the submission records. Run it
-    /// once after migration `0007`, and again after `db import`. A second run
-    /// writes only the rows that are still missing. The command skips a job
+    /// once after migration `0007`. A second run writes only the rows that are
+    /// still missing. The command skips a job
     /// source or a record that does not parse, and reports it.
     BackfillJobCells {
         /// Report the rows that the command would write. Write nothing.
@@ -775,6 +752,51 @@ enum CampaignAction {
         #[arg(long)]
         name: String,
     },
+    /// Set a campaign's state. `locked` keeps the plan it runs: no filing,
+    /// revision, cancel of that plan or delete until it is `active` again, and
+    /// it needs `--note`. `archived` hides it from the console's listings and
+    /// takes no new plan. A locked campaign is unlocked before it is archived.
+    State {
+        #[arg(value_name = "CAMPAIGN_ID", value_parser = parse_campaign_id)]
+        campaign_id: CampaignId,
+        /// `active`, `locked` or `archived`.
+        #[arg(value_name = "STATE")]
+        state: CampaignState,
+        /// Why the campaign is locked. Only with `locked`.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Replace a campaign's labels with `KEY=VALUE` pairs, the whole set.
+    /// Without pairs or `--clear`, print them.
+    Labels {
+        #[arg(value_name = "CAMPAIGN_ID", value_parser = parse_campaign_id)]
+        campaign_id: CampaignId,
+        #[arg(value_name = "KEY=VALUE", conflicts_with = "clear")]
+        pairs: Vec<String>,
+        /// Remove every label.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Tag a plan the campaign filed, current or superseded. A tag is never
+    /// moved, and its name is unique within the campaign. Needs a
+    /// `[database]`.
+    Tag {
+        #[arg(value_name = "CAMPAIGN_ID", value_parser = parse_campaign_id)]
+        campaign_id: CampaignId,
+        #[arg(long, value_parser = parse_plan_id)]
+        plan: PlanId,
+        /// Letters, digits, `.`, `_`, `-` and `/`, up to 64.
+        #[arg(long)]
+        name: String,
+        /// Why the plan is tagged.
+        #[arg(long)]
+        message: String,
+    },
+    /// List a campaign's tags, newest first.
+    Tags {
+        #[arg(value_name = "CAMPAIGN_ID", value_parser = parse_campaign_id)]
+        campaign_id: CampaignId,
+    },
     /// Hand a campaign to another owner, keeping the plan it names: a team
     /// taking over somebody's work inherits it mid-flight.
     Owner {
@@ -843,7 +865,7 @@ enum CatalogAction {
     Import {
         /// First UTC day to check for a daily build.
         #[arg(long)]
-        since: Option<chrono::NaiveDate>,
+        since: Option<jiff::civil::Date>,
     },
     /// Add new flavors to one imported entry.
     Refresh {
@@ -875,7 +897,7 @@ enum CatalogAction {
         /// `2026-10-19T22:54:49Z`. Without it, the command uses the creation
         /// time.
         #[arg(long, value_parser = parse_release_time, requires = "name")]
-        release_time: Option<chrono::DateTime<chrono::Utc>>,
+        release_time: Option<jiff::Timestamp>,
         /// One runtime member as a JSON object. Repeat it for each flavor, in
         /// order of precedence.
         #[arg(
@@ -983,6 +1005,33 @@ enum CatalogAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove one member from a hand-made entry. The other members keep their
+    /// positions. The command refuses to remove the last member.
+    RemoveMember {
+        #[arg(value_parser = parse_catalog_name)]
+        name: CatalogName,
+        /// Use the member key that `catalog list` prints. A model key is
+        /// `format::quantization`. A runtime key is its flavor, or `-` if it
+        /// has no flavor.
+        #[arg(long)]
+        member: String,
+        #[arg(long, value_parser = parse_org_ref)]
+        org: Option<OrgRef>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move an org entry and its members to global scope. The members keep
+    /// their positions and digests, and the org name is free after the move.
+    /// The global entry has `operator` as its creator.
+    MoveToGlobal {
+        #[arg(value_parser = parse_catalog_name)]
+        name: CatalogName,
+        /// The organization that holds the entry.
+        #[arg(long, value_parser = parse_org_ref)]
+        org: OrgRef,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Permanently tombstone a name. Without --yes, type the exact name again.
     Tombstone {
         #[arg(value_parser = parse_catalog_name)]
@@ -1008,6 +1057,10 @@ enum CatalogAction {
         cursor: Option<CatalogName>,
         #[arg(long, default_value = "50")]
         limit: NonZeroUsize,
+        /// Print each entry as one line of JSON, with the fields of `catalog
+        /// show`. The command writes `next_cursor` to stderr.
+        #[arg(long)]
+        json: bool,
     },
     /// Show one live entry and its members in order.
     Show {
@@ -1025,6 +1078,33 @@ enum CatalogAction {
         /// List this many digests of each kind that have no exact match.
         #[arg(long, default_value = "20")]
         top: usize,
+        /// Print the report as one JSON document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find each live entry, in every scope, that holds a digest. A model
+    /// digest also matches the Hugging Face alias digest of a vault member.
+    #[command(group(
+        clap::ArgGroup::new("selector")
+            .args(["digest", "model"])
+            .required(true)
+    ))]
+    Find {
+        /// The full descriptor digest.
+        #[arg(long)]
+        digest: Option<String>,
+        /// A model member as `<quantization>=<JSON object>`, as `create`
+        /// takes it. Each Hugging Face `revision` must be a commit. The label
+        /// does not change the digest.
+        #[arg(
+            long,
+            value_name = "QUANTIZATION=JSON",
+            value_parser = |s: &str| parse_model_member(s).map(Box::new)
+        )]
+        model: Option<Box<ModelMemberRequest>>,
+        /// Print each hit as one line of JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1343,7 +1423,7 @@ impl TableColumn for PlanColumn {
                 format!("{} (cancel pending)", plan.status.label())
             }
             Self::Status => plan.status.label().to_string(),
-            Self::Created => plan.created_at.to_rfc3339(),
+            Self::Created => plan.created_at.to_string(),
             Self::JobsExpire => job_expiry_cell(plan.job_expiry),
             Self::Jobs => plan.job_ids.len().to_string(),
             Self::Finished => snapshot.map_or_else(
@@ -1358,7 +1438,7 @@ impl TableColumn for PlanColumn {
             Self::Expired => expired_cell(snapshot, plan.expired_jobs.len()),
             Self::Warnings => warnings_cell(&plan.warnings),
             Self::Snapshot => {
-                snapshot.map_or_else(|| "-".to_string(), |s| s.computed_at.to_rfc3339())
+                snapshot.map_or_else(|| "-".to_string(), |s| s.computed_at.to_string())
             }
         }
     }
@@ -2550,15 +2630,15 @@ fn writes(command: &Command) -> bool {
     match command {
         // Its writes are audited per request.
         Command::Serve | Command::RuntimeOutput { .. } => false,
-        // A storage lock, the schema, an export, the document and the config check
+        // A storage lock, the schema, the document and the config check
         // change no records.
         Command::Config { .. } | Command::Unlock { .. } | Command::Openapi { .. } => false,
         Command::Db { action } => match action {
-            DbAction::Import { dry_run }
-            | DbAction::BackfillJobCells { dry_run }
-            | DbAction::BackfillRunEvidence { dry_run } => !dry_run,
+            DbAction::BackfillJobCells { dry_run } | DbAction::BackfillRunEvidence { dry_run } => {
+                !dry_run
+            }
             DbAction::BackfillRerunResults { .. } => true,
-            DbAction::Check | DbAction::Migrate { .. } | DbAction::Export { .. } => false,
+            DbAction::Check | DbAction::Migrate { .. } => false,
         },
         Command::ProcessSubmissions
         | Command::ScoreEval
@@ -2649,7 +2729,11 @@ fn writes(command: &Command) -> bool {
                         || !remove.is_empty())
             }
             CampaignAction::Revise { plan, dry_run, .. } => !dry_run && plan.is_some(),
+            CampaignAction::Labels { pairs, clear, .. } => *clear || !pairs.is_empty(),
+            CampaignAction::Tags { .. } => false,
             CampaignAction::Rename { .. }
+            | CampaignAction::State { .. }
+            | CampaignAction::Tag { .. }
             | CampaignAction::Owner { .. }
             | CampaignAction::Delete { .. } => true,
         },
@@ -2661,12 +2745,15 @@ fn writes(command: &Command) -> bool {
         Command::Catalog { action } => match action {
             CatalogAction::List { .. }
             | CatalogAction::Show { .. }
-            | CatalogAction::Coverage { .. } => false,
+            | CatalogAction::Coverage { .. }
+            | CatalogAction::Find { .. } => false,
             CatalogAction::Import { .. } | CatalogAction::Refresh { .. } => true,
             CatalogAction::Create { dry_run, .. }
             | CatalogAction::AddMember { dry_run, .. }
             | CatalogAction::Rename { dry_run, .. }
-            | CatalogAction::Relabel { dry_run, .. } => !dry_run,
+            | CatalogAction::Relabel { dry_run, .. }
+            | CatalogAction::RemoveMember { dry_run, .. }
+            | CatalogAction::MoveToGlobal { dry_run, .. } => !dry_run,
             CatalogAction::Pin { .. }
             | CatalogAction::Unpin { .. }
             | CatalogAction::Hide { .. }
@@ -2998,6 +3085,10 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
                 CampaignAction::List { .. }
                 | CampaignAction::Show { .. }
                 | CampaignAction::Rename { .. }
+                | CampaignAction::State { .. }
+                | CampaignAction::Labels { .. }
+                | CampaignAction::Tag { .. }
+                | CampaignAction::Tags { .. }
                 | CampaignAction::Owner { .. }
                 | CampaignAction::Delete { .. } => None,
             };
@@ -3029,6 +3120,10 @@ async fn run(command: Command, config: Config, config_path: &Path) -> anyhow::Re
                 | CampaignAction::List { .. }
                 | CampaignAction::Show { .. }
                 | CampaignAction::Rename { .. }
+                | CampaignAction::State { .. }
+                | CampaignAction::Labels { .. }
+                | CampaignAction::Tag { .. }
+                | CampaignAction::Tags { .. }
                 | CampaignAction::Owner { .. }
                 | CampaignAction::Delete { .. } => false,
             }
@@ -3112,7 +3207,7 @@ async fn handle_catalog_action(
                 runs,
                 &config.descriptor_catalog,
                 since,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .await?;
             println!(
@@ -3132,7 +3227,7 @@ async fn handle_catalog_action(
                 runs,
                 &config.descriptor_catalog,
                 &name,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .await?;
             println!("Added {} members to {name}.", result.members_added);
@@ -3164,7 +3259,7 @@ async fn handle_catalog_action(
                 Some(stores.vault.as_ref()),
                 &scope,
                 document,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
                 dry_run,
             )
             .await?;
@@ -3201,7 +3296,7 @@ async fn handle_catalog_action(
                 &scope,
                 &name,
                 document,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
                 dry_run,
             )
             .await?;
@@ -3238,7 +3333,7 @@ async fn handle_catalog_action(
             if dry_run {
                 println!("Dry run: the command writes nothing.");
             } else {
-                record_catalog_rename(stores.audit.as_deref(), &scope, result.audit_action(&scope))
+                record_catalog_change(stores.audit.as_deref(), &scope, result.audit_action(&scope))
                     .await;
             }
             print!("{}", rename_report(&name, &result, dry_run));
@@ -3262,6 +3357,51 @@ async fn handle_catalog_action(
                 println!("Would relabel {name}::{format}::{from} to {name}::{format}::{to}");
             } else {
                 println!("Relabeled {name}::{format}::{from} to {name}::{format}::{to}");
+            }
+        }
+        CatalogAction::RemoveMember {
+            name,
+            member,
+            org,
+            dry_run,
+        } => {
+            let scope = catalog_scope(stores, org.as_ref()).await?;
+            let removed = descriptor_catalog_admin::remove_entry_member(
+                catalog, &scope, &name, &member, dry_run,
+            )
+            .await?;
+            let name = &removed.entry.name;
+            let key = descriptor_catalog_admin::member_key(&removed.member);
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+                println!("Would remove {name}::{key}");
+            } else {
+                record_catalog_change(
+                    stores.audit.as_deref(),
+                    &scope,
+                    removed.audit_action(&scope),
+                )
+                .await;
+                println!("Removed {name}::{key}");
+            }
+        }
+        CatalogAction::MoveToGlobal { name, org, dry_run } => {
+            let org_id = org::require(&*stores.orgs, &org).await?.org_id;
+            let moved =
+                descriptor_catalog_admin::move_entry_to_global(catalog, &org_id, &name, dry_run)
+                    .await?;
+            let name = &moved.entry.name;
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+                println!("Would move {org_id}/{name} to global scope");
+            } else {
+                println!("Moved {org_id}/{name} to global scope");
+            }
+            if moved.original_creator != moved.entry.created_by {
+                println!(
+                    "Creator: {} replaces {}",
+                    moved.entry.created_by, moved.original_creator
+                );
             }
         }
         CatalogAction::Tombstone { name, org, yes } => {
@@ -3294,6 +3434,7 @@ async fn handle_catalog_action(
             prefix,
             cursor,
             limit,
+            json,
         } => {
             let scope = catalog_scope(stores, org.as_ref()).await?;
             let filter = DescriptorEntryFilter {
@@ -3311,6 +3452,10 @@ async fn handle_catalog_action(
             let page =
                 descriptor_catalog_admin::list(catalog, filter, after.as_ref(), limit).await?;
             for entry in page.items {
+                if json {
+                    println!("{}", serde_json::to_string(&entry)?);
+                    continue;
+                }
                 let keys = descriptor_catalog_admin::member_keys(&entry.members);
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -3319,15 +3464,17 @@ async fn handle_catalog_action(
                     entry.kind,
                     entry.state,
                     entry.descriptor_types().join(","),
-                    entry.release_time.to_rfc3339(),
+                    entry.release_time,
                     keys
                 );
             }
             for unreadable in page.unreadable {
                 eprintln!("Unreadable catalog entry: {unreadable}");
             }
-            if let Some(cursor) = page.resume_after {
-                println!("next_cursor: {}", cursor.name);
+            match page.resume_after {
+                Some(cursor) if json => eprintln!("next_cursor: {}", cursor.name),
+                Some(cursor) => println!("next_cursor: {}", cursor.name),
+                None => {}
             }
         }
         CatalogAction::Show { name, org } => {
@@ -3337,19 +3484,81 @@ async fn handle_catalog_action(
                 .ok_or_else(|| anyhow::anyhow!("no catalog entry {name}"))?;
             println!("{}", serde_json::to_string_pretty(&entry)?);
         }
-        CatalogAction::Coverage { days, top } => {
-            let since = chrono::TimeDelta::try_days(i64::from(days))
-                .and_then(|window| chrono::Utc::now().checked_sub_signed(window))
+        CatalogAction::Coverage { days, top, json } => {
+            let since = jiff::SignedDuration::try_from_hours(i64::from(days) * 24)
+                .and_then(|window| jiff::Timestamp::now().checked_sub(window).ok())
                 .ok_or_else(|| anyhow::anyhow!("--days {days} is out of range"))?;
             let (entries, unreadable) =
                 catalog_coverage::load_live_entries(catalog, &*stores.orgs).await?;
             let index = catalog_coverage::CoverageIndex::new(&entries);
             let report = catalog_coverage::coverage(stores, &index, since, unreadable).await?;
-            print!("{}", report.render(top));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.json(top))?);
+            } else {
+                print!("{}", report.render(top));
+            }
             report.log(days);
+        }
+        CatalogAction::Find {
+            digest,
+            model,
+            json,
+        } => {
+            let digest = match (digest, model) {
+                (Some(digest), _) => digest,
+                (None, Some(model)) => DescriptorMember::new_model(
+                    model.model,
+                    model.quantization,
+                    jiff::Timestamp::now(),
+                )?
+                .digest()
+                .to_owned(),
+                (None, None) => anyhow::bail!("catalog find needs --digest or --model"),
+            };
+            let mut hits = catalog
+                .find_by_digests(std::slice::from_ref(&digest))
+                .await?
+                .remove(&digest)
+                .unwrap_or_default();
+            hits.retain(|hit| hit.state != DescriptorEntryState::Tombstoned);
+            hits.sort_by_key(|hit| (hit.scope.to_string(), hit.name.to_string()));
+            if hits.is_empty() {
+                eprintln!("no live entry holds {digest}");
+            }
+            hits.into_iter().for_each(|hit| {
+                let key = member_key_text(&hit.member_key);
+                if json {
+                    let line = serde_json::json!({
+                        "digest": digest,
+                        "scope": hit.scope,
+                        "name": hit.name,
+                        "kind": hit.kind,
+                        "state": hit.state,
+                        "member_key": key,
+                    });
+                    println!("{line}");
+                } else {
+                    println!(
+                        "{digest}\t{}\t{}\t{}\t{}\t{key}",
+                        hit.scope, hit.name, hit.kind, hit.state
+                    );
+                }
+            });
         }
     }
     Ok(())
+}
+
+/// A member key in the form that `catalog list` prints and `remove-member`
+/// takes.
+fn member_key_text(key: &DescriptorMemberKey) -> String {
+    match key {
+        DescriptorMemberKey::Runtime { flavor } => flavor.as_deref().unwrap_or("-").to_owned(),
+        DescriptorMemberKey::Model {
+            format,
+            quantization,
+        } => format!("{format}::{quantization}"),
+    }
 }
 
 /// The lines that `catalog rename` prints after a rename or a merge.
@@ -3380,9 +3589,9 @@ fn rename_report(
     }
 }
 
-/// Record a completed rename or merge: `action` is a `CatalogRename` or a
-/// `CatalogMerge`.
-async fn record_catalog_rename(
+/// Record a completed catalog change: `action` is a `CatalogRename`, a
+/// `CatalogMerge`, or a `CatalogRemoveMember`.
+async fn record_catalog_change(
     log: Option<&dyn AuditStore>,
     scope: &CatalogScope,
     action: AuditAction,
@@ -3403,7 +3612,7 @@ async fn record_catalog_rename(
     }
     if let Err(error) = log.append(&event).await {
         tracing::error!(event_id = %event.event_id, error = %format!("{error:#}"),
-            "failed to write the catalog rename audit event");
+            "failed to write the catalog change audit event");
     }
 }
 
@@ -3542,9 +3751,9 @@ async fn run_audit(action: AuditCommand, stores: &Stores) -> anyhow::Result<()> 
 }
 
 /// The time before which `audit prune --older-than-days` deletes an event.
-fn prune_cutoff(older_than_days: u32) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    chrono::TimeDelta::try_days(i64::from(older_than_days))
-        .and_then(|age| chrono::Utc::now().checked_sub_signed(age))
+fn prune_cutoff(older_than_days: u32) -> anyhow::Result<jiff::Timestamp> {
+    jiff::SignedDuration::try_from_hours(i64::from(older_than_days) * 24)
+        .and_then(|age| jiff::Timestamp::now().checked_sub(age).ok())
         .ok_or_else(|| anyhow::anyhow!("--older-than-days {older_than_days} is out of range"))
 }
 
@@ -3639,6 +3848,15 @@ async fn campaign_owner(
             | campaign_admin::CampaignAdminError::CommitUnknown { .. }
             | campaign_admin::CampaignAdminError::NoPlan(_)
             | campaign_admin::CampaignAdminError::Archived(_)
+            | campaign_admin::CampaignAdminError::Locked { .. }
+            | campaign_admin::CampaignAdminError::TextTooLong(_)
+            | campaign_admin::CampaignAdminError::TextHasNul(_)
+            | campaign_admin::CampaignAdminError::LockNeedsNote
+            | campaign_admin::CampaignAdminError::NoteWithoutLock
+            | campaign_admin::CampaignAdminError::LockedArchive(_)
+            | campaign_admin::CampaignAdminError::BadTagName(_)
+            | campaign_admin::CampaignAdminError::TagTaken { .. }
+            | campaign_admin::CampaignAdminError::NoTagStore
             | campaign_admin::CampaignAdminError::NotOnPlan { .. }
             | campaign_admin::CampaignAdminError::NoDocument(_)
             | campaign_admin::CampaignAdminError::SourceMismatch(_)
@@ -3660,6 +3878,37 @@ async fn campaign_owner(
             | campaign_admin::CampaignAdminError::Contended(_)
             | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
         })
+}
+
+/// `KEY=VALUE` pairs, comma-separated; `-` for none.
+fn labels_text(labels: &Labels) -> String {
+    if labels.is_empty() {
+        return "-".to_owned();
+    }
+    labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `campaign_id`'s tags, newest first; none without a `[database]`.
+async fn campaign_tags(stores: &Stores, campaign_id: &CampaignId) -> anyhow::Result<Vec<PlanTag>> {
+    match stores.plan_tags.as_deref() {
+        Some(tags) => tags.campaign_tags(std::slice::from_ref(campaign_id)).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+fn print_tag_line(tag: &PlanTag) {
+    println!(
+        "  {}  {}  {}  {}  {}",
+        tag.name,
+        tag.plan_id,
+        tag.created_at,
+        submitter_label(tag.tagger.as_ref()),
+        tag.message
+    );
 }
 
 fn print_campaign_line(campaign: &Campaign) {
@@ -3703,6 +3952,15 @@ async fn ingest_into_campaign(
                 | campaign_admin::CampaignAdminError::CommitUnknown { .. }
                 | campaign_admin::CampaignAdminError::NoPlan(_)
                 | campaign_admin::CampaignAdminError::Archived(_)
+                | campaign_admin::CampaignAdminError::Locked { .. }
+                | campaign_admin::CampaignAdminError::TextTooLong(_)
+                | campaign_admin::CampaignAdminError::TextHasNul(_)
+                | campaign_admin::CampaignAdminError::LockNeedsNote
+                | campaign_admin::CampaignAdminError::NoteWithoutLock
+                | campaign_admin::CampaignAdminError::LockedArchive(_)
+                | campaign_admin::CampaignAdminError::BadTagName(_)
+                | campaign_admin::CampaignAdminError::TagTaken { .. }
+                | campaign_admin::CampaignAdminError::NoTagStore
                 | campaign_admin::CampaignAdminError::NotOnPlan { .. }
                 | campaign_admin::CampaignAdminError::NoDocument(_)
                 | campaign_admin::CampaignAdminError::SourceMismatch(_)
@@ -3847,6 +4105,15 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
         | campaign_admin::CampaignAdminError::CommitUnknown { .. }
         | campaign_admin::CampaignAdminError::NoPlan(_)
         | campaign_admin::CampaignAdminError::Archived(_)
+        | campaign_admin::CampaignAdminError::Locked { .. }
+        | campaign_admin::CampaignAdminError::TextTooLong(_)
+        | campaign_admin::CampaignAdminError::TextHasNul(_)
+        | campaign_admin::CampaignAdminError::LockNeedsNote
+        | campaign_admin::CampaignAdminError::NoteWithoutLock
+        | campaign_admin::CampaignAdminError::LockedArchive(_)
+        | campaign_admin::CampaignAdminError::BadTagName(_)
+        | campaign_admin::CampaignAdminError::TagTaken { .. }
+        | campaign_admin::CampaignAdminError::NoTagStore
         | campaign_admin::CampaignAdminError::NotOnPlan { .. }
         | campaign_admin::CampaignAdminError::NoDocument(_)
         | campaign_admin::CampaignAdminError::SourceMismatch(_)
@@ -4158,6 +4425,22 @@ async fn handle_campaign_action(
                     .as_ref()
                     .map_or("-", PlanId::as_str)
             );
+            println!("State        {}", campaign.state);
+            if let Some(note) = &campaign.state_note {
+                println!("Note         {note}");
+            }
+            if !campaign.labels.is_empty() {
+                println!("Labels       {}", labels_text(&campaign.labels));
+            }
+            let head_tags: Vec<String> = campaign_tags(stores, &campaign_id)
+                .await?
+                .into_iter()
+                .filter(|tag| campaign.current_plan_id.as_ref() == Some(&tag.plan_id))
+                .map(|tag| tag.name.as_str().to_owned())
+                .collect();
+            if !head_tags.is_empty() {
+                println!("Plan tags    {}", head_tags.join(", "));
+            }
             println!("Created      {}", campaign.created_at);
             println!("Updated      {}", campaign.updated_at);
 
@@ -4182,7 +4465,7 @@ async fn handle_campaign_action(
             let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
             let read = campaign.clone();
             let before = campaign.name.clone();
-            if !campaign.rename(name.clone(), chrono::Utc::now()) {
+            if !campaign.rename(name.clone(), jiff::Timestamp::now()) {
                 println!("Campaign {campaign_id}: no change.");
                 return Ok(());
             }
@@ -4196,6 +4479,94 @@ async fn handle_campaign_action(
             );
             Ok(())
         }
+        CampaignAction::State {
+            campaign_id,
+            state,
+            note,
+        } => {
+            let note = note
+                .map(NonEmptyTrimmedString::try_new)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--note: {e}"))?;
+            let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            let read = campaign.clone();
+            let before = campaign.state;
+            if !campaign_admin::restate(&mut campaign, state, note, jiff::Timestamp::now())? {
+                println!("Campaign {campaign_id}: no change.");
+                return Ok(());
+            }
+            campaign_admin::replace(&*campaigns, &read, &campaign).await?;
+            tracing::info!(%campaign_id, state = %campaign.state, "campaign state set");
+            println!("Campaign {campaign_id}: {before} -> {}.", campaign.state);
+            Ok(())
+        }
+        CampaignAction::Labels {
+            campaign_id,
+            pairs,
+            clear,
+        } => {
+            let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            if pairs.is_empty() && !clear {
+                println!("{}", labels_text(&campaign.labels));
+                return Ok(());
+            }
+            let labels = pairs
+                .iter()
+                .map(|pair| {
+                    pair.split_once('=')
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                        .ok_or_else(|| anyhow::anyhow!("label `{pair}` is not KEY=VALUE"))
+                })
+                .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?;
+            let labels = Labels::try_from(labels).map_err(|e| anyhow::anyhow!("labels: {e}"))?;
+            let read = campaign.clone();
+            if !campaign.set_labels(labels, jiff::Timestamp::now()) {
+                println!("Campaign {campaign_id}: no change.");
+                return Ok(());
+            }
+            campaign_admin::replace(&*campaigns, &read, &campaign).await?;
+            tracing::info!(%campaign_id, "campaign relabelled");
+            println!(
+                "Campaign {campaign_id}: labels {}.",
+                labels_text(&campaign.labels)
+            );
+            Ok(())
+        }
+        CampaignAction::Tag {
+            campaign_id,
+            plan,
+            name,
+            message,
+        } => {
+            let request = CreatePlanTagRequest {
+                plan_id: plan,
+                name: NonEmptyTrimmedString::try_new(name)
+                    .map_err(|e| anyhow::anyhow!("--name: {e}"))?,
+                message: NonEmptyTrimmedString::try_new(message)
+                    .map_err(|e| anyhow::anyhow!("--message: {e}"))?,
+            };
+            campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            let tag = campaign_admin::tag_plan(
+                stores.plan_tags.as_deref(),
+                stores.plans.as_ref(),
+                &campaign_id,
+                request,
+                None,
+            )
+            .await?;
+            println!(
+                "Campaign {campaign_id}: tagged {} as {}.",
+                tag.plan_id, tag.name
+            );
+            Ok(())
+        }
+        CampaignAction::Tags { campaign_id } => {
+            campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
+            let tags = campaign_tags(stores, &campaign_id).await?;
+            println!("{} tag(s):", tags.len());
+            tags.iter().for_each(print_tag_line);
+            Ok(())
+        }
         CampaignAction::Owner {
             campaign_id,
             user,
@@ -4206,7 +4577,7 @@ async fn handle_campaign_action(
             let read = campaign.clone();
             let before = campaign.owner.label();
             let groups = stores.campaign_groups.as_deref();
-            if !campaign.set_owner(owner, chrono::Utc::now()) {
+            if !campaign.set_owner(owner, jiff::Timestamp::now()) {
                 let left = campaign_admin::leave_group(&*campaigns, groups, &campaign_id).await?;
                 let group = if left.is_some() {
                     "; it left its campaign group"
@@ -4367,7 +4738,7 @@ async fn handle_vault_action(action: VaultAction, stores: Stores) -> anyhow::Res
             dry_run,
         } => {
             let pruned =
-                vault_admin::prune(&*vault, older_than, chrono::Utc::now(), dry_run).await?;
+                vault_admin::prune(&*vault, older_than, jiff::Timestamp::now(), dry_run).await?;
             let verb = if dry_run {
                 "[dry-run] would delete"
             } else {
@@ -4376,9 +4747,7 @@ async fn handle_vault_action(action: VaultAction, stores: Stores) -> anyhow::Res
             pruned.orphans.iter().for_each(|blob| {
                 println!(
                     "{verb} {} ({} bytes, written {})",
-                    blob.key,
-                    blob.bytes,
-                    blob.modified.to_rfc3339()
+                    blob.key, blob.bytes, blob.modified
                 );
             });
             let bytes: u64 = pruned.orphans.iter().map(|blob| blob.bytes).sum();
@@ -4415,7 +4784,7 @@ async fn handle_org_action(action: OrgAction, stores: Stores) -> anyhow::Result<
                     .map_err(|e| anyhow::anyhow!("--name: {e}"))?,
                 None => NonEmptyTrimmedString::try_new(slug.as_str())?,
             };
-            let org = Organization::new(slug, display_name, chrono::Utc::now());
+            let org = Organization::new(slug, display_name, jiff::Timestamp::now());
 
             // Claim first: the exclusive create makes the handle unique, and a
             // record written first would be one the race's loser must clean up.
@@ -5046,7 +5415,7 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
             let user = pipette_core::user::User {
                 account_type,
                 campaign_scope,
-                ..pipette_core::user::User::try_new(email, chrono::Utc::now())?
+                ..pipette_core::user::User::try_new(email, jiff::Timestamp::now())?
             };
             // Claim first, as `orgs create` does.
             let (user, adopted) = match user_store
@@ -5762,7 +6131,7 @@ async fn handle_user_key_action(action: UserKeyAction, stores: &Stores) -> anyho
                 println!("User {user_id} holds no key.");
                 return Ok(());
             }
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let rows: Vec<UserKeyRow> = keys.iter().map(|key| user_key_row(key, now)).collect();
             let mut table = tabled::Table::new(&rows);
             table.with(tabled::settings::Style::psql());
@@ -5801,16 +6170,16 @@ struct UserKeyRow {
     expires: String,
 }
 
-fn user_key_row(key: &UserKey, now: chrono::DateTime<chrono::Utc>) -> UserKeyRow {
+fn user_key_row(key: &UserKey, now: jiff::Timestamp) -> UserKeyRow {
     let expires = match key.expires_at {
         None => "never".to_string(),
-        Some(at) if key.expired(now) => format!("expired\n{}", at.to_rfc3339()),
-        Some(at) => at.to_rfc3339(),
+        Some(at) if key.expired(now) => format!("expired\n{}", at),
+        Some(at) => at.to_string(),
     };
     UserKeyRow {
         key_id: key.key_id.to_string(),
         key_details: key.key_details.to_string(),
-        added_at: key.added_at.to_rfc3339(),
+        added_at: key.added_at.to_string(),
         expires,
     }
 }
@@ -5828,11 +6197,13 @@ async fn handle_user_preauth_action(
             note,
         } => {
             require_user(&user_store, &user_id).await?;
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let ttl = match expires_in {
-                Some(d) => Some(chrono::Duration::from_std(d)?),
+                Some(d) => Some(jiff::SignedDuration::try_from(d)?),
                 None if no_expiry => None,
-                None => Some(chrono::Duration::days(DEFAULT_CLIENT_PREAUTH_TTL_DAYS)),
+                None => Some(jiff::SignedDuration::from_hours(
+                    24 * DEFAULT_CLIENT_PREAUTH_TTL_DAYS,
+                )),
             };
             let expires_at = ttl.map(|d| now + d);
             let minted = user_preauth::mint(
@@ -5868,7 +6239,7 @@ async fn handle_user_preauth_action(
                 return Ok(());
             }
             keys.sort_by_key(|k| std::cmp::Reverse(k.created_at));
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let rows: Vec<UserPreauthRow> = keys.iter().map(|k| user_preauth_row(k, now)).collect();
             let mut table = tabled::Table::new(&rows);
             table.with(tabled::settings::Style::psql());
@@ -5882,7 +6253,7 @@ async fn handle_user_preauth_action(
             Ok(())
         }
         UserPreauthAction::Prune { dry_run } => {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             // Records are listed before markers, which is what makes the race
             // err toward keeping a marker (see [`preauth_prune::targets`]).
             let keys = user_store.list_user_preauth_keys().await?;
@@ -5946,7 +6317,7 @@ struct UserPreauthRow {
     note: String,
 }
 
-fn user_preauth_row(k: &UserPreauthKey, now: chrono::DateTime<chrono::Utc>) -> UserPreauthRow {
+fn user_preauth_row(k: &UserPreauthKey, now: jiff::Timestamp) -> UserPreauthRow {
     let usage = match k.usage {
         UserPreauthUsage::SingleUse => "single-use",
         UserPreauthUsage::MultiUse => "multi-use",
@@ -5958,9 +6329,9 @@ fn user_preauth_row(k: &UserPreauthKey, now: chrono::DateTime<chrono::Utc>) -> U
     };
     let expires = k
         .expires_at
-        .map_or_else(|| "never".to_string(), |e| e.to_rfc3339());
+        .map_or_else(|| "never".to_string(), |e| e.to_string());
     UserPreauthRow {
-        key_id: format!("{}\n{}", k.key_id, k.created_at.to_rfc3339()),
+        key_id: format!("{}\n{}", k.key_id, k.created_at),
         user_id: k.user_id.to_string(),
         lifecycle: format!("{status}\n{expires}"),
         usage: usage.to_string(),
@@ -6075,11 +6446,13 @@ async fn handle_client_preauth_action(
             } else {
                 ClientPreauthUsage::SingleUse
             };
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let ttl = match expires_in {
-                Some(d) => Some(chrono::Duration::from_std(d)?),
+                Some(d) => Some(jiff::SignedDuration::try_from(d)?),
                 None if no_expiry => None,
-                None => Some(chrono::Duration::days(DEFAULT_CLIENT_PREAUTH_TTL_DAYS)),
+                None => Some(jiff::SignedDuration::from_hours(
+                    24 * DEFAULT_CLIENT_PREAUTH_TTL_DAYS,
+                )),
             };
             let expires_at = ttl.map(|d| now + d);
             let default_tags = tags
@@ -6124,7 +6497,7 @@ async fn handle_client_preauth_action(
                     ClientPreauthUsage::MultiUse => "multi-use",
                 },
                 match expires_at {
-                    Some(at) => at.to_rfc3339(),
+                    Some(at) => at.to_string(),
                     None => "never".to_string(),
                 }
             );
@@ -6144,7 +6517,7 @@ async fn handle_client_preauth_action(
                 return Ok(());
             }
             keys.sort_by_key(|k| std::cmp::Reverse(k.created_at));
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let rows: Vec<ClientPreauthRow> =
                 keys.iter().map(|k| client_preauth_row(k, now)).collect();
             let mut table = tabled::Table::new(&rows);
@@ -6157,7 +6530,7 @@ async fn handle_client_preauth_action(
             println!("Revoked (deleted) pre-auth key {key_id}.");
         }
         ClientPreauthAction::Prune { dry_run } => {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             // Records are listed before markers, which is what makes the race
             // err toward keeping a marker (see [`preauth_prune::targets`]).
             let keys = client_store.list_client_preauth_keys().await?;
@@ -6265,7 +6638,7 @@ fn leased_cell(census: &JobCensus) -> String {
 
 fn expires_label(expires_at: ExpiresAt) -> String {
     match expires_at {
-        ExpiresAt::At(at) => at.to_rfc3339(),
+        ExpiresAt::At(at) => at.to_string(),
         ExpiresAt::Never => "never".to_string(),
     }
 }
@@ -6352,7 +6725,7 @@ async fn handle_plan_action(
             explain,
             leases,
         } => {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             // `--explain` prints the starved groups with their ladders, so the
             // status block drops its own copy.
             match (leases, explain) {
@@ -6417,6 +6790,16 @@ async fn handle_plan_action(
             }
         }
         PlanAction::Cancel { plan_id } => {
+            let campaign_id = stores
+                .plans
+                .get_plan(&plan_id)
+                .await?
+                .and_then(|manifest| manifest.campaign_id);
+            if let Some(campaign_id) = campaign_id
+                && let Some(campaign) = stores.campaigns.get_campaign(&campaign_id).await?
+            {
+                campaign_admin::require_cancellable(&campaign, &plan_id)?;
+            }
             let outcome = match plan_cli::cancel_plan(stores.plans.as_ref(), &plan_id).await {
                 Err(PlanLookupError::NotFound { plan_id }) => {
                     anyhow::bail!("no plan {plan_id}, so there is nothing to cancel")
@@ -6517,7 +6900,7 @@ fn print_plan_results(page: &pipette_plan_types::ResultListView) {
             value,
             or_dash(&row.client_id),
             row.scored_at
-                .map_or_else(|| "-".to_string(), |at| at.to_rfc3339()),
+                .map_or_else(|| "-".to_string(), |at| at.to_string()),
         ]
     });
     let mut table = std::iter::once(header)
@@ -6542,12 +6925,12 @@ fn print_plan_status(record: plan_cli::PlanRecord, starved_block: bool) {
     }
     println!("Submitter {}", submitter_label(view.submitted_by.as_ref()));
     println!("Status    {}", view.status.label());
-    println!("Created   {}", view.created_at.to_rfc3339());
+    println!("Created   {}", view.created_at);
     if let Some(job_expiry) = view.job_expiry {
         println!("Expires   {}", expiry_range(job_expiry, " → "));
     }
     if let Some(ended) = view.terminal_at {
-        println!("Ended     {} ({})", ended.to_rfc3339(), view.status.label());
+        println!("Ended     {} ({})", ended, view.status.label());
     }
     if cancel_requested {
         println!(
@@ -6562,10 +6945,7 @@ fn print_plan_status(record: plan_cli::PlanRecord, starved_block: bool) {
         }
         Some(snapshot) => {
             let c = &snapshot.counts;
-            println!(
-                "\nProgress (computed {})",
-                snapshot.computed_at.to_rfc3339()
-            );
+            println!("\nProgress (computed {})", snapshot.computed_at);
             println!(
                 "  {} job(s): {} finished, {} running, {} available, {} failed",
                 c.total, c.finished, c.running, c.available, c.failed
@@ -6624,12 +7004,7 @@ fn print_plan_leases(leases: &PlanLeases) {
 
 /// Rows carry the deadline's age: the recycle cron is unreadable from here, so
 /// the reader judges whether `56m ago` is a stalled sweep.
-fn print_lease_list(
-    headline: &str,
-    deadline: &str,
-    held: &[Lease],
-    read_at: chrono::DateTime<chrono::Utc>,
-) {
+fn print_lease_list(headline: &str, deadline: &str, held: &[Lease], read_at: jiff::Timestamp) {
     if held.is_empty() {
         return;
     }
@@ -6645,8 +7020,8 @@ fn print_lease_list(
             "  {:<client_width$}  {:<job_width$}  {deadline} {} ({})",
             lease.client_id.as_ref(),
             lease.job_id.as_ref(),
-            lease.lease_expiry.to_rfc3339(),
-            lease_offset_label((lease.lease_expiry - read_at).num_seconds()),
+            lease.lease_expiry,
+            lease_offset_label(lease.lease_expiry.duration_since(read_at).as_secs()),
         );
     });
 }
@@ -6691,13 +7066,8 @@ fn print_plan_explanation(report: &PlanExplanation) {
         // Aged against the queue read, not the moment of printing.
         Some(computed_at) => println!(
             "  Snapshot  {} ({})",
-            computed_at.to_rfc3339(),
-            snapshot_age_label(
-                report
-                    .read_at
-                    .signed_duration_since(computed_at)
-                    .num_seconds()
-            )
+            computed_at,
+            snapshot_age_label(report.read_at.duration_since(computed_at).as_secs())
         ),
         None => println!("  Snapshot  no `queue-maintenance` pass ran for this plan"),
     }
@@ -6811,10 +7181,7 @@ fn print_narrowing_ladder(ladder: &[pipette_plan_types::NarrowingRung], working:
         });
 }
 
-fn client_preauth_row(
-    k: &ClientPreauthKey,
-    now: chrono::DateTime<chrono::Utc>,
-) -> ClientPreauthRow {
+fn client_preauth_row(k: &ClientPreauthKey, now: jiff::Timestamp) -> ClientPreauthRow {
     let usage = match k.usage {
         ClientPreauthUsage::SingleUse => "single-use",
         ClientPreauthUsage::MultiUse => "multi-use",
@@ -6841,9 +7208,9 @@ fn client_preauth_row(
     };
     let expires = k
         .expires_at
-        .map_or_else(|| "never".to_string(), |e| e.to_rfc3339());
+        .map_or_else(|| "never".to_string(), |e| e.to_string());
     ClientPreauthRow {
-        key_id: format!("{}\n{}", k.key_id, k.created_at.to_rfc3339()),
+        key_id: format!("{}\n{}", k.key_id, k.created_at),
         lifecycle: format!("{status}\n{expires}"),
         usage: usage.to_string(),
         seeds: format!("tags: {tags}\norg: {org}\nowner: {owner}\npermissions: {permissions}"),
@@ -7053,9 +7420,8 @@ fn parse_quantization_label(s: &str) -> Result<QuantizationLabel, String> {
     QuantizationLabel::try_new(s).map_err(|error| error.to_string())
 }
 
-fn parse_release_time(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|time| time.with_timezone(&chrono::Utc))
+fn parse_release_time(s: &str) -> Result<jiff::Timestamp, String> {
+    s.parse::<jiff::Timestamp>()
         .map_err(|error| error.to_string())
 }
 
@@ -7235,14 +7601,14 @@ fn parse_submitter_id(s: &str) -> Result<UserId, String> {
 /// Micros since the epoch, as the warehouse's `submitted_at`; a bare date is
 /// midnight UTC.
 fn parse_timestamp_micros(s: &str) -> Result<i64, String> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.timestamp_micros());
+    if let Ok(dt) = s.parse::<jiff::Timestamp>() {
+        return Ok(dt.as_microsecond());
     }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", s) {
         return date
-            .and_hms_opt(0, 0, 0)
-            .map(|naive| naive.and_utc().timestamp_micros())
-            .ok_or_else(|| format!("invalid date: {s}"));
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .map(|day| day.timestamp().as_microsecond())
+            .map_err(|_| format!("invalid date: {s}"));
     }
     Err(format!(
         "expected RFC3339 (e.g. 2026-06-01T00:00:00Z) or YYYY-MM-DD, got: {s}"
@@ -7354,12 +7720,6 @@ async fn run_db(action: DbAction, config: &Config) -> anyhow::Result<()> {
             database::check(config).await?;
             println!("the database answers and its schema is current");
         }
-        DbAction::Import { dry_run } => {
-            copy_db(config, record_copy::CopyMode::Merge, dry_run).await?;
-        }
-        DbAction::Export { dry_run } => {
-            copy_db(config, record_copy::CopyMode::Mirror, dry_run).await?;
-        }
         DbAction::BackfillJobCells { dry_run } => {
             let report = database::backfill_job_cells(
                 config,
@@ -7417,108 +7777,6 @@ async fn run_db(action: DbAction, config: &Config) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// A merge copies the object stores into the database (`db import`). A mirror
-/// copies the database to the object stores (`db export`).
-async fn copy_db(
-    config: &Config,
-    mode: record_copy::CopyMode,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    database::check(config).await?;
-    let database = build_stores(config).await?;
-    let objects = build_object_stores(config).await?;
-    let (from, to) = match mode {
-        record_copy::CopyMode::Merge => (&objects, &database),
-        record_copy::CopyMode::Mirror => (&database, &objects),
-    };
-    let report = record_copy::copy_records(from, to, mode, dry_run).await?;
-    finish_copy(&report)
-}
-
-fn finish_copy(report: &record_copy::CopyReport) -> anyhow::Result<()> {
-    print_copy_report(report);
-    tracing::info!(
-        mode = ?report.mode,
-        dry_run = report.dry_run,
-        written = report.written(),
-        deleted = report.deleted(),
-        conflicts = report.conflicts(),
-        unreadable = report.unreadable(),
-        "record copy finished"
-    );
-    let (conflicts, unreadable) = (report.conflicts(), report.unreadable());
-    anyhow::ensure!(
-        conflicts == 0 && unreadable == 0,
-        "{conflicts} conflict(s) and {unreadable} unreadable record(s) were not copied; \
-         resolve them and run again"
-    );
-    Ok(())
-}
-
-#[derive(tabled::Tabled)]
-struct ImportRow {
-    #[tabled(rename = "Keyspace")]
-    keyspace: &'static str,
-    #[tabled(rename = "Read")]
-    read: usize,
-    #[tabled(rename = "Written")]
-    written: usize,
-    #[tabled(rename = "Unchanged")]
-    unchanged: usize,
-    #[tabled(rename = "Deleted")]
-    deleted: usize,
-    #[tabled(rename = "Skipped")]
-    skipped: usize,
-    #[tabled(rename = "Unreadable")]
-    unreadable: usize,
-    #[tabled(rename = "Conflicts")]
-    conflicts: usize,
-}
-
-fn print_copy_report(report: &record_copy::CopyReport) {
-    let rows: Vec<ImportRow> = report
-        .keyspaces
-        .iter()
-        .map(|k| ImportRow {
-            keyspace: k.keyspace,
-            read: k.read,
-            written: k.written,
-            unchanged: k.unchanged,
-            deleted: k.deleted,
-            skipped: k.skipped.len(),
-            unreadable: k.unreadable.len(),
-            conflicts: k.conflicts.len(),
-        })
-        .collect();
-    let mut table = tabled::Table::new(&rows);
-    table.with(tabled::settings::Style::psql());
-    if report.dry_run {
-        println!("Dry run: nothing changed; Written and Deleted count what would be.");
-    }
-    println!("{table}");
-    report.keyspaces.iter().for_each(print_copy_notes);
-}
-
-/// Each skip reason with its count, then each unreadable record and conflict.
-fn print_copy_notes(k: &record_copy::KeyspaceReport) {
-    let reasons = k.skipped.iter().fold(
-        std::collections::BTreeMap::<&str, usize>::new(),
-        |mut reasons, note| {
-            *reasons.entry(note.reason.as_str()).or_default() += 1;
-            reasons
-        },
-    );
-    reasons
-        .iter()
-        .for_each(|(reason, count)| println!("{}: {count} skipped: {reason}", k.keyspace));
-    k.unreadable
-        .iter()
-        .for_each(|note| println!("{}: unreadable {}: {}", k.keyspace, note.id, note.reason));
-    k.conflicts
-        .iter()
-        .for_each(|note| println!("{}: conflict {}: {}", k.keyspace, note.id, note.reason));
 }
 
 async fn serve(config: Config, stores: Stores) -> anyhow::Result<()> {
@@ -7612,7 +7870,7 @@ impl ClientRow {
         owner: Option<&ClientOwner>,
         tags: Option<&std::collections::BTreeSet<pipette_plan_types::Tag>>,
         permissions: Option<&ClientPermissionSet>,
-        migrated: Option<chrono::DateTime<chrono::Utc>>,
+        migrated: Option<jiff::Timestamp>,
     ) -> Self {
         let flags = |flags: &std::collections::BTreeSet<String>| {
             if flags.is_empty() {
@@ -8290,6 +8548,7 @@ mod tests {
     use pipette_plan_types::{BenchmarkType, JobId, RuntimeOutput, WarningKind};
     use pipette_store::{ClaimResult, JobState};
     use pipette_store_fs::build_local_fs_stores;
+    use pipette_store_init::build_object_stores;
     use pipette_store_testkit::CapturingAuditStore;
     use pipette_web_testkit::{
         own_client_by_org, register_pending, registered_user, seed_org, seeded_state, set_user_org,
@@ -8363,7 +8622,7 @@ mod tests {
             old_name: old_name.clone(),
             new_name: new_name.clone(),
         };
-        record_catalog_rename(Some(&log), &scope, action).await;
+        record_catalog_change(Some(&log), &scope, action).await;
 
         let events = log.events();
         assert_eq!(events.len(), 1);
@@ -8406,8 +8665,6 @@ mod tests {
     #[case::an_unlock(&["unlock"], false)]
     #[case::the_openapi_document(&["openapi"], false)]
     #[case::a_migration(&["db", "migrate"], false)]
-    #[case::an_import(&["db", "import"], true)]
-    #[case::an_import_dry_run(&["db", "import", "--dry-run"], false)]
     #[case::a_job_cells_backfill(&["db", "backfill-job-cells"], true)]
     #[case::a_run_evidence_backfill(&["db", "backfill-run-evidence"], true)]
     #[case::a_run_evidence_backfill_dry_run(&["db", "backfill-run-evidence", "--dry-run"], false)]
@@ -8446,6 +8703,10 @@ mod tests {
     #[case::catalog_list(&["catalog", "list"], false)]
     #[case::catalog_show(&["catalog", "show", "Fork"], false)]
     #[case::catalog_coverage(&["catalog", "coverage", "--days", "7"], false)]
+    #[case::catalog_list_json(&["catalog", "list", "--json"], false)]
+    #[case::catalog_coverage_json(&["catalog", "coverage", "--json"], false)]
+    #[case::catalog_find_digest(&["catalog", "find", "--digest", "abc"], false)]
+    #[case::catalog_find_model(&["catalog", "find", "--model", &model_member("q4_0"), "--json"], false)]
     #[case::org_catalog_create(&["catalog", "create", "entry.toml", "--org", "acme"], true)]
     #[case::org_catalog_create_dry_run(&["catalog", "create", "entry.toml", "--org", "acme", "--dry-run"], false)]
     #[case::org_catalog_add(&["catalog", "add-member", "Fork", "member.toml", "--org", "acme"], true)]
@@ -8458,9 +8719,20 @@ mod tests {
     #[case::catalog_relabel(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0"], true)]
     #[case::catalog_relabel_dry_run(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--dry-run"], false)]
     #[case::org_catalog_relabel(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--org", "acme"], true)]
+    #[case::catalog_remove_member(&["catalog", "remove-member", "AcmeLM", "--member", "gguf::q4_0"], true)]
+    #[case::catalog_remove_member_dry_run(&["catalog", "remove-member", "AcmeLM", "--member", "gguf::q4_0", "--dry-run"], false)]
+    #[case::org_catalog_remove_member(&["catalog", "remove-member", "AcmeLM", "--member", "gguf::q4_0", "--org", "acme"], true)]
+    #[case::catalog_move_to_global(&["catalog", "move-to-global", "AcmeLM", "--org", "acme"], true)]
+    #[case::catalog_move_to_global_dry_run(&["catalog", "move-to-global", "AcmeLM", "--org", "acme", "--dry-run"], false)]
     #[case::org_catalog_relabel_dry_run(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "f16_q4_0", "--to", "q4_0", "--org", "acme", "--dry-run"], false)]
     #[case::org_catalog_list(&["catalog", "list", "--org", "acme"], false)]
     #[case::org_catalog_show(&["catalog", "show", "Fork", "--org", "acme"], false)]
+    #[case::campaign_lock(&["campaigns", "state", NIL_CAMPAIGN_ID, "locked", "--note", "release"], true)]
+    #[case::campaign_labels_set(&["campaigns", "labels", NIL_CAMPAIGN_ID, "study=acmelm"], true)]
+    #[case::campaign_labels_clear(&["campaigns", "labels", NIL_CAMPAIGN_ID, "--clear"], true)]
+    #[case::campaign_labels_print(&["campaigns", "labels", NIL_CAMPAIGN_ID], false)]
+    #[case::campaign_tag(&["campaigns", "tag", NIL_CAMPAIGN_ID, "--plan", NIL_PLAN_ID, "--name", "v1", "--message", "m"], true)]
+    #[case::campaign_tags(&["campaigns", "tags", NIL_CAMPAIGN_ID], false)]
     fn a_command_is_audited_when_it_writes(#[case] args: &[&str], #[case] audited: bool) {
         let argv = std::iter::once("pipette-mgmt").chain(args.iter().copied());
         let cli = Cli::try_parse_from(argv);
@@ -8484,6 +8756,8 @@ mod tests {
     #[case::rename_without_new_name(&["catalog", "rename", "Fork"])]
     #[case::bad_format(&["catalog", "relabel", "AcmeLM", "--format", "onnx2", "--from", "a", "--to", "b"])]
     #[case::bad_label(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "a", "--to", "Q4"])]
+    #[case::remove_member_without_member(&["catalog", "remove-member", "AcmeLM"])]
+    #[case::move_to_global_without_org(&["catalog", "move-to-global", "AcmeLM"])]
     #[case::relabel_without_to(&["catalog", "relabel", "AcmeLM", "--format", "gguf", "--from", "a"])]
     #[case::no_source(&["catalog", "create"])]
     #[case::file_and_name(&["catalog", "create", "entry.toml", "--name", "Fork", "--runtime", RUNTIME_JSON])]
@@ -8538,7 +8812,7 @@ mod tests {
             anyhow::bail!("catalog create did not keep the inline values");
         };
         assert_eq!(name.to_string(), "Fork");
-        assert_eq!(release_time.to_rfc3339(), "2026-10-19T22:54:49+00:00");
+        assert_eq!(release_time.to_string(), "2026-10-19T22:54:49Z");
         assert_eq!(
             runtimes,
             [
@@ -8558,6 +8832,15 @@ mod tests {
             member.model,
             serde_json::from_str::<pipette_plan_types::Model>(MODEL_JSON)?
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_selector(&["catalog", "find"])]
+    #[case::both_selectors(&["catalog", "find", "--digest", "abc", "--model", &model_member("q4_0")])]
+    fn catalog_find_needs_exactly_one_selector(#[case] args: &[&str]) -> anyhow::Result<()> {
+        let argv = std::iter::once("pipette-mgmt").chain(args.iter().copied());
+        assert!(Cli::try_parse_from(argv).is_err(), "{args:?}");
         Ok(())
     }
 
@@ -8670,6 +8953,24 @@ mod tests {
             anyhow::bail!("dry run attempted to relabel a member")
         }
 
+        async fn remove_member(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _key: &pipette_plan_types::DescriptorMemberKey,
+        ) -> anyhow::Result<pipette_store::RemoveMemberOutcome> {
+            anyhow::bail!("dry run attempted to remove a member")
+        }
+
+        async fn move_entry_to_global(
+            &self,
+            _org: &pipette_plan_types::OrgId,
+            _name: &CatalogName,
+            _actor: &pipette_plan_types::AuditActor,
+        ) -> anyhow::Result<pipette_store::MoveToGlobalOutcome> {
+            anyhow::bail!("dry run attempted to move an entry to global scope")
+        }
+
         async fn transition_state(
             &self,
             _scope: &CatalogScope,
@@ -8748,7 +9049,7 @@ mod tests {
             &HubClient::new(hub.endpoint.clone(), NonZeroUsize::MIN)?,
             &scope,
             document,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             true,
         )
         .await?;
@@ -8877,37 +9178,37 @@ mod tests {
         "\n→ ",
         at("2026-08-19T17:55:00Z"),
         at("2026-08-19T17:55:00Z"),
-        "2026-08-19T17:55:00+00:00"
+        "2026-08-19T17:55:00Z"
     )]
     #[case::list_range(
         "\n→ ",
         at("2026-08-19T17:55:00Z"),
         at("2026-09-18T17:55:00Z"),
-        "2026-08-19T17:55:00+00:00\n→ 2026-09-18T17:55:00+00:00"
+        "2026-08-19T17:55:00Z\n→ 2026-09-18T17:55:00Z"
     )]
     #[case::list_never(
         "\n→ ",
         at("2026-08-19T17:55:00Z"),
         ExpiresAt::Never,
-        "2026-08-19T17:55:00+00:00\n→ never"
+        "2026-08-19T17:55:00Z\n→ never"
     )]
     #[case::status_uniform(
         " → ",
         at("2026-08-19T17:55:00Z"),
         at("2026-08-19T17:55:00Z"),
-        "2026-08-19T17:55:00+00:00"
+        "2026-08-19T17:55:00Z"
     )]
     #[case::status_range(
         " → ",
         at("2026-08-19T17:55:00Z"),
         at("2026-09-18T17:55:00Z"),
-        "2026-08-19T17:55:00+00:00 → 2026-09-18T17:55:00+00:00"
+        "2026-08-19T17:55:00Z → 2026-09-18T17:55:00Z"
     )]
     #[case::status_never(
         " → ",
         at("2026-08-19T17:55:00Z"),
         ExpiresAt::Never,
-        "2026-08-19T17:55:00+00:00 → never"
+        "2026-08-19T17:55:00Z → never"
     )]
     fn expiry_ranges(
         #[case] sep: &str,
@@ -8925,7 +9226,7 @@ mod tests {
 
     fn snapshot_with(groups: &[usize]) -> ProgressSnapshot {
         ProgressSnapshot {
-            computed_at: chrono::DateTime::UNIX_EPOCH,
+            computed_at: jiff::Timestamp::UNIX_EPOCH,
             counts: pipette_plan_types::Counts {
                 total: 0,
                 finished: 0,
@@ -9170,7 +9471,7 @@ mod tests {
         #[case] expected: &str,
     ) {
         let snapshot = running.map(|running| ProgressSnapshot {
-            computed_at: chrono::Utc::now(),
+            computed_at: jiff::Timestamp::now(),
             counts: Counts {
                 total: running,
                 finished: 0,
@@ -9910,7 +10211,7 @@ mod tests {
             NonEmptyTrimmedString::try_new("acme checkpoint")?,
             owner,
             artifact,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .await?
         .pop()
@@ -10025,7 +10326,10 @@ mod tests {
                 user_id: user_id.clone(),
             },
         )
-        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), chrono::Utc::now());
+        .around(
+            PlanId::from_uuid(uuid::Uuid::now_v7()),
+            jiff::Timestamp::now(),
+        );
         stores.campaigns.put_campaign(&campaign).await?;
         let device = ClientId::try_new("ev1_laptop")?;
         stores
@@ -10229,7 +10533,7 @@ mod tests {
             &catalog_hub(&Config::default())?,
             &scope,
             document,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             false,
         )
         .await?;
@@ -10269,7 +10573,7 @@ mod tests {
         org: &Organization,
     ) -> anyhow::Result<pipette_core::user::User> {
         let member =
-            pipette_core::user::User::try_new(email("op@example.com")?, chrono::Utc::now())?;
+            pipette_core::user::User::try_new(email("op@example.com")?, jiff::Timestamp::now())?;
         stores.users.put_user(&member).await?;
         stores
             .orgs
@@ -10302,6 +10606,135 @@ mod tests {
             "the refusal must name the holder: {message}"
         );
         assert_eq!(reopen(&dir)?.orgs.list_orgs().await?.len(), 1);
+        Ok(())
+    }
+
+    /// `campaigns` with no plan document to read, as the record and tag
+    /// commands are.
+    async fn campaign_cli(stores: &Stores, action: CampaignAction) -> anyhow::Result<()> {
+        handle_campaign_action(
+            action,
+            stores,
+            IngestSettings {
+                descriptor_config: &pipette_core::config::DescriptorCatalogConfig::default(),
+                models: ModelCheck::none(),
+                max_jobs: std::num::NonZeroUsize::MIN,
+                creating_max_age: std::time::Duration::from_secs(60),
+                import: None,
+            },
+        )
+        .await
+    }
+
+    /// The CLI keeps the API's rules: a lock needs a note and holds the head
+    /// against a cancel, a delete and an archive; labels replace the whole set;
+    /// a tag name is taken once, and a host command's tag has no tagger.
+    #[tokio::test]
+    async fn campaign_state_labels_and_tags_follow_the_api_rules() -> anyhow::Result<()> {
+        let Some(test_db) = pipette_store_sql::scratch::TestDb::new().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let stores = pipette_store_sql::overlay(test_db.db(), reopen(&dir)?);
+        let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
+        let manifest =
+            pipette_core::plan::sample_manifest(plan_id.clone(), PlanStatus::Active, false)?;
+        let campaign_id = manifest
+            .campaign_id
+            .clone()
+            .context("the sample names a campaign")?;
+        stores.plans.put_plan(&manifest).await?;
+        let now = jiff::Timestamp::now();
+        stores
+            .campaigns
+            .put_campaign(&Campaign {
+                campaign_id: campaign_id.clone(),
+                name: NonEmptyTrimmedString::try_new("Nightly")?,
+                owner: CampaignOwner::User {
+                    user_id: UserId::mint(),
+                },
+                current_plan_id: Some(plan_id.clone()),
+                labels: Labels::default(),
+                state: CampaignState::Active,
+                state_note: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        let state = |state: CampaignState, note: Option<&str>| CampaignAction::State {
+            campaign_id: campaign_id.clone(),
+            state,
+            note: note.map(str::to_owned),
+        };
+        let refusal = |result: anyhow::Result<()>| {
+            result
+                .err()
+                .map(|e| e.to_string())
+                .context("the command must be refused")
+        };
+        let stored = || stores.campaigns.get_campaign(&campaign_id);
+
+        let message = refusal(campaign_cli(&stores, state(CampaignState::Locked, None)).await)?;
+        assert!(message.contains("needs a note"), "{message}");
+        let long = "x".repeat(campaign_admin::TEXT_MAX_CHARS + 1);
+        let message =
+            refusal(campaign_cli(&stores, state(CampaignState::Locked, Some(&long))).await)?;
+        assert!(message.contains("longer than"), "{message}");
+        campaign_cli(&stores, state(CampaignState::Locked, Some("release"))).await?;
+        let locked = stored().await?.context("the campaign is stored")?;
+        assert_eq!(
+            (locked.state, locked.state_note.as_ref().map(|n| n.as_str())),
+            (CampaignState::Locked, Some("release"))
+        );
+        let message = refusal(campaign_cli(&stores, state(CampaignState::Archived, None)).await)?;
+        assert!(message.contains("unlock it before archiving"), "{message}");
+        let cancel = PlanAction::Cancel {
+            plan_id: plan_id.clone(),
+        };
+        let message = refusal(handle_plan_action(cancel, &stores, &Config::default()).await)?;
+        assert!(message.contains("is locked (release)"), "{message}");
+        let delete = CampaignAction::Delete {
+            campaign_id: campaign_id.clone(),
+        };
+        let message = refusal(campaign_cli(&stores, delete).await)?;
+        assert!(message.contains("is locked"), "{message}");
+        campaign_cli(&stores, state(CampaignState::Active, None)).await?;
+        let active = stored().await?.context("the campaign is stored")?;
+        assert_eq!(
+            (active.state, active.state_note),
+            (CampaignState::Active, None)
+        );
+
+        let labels = |pairs: &[&str], clear: bool| CampaignAction::Labels {
+            campaign_id: campaign_id.clone(),
+            pairs: pairs.iter().map(|pair| (*pair).to_owned()).collect(),
+            clear,
+        };
+        campaign_cli(&stores, labels(&["study=acmelm", "device=s26"], false)).await?;
+        let labelled = stored().await?.context("the campaign is stored")?;
+        assert_eq!(labels_text(&labelled.labels), "device=s26, study=acmelm");
+        let message = refusal(campaign_cli(&stores, labels(&["study"], false)).await)?;
+        assert!(message.contains("KEY=VALUE"), "{message}");
+        campaign_cli(&stores, labels(&[], true)).await?;
+        let cleared = stored().await?.context("the campaign is stored")?;
+        assert!(cleared.labels.is_empty());
+
+        let tag = || CampaignAction::Tag {
+            campaign_id: campaign_id.clone(),
+            plan: plan_id.clone(),
+            name: "release/2026.11".into(),
+            message: "shipped".into(),
+        };
+        campaign_cli(&stores, tag()).await?;
+        let tags = campaign_tags(&stores, &campaign_id).await?;
+        assert_eq!(
+            tags.iter()
+                .map(|tag| (tag.name.as_str(), &tag.plan_id, tag.tagger.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![("release/2026.11", &plan_id, None)]
+        );
+        let message = refusal(campaign_cli(&stores, tag()).await)?;
+        assert!(message.contains("already has a tag"), "{message}");
         Ok(())
     }
 
@@ -10614,7 +11047,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             ),
         )?;
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let campaign = Campaign {
             campaign_id: CampaignId::mint(),
             name: NonEmptyTrimmedString::try_new("Nightly")?,
@@ -10624,6 +11057,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             current_plan_id: None,
             labels: Default::default(),
             state: Default::default(),
+            state_note: None,
             created_at: now,
             updated_at: now,
         };
@@ -10785,7 +11219,10 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                     NonEmptyTrimmedString::try_new("nightly")?,
                     CampaignOwner::Org { org_id },
                 )
-                .around(PlanId::from_uuid(uuid::Uuid::now_v7()), chrono::Utc::now());
+                .around(
+                    PlanId::from_uuid(uuid::Uuid::now_v7()),
+                    jiff::Timestamp::now(),
+                );
                 stores.campaigns.put_campaign(&campaign).await?;
                 campaign.campaign_id.to_string()
             }
@@ -10978,7 +11415,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         let dir = tempfile::tempdir()?;
         let org = create_org(&dir, "acme").await?;
         let stores = reopen(&dir)?;
-        let user = pipette_core::user::User::try_new(email("op@example.com")?, chrono::Utc::now())?;
+        let user =
+            pipette_core::user::User::try_new(email("op@example.com")?, jiff::Timestamp::now())?;
         stores.users.put_user(&user).await?;
 
         assert!(
@@ -11186,7 +11624,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             anyhow::bail!("one minted key must list as one record, got {}", keys.len());
         };
         assert_eq!(key.default_owner.as_ref(), Some(&expected));
-        let seeds = client_preauth_row(key, chrono::Utc::now()).seeds;
+        let seeds = client_preauth_row(key, jiff::Timestamp::now()).seeds;
         assert!(
             seeds.contains(&format!("owner: {}", expected.label())),
             "{seeds}"
@@ -11267,8 +11705,10 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         let auth = stores.users.clone();
 
         // What the keyless `POST /api/v1/users/register` leaves.
-        let requested =
-            pipette_core::user::User::requested(email("asker@example.com")?, chrono::Utc::now())?;
+        let requested = pipette_core::user::User::requested(
+            email("asker@example.com")?,
+            jiff::Timestamp::now(),
+        )?;
         auth.claim_user_email(requested.contact_email.as_str(), &requested.user_id)
             .await?;
         auth.put_user(&requested).await?;
@@ -11397,7 +11837,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         handle_user_action(create("ci@example.test", service, in_acme)?, stores.clone()).await?;
         let robot = auth.list_users().await?.pop().context("the service")?;
         let loner =
-            pipette_core::user::User::try_new(email("op@example.test")?, chrono::Utc::now())?;
+            pipette_core::user::User::try_new(email("op@example.test")?, jiff::Timestamp::now())?;
         auth.put_user(&loner).await?;
 
         let refused = match write {
@@ -11493,7 +11933,10 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                     org_id: org_id.clone(),
                 },
             )
-            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), chrono::Utc::now()))
+            .around(
+                PlanId::from_uuid(uuid::Uuid::now_v7()),
+                jiff::Timestamp::now(),
+            ))
         };
         let campaign = team_campaign(&acme.org_id)?;
         let theirs = team_campaign(&labs.org_id)?;
@@ -11686,7 +12129,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
         let user = pipette_core::user::User {
             status,
-            ..pipette_core::user::User::try_new(email("op@example.com")?, chrono::Utc::now())?
+            ..pipette_core::user::User::try_new(email("op@example.com")?, jiff::Timestamp::now())?
         };
         auth.claim_user_email(user.contact_email.as_str(), &user.user_id)
             .await?;
@@ -11746,7 +12189,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                     expires_at: None,
                     note: None,
                 },
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
         };
         let (dead, other) = (preauth(&stranded)?, preauth(&UserId::mint())?);
@@ -11759,7 +12202,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         auth.record_user_first_clerk_sign_in(
             &stranded,
             &pipette_plan_types::FirstClerkSignIn {
-                at: chrono::Utc::now(),
+                at: jiff::Timestamp::now(),
                 prior_keys: Vec::new(),
             },
         )
@@ -12094,7 +12537,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         // The keyspace has no reader, so a fresh claim is the assertion.
         let successor = pipette_core::user::User::try_new(
             ContactEmail::try_new("successor@example.com")?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )?
         .user_id;
         for digest in &digests {
@@ -12124,7 +12567,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             let key = UserKey::new(
                 public_key.clone(),
                 NonEmptyTrimmedString::try_new(format!("machine {byte}"))?,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             );
             stores.users.put_user_key(user_id, &key).await?;
             let digest = digest_of(&public_key);
@@ -12145,7 +12588,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         UserId,
         Vec<(UserKeyId, pipette_core::key_index::PublicKeyDigest)>,
     )> {
-        let user = pipette_core::user::User::try_new(email(address)?, chrono::Utc::now())?;
+        let user = pipette_core::user::User::try_new(email(address)?, jiff::Timestamp::now())?;
         stores.users.put_user(&user).await?;
         let held = claimed_keys(stores, &user.user_id, bytes).await?;
         Ok((user.user_id, held))
@@ -12296,7 +12739,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("d")?,
                 contact_email: ContactEmail::try_new("d@example.com")?,
                 status: pipette_core::client::ClientStatus::Approved,
-                registered_at: chrono::Utc::now(),
+                registered_at: jiff::Timestamp::now(),
                 device_profile: Default::default(),
                 capabilities: Default::default(),
             })
@@ -12316,7 +12759,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         assert!(stores.clients.get_client(&client_id).await?.is_none());
         let account = pipette_core::user::User::try_new(
             ContactEmail::try_new("rehomed@example.com")?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )?
         .user_id;
         assert_eq!(
@@ -12524,7 +12967,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             client_details: NonEmptyTrimmedString::try_new("details")?,
             contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
-            registered_at: chrono::Utc::now(),
+            registered_at: jiff::Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         })
@@ -12688,7 +13131,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             "client_id": "ev1_held",
             "benchmark_id": "prefill_throughput_256",
             "benchmark_type": "prefill_throughput",
-            "submitted_at": chrono::Utc::now().to_rfc3339(),
+            "submitted_at": jiff::Timestamp::now().to_string(),
             "retriable": retriable,
             "failure_reason": "thermal throttle",
             "runtime_stderr": "throttled at 94C\n",
@@ -12822,7 +13265,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                             &job_id,
                             ExpiresAt::Never,
                             &ClientId::try_new("ev1_victim")?,
-                            chrono::Utc::now() + chrono::Duration::hours(1),
+                            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
                         )
                         .await?;
                     anyhow::ensure!(matches!(claim, ClaimResult::Claimed(_)));
@@ -13524,12 +13967,12 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] expires_in_hours: Option<i64>,
         #[case] status: &str,
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let minted = user_preauth::mint(
             UserPreauthParams {
                 user_id: UserId::try_new("user_abc")?,
                 usage: UserPreauthUsage::SingleUse,
-                expires_at: expires_in_hours.map(|h| now + chrono::Duration::hours(h)),
+                expires_at: expires_in_hours.map(|h| now + jiff::SignedDuration::from_hours(h)),
                 note: None,
             },
             now,
@@ -13547,7 +13990,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     }
 
     fn user_key(
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        expires_at: Option<jiff::Timestamp>,
     ) -> anyhow::Result<pipette_core::user_preauth::UserMintedKey> {
         Ok(user_preauth::mint(
             UserPreauthParams {
@@ -13556,7 +13999,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 expires_at,
                 note: None,
             },
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )?)
     }
 
@@ -13566,11 +14009,11 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     async fn user_preauth_prune_sweeps_expired_keys_and_spent_markers() -> anyhow::Result<()> {
         let (_dir, stores) = flag_reindex_stores().await?;
         let auth = stores.users.clone();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
-        let expired = user_key(Some(now - chrono::Duration::hours(1)))?;
+        let expired = user_key(Some(now - jiff::SignedDuration::from_hours(1)))?;
         auth.put_user_preauth_key(&expired.key).await?;
-        let live = user_key(Some(now + chrono::Duration::days(30)))?;
+        let live = user_key(Some(now + jiff::SignedDuration::from_hours(30 * 24)))?;
         auth.put_user_preauth_key(&live.key).await?;
 
         // Spending leaves the marker without its record: the orphan to sweep.

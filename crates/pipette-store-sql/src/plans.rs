@@ -1,18 +1,17 @@
-//! Plans on SQL: a manifest is a `plans` row plus a `plan_jobs` row per job. A
-//! marker's expiry is the `ExpiresAt` display string, truncated to the second
-//! as the object key is.
+//! Plans on SQL: a manifest is a `plans` row plus the jobs of its lineage's
+//! spans ([`crate::plan_job_spans`]). A marker's expiry is the `ExpiresAt` display
+//! string. The store truncates it to the second, as it does for the object key.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sqlx::FromRow;
 use sqlx::postgres::PgRow;
+use sqlx::{FromRow, PgConnection};
 
 use pipette_core::plan::{PlanHeader, PlanManifest, PlanNotes, PlanSource, PlanSummary};
 use pipette_plan_types::{
@@ -30,6 +29,7 @@ use crate::ClaimVanishedError;
 use crate::db::SqlDatabase;
 use crate::listing;
 use crate::listing::{Keyspace, Rows};
+use crate::plan_job_spans::{self, Expired, ManifestJobs, SpanCounts};
 use crate::retry::retry;
 
 const PLANS: Keyspace = Keyspace {
@@ -46,6 +46,11 @@ pub(crate) struct SqlPlanStore {
 impl SqlPlanStore {
     pub(crate) fn new(db: SqlDatabase) -> Self {
         Self { db }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> &SqlDatabase {
+        &self.db
     }
 
     /// One statement for the ids in `$1`. A row that does not parse is
@@ -157,8 +162,10 @@ macro_rules! header_select {
     };
 }
 
-/// A `plans` row with its `plan_jobs` rows. One statement reads both, so a read
-/// sees one snapshot of the manifest.
+/// A `plans` row with its span membership. One statement reads both, so a read
+/// sees one snapshot of the manifest. The subquery has one branch for open
+/// spans and one for closed spans. Each branch bounds `to_plan`, so a head
+/// read uses the span index.
 macro_rules! plan_select {
     () => {
         "SELECT p.plan_id, p.status, p.campaign_id, p.submitted_by, p.body,
@@ -166,7 +173,17 @@ macro_rules! plan_select {
                             j.job_id, j.ordinal, j.content_key, j.rerun_of, j.expired,
                             j.outcome)
                         ORDER BY j.ordinal NULLS LAST, j.job_id), '[]')::text
-                 FROM plan_jobs j WHERE j.plan_id = p.plan_id) AS jobs
+                 FROM (
+                     SELECT job_id, ordinal, content_key, rerun_of, expired, outcome
+                     FROM plan_job_spans
+                     WHERE lineage = coalesce(p.campaign_id, p.plan_id)
+                       AND to_plan IS NULL AND from_plan <= p.plan_id
+                     UNION ALL
+                     SELECT job_id, ordinal, content_key, rerun_of, expired, outcome
+                     FROM plan_job_spans
+                     WHERE lineage = coalesce(p.campaign_id, p.plan_id)
+                       AND to_plan > p.plan_id AND from_plan <= p.plan_id
+                 ) j) AS jobs
          FROM plans p"
     };
 }
@@ -237,7 +254,7 @@ struct PlanRow {
     #[sqlx(flatten)]
     columns: PlanColumns,
     /// A JSON array with one `[job_id, ordinal, content_key, rerun_of,
-    /// expired, outcome]` array for each `plan_jobs` row.
+    /// expired, outcome]` array for each job in the plan's spans.
     jobs: String,
 }
 
@@ -251,36 +268,14 @@ type JobEntry = (
     Option<String>,
 );
 
-/// The `plan_jobs` columns of one job.
-#[derive(Default)]
-struct JobRow {
-    ordinal: Option<i32>,
-    content_key: Option<String>,
-    rerun_of: Option<String>,
-    /// The `ExpiredJob` as JSON text.
-    expired: Option<String>,
-    /// The `SettledOutcome` as its serialized name.
-    outcome: Option<String>,
-}
-
-/// The `plan_jobs` rows of one plan, as one array for each column.
-#[derive(Default)]
-struct JobColumns {
-    job_ids: Vec<String>,
-    ordinals: Vec<Option<i32>>,
-    content_keys: Vec<Option<String>>,
-    rerun_of: Vec<Option<String>>,
-    expired: Vec<Option<String>>,
-    outcomes: Vec<Option<String>>,
-}
-
 /// A manifest as `put_plan` writes it.
 struct StoredPlan {
     status: String,
     campaign_id: Option<String>,
     submitted_by: Option<String>,
     body: String,
-    jobs: JobColumns,
+    /// The per-job fields the span write compares.
+    span_jobs: ManifestJobs,
 }
 
 /// A manifest that does not split into its rows.
@@ -308,7 +303,7 @@ fn take_text(body: &mut Map<String, Value>, field: &str) -> Result<Option<String
     }
 }
 
-/// Split `manifest` into its `plans` columns, body and `plan_jobs` rows.
+/// Split `manifest` into its `plans` columns, body and span jobs.
 fn split(manifest: &PlanManifest) -> anyhow::Result<StoredPlan> {
     let plan_id = &manifest.plan_id;
     let Value::Object(mut body) = serde_json::to_value(manifest)? else {
@@ -334,10 +329,10 @@ fn split(manifest: &PlanManifest) -> anyhow::Result<StoredPlan> {
         .contains(&field.as_str())
     });
 
-    let mut jobs: BTreeMap<&JobId, JobRow> = BTreeMap::new();
+    let mut span_jobs = ManifestJobs::new();
     manifest.job_ids.iter().enumerate().try_for_each(
         |(ordinal, job_id)| -> anyhow::Result<()> {
-            let row = jobs.entry(job_id).or_default();
+            let row = span_jobs.entry(job_id.as_str().to_owned()).or_default();
             if row.ordinal.is_some() {
                 return Err(SplitError::JobTwice {
                     plan_id: plan_id.clone(),
@@ -353,40 +348,46 @@ fn split(manifest: &PlanManifest) -> anyhow::Result<StoredPlan> {
         .content_keys
         .iter()
         .for_each(|(job_id, content_key)| {
-            jobs.entry(job_id).or_default().content_key = Some(content_key.clone());
+            span_jobs
+                .entry(job_id.as_str().to_owned())
+                .or_default()
+                .content_key = Some(content_key.clone());
         });
     manifest.rerun_of.iter().for_each(|(job_id, rerun_of)| {
-        jobs.entry(job_id).or_default().rerun_of = Some(rerun_of.as_str().to_string());
+        span_jobs
+            .entry(job_id.as_str().to_owned())
+            .or_default()
+            .rerun_of = Some(rerun_of.as_str().to_string());
     });
     manifest
         .expired_jobs
         .iter()
         .try_for_each(|(job_id, expired)| -> anyhow::Result<()> {
-            jobs.entry(job_id).or_default().expired = Some(serde_json::to_string(expired)?);
+            span_jobs
+                .entry(job_id.as_str().to_owned())
+                .or_default()
+                .expired = Some(Expired::parse(serde_json::to_string(expired)?)?);
             Ok(())
         })?;
     manifest.settled_jobs.iter().for_each(|(job_id, outcome)| {
-        jobs.entry(job_id).or_default().outcome = Some(outcome.label().to_owned());
+        span_jobs
+            .entry(job_id.as_str().to_owned())
+            .or_default()
+            .outcome = Some(outcome.label().to_owned());
     });
-    let jobs = jobs
-        .into_iter()
-        .fold(JobColumns::default(), |mut columns, (job_id, row)| {
-            columns.job_ids.push(job_id.as_str().to_string());
-            columns.ordinals.push(row.ordinal);
-            columns.content_keys.push(row.content_key);
-            columns.rerun_of.push(row.rerun_of);
-            columns.expired.push(row.expired);
-            columns.outcomes.push(row.outcome);
-            columns
-        });
-
     Ok(StoredPlan {
         status,
         campaign_id,
         submitted_by,
         body: serde_json::to_string(&body)?,
-        jobs,
+        span_jobs,
     })
+}
+
+/// The per-job fields that `put_plan` stores for `manifest`.
+#[cfg(test)]
+pub(crate) fn manifest_jobs(manifest: &PlanManifest) -> anyhow::Result<ManifestJobs> {
+    Ok(split(manifest)?.span_jobs)
 }
 
 /// A stored plan that does not make a manifest.
@@ -394,7 +395,7 @@ fn split(manifest: &PlanManifest) -> anyhow::Result<StoredPlan> {
 enum AssembleError {
     #[error("body: {0}")]
     Body(#[source] serde_json::Error),
-    #[error("plan_jobs: {0}")]
+    #[error("plan job spans: {0}")]
     PlanJobs(#[source] serde_json::Error),
     #[error(transparent)]
     Manifest(serde_json::Error),
@@ -775,6 +776,49 @@ impl<R: ListedRow> Rows for MatchingPlans<'_, R> {
     }
 }
 
+/// Write the `plans` row and the spans of one manifest in
+/// `tx`. The transaction writes the lineage's guard row first. A concurrent
+/// writer of that lineage fails with a conflict, and the retry repeats its
+/// transaction.
+async fn write_plan(
+    tx: &mut PgConnection,
+    plan_id: &str,
+    stored: &StoredPlan,
+) -> Result<SpanCounts, sqlx::Error> {
+    let campaign_id = stored.campaign_id.as_deref();
+    plan_job_spans::guard(tx, plan_job_spans::lineage_of(plan_id, campaign_id)).await?;
+    // Ingestion sets `campaign_id`; later writes keep it, so the plan stays
+    // in one lineage.
+    sqlx::query(
+        "INSERT INTO plans (plan_id, status, campaign_id, submitted_by, body)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (plan_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             campaign_id = EXCLUDED.campaign_id,
+             submitted_by = EXCLUDED.submitted_by,
+             body = EXCLUDED.body",
+    )
+    .bind(plan_id)
+    .bind(stored.status.as_str())
+    .bind(campaign_id)
+    .bind(stored.submitted_by.as_deref())
+    .bind(stored.body.as_str())
+    .execute(&mut *tx)
+    .await?;
+    plan_job_spans::write_spans(tx, plan_id, campaign_id, &stored.span_jobs).await
+}
+
+/// [`write_plan`] of `manifest` in `tx`, for a test that holds the
+/// transaction. The outer error is a manifest that does not split.
+#[cfg(test)]
+pub(crate) async fn write_in(
+    tx: &mut PgConnection,
+    manifest: &PlanManifest,
+) -> anyhow::Result<Result<SpanCounts, sqlx::Error>> {
+    let stored = split(manifest)?;
+    Ok(write_plan(tx, manifest.plan_id.as_str(), &stored).await)
+}
+
 #[async_trait]
 impl PlanStore for SqlPlanStore {
     async fn put_plan(&self, manifest: &PlanManifest) -> anyhow::Result<()> {
@@ -782,69 +826,21 @@ impl PlanStore for SqlPlanStore {
         let stored = &stored;
         let plan_id = manifest.plan_id.as_str();
         let db = &self.db;
-        retry("put_plan", || {
+        let spans = retry("put_plan", || {
             Box::pin(async move {
                 let mut tx = db.begin().await?;
-                // Write this row first: a racing writer of the same plan waits
-                // on it and fails with a conflict, which the retry reruns.
-                sqlx::query(
-                    "INSERT INTO plans (plan_id, status, campaign_id, submitted_by, body)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (plan_id) DO UPDATE SET
-                         status = EXCLUDED.status,
-                         campaign_id = EXCLUDED.campaign_id,
-                         submitted_by = EXCLUDED.submitted_by,
-                         body = EXCLUDED.body",
-                )
-                .bind(plan_id)
-                .bind(stored.status.as_str())
-                .bind(stored.campaign_id.as_deref())
-                .bind(stored.submitted_by.as_deref())
-                .bind(stored.body.as_str())
-                .execute(&mut *tx)
-                .await?;
-                let jobs = &stored.jobs;
-                sqlx::query("DELETE FROM plan_jobs WHERE plan_id = $1 AND NOT (job_id = ANY($2))")
-                    .bind(plan_id)
-                    .bind(jobs.job_ids.as_slice())
-                    .execute(&mut *tx)
-                    .await?;
-                // Unchanged jobs keep their rows. `job_ids` keep their order
-                // for the plan's life, so no row moves onto another's ordinal.
-                // An older build's statement omits `outcome`, so its write
-                // keeps the row's.
-                sqlx::query(
-                    "INSERT INTO plan_jobs
-                         (plan_id, job_id, ordinal, content_key, rerun_of, expired, outcome)
-                     SELECT $1, job.job_id, job.ordinal, job.content_key, job.rerun_of,
-                            job.expired::jsonb, job.outcome
-                     FROM unnest($2::text[], $3::integer[], $4::text[], $5::text[], $6::text[],
-                                 $7::text[])
-                         AS job (job_id, ordinal, content_key, rerun_of, expired, outcome)
-                     ON CONFLICT (plan_id, job_id) DO UPDATE SET
-                         ordinal = EXCLUDED.ordinal,
-                         content_key = EXCLUDED.content_key,
-                         rerun_of = EXCLUDED.rerun_of,
-                         expired = EXCLUDED.expired,
-                         outcome = EXCLUDED.outcome
-                     WHERE (plan_jobs.ordinal, plan_jobs.content_key, plan_jobs.rerun_of,
-                            plan_jobs.expired, plan_jobs.outcome)
-                         IS DISTINCT FROM (EXCLUDED.ordinal, EXCLUDED.content_key,
-                            EXCLUDED.rerun_of, EXCLUDED.expired, EXCLUDED.outcome)",
-                )
-                .bind(plan_id)
-                .bind(jobs.job_ids.as_slice())
-                .bind(jobs.ordinals.as_slice())
-                .bind(jobs.content_keys.as_slice())
-                .bind(jobs.rerun_of.as_slice())
-                .bind(jobs.expired.as_slice())
-                .bind(jobs.outcomes.as_slice())
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await
+                let spans = write_plan(&mut tx, plan_id, stored).await?;
+                tx.commit().await?;
+                Ok(spans)
             })
         })
         .await?;
+        tracing::debug!(
+            plan_id,
+            spans_deleted = spans.deleted,
+            spans_written = spans.written,
+            "plan job spans applied"
+        );
         Ok(())
     }
 
@@ -991,7 +987,7 @@ impl PlanStore for SqlPlanStore {
         .await
     }
 
-    /// Reads no `plan_jobs` row.
+    /// Reads no job membership.
     async fn list_matching_plan_headers(
         &self,
         filter: &PlanFilter,
@@ -1248,7 +1244,7 @@ impl PlanStore for SqlPlanStore {
     }
 
     async fn list_all_job_plan_markers(&self) -> anyhow::Result<Vec<JobPlanMarker>> {
-        let rows: Vec<(String, String, String, DateTime<Utc>)> = self
+        let rows: Vec<(String, String, String, jiff_sqlx::Timestamp)> = self
             .db
             .fetch_all("list_all_job_plan_markers", || {
                 sqlx::query_as(
@@ -1271,7 +1267,7 @@ impl PlanStore for SqlPlanStore {
                     job_id,
                     plan_id,
                     expires_at,
-                    written_at,
+                    written_at: written_at.to_jiff(),
                 })
             })
             .collect())
@@ -1473,7 +1469,7 @@ impl PlanStore for SqlPlanStore {
     }
 
     async fn list_pending_source_markers(&self) -> anyhow::Result<Vec<PendingSourceMarker>> {
-        let rows: Vec<(String, DateTime<Utc>)> = self
+        let rows: Vec<(String, jiff_sqlx::Timestamp)> = self
             .db
             .fetch_all("list_pending_source_markers", || {
                 sqlx::query_as(
@@ -1486,7 +1482,7 @@ impl PlanStore for SqlPlanStore {
             .filter_map(|(raw, written_at)| {
                 Some(PendingSourceMarker {
                     plan_id: plan_id_of(&raw, "pending source marker")?,
-                    written_at,
+                    written_at: written_at.to_jiff(),
                 })
             })
             .collect())
@@ -1623,7 +1619,7 @@ impl PlanStore for SqlPlanStore {
                            AND c.scope = $2
                            AND o.outcome = 'finished'
                            AND o.run_flags IS NOT NULL
-                           AND NOT EXISTS (SELECT 1 FROM plan_jobs p WHERE p.rerun_of = c.job_id)
+                           AND NOT EXISTS (SELECT 1 FROM plan_job_spans p WHERE p.rerun_of = c.job_id)
                      ) ranked
                      WHERE newest <= $3
                      ORDER BY job_id DESC",
@@ -1731,7 +1727,7 @@ impl PlanStore for SqlPlanStore {
     }
 
     /// One statement for every job. It reads each plan's `created_at` and the
-    /// job's own `plan_jobs` row, so no plan's job list leaves the database.
+    /// job's span membership, so no plan's job list leaves the database.
     async fn job_holders(
         &self,
         campaign_id: &CampaignId,
@@ -1749,8 +1745,11 @@ impl PlanStore for SqlPlanStore {
                             CASE WHEN p.body IS JSON OBJECT
                                  THEN p.body::json ->> 'created_at' END
                      FROM job_plan_links l
-                     JOIN plan_jobs j ON (j.plan_id, j.job_id) = (l.plan_id, l.job_id)
                      JOIN plans p ON p.plan_id = l.plan_id
+                     JOIN plan_job_spans j
+                       ON j.lineage = coalesce(p.campaign_id, p.plan_id)
+                      AND j.job_id = l.job_id AND j.from_plan <= p.plan_id
+                      AND (j.to_plan IS NULL OR p.plan_id < j.to_plan)
                      WHERE l.job_id = ANY($1) AND j.ordinal IS NOT NULL
                        AND p.campaign_id = $2",
                 )
@@ -1790,11 +1789,13 @@ impl PlanStore for SqlPlanStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::Context;
     use futures::{StreamExt, TryStreamExt};
+    use jiff::Timestamp;
 
     use pipette_core::plan::{ExpiredJob, sample_manifest};
     use pipette_core::types::Mint;
@@ -1806,8 +1807,8 @@ mod tests {
     use crate::scratch::TestDb;
     use crate::testing::race;
 
-    /// A `plan_jobs` row as a tuple of the job, its ordinal, its content key,
-    /// its rerun source, whether it holds an expiry, and its outcome.
+    /// A plan job as a tuple of the job, its ordinal, its content key,
+    /// its rerun source, whether it has an expiry, and its outcome.
     type StoredJob = (
         String,
         Option<i32>,
@@ -2011,7 +2012,7 @@ mod tests {
             .write_gc_candidates(&keys(&["plans:a", "plans:b"]))
             .await?;
         let first_seen = || {
-            sqlx::query_scalar::<_, DateTime<Utc>>(
+            sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
                 "SELECT first_seen_at FROM plan_index_gc_candidates WHERE key = 'plans:b'",
             )
             .fetch_one(test_db.db().pool())
@@ -2041,7 +2042,7 @@ mod tests {
     /// A record whose `created_at` carries nanoseconds, which a `timestamptz`
     /// would drop.
     fn record(n: u128) -> anyhow::Result<ContentKeyRecord> {
-        let created_at = DateTime::from_timestamp(1_780_000_000 + i64::try_from(n)?, 123_456_789)
+        let created_at = jiff::Timestamp::new(1_780_000_000 + i64::try_from(n)?, 123_456_789)
             .context("timestamp")?;
         Ok(ContentKeyRecord {
             job_id: job(n),
@@ -2671,7 +2672,7 @@ mod tests {
             JobId::new_unchecked("job-1"),
             ExpiredJob {
                 horizon: "2026-10-07T09:00:00Z".parse()?,
-                recorded_at: DateTime::from_timestamp(1_780_000_000, 123_456_789)
+                recorded_at: jiff::Timestamp::new(1_780_000_000, 123_456_789)
                     .context("timestamp")?,
             },
         );
@@ -2726,7 +2727,7 @@ mod tests {
         // `job-9` is in no `job_ids`, so its row has no ordinal.
         let jobs: Vec<StoredJob> = sqlx::query_as(
             "SELECT job_id, ordinal, content_key, rerun_of, expired IS NOT NULL, outcome
-                 FROM plan_jobs WHERE plan_id = $1 ORDER BY job_id",
+                 FROM plan_job_rows WHERE plan_id = $1 ORDER BY job_id",
         )
         .bind(plan(1).as_str())
         .fetch_all(db.pool())
@@ -2763,8 +2764,9 @@ mod tests {
         Ok(())
     }
 
-    /// `plan_jobs.expired` holds a lapse under its stored names, which the jobs
-    /// page renames: a write produces them, and a row in them reads back.
+    /// A span stores a lapse under its stored names, and the jobs page uses
+    /// other names. The view shows the stored names, and `get_plan` reads them
+    /// back as the lapse.
     #[tokio::test]
     async fn the_expired_column_keeps_the_stored_names() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
@@ -2782,7 +2784,7 @@ mod tests {
         manifest.expired_jobs = BTreeMap::from([(JobId::new_unchecked("job-1"), lapse.clone())]);
         store.put_plan(&manifest).await?;
         let written: String = sqlx::query_scalar(
-            "SELECT expired::text FROM plan_jobs WHERE plan_id = $1 AND job_id = 'job-1'",
+            "SELECT expired::text FROM plan_job_rows WHERE plan_id = $1 AND job_id = 'job-1'",
         )
         .bind(plan(1).as_str())
         .fetch_one(db.pool())
@@ -2790,7 +2792,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&written)?, stored);
 
         sqlx::query(
-            "UPDATE plan_jobs SET expired = $2::jsonb WHERE plan_id = $1 AND job_id = 'job-2'",
+            "UPDATE plan_job_spans SET expired = $2::jsonb WHERE from_plan = $1 AND job_id = 'job-2'",
         )
         .bind(plan(1).as_str())
         .bind(stored.to_string())
@@ -2807,43 +2809,6 @@ mod tests {
         Ok(())
     }
 
-    /// An older build's migration-0001 statement names no `outcome`, so its
-    /// write keeps the outcome a newer build recorded.
-    #[tokio::test]
-    async fn an_older_build_keeps_the_outcome() -> anyhow::Result<()> {
-        let test_db = crate::testing::test_db_or_skip!();
-        let db = test_db.db();
-        let store = store(&test_db);
-        let manifest = sample_manifest(plan(1), PlanStatus::Active, false)?;
-        store.put_plan(&manifest).await?;
-
-        sqlx::query(
-            "INSERT INTO plan_jobs (plan_id, job_id, ordinal, content_key, rerun_of, expired)
-             VALUES ($1, 'job-1', 0, $2, NULL, NULL)
-             ON CONFLICT (plan_id, job_id) DO UPDATE SET
-                 ordinal = EXCLUDED.ordinal,
-                 content_key = EXCLUDED.content_key,
-                 rerun_of = EXCLUDED.rerun_of,
-                 expired = EXCLUDED.expired",
-        )
-        .bind(plan(1).as_str())
-        .bind("3".repeat(64))
-        .execute(db.pool())
-        .await?;
-
-        let read = store
-            .get_plan(&plan(1))
-            .await?
-            .context("the plan is stored")?;
-        assert_eq!(read.settled_jobs, manifest.settled_jobs);
-        assert_eq!(
-            read.content_keys.get(&JobId::new_unchecked("job-1")),
-            Some(&"3".repeat(64)),
-            "the older write landed"
-        );
-        Ok(())
-    }
-
     /// A status refresh rewrites the `plans` row and leaves each unchanged job
     /// row as it was; a job that leaves the manifest loses its row.
     #[tokio::test]
@@ -2853,7 +2818,7 @@ mod tests {
         let store = store(&test_db);
         let versions = || async {
             let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT job_id, xmin::text FROM plan_jobs WHERE plan_id = $1 ORDER BY job_id",
+                "SELECT job_id, xmin::text FROM plan_job_spans WHERE from_plan = $1 ORDER BY job_id",
             )
             .bind(plan(1).as_str())
             .fetch_all(db.pool())
@@ -3021,8 +2986,8 @@ mod tests {
         Ok(())
     }
 
-    /// A 5,000-job manifest with a full snapshot runs past 1 MiB, and is one
-    /// `plans` row and a `plan_jobs` row for each job.
+    /// A 5,000-job manifest with a full snapshot runs past 1 MiB. It writes one
+    /// `plans` row and a span for each job, and reads back whole.
     #[tokio::test]
     async fn a_large_manifest_round_trips() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
@@ -3036,7 +3001,7 @@ mod tests {
         store.put_plan(&small).await?;
 
         let jobs: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM plan_jobs WHERE plan_id = $1 AND ordinal IS NOT NULL",
+            "SELECT count(*) FROM plan_job_rows WHERE plan_id = $1 AND ordinal IS NOT NULL",
         )
         .bind(plan(1).as_str())
         .fetch_one(db.pool())
@@ -3177,7 +3142,7 @@ mod tests {
         let store = store(&test_db);
         let at = |nanos: u32| -> anyhow::Result<ExpiresAt> {
             Ok(ExpiresAt::At(
-                DateTime::from_timestamp(1_780_000_000, nanos).context("timestamp")?,
+                jiff::Timestamp::new(1_780_000_000, i32::try_from(nanos)?).context("timestamp")?,
             ))
         };
         let (shared, other) = (JobId::try_new("job-a")?, JobId::try_new("job-a-1")?);
@@ -3247,7 +3212,7 @@ mod tests {
     async fn a_rewritten_marker_carries_its_latest_write_time() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = store(&test_db);
-        let pending_at = async || -> anyhow::Result<DateTime<Utc>> {
+        let pending_at = async || -> anyhow::Result<Timestamp> {
             Ok(store
                 .list_pending_source_markers()
                 .await?
@@ -3255,7 +3220,7 @@ mod tests {
                 .context("one pending marker")?
                 .written_at)
         };
-        let member_at = async || -> anyhow::Result<DateTime<Utc>> {
+        let member_at = async || -> anyhow::Result<Timestamp> {
             Ok(store
                 .list_all_job_plan_markers()
                 .await?
@@ -3269,9 +3234,9 @@ mod tests {
             .write_job_plan_marker(&job(1), &plan(1), ExpiresAt::Never)
             .await?;
         let (pending, member) = (pending_at().await?, member_at().await?);
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(
-            (now - pending).num_seconds().abs() < 60,
+            now.duration_since(pending).as_secs().abs() < 60,
             "a server time near the app's"
         );
 

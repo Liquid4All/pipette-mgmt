@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::dataset::{ProbeState, ServeRefusal};
 use pipette_plan_types::{BenchmarkId, DatasetUpstream, ErrorBody};
@@ -119,11 +119,11 @@ pub async fn get_dataset(
 
     let max_age = i64::try_from(state.config.dataset_probe_max_age_secs.get())
         .ok()
-        .and_then(chrono::Duration::try_seconds)
+        .map(jiff::SignedDuration::from_secs)
         .ok_or_else(|| {
             AppError::Internal("dataset_probe_max_age_secs is out of range".to_string())
         })?;
-    match artifact.serveable(Utc::now(), max_age) {
+    match artifact.serveable(Timestamp::now(), max_age) {
         Ok(()) => {}
         Err(ServeRefusal::Stale { checked_at }) => {
             tracing::error!(

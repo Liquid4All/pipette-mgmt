@@ -5,16 +5,19 @@ A **model-params row** is one model's parameter counts,
 parameter table. A scoring pass stores a row's counts on the warehouse rows it
 writes, and a filing warns `uncatalogued_model` for a model with no row.
 
-A result row has a `null` `model_params_total_millions` if the scoring pass
-ran before its model had a row. A plan's jobs page
+The warehouse keeps the counts a result row was scored with: `null` if the
+scoring pass ran before its model had a row, and the old counts if the row
+changed since. A plan's jobs page
 (`GET /api/v1/plans/{plan_id}/jobs?results=true`) and results file
-(`GET /api/v1/plans/{plan_id}/results.csv`) then take both counts from the row
-that its descriptor resolves to. A result row without a model uses counts for
-the model that its job requested. Historical rows without a model keep null
-counts. A stored count wins. The `fix-model-param` command rewrites the warehouse.
+(`GET /api/v1/plans/{plan_id}/results.csv`) take both counts from the row that
+its descriptor resolves to, over any stored counts. A model with no row keeps
+its stored counts. A result row without a model fills empty counts from the
+model that its job requested. Historical rows without a model keep null counts.
+Readers of the warehouse itself see stored counts until the `fix-model-param`
+command rewrites them.
 
-The results file remains available if a plan-source read fails. Stored counts
-stay intact. Missing counts that depend on the requested model remain empty.
+The results file remains available if a plan-source read fails. Missing counts
+that depend on the requested model remain empty.
 
 ## Rows
 

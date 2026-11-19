@@ -4,21 +4,23 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use pipette_plan_types::{
     AddDescriptorMemberRequest, AuditAction, CatalogName, CatalogScope,
     CreateDescriptorEntryRequest, DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind,
-    DescriptorEntryState, DescriptorKind, DescriptorMember, EntryError, GitOid, HfRevision,
-    MemberError, Model, ModelFormat, ModelMemberRequest, ModelType, NonEmptyVec, QuantizationLabel,
-    Runtime, descriptor_digest, hf_repos, hf_repos_mut, names_vault_source,
+    DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberKey, EntryError,
+    GitOid, HfRevision, MemberError, Model, ModelFormat, ModelMemberRequest, ModelType,
+    NonEmptyVec, QuantizationLabel, Runtime, descriptor_digest, hf_repos, hf_repos_mut,
+    names_vault_source,
 };
 use pipette_store::{
     AppendOutcome, CatalogEntryKey, CreateEntryOutcome, DescriptorCatalogStore,
-    DescriptorEntryFilter, DescriptorEntryPage, MergeOutcome, MergedMembers, RelabelOutcome,
-    RenameOutcome, SetStateOutcome, TransitionOutcome, VaultStore, merge_outcome,
+    DescriptorEntryFilter, DescriptorEntryPage, MergeOutcome, MergedMembers, MoveToGlobalOutcome,
+    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetStateOutcome, TransitionOutcome,
+    VaultStore, merge_outcome, move_to_global_outcome, remove_outcome,
 };
 
 use crate::hf_import::{self, HfImportError, HubClient, HubError, HubGate, ImportFault};
@@ -125,7 +127,7 @@ fn log_model_entry(entry: &DescriptorEntry) {
 struct CreateDocument {
     name: CatalogName,
     #[serde(default, deserialize_with = "release_time")]
-    release_time: Option<DateTime<Utc>>,
+    release_time: Option<Timestamp>,
     #[serde(default)]
     runtimes: Option<NonEmptyVec<Runtime>>,
     #[serde(default)]
@@ -135,7 +137,7 @@ struct CreateDocument {
 /// Accepts a quoted RFC 3339 string or a native TOML datetime.
 fn release_time<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<DateTime<Utc>>, D::Error> {
+) -> Result<Option<Timestamp>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Raw {
@@ -147,8 +149,8 @@ fn release_time<'de, D: serde::Deserializer<'de>>(
         Raw::Str(s) => s,
         Raw::Native(dt) => dt.to_string(),
     };
-    DateTime::parse_from_rfc3339(&text)
-        .map(|time| Some(time.with_timezone(&Utc)))
+    text.parse::<jiff::Timestamp>()
+        .map(Some)
         .map_err(serde::de::Error::custom)
 }
 
@@ -168,7 +170,7 @@ enum MemberInput {
 /// A create file with a checked name and one kind of member.
 struct CreateInput {
     name: CatalogName,
-    release_time: Option<DateTime<Utc>>,
+    release_time: Option<Timestamp>,
     members: MemberInput,
 }
 
@@ -282,7 +284,7 @@ async fn build_create(
     vault: Option<&dyn VaultStore>,
     scope: &CatalogScope,
     input: CreateDescriptorEntryRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creator: DescriptorEntryCreator,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     let CreateInput {
@@ -377,7 +379,7 @@ impl MemberInput {
         hub: &HubClient,
         vault: Option<&dyn VaultStore>,
         scope: &CatalogScope,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<(NonEmptyVec<DescriptorMember>, Vec<CommitPin>)> {
         match self {
             Self::Runtimes(runtimes) => {
@@ -491,7 +493,7 @@ async fn check_catalog_vault(
 async fn pin_model(
     hub: &HubClient,
     document: ModelMemberRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<(DescriptorMember, Vec<CommitPin>)> {
     let ModelMemberRequest {
         quantization,
@@ -571,9 +573,9 @@ fn not_public(hf_repo: &str, reason: &'static str, message: &str) -> anyhow::Err
 fn new_entry(
     scope: &CatalogScope,
     name: CatalogName,
-    release_time: Option<DateTime<Utc>>,
+    release_time: Option<Timestamp>,
     members: NonEmptyVec<DescriptorMember>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creator: DescriptorEntryCreator,
 ) -> anyhow::Result<DescriptorEntry> {
     same_build(&members)?;
@@ -622,7 +624,7 @@ pub async fn create(
     hub: &HubClient,
     scope: &CatalogScope,
     document: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
     create_with_vault(
@@ -644,7 +646,7 @@ pub async fn create_with_vault(
     vault: Option<&dyn VaultStore>,
     scope: &CatalogScope,
     document: Document<'_, CreateDescriptorEntryRequest>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
     let CreateInput {
@@ -689,7 +691,7 @@ pub async fn create_entry(
     scope: &CatalogScope,
     input: CreateDescriptorEntryRequest,
     creator: DescriptorEntryCreator,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     create_entry_preflighted(store, hub, None, scope, input, creator, now).await
 }
@@ -702,7 +704,7 @@ pub async fn create_entry_with_vault(
     scope: &CatalogScope,
     input: CreateDescriptorEntryRequest,
     creator: DescriptorEntryCreator,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     create_entry_preflighted(store, hub, Some(vault), scope, input, creator, now).await
 }
@@ -714,7 +716,7 @@ async fn create_entry_preflighted(
     scope: &CatalogScope,
     input: CreateDescriptorEntryRequest,
     creator: DescriptorEntryCreator,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     preflight_create(store, scope, &input.name).await?;
     let entry = build_create(hub, vault, scope, input, now, creator).await?;
@@ -785,7 +787,7 @@ pub async fn add_member(
     scope: &CatalogScope,
     name: &CatalogName,
     document: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
     add_member_with_vault(
@@ -813,7 +815,7 @@ pub async fn add_member_with_vault(
     scope: &CatalogScope,
     name: &CatalogName,
     document: Document<'_, AddDescriptorMemberRequest>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     dry_run: bool,
 ) -> anyhow::Result<Preview> {
     // Preserve the CLI's lookup and kind refusals before it parses the file.
@@ -845,7 +847,7 @@ pub async fn add_entry_member(
     scope: &CatalogScope,
     name: &CatalogName,
     input: AddDescriptorMemberRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     add_entry_member_preflighted(store, hub, None, scope, name, input, now).await
 }
@@ -858,7 +860,7 @@ pub async fn add_entry_member_with_vault(
     scope: &CatalogScope,
     name: &CatalogName,
     input: AddDescriptorMemberRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     add_entry_member_preflighted(store, hub, Some(vault), scope, name, input, now).await
 }
@@ -870,7 +872,7 @@ async fn add_entry_member_preflighted(
     scope: &CatalogScope,
     name: &CatalogName,
     input: AddDescriptorMemberRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DescriptorEntry, CatalogWriteError> {
     let input = MemberInput::of_member(input).map_err(CatalogWriteError::Invalid)?;
     preflight_add(store, scope, name, input.descriptor_kind()).await?;
@@ -1604,6 +1606,187 @@ pub async fn relabel_entry(
     Ok(entry)
 }
 
+/// A member removal from a hand-made entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedMember {
+    /// The entry without the member.
+    pub entry: DescriptorEntry,
+    pub member: DescriptorMember,
+}
+
+impl RemovedMember {
+    /// The audit action that records the stored name and the removed member.
+    pub fn audit_action(&self, scope: &CatalogScope) -> AuditAction {
+        AuditAction::CatalogRemoveMember {
+            scope: scope.clone(),
+            name: self.entry.name.clone(),
+            member: member_key(&self.member),
+            digest: self.member.digest().to_owned(),
+        }
+    }
+}
+
+/// Remove the member `key` from a hand-made entry, and return the entry and the
+/// member. `key` has the form that `catalog list` prints. With `dry_run`, check
+/// the same things and write nothing.
+pub async fn remove_entry_member(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    key: &str,
+    dry_run: bool,
+) -> Result<RemovedMember, CatalogWriteError> {
+    let entry = store
+        .get_entry(scope, name)
+        .await
+        .map_err(CatalogWriteError::Storage)?
+        .ok_or_else(|| CatalogWriteError::NotFound(format!("no catalog entry {name}")))?;
+    // The descriptor kind of an entry never changes, so the parse holds for the write.
+    let member_key = DescriptorMemberKey::parse_for_kind(key, entry.descriptor_kind())
+        .with_context(|| format!("member key {key:?}"))
+        .map_err(CatalogWriteError::Invalid)?;
+    let outcome = if dry_run {
+        remove_outcome(Some(entry), &member_key)
+    } else {
+        store
+            .remove_member(scope, name, &member_key)
+            .await
+            .map_err(CatalogWriteError::Storage)?
+    };
+    let removed = match outcome {
+        RemoveMemberOutcome::Removed { entry, member } => RemovedMember {
+            entry,
+            member: *member,
+        },
+        RemoveMemberOutcome::NoSuchEntry => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "no catalog entry {name}"
+            )));
+        }
+        RemoveMemberOutcome::Tombstoned => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} is tombstoned"
+            )));
+        }
+        RemoveMemberOutcome::ImporterKind(kind) => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} is a {kind} entry; the importer owns its members"
+            )));
+        }
+        RemoveMemberOutcome::NoSuchMember => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "catalog entry {name} has no member {key}"
+            )));
+        }
+        RemoveMemberOutcome::LastMember => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "{key} is the last member of catalog entry {name}; use catalog tombstone to retire the entry"
+            )));
+        }
+    };
+    if !dry_run {
+        let name = &removed.entry.name;
+        match removed.member.model_key() {
+            Some(_) => log_model_member(scope, name, &removed.member, "catalog member removed"),
+            None => log_catalog_write(
+                scope,
+                name,
+                removed.member.flavor().unwrap_or("-"),
+                removed.entry.state.as_ref(),
+                "catalog member removed",
+            ),
+        }
+    }
+    Ok(removed)
+}
+
+/// A move of an org entry to global scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedEntry {
+    /// The entry in global scope.
+    pub entry: DescriptorEntry,
+    /// The organization that held the entry.
+    pub org_id: pipette_plan_types::OrgId,
+    /// The creator of the org entry.
+    pub original_creator: DescriptorEntryCreator,
+}
+
+/// Move the entry `name` of the organization `org_id` to global scope, with
+/// its members, and return the global entry. The global entry has `operator`
+/// as its creator. The move and its audit event commit together. With `dry_run`,
+/// check the same things and write nothing.
+pub async fn move_entry_to_global(
+    store: &dyn DescriptorCatalogStore,
+    org_id: &pipette_plan_types::OrgId,
+    name: &CatalogName,
+    dry_run: bool,
+) -> Result<MovedEntry, CatalogWriteError> {
+    check_reserved_name(&CatalogScope::Global, name).map_err(CatalogWriteError::Invalid)?;
+    let outcome = if dry_run {
+        let org_scope = CatalogScope::Org(org_id.clone());
+        let entry = store
+            .get_entry(&org_scope, name)
+            .await
+            .map_err(CatalogWriteError::Storage)?;
+        let holder = store
+            .get_entry(&CatalogScope::Global, name)
+            .await
+            .map_err(CatalogWriteError::Storage)?
+            .map(|holder| (holder.name, holder.state));
+        move_to_global_outcome(entry, holder)
+    } else {
+        store
+            .move_entry_to_global(org_id, name, &crate::audit::host_actor())
+            .await
+            .map_err(CatalogWriteError::Storage)?
+    };
+    let moved = match outcome {
+        MoveToGlobalOutcome::Moved {
+            entry,
+            original_creator,
+        } => MovedEntry {
+            entry,
+            org_id: org_id.clone(),
+            original_creator,
+        },
+        MoveToGlobalOutcome::NoSuchEntry => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "no catalog entry {name} in organization {org_id}"
+            )));
+        }
+        MoveToGlobalOutcome::Tombstoned => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} in organization {org_id} is tombstoned"
+            )));
+        }
+        MoveToGlobalOutcome::GlobalNameTaken {
+            name: holder,
+            state,
+        } => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "the {state} global entry already holds the catalog name {holder}"
+            )));
+        }
+        MoveToGlobalOutcome::GlobalScope(error) => {
+            return Err(CatalogWriteError::Invalid(
+                anyhow::Error::new(error)
+                    .context(format!("catalog entry {name} cannot move to global scope")),
+            ));
+        }
+    };
+    if !dry_run {
+        tracing::info!(
+            catalog_name = %moved.entry.name,
+            org_id = %org_id,
+            original_created_by = %moved.original_creator,
+            member_count = moved.entry.members.len(),
+            state = moved.entry.state.as_ref(),
+            "catalog entry moved to global scope"
+        );
+    }
+    Ok(moved)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -1632,7 +1815,7 @@ pub(crate) mod tests {
     }
 
     /// The entry that `document` creates in an empty store, written nowhere.
-    async fn dry_run_entry(document: &str, now: DateTime<Utc>) -> anyhow::Result<DescriptorEntry> {
+    async fn dry_run_entry(document: &str, now: Timestamp) -> anyhow::Result<DescriptorEntry> {
         let store = Memory::default();
         let preview = create(
             &store,
@@ -1697,7 +1880,7 @@ pub(crate) mod tests {
         let store = Memory::default();
         let scope = CatalogScope::Global;
         let hub = no_hub()?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let refused = if body.get("name").is_some() {
             let input = serde_json::from_value(body)?;
             create_entry(
@@ -1747,8 +1930,8 @@ pub(crate) mod tests {
             format!("name = 'Fork'\nrelease_time = {release_time}\nruntimes = [{RUNTIME}]");
         let dated = parse_create(&CatalogScope::Global, &document)?;
         assert_eq!(
-            dated.release_time.map(|time| time.to_rfc3339()),
-            Some("2026-10-20T00:00:00+00:00".to_owned())
+            dated.release_time.map(|time| time.to_string()),
+            Some("2026-10-20T00:00:00Z".to_owned())
         );
         Ok(())
     }
@@ -1757,7 +1940,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_parsed_request_writes_what_its_toml_writes() -> anyhow::Result<()> {
         let hub = no_hub()?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let from_toml =
             dry_run_entry(&format!("name = 'Fork'\nruntimes = [{RUNTIME}]"), now).await?;
         let runtime = |flavor: &str| {
@@ -1821,7 +2004,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn create_checks_the_release_time_and_builds() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let entry = dry_run_entry(&format!("name = 'Fork'\nruntimes = [{RUNTIME}]"), now).await?;
         assert_eq!(entry.release_time, entry.created_at);
         let future =
@@ -1937,7 +2120,7 @@ pub(crate) mod tests {
                 "name = 'Fork'\nruntimes = [{}]",
                 vault_runtime(&own, "org_1", "linux-x64-rocm")
             )),
-            Utc::now(),
+            Timestamp::now(),
             false,
         )
         .await?;
@@ -1961,7 +2144,7 @@ pub(crate) mod tests {
                     Some(vault),
                     scope,
                     Document::Toml(&create),
-                    Utc::now(),
+                    Timestamp::now(),
                     true,
                 )
                 .await
@@ -1976,7 +2159,7 @@ pub(crate) mod tests {
                     scope,
                     name,
                     Document::Toml(&add),
-                    Utc::now(),
+                    Timestamp::now(),
                     true,
                 )
                 .await
@@ -2040,7 +2223,7 @@ pub(crate) mod tests {
     ) -> anyhow::Result<()> {
         let parsed = match parse_member(&document) {
             Ok(input) => input
-                .resolve(&no_hub()?, None, &CatalogScope::Global, Utc::now())
+                .resolve(&no_hub()?, None, &CatalogScope::Global, Timestamp::now())
                 .await
                 .map(|_| ()),
             Err(error) => Err(error),
@@ -2276,12 +2459,51 @@ pub(crate) mod tests {
             Ok(RelabelOutcome::Relabeled(relabeled))
         }
 
-        async fn get_entry(
+        async fn remove_member(
             &self,
             _scope: &CatalogScope,
             name: &CatalogName,
+            key: &DescriptorMemberKey,
+        ) -> anyhow::Result<RemoveMemberOutcome> {
+            let mut entries = self.entries()?;
+            let outcome = remove_outcome(entries.get(&name.key()).cloned(), key);
+            if let RemoveMemberOutcome::Removed { entry, .. } = &outcome {
+                entries.insert(entry.name.key(), entry.clone());
+            }
+            Ok(outcome)
+        }
+
+        async fn move_entry_to_global(
+            &self,
+            org: &OrgId,
+            name: &CatalogName,
+            _actor: &pipette_plan_types::AuditActor,
+        ) -> anyhow::Result<MoveToGlobalOutcome> {
+            let mut entries = self.entries()?;
+            // shortcut: one map holds every scope, so an org entry and a global
+            // entry never share a name here. The SQL tests cover a taken global name.
+            let org = CatalogScope::Org(org.clone());
+            let entry = entries
+                .get(&name.key())
+                .filter(|entry| entry.scope == org)
+                .cloned();
+            let outcome = move_to_global_outcome(entry, None);
+            if let MoveToGlobalOutcome::Moved { entry, .. } = &outcome {
+                entries.insert(entry.name.key(), entry.clone());
+            }
+            Ok(outcome)
+        }
+
+        async fn get_entry(
+            &self,
+            scope: &CatalogScope,
+            name: &CatalogName,
         ) -> anyhow::Result<Option<DescriptorEntry>> {
-            let entry = self.entries()?.get(&name.key()).cloned();
+            let entry = self
+                .entries()?
+                .get(&name.key())
+                .filter(|entry| &entry.scope == scope)
+                .cloned();
             let barrier = self
                 .2
                 .lock()
@@ -2360,7 +2582,7 @@ pub(crate) mod tests {
         let store = Memory::default();
         store.1.store(true, Ordering::Relaxed);
         let scope = CatalogScope::Global;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let input = serde_json::from_value(serde_json::json!({
             "name": "Fork",
             "runtimes": [{
@@ -2401,7 +2623,7 @@ pub(crate) mod tests {
     async fn overlapping_http_appends_return_committed_members() -> anyhow::Result<()> {
         let store = Memory::default();
         let scope = CatalogScope::Global;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let input = serde_json::from_value(serde_json::json!({
             "name": "Fork",
             "runtimes": [{
@@ -2452,7 +2674,7 @@ pub(crate) mod tests {
     async fn commands_keep_live_members_and_hide_tombstones() -> anyhow::Result<()> {
         let store = Memory::default();
         let hub = no_hub()?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let name = CatalogName::try_new("Fork")?;
         let document = format!("name = 'Fork'\nruntimes = [{RUNTIME}]");
         let preview = create(&store, &hub, &CatalogScope::Global, &document, now, true).await?;
@@ -2832,7 +3054,7 @@ pub(crate) mod tests {
             &client(&hub)?,
             &CatalogScope::Global,
             &document,
-            Utc::now(),
+            Timestamp::now(),
             false,
         )
         .await;
@@ -2878,7 +3100,7 @@ pub(crate) mod tests {
             &client(&hub)?,
             &CatalogScope::Global,
             &document,
-            Utc::now(),
+            Timestamp::now(),
             false,
         )
         .await
@@ -2909,7 +3131,7 @@ pub(crate) mod tests {
             &client(&hub)?,
             &CatalogScope::Global,
             &document,
-            Utc::now(),
+            Timestamp::now(),
             false,
         )
         .await?;
@@ -2935,7 +3157,7 @@ pub(crate) mod tests {
         let client = client(&hub)?;
         let store = Memory::default();
         let scope = CatalogScope::Global;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let name = CatalogName::try_new("AcmeLM-VL-3B")?;
         let q4_0 = gguf("AcmeLM-VL-3B-GGUF", "AcmeLM-Q4_0.gguf", "");
         let q8_0 = gguf("AcmeLM-VL-3B-GGUF", "AcmeLM-Q8_0.gguf", "");
@@ -3305,6 +3527,230 @@ pub(crate) mod tests {
         let (got, text) = refusal(&result.err().context("the relabel must be refused")?);
         assert_eq!(got, variant, "{text}");
         assert!(text.contains(message), "{text}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::missing("Missing", "linux-x64-rocm", "not found", "no catalog entry Missing")]
+    #[case::tombstoned("Dead", "linux-x64-rocm", "conflict", "is tombstoned")]
+    #[case::stable(
+        "llamacpp-v1",
+        "linux-x64-rocm",
+        "conflict",
+        "the importer owns its members"
+    )]
+    #[case::no_member("AcmeLM", "gguf::q2_k", "not found", "has no member gguf::q2_k")]
+    #[case::last_member("Fork", "linux-x64-rocm", "conflict", "use catalog tombstone")]
+    #[case::model_key_shape("AcmeLM", "q4_0", "invalid", "member key \"q4_0\"")]
+    #[case::runtime_key_shape("Fork", "gguf::q4_0", "invalid", "at most two parts")]
+    #[tokio::test]
+    async fn a_member_removal_refusal_is_the_same_in_a_dry_run(
+        #[case] entry: &str,
+        #[case] key: &str,
+        #[case] variant: &str,
+        #[case] message: &str,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let before = store.entries()?.clone();
+        let name = CatalogName::try_new(entry)?;
+        let result = remove_entry_member(&store, &CatalogScope::Global, &name, key, dry_run).await;
+        let (got, text) = refusal(&result.err().context("the removal must be refused")?);
+        assert_eq!(got, variant, "{text}");
+        assert!(text.contains(message), "{text}");
+        assert_eq!(*store.entries()?, before, "a refused removal wrote");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::model("AcmeLM", "q4_0", pipette_plan_types::SelectorError::IncompleteModel)]
+    #[case::runtime(
+        "Fork",
+        "gguf::q4_0",
+        pipette_plan_types::SelectorError::RuntimeKeyShape
+    )]
+    #[tokio::test]
+    async fn a_member_removal_keeps_the_parser_error(
+        #[case] entry: &str,
+        #[case] key: &str,
+        #[case] expected: pipette_plan_types::SelectorError,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = renamable().await?;
+        let name = CatalogName::try_new(entry)?;
+        let Err(CatalogWriteError::Invalid(error)) =
+            remove_entry_member(&store, &CatalogScope::Global, &name, key, dry_run).await
+        else {
+            anyhow::bail!("the malformed key must return Invalid");
+        };
+        assert!(error.is::<pipette_plan_types::SelectorError>(), "{error:?}");
+        assert_eq!(
+            format!("{error:#}"),
+            format!("member key {key:?}: {expected}")
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::model("AcmeLM", "gguf::q4_0", "gguf::q8_0")]
+    #[case::runtime("Duo", "linux-x64-vulkan", "linux-x64-rocm")]
+    #[tokio::test]
+    async fn a_member_removal_keeps_the_other_members(
+        #[case] entry: &str,
+        #[case] key: &str,
+        #[case] kept: &str,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        use pipette_store_testkit::{a_descriptor_entry, a_member};
+        let store = renamable().await?;
+        let mut duo = a_descriptor_entry(
+            "Duo",
+            DescriptorEntryKind::HandMade,
+            1,
+            a_member("b1", "linux-x64-rocm")?,
+        )?;
+        duo.members.extend([a_member("b1", "linux-x64-vulkan")?]);
+        store.create_entry(&duo).await?;
+        let scope = CatalogScope::Global;
+        let name = CatalogName::try_new(entry)?;
+        let before = store.get_entry(&scope, &name).await?.context("fixture")?;
+
+        let removed = remove_entry_member(&store, &scope, &name, key, dry_run).await?;
+
+        assert_eq!(member_key(&removed.member), key);
+        assert_eq!(member_keys(&removed.entry.members), kept);
+        let (gone, rest): (Vec<_>, Vec<_>) = before
+            .members
+            .iter()
+            .partition(|member| member.digest() == removed.member.digest());
+        assert_eq!(gone, [&removed.member]);
+        assert_eq!(removed.entry.members.iter().collect::<Vec<_>>(), rest);
+        assert_eq!(
+            removed.audit_action(&scope),
+            AuditAction::CatalogRemoveMember {
+                scope: scope.clone(),
+                name: before.name.clone(),
+                member: key.to_owned(),
+                digest: removed.member.digest().to_owned(),
+            }
+        );
+        let stored = store.get_entry(&scope, &name).await?;
+        let expected = if dry_run { before } else { removed.entry };
+        assert_eq!(stored, Some(expected));
+        Ok(())
+    }
+
+    /// A store with entries of `org_acme` for the move tests.
+    async fn movable() -> anyhow::Result<Memory> {
+        use pipette_store_testkit::{a_member, a_model_member};
+        let store = Memory::default();
+        let org = CatalogScope::Org(OrgId::try_new("org_acme")?);
+        let account = DescriptorEntryCreator::Account(UserId::try_new(
+            "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
+        )?);
+        let at = Timestamp::now();
+        let in_org = |name: &str, member: DescriptorMember| -> anyhow::Result<DescriptorEntry> {
+            Ok(DescriptorEntry::new(
+                org.clone(),
+                CatalogName::try_new(name)?,
+                DescriptorEntryKind::HandMade,
+                DescriptorEntryState::Active,
+                at,
+                at,
+                account.clone(),
+                NonEmptyVec::try_new(vec![member])?,
+            )?)
+        };
+        let runtime = || a_member("b1", "linux-x64-rocm");
+        let mut model = in_org(
+            "AcmeLM",
+            a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?,
+        )?;
+        model.state = DescriptorEntryState::Hidden;
+        model
+            .members
+            .extend([a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?]);
+        let mut dead = in_org("Dead", runtime()?)?;
+        dead.state = DescriptorEntryState::Tombstoned;
+        let vault = DescriptorMember::new(
+            serde_json::from_value(json!({
+                "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
+                "url": "/vault/resources/vault_1/content", "principal_id": "org_acme",
+                "flavor": "linux-x64-rocm"
+            }))?,
+            Timestamp::now(),
+        )?;
+        let entries = [
+            model,
+            dead,
+            in_org("VaultFork", vault)?,
+            in_org("llamacpp-v9", runtime()?)?,
+        ];
+        for entry in &entries {
+            store.create_entry(entry).await?;
+        }
+        Ok(store)
+    }
+
+    #[rstest]
+    #[case::missing(
+        "Missing",
+        "not found",
+        "no catalog entry Missing in organization org_acme"
+    )]
+    #[case::tombstoned("Dead", "conflict", "is tombstoned")]
+    #[case::vault(
+        "VaultFork",
+        "invalid",
+        "catalog entry VaultFork cannot move to global scope"
+    )]
+    #[case::reserved("llamacpp-v9", "invalid", "reserved for the llamacpp importer")]
+    #[tokio::test]
+    async fn a_move_to_global_refusal_is_the_same_in_a_dry_run(
+        #[case] entry: &str,
+        #[case] variant: &str,
+        #[case] message: &str,
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = movable().await?;
+        let before = store.entries()?.clone();
+        let org_id = OrgId::try_new("org_acme")?;
+        let name = CatalogName::try_new(entry)?;
+        let result = move_entry_to_global(&store, &org_id, &name, dry_run).await;
+        let (got, text) = refusal(&result.err().context("the move must be refused")?);
+        assert_eq!(got, variant, "{text}");
+        assert!(text.contains(message), "{text}");
+        assert_eq!(*store.entries()?, before, "a refused move wrote");
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_move_to_global_keeps_the_entry_and_replaces_the_creator(
+        #[values(true, false)] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let store = movable().await?;
+        let org_id = OrgId::try_new("org_acme")?;
+        let org = CatalogScope::Org(org_id.clone());
+        let name = CatalogName::try_new("acmelm")?;
+        let before = store.get_entry(&org, &name).await?.context("fixture")?;
+
+        let moved = move_entry_to_global(&store, &org_id, &name, dry_run).await?;
+
+        let expected = DescriptorEntry {
+            scope: CatalogScope::Global,
+            created_by: DescriptorEntryCreator::Operator,
+            ..before.clone()
+        };
+        assert_eq!(moved.entry, expected);
+        assert_eq!(moved.original_creator, before.created_by);
+        let (in_org, global) = if dry_run {
+            (Some(before), None)
+        } else {
+            (None, Some(expected))
+        };
+        assert_eq!(store.get_entry(&org, &name).await?, in_org);
+        assert_eq!(store.get_entry(&CatalogScope::Global, &name).await?, global);
         Ok(())
     }
 

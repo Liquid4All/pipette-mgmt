@@ -10,7 +10,7 @@ import { handle } from "./format";
 import { browserOnly, clear, load, save, type Identity } from "./identity";
 import { describeBrowser } from "./keys";
 import { pageStorage } from "./legacy";
-import { bySlug, knownOrg, ownOrg, resolveOrg, type OrgRef } from "./orgs";
+import { byName, knownOrg, ownOrg, resolveOrg, type OrgRef } from "./orgs";
 import { signInWithClerk } from "./signin";
 import type { OrgView, OwnUserView } from "./api-types";
 
@@ -69,7 +69,7 @@ class Session {
       if (this.identity !== signer) return;
       this.others = others
         .filter((each) => each.org_id !== read.org_id)
-        .sort(bySlug);
+        .sort(byName);
       this.account = read;
       this.error = "";
     } catch (e) {

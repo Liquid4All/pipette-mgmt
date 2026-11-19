@@ -95,7 +95,7 @@ The route also answers the errors every filing answers
 | 401 | Missing or invalid auth headers, or a device signed ([filing errors](../campaigns.md#errors)) |
 | 403 | As for a [variant edit](edit_variants.md) |
 | 404 | No such campaign, also when a delete removed it during an import. Or an `inherit_from` plan is not there, or is not one the caller can read; the message names it. Nothing is filed |
-| 409 | The campaign is [archived](update_campaign.md): unarchive it first; nothing is filed, dry runs included. Or the campaign runs a plan other than `base_plan_id`, and not as a retry that landed, runs no plan, or runs one with no stored document: nothing is filed. Or another revision moved the campaign, or a delete removed it, while this one was filed: this revision does not become the head, and the server cancels it. Or the campaign changed its owner or its current plan during the import: nothing is filed |
+| 409 | The campaign is [locked or archived](update_campaign.md): unlock or unarchive it first; nothing is filed, dry runs included. Or the campaign runs a plan other than `base_plan_id`, and not as a retry that landed, runs no plan, or runs one with no stored document: nothing is filed. Or another revision moved the campaign, or a delete removed it, while this one was filed: this revision does not become the head, and the server cancels it. Or the campaign changed its owner or its current plan during the import: nothing is filed |
 | 413 | The body is over `plan_body_limit_bytes` ([request size limits](../../httpapi.md#12-request-size-limits)) |
 | 415 | The `Content-Type` is not `application/toml` |
 | 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |

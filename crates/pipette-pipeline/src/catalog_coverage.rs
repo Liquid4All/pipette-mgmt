@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -32,7 +32,8 @@ use crate::descriptor_names::CatalogReadScope;
 
 /// Why the catalog does not name a descriptor. The order of the variants is
 /// the order in which the report checks the causes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Cause {
     /// The result has no descriptor of this kind.
     NoDescriptor,
@@ -129,9 +130,12 @@ pub async fn load_live_entries(
     orgs: &dyn OrgStore,
 ) -> anyhow::Result<(Vec<DescriptorEntry>, usize)> {
     let filter = DescriptorEntryFilter {
-        scopes: CatalogReadScope::EveryOrg { own_org: None }
-            .readable_scopes(orgs)
-            .await?,
+        scopes: CatalogReadScope {
+            own_org: None,
+            every_org: true,
+        }
+        .readable_scopes(orgs)
+        .await?,
         ..Default::default()
     };
     let mut entries = Vec::new();
@@ -248,7 +252,7 @@ impl KindCoverage {
 /// The `catalog coverage` report.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CoverageReport {
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
     /// Results in the window. Each kind counts each of them once.
     pub results: usize,
     pub runtime: KindCoverage,
@@ -259,7 +263,7 @@ pub struct CoverageReport {
 }
 
 impl CoverageReport {
-    fn new(since: DateTime<Utc>, unreadable_entries: usize) -> Self {
+    fn new(since: Timestamp, unreadable_entries: usize) -> Self {
         Self {
             since,
             results: 0,
@@ -275,7 +279,7 @@ impl CoverageReport {
             .rsplit_once('_')
             .filter(|(_, metric_index)| metric_index.parse::<usize>().is_ok())
             .map_or(row.result_id.as_str(), |(job_id, _)| job_id);
-        if row.submitted_at < self.since.timestamp_micros() || !seen.insert(job_id.to_owned()) {
+        if row.submitted_at < self.since.as_microsecond() || !seen.insert(job_id.to_owned()) {
             return;
         }
         self.results += 1;
@@ -318,8 +322,7 @@ impl CoverageReport {
         let _ = writeln!(
             out,
             "catalog coverage: {} results submitted since {}",
-            self.results,
-            self.since.to_rfc3339()
+            self.results, self.since
         );
         if self.unreadable_entries > 0 {
             let _ = writeln!(
@@ -332,6 +335,18 @@ impl CoverageReport {
             .into_iter()
             .for_each(|(heading, kind)| render_kind(&mut out, heading, kind, top));
         out
+    }
+
+    /// The report as one JSON document, with the `top` digests of each kind
+    /// that the catalog does not name exactly.
+    pub fn json(&self, top: usize) -> Value {
+        serde_json::json!({
+            "since": self.since.to_string(),
+            "results": self.results,
+            "unreadable_entries": self.unreadable_entries,
+            "runtimes": kind_json(&self.runtime, top),
+            "models": kind_json(&self.model, top),
+        })
     }
 
     pub fn log(&self, days: u32) {
@@ -379,8 +394,8 @@ fn render_kind(out: &mut String, heading: &str, kind: &KindCoverage, top: usize)
                 .map(|(cause, count)| format!("{}: {count}", cause.label())),
         );
         let why = why.join(", ");
-        let newest = DateTime::<Utc>::from_timestamp_micros(unnamed.newest)
-            .map(|at| at.format("%Y-%m-%d").to_string())
+        let newest = jiff::Timestamp::from_microsecond(unnamed.newest)
+            .map(|at| at.strftime("%Y-%m-%d").to_string())
             .unwrap_or_default();
         let _ = writeln!(
             out,
@@ -390,6 +405,32 @@ fn render_kind(out: &mut String, heading: &str, kind: &KindCoverage, top: usize)
             unnamed.sample
         );
     });
+}
+
+fn kind_json(kind: &KindCoverage, top: usize) -> Value {
+    let top = kind
+        .top(top)
+        .into_iter()
+        .map(|(digest, line)| {
+            serde_json::json!({
+                "digest": digest,
+                "results": line.results,
+                "causes": line.causes,
+                "alias_results": line.alias_results,
+                "alias_member": line.alias_member,
+                "newest": jiff::Timestamp::from_microsecond(line.newest)
+                    .ok()
+                    .map(|at| at.to_string()),
+                "descriptor": line.sample,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "exact": kind.exact,
+        "alias": kind.alias,
+        "unnamed": kind.unnamed,
+        "top": top,
+    })
 }
 
 /// `count` as a percentage of `total`, with one decimal.
@@ -440,7 +481,7 @@ where
 pub async fn coverage(
     stores: &Stores,
     index: &CoverageIndex,
-    since: DateTime<Utc>,
+    since: Timestamp,
     unreadable_entries: usize,
 ) -> anyhow::Result<CoverageReport> {
     let mut report = CoverageReport::new(since, unreadable_entries);
@@ -477,8 +518,8 @@ mod tests {
     /// The window starts at 1 000 000 µs.
     const SINCE: i64 = 1_000_000;
 
-    fn since() -> anyhow::Result<DateTime<Utc>> {
-        DateTime::from_timestamp_micros(SINCE).context("a valid time")
+    fn since() -> anyhow::Result<Timestamp> {
+        jiff::Timestamp::from_microsecond(SINCE).context("a valid time")
     }
 
     /// The canonical string and the digest of `value`, as the server stores
@@ -566,7 +607,7 @@ mod tests {
         fork.scope = CatalogScope::Org(OrgId::try_new("org_1")?);
         fork.members = NonEmptyVec::try_new(vec![DescriptorMember::new(
             serde_json::from_value(vault_runtime("vault_1", "nightly"))?,
-            Utc::now(),
+            Timestamp::now(),
         )?])?;
         Ok(CoverageIndex::new(&[
             fork,
@@ -747,6 +788,26 @@ mod tests {
         let text = report.render(3);
         assert!(text.contains("an alias would name"), "{text}");
         assert!(text.contains("no member has this build"), "{text}");
+
+        let document = report.json(1);
+        assert_eq!(document["results"], 10);
+        assert_eq!(document["runtimes"]["exact"], 2);
+        assert_eq!(document["runtimes"]["unnamed"]["no_member"], 3);
+        assert_eq!(document["models"]["unnamed"]["no_descriptor"], 5);
+        let runtimes = document["runtimes"]["top"]
+            .as_array()
+            .context("a top array")?;
+        assert_eq!(runtimes.len(), 1, "--top limits the digests");
+        let (digest, _) = top.first().context("one unnamed digest")?;
+        assert_eq!(runtimes[0]["digest"], json!(digest));
+        assert_eq!(runtimes[0]["results"], 2);
+        assert_eq!(runtimes[0]["causes"], json!({"no_member": 2}));
+        assert_eq!(
+            runtimes[0]["descriptor"],
+            json!(first.sample),
+            "the descriptor is the stored string"
+        );
+        assert!(runtimes[0]["descriptor"].is_string());
         Ok(())
     }
 }

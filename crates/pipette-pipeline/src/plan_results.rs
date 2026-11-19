@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -95,8 +95,8 @@ pub struct ResultRow {
     /// The non-null `device_*` columns of [`DEVICE_COLUMNS`], without the prefix.
     pub device: BTreeMap<String, Value>,
     pub client_version: Option<String>,
-    pub submitted_at: Option<DateTime<Utc>>,
-    pub scored_at: Option<DateTime<Utc>>,
+    pub submitted_at: Option<Timestamp>,
+    pub scored_at: Option<Timestamp>,
     /// Device milliseconds on the job as the client reported them; every row of
     /// one scoring run carries the same value.
     pub device_time_ms: Option<i64>,
@@ -115,7 +115,7 @@ pub struct ResultRow {
     /// The time that a device submitted the run that the row scores. It equals
     /// `submitted_at`, except on a re-scored copy. There it is the time of the
     /// run that the copy scores again. `null` where the warehouse holds none.
-    pub run_submitted_at: Option<DateTime<Utc>>,
+    pub run_submitted_at: Option<Timestamp>,
     /// The `runtime_version` that the scoring service returned for an eval
     /// row. It is `null` on every other row and on a failed eval row.
     pub score_runtime_version: Option<String>,
@@ -305,11 +305,11 @@ fn stored_json(stored: &str) -> Value {
 }
 
 impl ResultRow {
-    /// Fill counts the warehouse lacks from the table, matched as the scorer
-    /// matches. For a row without a model, the function uses `requested`, the
-    /// model that the job requested. A plan-attached failure can produce this row.
-    /// The function preserves a stored count even if the table now contains a
-    /// different count.
+    /// Set the counts from the table, matched as the scorer matches, so a table
+    /// edit reaches rows scored before it. A model the table lacks keeps the
+    /// stored counts. For a row without a model, the function fills only empty
+    /// counts, from `requested`, the model that the job requested. A
+    /// plan-attached failure can produce this row.
     pub fn fill_model_params(&mut self, table: &ModelParamTable, requested: Option<&Model>) {
         (
             self.model_params_total_millions,
@@ -328,16 +328,15 @@ impl ResultRow {
             self.model_params_total_millions,
             self.model_params_active_millions,
         );
-        if stored.0.is_some() {
-            return stored;
-        }
-        let resolved = if self.records_no_model() {
-            requested.and_then(|model| table.resolve_model(model))
-        } else {
+        let resolved = if !self.records_no_model() {
             table.resolve_recorded(
                 self.model_descriptor.as_deref(),
                 self.model_vault_descriptor.as_deref(),
             )
+        } else if stored.0.is_none() {
+            requested.and_then(|model| table.resolve_model(model))
+        } else {
+            None
         };
         resolved.map_or(stored, |(_, entry)| (Some(entry.total), Some(entry.active)))
     }
@@ -1178,8 +1177,8 @@ mod tests {
         assert_eq!(row.client_version.as_deref(), Some("1.4.0"));
         assert_eq!(row.score_runtime_version.as_deref(), Some("1.2.3"));
         assert_eq!(
-            row.scored_at.map(|at| at.to_rfc3339()),
-            Some("2026-09-29T10:05:00+00:00".to_string())
+            row.scored_at.map(|at| at.to_string()),
+            Some("2026-09-29T10:05:00Z".to_string())
         );
         Ok(())
     }

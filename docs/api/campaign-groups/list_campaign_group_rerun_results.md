@@ -1,7 +1,8 @@
 # `GET /api/v1/campaign-groups/{group_id}/rerun-results`
 
 The re-runs the group's [policies](../campaign-groups.md#policies) filed in
-the members whose plans the caller may read, and how each answered
+the members whose plans the caller may read, none of an eval's cell, and how
+each answered
 ([re-run results](../campaign-groups.md#re-run-results)). It reads what
 queue-maintenance recorded, and not pipette-duckdb.
 
@@ -28,8 +29,8 @@ queue-maintenance recorded, and not pipette-duckdb.
     E2E in percent against 100, where a share whose excess rounds to 0.0% is
     not over. For `failed`, 1 when a row is a device failure with one of
     `codes`, the list of codes the policy re-ran at the filing, without their
-    re-runs, else 0, and no `threshold`; `codes` is `null` for the other kinds. `before_code` is the replaced run's
-    failure code, for `failed` only.
+    re-runs, else 0, and no `threshold`; `codes` is `null` for the other kinds.
+    `before_code` is the replaced run's failure code, for `failed` only.
   - Once the re-run's rows are read: `after`, the check's value on them,
     `null` when they hold none; `after_code`, the re-run's failure code for
     `failed`; `outcome`, `flagged` when the check still flags the re-run at

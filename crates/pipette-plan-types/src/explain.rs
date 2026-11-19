@@ -5,7 +5,7 @@
 //! read it gets the scheduling state, its own job counts and fixed reason strings,
 //! with the rest absent.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{FleetDetail, PlanId};
@@ -118,11 +118,13 @@ pub struct PlanExplanation {
     /// The scheduling state as one sentence at the caller's tier.
     pub headline: String,
     /// When the report read the queue and the fleet; every count dates from it.
-    pub read_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub read_at: Timestamp,
     /// When maintenance last computed the plan's snapshot. `null` when none
     /// has, which by itself explains a plan that reads `active` and runs
     /// nothing.
-    pub snapshot_computed_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub snapshot_computed_at: Option<Timestamp>,
     pub census: JobCensus,
     /// `true` when the live scan found the plan starved but the cached
     /// starvation set names none of its jobs, so the groups carry no ladder.

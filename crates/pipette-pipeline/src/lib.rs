@@ -37,7 +37,6 @@ pub mod plan_results;
 pub mod plan_validation;
 pub mod queue_maintenance;
 mod recalculation;
-pub mod record_copy;
 pub mod requeue_eval;
 pub mod run_evidence;
 pub mod score;
