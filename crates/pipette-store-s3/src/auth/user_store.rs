@@ -145,7 +145,7 @@ impl UserStore for S3UserStore {
                 UserPreauthRejectionError::NotFound,
             ));
         };
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let grant = match pipette_core::user_preauth::validate(&key, secret, now) {
             Ok(grant) => grant,
             Err(rejection) => return Ok(UserPreauthConsumeOutcome::Rejected(rejection)),
@@ -295,7 +295,7 @@ mod tests {
         let (store, users) = user_store();
 
         let email = pipette_plan_types::ContactEmail::try_new("Operator@Example.com")?;
-        let user = pipette_core::user::User::try_new(email, chrono::Utc::now())?;
+        let user = pipette_core::user::User::try_new(email, jiff::Timestamp::now())?;
         let user_id = user.user_id.clone();
         users
             .claim_user_email(user.contact_email.as_str(), &user_id)
@@ -380,7 +380,7 @@ mod tests {
                 expires_at: None,
                 note: None,
             },
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         users.put_user_preauth_key(&minted.key).await?;

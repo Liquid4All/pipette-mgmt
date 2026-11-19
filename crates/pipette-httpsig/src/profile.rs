@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use sfv::{BareItem, InnerList, Item};
 use strum::{AsRefStr, Display, EnumString};
 
@@ -103,7 +103,7 @@ pub(crate) fn components(list: &InnerList) -> Result<Vec<Component>, HttpSigErro
 
 pub(crate) struct Params {
     pub(crate) key_id: UserKeyId,
-    pub(crate) created: DateTime<Utc>,
+    pub(crate) created: Timestamp,
     pub(crate) nonce: Nonce,
 }
 
@@ -112,8 +112,8 @@ impl Params {
     /// then decides.
     pub(crate) fn check(
         list: &InnerList,
-        now: DateTime<Utc>,
-        max_skew: TimeDelta,
+        now: Timestamp,
+        max_skew: SignedDuration,
     ) -> Result<Self, HttpSigError> {
         let (mut created, mut expires, mut nonce, mut key_id, mut alg, mut tag) =
             (None, None, None, None, None, None);
@@ -154,14 +154,14 @@ impl Params {
         let key_id = UserKeyId::try_new(key_id.ok_or(Profile("keyid is required"))?)
             .map_err(|_| Profile("keyid is not a user key id"))?;
         let created = created
-            .and_then(|s| DateTime::from_timestamp(s, 0))
+            .and_then(|s| Timestamp::from_second(s).ok())
             .ok_or(Profile("created is required"))?;
-        if (now - created).abs() > max_skew {
+        if now.duration_since(created).abs() > max_skew {
             return Err(HttpSigError::Stale {
-                skew_secs: (now - created).num_seconds(),
+                skew_secs: now.duration_since(created).as_secs(),
             });
         }
-        if expires.is_some_and(|expires| expires <= now.timestamp()) {
+        if expires.is_some_and(|expires| expires <= now.as_second()) {
             return Err(HttpSigError::Expired);
         }
         Ok(Self {
@@ -210,23 +210,23 @@ pub(crate) fn inner_list(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeDelta, Utc};
+    use jiff::{SignedDuration, Timestamp};
 
     use crate::fields::signature_input;
     use crate::profile::*;
 
     const KEY_ID: &str = "userkey_0000000000000000000000000000000000000000000000000000000000000000";
-    const SKEW: TimeDelta = TimeDelta::seconds(300);
+    const SKEW: SignedDuration = SignedDuration::from_secs(300);
 
     fn checked(input: &str) -> Result<(), HttpSigError> {
         let (_, list) = signature_input(input)?;
         components(&list)?;
-        Params::check(&list, Utc::now(), SKEW).map(|_| ())
+        Params::check(&list, Timestamp::now(), SKEW).map(|_| ())
     }
 
     #[test]
     fn a_signature_outside_the_profile_is_refused() {
-        let created = Utc::now().timestamp();
+        let created = Timestamp::now().as_second();
         let all = r#""@method" "@authority" "@path" "@query""#;
         let good =
             format!(r#";created={created};nonce="n";keyid="{KEY_ID}";alg="ed25519";tag="pipette""#);
@@ -324,7 +324,7 @@ mod tests {
     /// refused.
     #[test]
     fn an_expires_ahead_is_accepted() {
-        let created = Utc::now().timestamp();
+        let created = Timestamp::now().as_second();
         let input = format!(
             r#"sig=("@method" "@authority" "@path" "@query");created={created};expires={};nonce="n";keyid="{KEY_ID}";alg="ed25519";tag="pipette""#,
             created + 60

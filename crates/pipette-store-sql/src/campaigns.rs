@@ -185,14 +185,10 @@ fn campaign_row(campaign: &Campaign) -> anyhow::Result<(String, String, &'static
         state: CampaignState::Active,
         ..campaign.clone()
     };
-    let state = match campaign.state {
-        CampaignState::Active => "active",
-        CampaignState::Archived => "archived",
-    };
     Ok((
         serde_json::to_string_pretty(&bare)?,
         serde_json::to_string(&campaign.labels)?,
-        state,
+        campaign.state.as_str(),
     ))
 }
 
@@ -206,7 +202,7 @@ fn read_campaign(body: &str, labels: &str, state: &str) -> anyhow::Result<Campai
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::campaign::{CampaignOwner, NewCampaign};
     use pipette_core::types::Mint;
@@ -222,7 +218,7 @@ mod tests {
                 user_id: UserId::mint(),
             },
         )
-        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now()))
+        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now()))
     }
 
     async fn write_raw(db: &SqlDatabase, id: &str, body: &str) -> anyhow::Result<()> {
@@ -293,9 +289,9 @@ mod tests {
         let mut campaign = a_campaign("Nightly")?;
         campaign.set_labels(
             serde_json::from_value(serde_json::json!({"study": "acmelm-text", "device": "s26"}))?,
-            Utc::now(),
+            Timestamp::now(),
         );
-        campaign.set_state(CampaignState::Archived, Utc::now());
+        campaign.set_state(CampaignState::Archived, None, Timestamp::now());
         store.put_campaign(&campaign).await?;
         let body = stored_body(db, &campaign.campaign_id)
             .await?

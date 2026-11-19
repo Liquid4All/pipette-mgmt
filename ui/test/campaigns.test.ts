@@ -24,9 +24,9 @@ const acme = { kind: "org", org_id: "org_acme", slug: "acme" } as const;
 
 describe("the campaign listings", () => {
   test("each branch asks the newest first with each plan, and only every campaign's names owners", () => {
-    expect(campaignQuery({ kind: "all" }, null, "")).toBe("order=newest&plan=true&models=true&state=active&names=true");
-    expect(campaignQuery({ kind: "me" }, "campaign_9", "")).toBe("order=newest&plan=true&models=true&state=active&owner=mine&cursor=campaign_9");
-    expect(campaignQuery(acme, null, "5")).toBe("order=newest&plan=true&models=true&state=active&owner=org&org_id=org_acme&limit=5");
+    expect(campaignQuery({ kind: "all" }, null, "")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&names=true");
+    expect(campaignQuery({ kind: "me" }, "campaign_9", "")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&owner=mine&cursor=campaign_9");
+    expect(campaignQuery(acme, null, "5")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&owner=org&org_id=org_acme&limit=5");
     expect(campaignQuery({ kind: "me" }, null, "", "plan-1", "archived")).toBe("order=newest&plan=true&models=true&plan_id=plan-1&owner=mine");
     expect([campaignQuery({ kind: "me" }, null, "", "", "archived"), campaignQuery({ kind: "me" }, null, "", "", "all")])
       .toEqual(["order=newest&plan=true&models=true&state=archived&owner=mine", "order=newest&plan=true&models=true&owner=mine"]);
@@ -96,21 +96,35 @@ describe("the campaign listings", () => {
 
   test("the listing hides a campaign's id until the reader picks that column", () => {
     const keys = (picks: Picks | null) => drawnColumns(campaignTable({}, false).columns, picks).map((c) => c.key);
-    expect(keys(null)).toEqual(["name", "status", "progress", "labels", "created_at", "updated_at"]);
+    expect(keys(null)).toEqual(["name", "status", "policies", "progress", "labels", "created_at", "updated_at"]);
     expect(keys({ campaign_id: true, labels: false }))
-      .toEqual(["campaign_id", "name", "status", "progress", "created_at", "updated_at"]);
+      .toEqual(["campaign_id", "name", "status", "policies", "progress", "created_at", "updated_at"]);
   });
 
   test("a pick on a branch without the owner column leaves that column drawn on every campaign's branch", () => {
     stubStorage();
     new PickedColumns("pipette.campaigns.columns", campaignTable({}, false).columns).pick("labels", false);
     expect(drawnKeys("pipette.campaigns.columns", campaignTable({}, true).columns))
-      .toEqual(["name", "owner", "status", "progress", "created_at", "updated_at"]);
+      .toEqual(["name", "owner", "status", "policies", "progress", "created_at", "updated_at"]);
   });
 
   test("a list of keys kept on a branch without the owner column hides that column on every campaign's branch", () => {
     stubStorage().set("pipette.campaigns.columns", JSON.stringify(["name", "status"]));
     expect(drawnKeys("pipette.campaigns.columns", campaignTable({}, true).columns)).toEqual(["name", "status"]);
+  });
+
+  test("a row's policies read each check, and its filter whether any is triggered; a campaign in no group has none", () => {
+    const row = (triggered: boolean): CampaignView => ({
+      campaign_id: "campaign_1",
+      policy_checks: [{ kind: "swap", triggered: false }, { kind: "spread", triggered }],
+    }) as CampaignView;
+    const spec = campaignTable({}, false);
+    const raw = (of: CampaignView) => spec.columns.find((column) => column.key === "policies")?.raw(of);
+    const choice = (of: CampaignView) => spec.choices?.find((choice) => choice.key === "policies")?.values(of);
+    expect([raw(row(true)), choice(row(true)), choice(row(false))])
+      .toEqual(["swap cleared, spread triggered", ["triggered"], ["cleared"]]);
+    const ungrouped = { campaign_id: "campaign_2" } as CampaignView;
+    expect([raw(ungrouped), choice(ungrouped)]).toEqual([null, []]);
   });
 
   test("a row's progress prints its plan's finished, failed and running jobs of all", () => {
@@ -301,6 +315,8 @@ describe("the new-campaign form", () => {
     expect(newCampaignOwners(reader(["manage_orgs"], "org_acme"))).toEqual(me);
     expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"], "org_acme"))).toEqual([...me, org]);
     expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"]))).toEqual(me);
+    expect(newCampaignOwners({ ...reader(["submit_plans"], "org_acme"), org_display_name: "Acme Corp" }))
+      .toEqual([...me, { value: "org_acme", label: "Acme Corp (organization)" }]);
   });
 
   test("chooses the owner an address names only when it offers it", () => {

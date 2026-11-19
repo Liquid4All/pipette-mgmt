@@ -146,7 +146,7 @@ pub async fn owner_scope(
         VaultOwner::Org { org_id } => Some(org_id.clone()),
         VaultOwner::User { user_id } => orgs.get_membership(user_id).await?,
     };
-    Ok(org.map_or(CatalogReadScope::Unaffiliated, CatalogReadScope::Org))
+    Ok(CatalogReadScope::own(org))
 }
 
 /// Replace each catalog-name string in a variant's `runtimes` with its runtime
@@ -443,7 +443,7 @@ mod tests {
                 pipette_store_testkit::no_queue(),
             )?;
             let catalog = crate::descriptor_catalog_admin::tests::Memory::default();
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let runtime: pipette_plan_types::Runtime = serde_json::from_value(
                 serde_json::json!({"type":"llamacpp_cli_stock_tools", "source":"github_release", "repository_url":"github.com/ggml-org/llama.cpp", "repository_version":"b1", "flavor":"macos-arm64"}),
             )?;

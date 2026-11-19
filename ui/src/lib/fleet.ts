@@ -2,6 +2,7 @@
 // in the address bar, so a bookmark reproduces the listing, and passed on to
 // `GET /api/v1/clients` (`docs/api/devices/list_clients.md`).
 
+import { orgName, type OrgRef } from "./orgs";
 import { clientLink } from "./routes";
 import type { TableSpec } from "./table";
 import type { ClientListRow } from "./api-types";
@@ -65,7 +66,7 @@ export function pagePairs(filters: FleetFilters): [string, string][] {
 export type DeviceBranch =
   | { kind: "all" }
   | { kind: "me" }
-  | { kind: "org"; org_id: string; slug: string; count: number | null }
+  | ({ kind: "org"; count: number | null } & OrgRef)
   | { kind: "server" };
 
 /** The `GET /api/v1/clients` pairs that narrow the fleet to `branch`. */
@@ -100,7 +101,7 @@ export function emptyNotice(branch: DeviceBranch, filters: FleetFilters, cursor:
     return "Capability filters need at least one requires flag. Other clauses only narrow the selection.";
   }
   if (branch.kind === "org" && branch.count === 0) {
-    return `${branch.slug} owns no devices, directly or through a member.`;
+    return `${orgName(branch)} owns no devices, directly or through a member.`;
   }
   if (cursor) return "No clients at this position. Go back to the first page.";
   if (filtering(filters)) {
@@ -109,8 +110,8 @@ export function emptyNotice(branch: DeviceBranch, filters: FleetFilters, cursor:
   switch (branch.kind) {
     case "all": return status ? `No client is ${status}.` : "No clients registered.";
     case "me": return status ? `You own no ${status} devices.` : "You own no devices.";
-    case "org": return status ? `${branch.slug} owns no ${status} devices.`
-      : `${branch.slug} owns no devices, directly or through a member.`;
+    case "org": return status ? `${orgName(branch)} owns no ${status} devices.`
+      : `${orgName(branch)} owns no devices, directly or through a member.`;
     case "server": return status ? `No unclaimed device is ${status}.` : "Every device has an owner.";
   }
 }

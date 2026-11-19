@@ -180,7 +180,7 @@ impl CampaignChain {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::campaign::{Campaign, CampaignOwner, NewCampaign};
     use pipette_core::plan::PlanManifest;
@@ -200,7 +200,7 @@ mod tests {
                 .put_plan(&PlanManifest {
                     plan_id: plan_id.clone(),
                     status: PlanStatus::Active,
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     submitted_by: None,
                     campaign_id: None,
                     previous_plan_id: ids.last().cloned(),
@@ -231,7 +231,7 @@ mod tests {
                 user_id: UserId::mint(),
             },
         )
-        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
         // `None` is a record written before a campaign needed a first plan.
         Ok(Campaign {
             current_plan_id: head,

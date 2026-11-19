@@ -42,8 +42,9 @@ async fn test_auth_rejected_with_expired_timestamp(
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    let outside = (chrono::Utc::now() + chrono::Duration::minutes(offset_minutes))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let outside = (jiff::Timestamp::now() + jiff::SignedDuration::from_mins(offset_minutes))
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let headers =
         pipette_web_testkit::auth_headers_at(&sk, &client_id, "GET", "/clients/me", outside)?;
     let resp =
@@ -79,7 +80,9 @@ async fn test_a_malformed_client_id_is_refused_by_name(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let headers = vec![
         ("X-Client-Id", client_id.to_string()),
         ("X-Timestamp", timestamp),
@@ -347,7 +350,9 @@ async fn test_a_repeated_request_hinges_on_the_nonce(
     let state = make_state(dir.path()).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let captured = pipette_web_testkit::auth_headers_at(
         &sk,
         &client_id,
@@ -439,7 +444,9 @@ async fn test_an_empty_nonce_is_rejected_as_missing() -> anyhow::Result<()> {
     let state = make_state_with_legacy_signatures(dir.path(), false).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let payload = format!("v1\nGET\n/clients/me\n{timestamp}\n{client_id}\n");
     let headers = vec![
         ("X-Client-Id", client_id.to_string()),
@@ -486,7 +493,9 @@ async fn test_a_small_order_public_key_cannot_be_signed_for(
     let client_id =
         pipette_web_testkit::register_and_approve_public_key(&state, &hex::encode(identity))
             .await?;
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let headers = vec![
         ("X-Client-Id", client_id.to_string()),
         ("X-Timestamp", timestamp),
@@ -518,7 +527,9 @@ async fn test_an_off_curve_public_key_is_the_callers_fault() -> anyhow::Result<(
     let client_id =
         pipette_web_testkit::register_and_approve_public_key(&state, &hex::encode(off_curve))
             .await?;
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let headers = vec![
         ("X-Client-Id", client_id.to_string()),
         ("X-Timestamp", timestamp),
@@ -687,7 +698,9 @@ async fn test_signed_payload_wire_format(
     let state = make_state_from_config(config).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let nonce = "0123456789abcdef0123456789abcdef";
     let payload = format!("v1\nGET\n/clients/me\n{timestamp}\n{client_id}\n{nonce}");
     let mut headers = vec![
@@ -753,7 +766,9 @@ async fn test_a_v3_signature_is_held_to_its_authority(
     let state = make_state_from_config(config).await?;
     let (sk, client_id) = register_and_approve(&state).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let nonce = "0123456789abcdef0123456789abcdef";
     let payload = format!("v3\nGET\n{signed_for}\n/clients/me\n{timestamp}\n{client_id}\n{nonce}");
     let headers = vec![

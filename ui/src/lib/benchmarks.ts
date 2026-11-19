@@ -5,13 +5,13 @@
 
 import { ApiError } from "./api";
 import { textOrder } from "./format";
-import { administersOrg, bySlug, ownOrg, type OrgRef } from "./orgs";
+import { administersOrg, byName, choiceName, orgName, ownOrg, type OrgRef } from "./orgs";
 import { benchmarkLink, legacyOrgFilter } from "./routes";
 import type { TableSpec } from "./table";
 import type { OrgBenchmarks, OwnUserView } from "./api-types";
 
 /** Which catalogs a listing draws (the classic `Branch`). */
-export type BenchmarkBranch = { kind: "all" } | { kind: "org"; slug: string };
+export type BenchmarkBranch = { kind: "all" } | ({ kind: "org" } & Pick<OrgRef, "slug" | "display_name">);
 
 /** Whether the reader reads every organization's catalog (`read_reach`), rather than its own alone. */
 export const readsEveryCatalog = (reader: OwnUserView) => reader.may.read_roster === "every";
@@ -34,13 +34,13 @@ export const catalogOrg = async (
   await resolve(catalog.org_id).catch(() => null) ?? { org_id: catalog.org_id, slug: reference };
 
 /**
- * The organizations the new-benchmark form offers, by slug: every one or the
+ * The organizations the new-benchmark form offers, by display name: every one or the
  * reader's own, as its roster administration reaches; else why none.
  */
 export function writeOrgs(reader: OwnUserView, every: OrgRef[]): { orgs: OrgRef[]; refusal: string } {
   const reach = reader.may.administer_roster;
   const own = ownOrg(reader);
-  const orgs = reach === "every" ? [...every].sort(bySlug) : reach === "own" && own ? [own] : [];
+  const orgs = reach === "every" ? [...every].sort(byName) : reach === "own" && own ? [own] : [];
   return orgs.length || reach === "every" ? { orgs, refusal: "" }
     : { orgs, refusal: "you administer no organization's benchmarks" };
 }
@@ -71,21 +71,30 @@ export function benchmarkRows(catalogs: BenchmarkCatalogs["catalogs"]): Benchmar
       ...catalog.benchmarks.map((entry) => row(org, entry.benchmark_id, entry.benchmark_type)),
       ...catalog.unreadable_benchmark_ids.map((benchmark_id) => row(org, benchmark_id, null)),
     ])
-    .sort((a, b) => textOrder(a.org.slug, b.org.slug) || textOrder(a.benchmark_id, b.benchmark_id));
+    .sort((a, b) => byName(a.org, b.org) || textOrder(a.benchmark_id, b.benchmark_id));
 }
 
-/** The benchmark listing's columns and filters; `orgs` where its rows name their organization. */
-export function benchmarkTable(orgs: boolean): TableSpec<BenchmarkRow> {
+/**
+ * The benchmark listing's columns and filters. `orgs` holds the organizations that the reader reads, or `null` where
+ * the rows do not name their organization. The organization filter keeps each slug in the address and shows the
+ * display name.
+ */
+export function benchmarkTable(orgs: OrgRef[] | null): TableSpec<BenchmarkRow> {
+  const named = (slug: string) => {
+    const org = orgs?.find((each) => each.slug === slug);
+    return org && orgs ? choiceName(org, orgs) : slug;
+  };
   return {
     columns: [
       { key: "benchmark_id", label: "benchmark_id", raw: (row) => row.benchmark_id, href: (row) => row.href },
-      ...(orgs ? [{ key: "organization", label: "organization", raw: (row: BenchmarkRow) => row.org.slug }] : []),
+      ...(orgs ? [{ key: "organization", label: "organization", raw: (row: BenchmarkRow) => orgName(row.org) }] : []),
       { key: "benchmark_type", label: "benchmark_type", raw: (row) => row.benchmark_type },
     ],
     texts: [{ key: "id", label: "benchmark_id", texts: (row) => [row.benchmark_id] }],
     choices: [
       { key: "type", label: "benchmark_type", values: (row) => [row.benchmark_type ?? "unreadable"] },
-      ...(orgs ? [{ key: "organization", label: "organization", values: (row: BenchmarkRow) => [row.org.slug] }] : []),
+      ...(orgs ? [{ key: "organization", label: "organization", values: (row: BenchmarkRow) => [row.org.slug],
+                   name: named }] : []),
     ],
   };
 }
@@ -93,7 +102,7 @@ export function benchmarkTable(orgs: boolean): TableSpec<BenchmarkRow> {
 /** What an empty listing says, as `benchmarks.html` words it; `read` is the organizations the reader reads. */
 export function benchmarksEmpty(branch: BenchmarkBranch, read: number): string {
   if (!read) return "You belong to no organization, so no private benchmark is yours to read.";
-  return branch.kind === "org" ? `${branch.slug} keeps no private benchmarks.` : "No private benchmarks you may see.";
+  return branch.kind === "org" ? `${orgName(branch)} keeps no private benchmarks.` : "No private benchmarks you may see.";
 }
 
 /** Where a link carrying the old `org` filter lands (the classic `benchmarks`): that organization's listing, the paging kept. */
@@ -142,7 +151,7 @@ export function pathBenchmarkId(raw: string): string {
 /** A refused create: a `412` is an id the organization keeps, worded as the classic `create_benchmark` worded it, with its page. */
 export function createRefused(e: unknown, org: OrgRef, benchmark_id: string): { message: string; kept: string | null } | null {
   if (!(e instanceof ApiError) || e.status !== 412) return null;
-  return { message: `${org.slug} already keeps a benchmark ${benchmark_id}`, kept: benchmarkLink(org, benchmark_id) };
+  return { message: `${orgName(org)} already keeps a benchmark ${benchmark_id}`, kept: benchmarkLink(org, benchmark_id) };
 }
 
 /** A refused replace: a `412` is an entry deleted since the page drew it, which the edit does not write back. */

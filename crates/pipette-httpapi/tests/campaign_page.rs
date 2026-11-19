@@ -20,8 +20,8 @@ use pipette_web_testkit::{
     DUCKDB_TIMEOUT, FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner, add_starved_snapshot,
     approved_client, approved_object_client, body_json, created_campaign, file_job_bodies,
     filed_plan, json_str, post_plan_document, put_idle_campaign, put_plan_document,
-    registered_user, seed_org, seeded_object_state, seeded_sql_state, seeded_state, set_user_org,
-    signed_empty, signed_json, user_address, with_duckdb,
+    registered_user, seed_org, seed_org_named, seeded_object_state, seeded_sql_state, seeded_state,
+    set_user_org, signed_empty, signed_json, user_address, with_duckdb,
 };
 
 async fn read(
@@ -188,6 +188,7 @@ async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Res
             "may_administer",
             "may_edit_variants",
             "may_rerun",
+            "may_tag",
             "name",
             "names",
             "owner",
@@ -292,7 +293,7 @@ async fn test_the_overview_withholds_what_the_plan_scope_does_not_read() -> anyh
     let duckdb = MockServer::start_async().await;
     let state = with_duckdb(state, &duckdb.base_url())?;
     let totals = mock_device_time(&duckdb, 1_000, 0).await;
-    let acme = seed_org(&state, "acme").await?.org_id;
+    let acme = seed_org_named(&state, "acme", "Acme Corp.").await?.org_id;
     let author = member(
         &state,
         &acme,
@@ -316,7 +317,7 @@ async fn test_the_overview_withholds_what_the_plan_scope_does_not_read() -> anyh
     let rows = history(&body)?;
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row["plan"].is_null()), "{body}");
-    assert_eq!(body["names"], json!({ acme.as_str(): "acme" }));
+    assert_eq!(body["names"], json!({ acme.as_str(): "Acme Corp." }));
     // A total over a plan the reader may not read is not asked for.
     assert_no_totals(&body);
     totals.assert_calls_async(0).await;

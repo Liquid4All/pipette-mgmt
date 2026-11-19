@@ -34,7 +34,7 @@
   import { DISABLE_ACCOUNT, MAKE_READER } from "../lib/danger";
   import { take } from "../lib/flash";
   import { when } from "../lib/format";
-  import { bySlug, type OrgRef } from "../lib/orgs";
+  import { byName, choiceName, orgName, type OrgRef } from "../lib/orgs";
   import { filedEmpty, filedQuery, takenScope } from "../lib/plans";
   import { mintBody } from "../lib/preauth";
   import { toggled } from "../lib/rights";
@@ -86,7 +86,7 @@
       admin ? preauthKeys(signer, id) : [],
       admin && reader.may.administer_roster === "every" ? orgs(signer, { counts: false }) : [],
     ]);
-    return { record, org, keys, preauth, orgs: listed.sort(bySlug) };
+    return { record, org, keys, preauth, orgs: listed.sort(byName) };
   }
   page.run(read);
 
@@ -239,7 +239,7 @@
           <dt>account_type</dt><dd>{shown.account_type}</dd>
           <dt>status</dt><dd><StatusPill status={shown.status} /></dd>
           <dt>organization</dt><dd>
-            {#if drawn.org}<a href={orgLink(drawn.org)}>{drawn.org.slug}</a> <span class="muted id">{drawn.org.org_id}</span>
+            {#if drawn.org}<a href={orgLink(drawn.org)}>{orgName(drawn.org)}</a> <span class="muted id">{drawn.org.org_id}</span>
             {:else if shown.org_id}<span class="id">{shown.org_id}</span>
             {:else}<span class="muted">none</span>{/if}
           </dd>
@@ -369,14 +369,14 @@
                 <form class="bar" onsubmit={(event) => move(event, moveTo || null)}>
                   <select bind:value={moveTo} aria-label="organization" aria-describedby={ids.text}>
                     <option value="">no organization</option>
-                    {#each drawn.orgs as each (each.org_id)}<option value={each.org_id}>{each.slug}</option>{/each}
+                    {#each drawn.orgs as each (each.org_id)}<option value={each.org_id}>{choiceName(each, drawn.orgs)}</option>{/each}
                   </select>
                   <button type="submit" aria-disabled={work.busy}>Move</button>
                 </form>
               {:else if !self}
                 <form onsubmit={(event) => move(event, null)}>
                   <button type="submit" aria-describedby={ids.text} aria-disabled={work.busy}>Remove from {
-                    drawn.org?.slug ?? "the organization"}</button>
+                    (drawn.org ? orgName(drawn.org) : "the organization")}</button>
                 </form>
               {/if}
             {/snippet}

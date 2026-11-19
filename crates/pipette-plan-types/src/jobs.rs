@@ -2,7 +2,7 @@
 //! `GET /api/v1/plans/{plan_id}/jobs` (a plan's jobs and results), the one
 //! surface that discloses a plan's `job_ids`; the plan read withholds them.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::results::ResultRow;
@@ -67,7 +67,7 @@ pub struct FailedJob {
     pub benchmark_id: BenchmarkId,
     pub benchmark_type: BenchmarkType,
     pub status: JobStatus,
-    pub submitted_at: DateTime<Utc>,
+    pub submitted_at: Timestamp,
     pub failure_reason: NonEmptyTrimmedString,
     #[serde(default)]
     pub failure_code: FailureCode,
@@ -86,8 +86,8 @@ pub struct SubmittedJob {
     pub benchmark_id: BenchmarkId,
     pub benchmark_type: BenchmarkType,
     pub status: JobStatus,
-    pub submitted_at: DateTime<Utc>,
-    pub scored_at: Option<DateTime<Utc>>,
+    pub submitted_at: Timestamp,
+    pub scored_at: Option<Timestamp>,
     pub score_runtime_version: Option<String>,
     pub metrics: Option<Vec<JobMetric>>,
 }
@@ -190,7 +190,8 @@ pub enum JobState {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct JobQueue {
     /// The deadline the queue holds the job under; `null` for none.
-    pub expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub expires_at: Option<Timestamp>,
     /// `null` while the job waits for a client.
     pub lease: Option<Lease>,
 }
@@ -200,7 +201,8 @@ pub struct JobQueue {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Lease {
     /// When the lease lapses without a heartbeat.
-    pub expires_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub expires_at: Timestamp,
     /// The machine holding it, as the server handed it out. `null` at the
     /// withheld fleet tier.
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
@@ -225,8 +227,10 @@ pub struct PlanCell {
 pub struct ExpiredJob {
     /// This plan's deadline for the job, not the queue's `expires_at`, which
     /// is the latest across the plans that share the job.
-    pub expires_at: DateTime<Utc>,
-    pub recorded_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub expires_at: Timestamp,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub recorded_at: Timestamp,
 }
 
 /// What a job's plan records of it, in its manifest.

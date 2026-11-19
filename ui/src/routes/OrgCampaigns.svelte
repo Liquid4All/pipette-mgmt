@@ -19,9 +19,9 @@
 </script>
 
 <OrgScope reference={route.org} title="Campaigns" inline
-          action={(org) => newCampaignAction({ kind: "org", org_id: org.org_id, slug: org.slug })}>
+          action={(org) => newCampaignAction({ kind: "org", ...org })}>
   {#snippet children(org)}
-    {@const branch = { kind: "org" as const, org_id: org.org_id, slug: org.slug }}
+    {@const branch = { kind: "org" as const, ...org }}
     {@const base = orgLink(org, "/campaigns")}
     <TabBar label="Campaigns" items={listingTabs(base, groups)} />
     {#if groups}

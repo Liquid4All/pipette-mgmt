@@ -1,29 +1,23 @@
 <script lang="ts">
-  // A campaign group's Campaigns tab once read: its record, and its member campaigns as the campaign listings draw them
-  // with each policy that is on marked cleared or triggered, with an add from the owner's other campaigns and a remove
-  // of each, each a write the page passes.
-  import { allCleared, marksText, mayFile, memberOffers, memberRows, policyMarks } from "../campaign-groups";
+  // A campaign group's Campaigns tab once read: its record, and its member campaigns as the campaign listings draw them,
+  // with how many every policy that is on cleared, an add from the owner's other campaigns and a remove of each, each a
+  // write the page passes.
+  import { mayFile, memberOffers, memberRows } from "../campaign-groups";
   import { campaignTable } from "../campaigns";
   import { when } from "../format";
-  import { offeredChoices, type TableSpec } from "../table";
-  import type {
-    CampaignGroupPolicyPreview, CampaignGroupView, CampaignView, OwnUserView, UserPermission,
-  } from "../api-types";
-  import { name as campaignName, progress, progressHead, status } from "./CampaignListing.svelte";
+  import { offeredChoices } from "../table";
+  import type { CampaignGroupView, CampaignView, OwnUserView } from "../api-types";
+  import { name as campaignName, policies, progress, progressHead, status } from "./CampaignListing.svelte";
   import DataTable from "./DataTable.svelte";
   import LabelChips from "./LabelChips.svelte";
   import MultiSelect from "./MultiSelect.svelte";
   import OwnerCell from "./OwnerCell.svelte";
-  import { Busy, type Loader } from "./work.svelte";
+  import { Busy } from "./work.svelte";
 
-  let { group, listed, preview, lacks, reader, names, listing, add, remove }: {
+  let { group, listed, reader, names, listing, add, remove }: {
     group: CampaignGroupView;
     /** The campaigns read beside the group: the members' plans, and what the add offers. */
     listed: CampaignView[];
-    /** The group's policy preview, whose `triggered` gives each member's policy marks. */
-    preview: Loader<CampaignGroupPolicyPreview>;
-    /** The grants the preview takes that the reader lacks; with any, `preview` is never read. */
-    lacks: UserPermission[];
     reader: OwnUserView;
     names: Record<string, string>;
     /** The owner's listing, which a member's label opens narrowed to it. */
@@ -35,20 +29,12 @@
   const files = $derived(mayFile(reader, group.owner));
   // The rows are read already, so the members' table filters in the page alone; they carry no models to search.
   const table = campaignTable({}, false);
-  const checked = $derived(new Map((preview.data?.members ?? []).map((row) => [row.campaign_id, row])));
-  const spec: TableSpec<CampaignView> = $derived({
-    ...table, server: [],
-    columns: [...table.columns, { key: "policies", label: "policies", raw: (row) => {
-      const marks = checked.get(row.campaign_id);
-      return marks ? marksText(marks) : null;
-    } }],
-    texts: table.texts?.map((text) => ({ ...text, placeholder: "campaign id, name or label" })),
-    choices: [...table.choices ?? [], { key: "policies", label: "policies", values: (row) => {
-      const marks = checked.get(row.campaign_id);
-      return marks ? [allCleared(marks) ? "cleared" : "triggered"] : [];
-    } }],
-  });
-  const cleared = $derived(preview.data?.members.filter(allCleared).length ?? 0);
+  const spec = { ...table, server: [],
+                 texts: table.texts?.map((text) => ({ ...text, placeholder: "campaign id, name or label" })) };
+  const members = $derived(memberRows(group.members, listed));
+  // The members queue-maintenance has read under the group's policies.
+  const checked = $derived(members.filter((row) => row.policy_checks));
+  const cleared = $derived(checked.filter((row) => row.policy_checks?.every((check) => !check.triggered)).length);
 
   let picked = $state<string[]>([]);
   const adding = new Busy();
@@ -67,11 +53,6 @@
 </script>
 
 {#snippet labels(row: CampaignView)}<LabelChips labels={row.labels} {listing} />{/snippet}
-{#snippet policies(row: CampaignView)}
-  {@const marks = checked.get(row.campaign_id)}
-  {#if marks}{#each policyMarks(marks) as { kind, state } (kind)}<span data-state={state}>{kind} {state}</span>{" "}{/each}
-  {:else}—{/if}
-{/snippet}
 {#snippet removal(row: CampaignView)}
   <button type="button" aria-label="Remove {row.name} from the group" aria-disabled={removing.busy}
           onclick={() => removeRow(row)}>Remove</button>
@@ -98,15 +79,8 @@
 {:else}
   <p class="muted">Adding or removing its campaigns takes <code>submit_plans</code> for its owner.</p>
 {/if}
-<!-- A policy is triggered while it flags a job of the plan or its re-runs wait for rows, else cleared. -->
-{#if lacks.length}
-  <p class="muted">Policy checks take
-    {#each lacks as grant, index (grant)}{#if index}{" and "}{/if}<code>{grant}</code>{/each}.</p>
-{:else if preview.error}<p class="err" role="alert">Reading the policy checks failed: {preview.error}</p>
-{:else if !preview.data}<p class="muted">Reading the policy checks…</p>
-{:else}<p>{cleared} of {preview.data.members.length} campaigns cleared on every policy that is on.</p>
-{/if}
-<DataTable {spec} rows={memberRows(group.members, listed)} id={(row) => row.campaign_id} noun="campaigns"
-           empty="This group holds no campaign." cells={{ name: campaignName, status, progress, labels, policies }}
+{#if checked.length}<p>{cleared} of {checked.length} campaigns cleared on every policy that is on.</p>{/if}
+<DataTable {spec} rows={members} id={(row) => row.campaign_id} noun="campaigns"
+           empty="This group holds no campaign." cells={{ name: campaignName, status, policies, progress, labels }}
            heads={{ progress: progressHead }}
            action={files ? removal : undefined} />

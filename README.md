@@ -78,7 +78,8 @@ Eval methodology ([docs/methodology/](docs/methodology/)):
 [GPQA Diamond](docs/methodology/gpqa_diamond-2026.06.1.md),
 [IFBench](docs/methodology/ifbench-2026.06.1.md),
 [IFStruct](docs/methodology/ifstruct-release_v1_0.md),
-[MATH-500](docs/methodology/math_500-2026.06.1.md), and how
+MATH-500 ([2026.06.1](docs/methodology/math_500-2026.06.1.md),
+[2026.10.1](docs/methodology/math_500-2026.10.1.md)), and how
 [vl_spec_decode rows pair](docs/methodology/vl-spec-decode.md).
 
 Design notes, the why behind decisions ([docs/design/](docs/design/)):

@@ -744,7 +744,7 @@ fn an_app_member(version: &str) -> anyhow::Result<pipette_plan_types::Descriptor
             "type": "llamacpp_ios_pipette", "repository_url": "github.com/ggml-org/llama.cpp",
             "repository_version": version, "flavor": "ios-arm64",
         }))?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?)
 }
 
@@ -825,6 +825,116 @@ async fn short_list_resolves_the_app_build_that_a_device_reports() -> anyhow::Re
             "{name}"
         );
     }
+    Ok(())
+}
+
+/// Desktop availability gates both regular and speculative MLX model entries.
+#[rstest]
+#[case::available("macOS", Some("arm64"), &["runtime:mlx"], true)]
+#[case::not_installed("macOS", Some("arm64"), &[], false)]
+#[case::ios("iOS", Some("arm64"), &["runtime:mlx"], false)]
+#[tokio::test]
+async fn short_list_requires_desktop_mlx_availability(
+    #[case] os: &str,
+    #[case] arch: Option<&str>,
+    #[case] flags: &[&str],
+    #[case] offered: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    let mut config = (*sql.state.config).clone();
+    config.descriptor_catalog.offer_rules.push(OfferRule {
+        runtime_type: pipette_plan_types::RuntimeType::MlxMacosPipette,
+        flavor: "macos-arm64".into(),
+        requires: ["os:macos", "runtime:mlx"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        any_of: Vec::new(),
+    });
+    sql.state.config = std::sync::Arc::new(config);
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let runtime = pipette_plan_types::DescriptorMember::new(
+        serde_json::from_value(json!({
+            "type": "mlx_macos_pipette", "version": "0.31.3", "flavor": "macos-arm64",
+            "source": { "type": "pip_requirements_text", "contents": "mlx-lm==0.31.3" },
+        }))?,
+        jiff::Timestamp::now(),
+    )?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "MLX-Runtime",
+            Kind::HandMade,
+            300,
+            runtime,
+        )?)
+        .await?;
+    for (name, second, model_type) in [
+        ("MLX-Model", 200, "mlx"),
+        ("MLX-Speculative", 100, "mlx_speculative"),
+    ] {
+        store
+            .create_entry(&a_model_entry_of(
+                name,
+                second,
+                &[(model_type, "AcmeLM-3B-MLX", "4bit")],
+            )?)
+            .await?;
+    }
+    let (_, client_id) = register_pending(state).await?;
+    let mut client = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .context("registered client")?;
+    client.status = ClientStatus::Approved;
+    client.device_profile.device_os_name = Some(NonEmptyTrimmedString::try_new(os)?);
+    client.device_profile.device_cpu_arch = arch.map(NonEmptyTrimmedString::try_new).transpose()?;
+    client.capabilities = flags.iter().map(|flag| (*flag).to_owned()).collect();
+    state.client_store.put_client(&client).await?;
+    let signer = registered_user(state, &[UserPermission::ReadClients]).await?;
+    let (status, body) = read(state, &signer, &format!("{BASE}/devices/{client_id}")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    if offered {
+        assert_eq!(
+            field_of(&body["items"], "name"),
+            Some(vec![
+                json!("MLX-Runtime"),
+                json!("MLX-Model"),
+                json!("MLX-Speculative"),
+            ]),
+            "{body}"
+        );
+        for (item, expected_type) in body["items"].as_array().context("items")?.iter().zip([
+            "mlx_macos_pipette",
+            "mlx",
+            "mlx_speculative",
+        ]) {
+            assert_eq!(item["members"].as_array().context("members")?.len(), 1);
+            assert_eq!(item["members"][0]["descriptor"]["type"], expected_type);
+        }
+        assert_eq!(body["withheld"]["member_count"], 0);
+    } else {
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["withheld"]["member_count"], 3);
+        assert_eq!(body["withheld"]["entry_count"], 3);
+        let withheld = body["withheld"]["members"]
+            .as_array()
+            .context("withheld members")?;
+        for (name, reason) in [
+            ("MLX-Runtime", "not_met"),
+            ("MLX-Model", "no_runtime"),
+            ("MLX-Speculative", "no_runtime"),
+        ] {
+            let member = withheld
+                .iter()
+                .find(|member| member["name"] == name)
+                .context("withheld member")?;
+            assert_eq!(member["reason_code"], reason, "{body}");
+        }
+    }
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
     Ok(())
 }
 
@@ -950,7 +1060,7 @@ fn a_runtime_member(
             "repository_url": "github.com/openvinotoolkit/model_server",
             "repository_version": "v2026.4.0", "flavor": flavor,
         }))?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?)
 }
 
@@ -1098,6 +1208,231 @@ async fn short_list_offers_model_members_that_an_offered_runtime_loads(
     Ok(())
 }
 
+/// The Windows device's short list for each reader. acme's `x` shadows global
+/// `x`, whose second member has no offer rule. acme's `Custom-1` has no offer
+/// rule either. Only acme's `ovms-acme` loads the `openvino` model members, so
+/// it also offers the global `GlobalLM` to acme. acme's hidden entry stays
+/// absent. Only beta's reader sees beta's `y`.
+#[rstest]
+#[case::acme_member(
+    "acme",
+    &[
+        ("x", "acme"),
+        ("global/x", "global"),
+        ("ovms-acme", "acme"),
+        ("AcmeLM", "acme"),
+        ("GlobalLM", "global"),
+    ],
+    &[("Custom-1", "acme", "no_rule"), ("global/x", "global", "no_rule")],
+    1,
+)]
+#[case::edit_any_catalog_reads_its_own_org_only(
+    "every_acme",
+    &[
+        ("x", "acme"),
+        ("global/x", "global"),
+        ("ovms-acme", "acme"),
+        ("AcmeLM", "acme"),
+        ("GlobalLM", "global"),
+    ],
+    &[("Custom-1", "acme", "no_rule"), ("global/x", "global", "no_rule")],
+    1,
+)]
+#[case::beta_member(
+    "beta",
+    &[("y", "beta"), ("x", "global")],
+    &[("x", "global", "no_rule"), ("GlobalLM", "global", "no_runtime")],
+    1,
+)]
+#[case::unaffiliated(
+    "none",
+    &[("x", "global")],
+    &[("x", "global", "no_rule"), ("GlobalLM", "global", "no_runtime")],
+    1,
+)]
+#[tokio::test]
+async fn short_list_adds_the_callers_org_entries(
+    #[case] reader: &str,
+    #[case] expected_items: &[(&str, &str)],
+    #[case] expected_withheld: &[(&str, &str, &str)],
+    #[case] expected_withheld_entries: usize,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    let (uri, unaffiliated) = windows_device(&mut sql).await?;
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let beta = seed_org(state, "beta").await?.org_id;
+    let acme_scope = CatalogScope::Org(acme.clone());
+    let beta_scope = CatalogScope::Org(beta.clone());
+    let entries = [
+        (
+            &beta_scope,
+            a_descriptor_entry("y", Kind::HandMade, 400, a_member("b4", "windows-x64-cpu")?)?,
+        ),
+        (
+            &acme_scope,
+            a_descriptor_entry(
+                "Custom-1",
+                Kind::HandMade,
+                300,
+                a_member("b3", "linux-x64-rocm")?,
+            )?,
+        ),
+        (
+            &acme_scope,
+            a_descriptor_entry(
+                "Hidden-1",
+                Kind::HandMade,
+                250,
+                a_member("b3", "windows-x64-cpu")?,
+            )?,
+        ),
+        (
+            &acme_scope,
+            a_descriptor_entry("x", Kind::HandMade, 200, a_member("b2", "windows-x64-cpu")?)?,
+        ),
+        (
+            &acme_scope,
+            a_model_entry_of("AcmeLM", 150, &[("openvino", "AcmeLM-int4-ov", "int4")])?,
+        ),
+        (
+            &CatalogScope::Global,
+            a_model_entry_of("GlobalLM", 120, &[("openvino", "GlobalLM-int4-ov", "int4")])?,
+        ),
+        (
+            &CatalogScope::Global,
+            a_descriptor_entry("x", Kind::Stable, 100, a_member("b1", "windows-x64-cpu")?)?,
+        ),
+        (
+            &acme_scope,
+            a_descriptor_entry(
+                "ovms-acme",
+                Kind::HandMade,
+                50,
+                a_runtime_member("ovms", "windows-x64")?,
+            )?,
+        ),
+    ];
+    for (scope, mut entry) in entries {
+        entry.scope = scope.clone();
+        store.create_entry(&entry).await?;
+    }
+    store
+        .set_state(&acme_scope, &CatalogName::try_new("x")?, EntryState::Pinned)
+        .await?;
+    store
+        .append_members(
+            &CatalogScope::Global,
+            &CatalogName::try_new("x")?,
+            NonEmptyVec::try_new(vec![a_member("b1", "linux-x64-rocm")?])?,
+        )
+        .await?;
+    store
+        .set_state(
+            &acme_scope,
+            &CatalogName::try_new("Hidden-1")?,
+            EntryState::Hidden,
+        )
+        .await?;
+    let signer = match reader {
+        "none" => unaffiliated,
+        org_reader => {
+            let (org, permissions) = match org_reader {
+                "acme" => (&acme, vec![UserPermission::ReadClients]),
+                "beta" => (&beta, vec![UserPermission::ReadClients]),
+                "every_acme" => (
+                    &acme,
+                    vec![UserPermission::ReadClients, UserPermission::EditAnyCatalog],
+                ),
+                other => anyhow::bail!("unknown reader {other}"),
+            };
+            let signer = registered_user(state, &permissions).await?;
+            set_user_org(state, &signer.1, Some(org.clone())).await?;
+            signer
+        }
+    };
+    let label = |scope: &Value| match scope.as_str() {
+        Some("global") => "global".to_owned(),
+        Some(id) if id == acme.as_str() => "acme".to_owned(),
+        Some(id) if id == beta.as_str() => "beta".to_owned(),
+        other => format!("{other:?}"),
+    };
+    let (status, body) = read(state, &signer, &uri).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items: Vec<(String, String)> = body["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            (
+                item["display_name"].as_str().unwrap_or_default().to_owned(),
+                label(&item["scope"]),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = expected_items
+        .iter()
+        .map(|(name, scope)| ((*name).to_owned(), (*scope).to_owned()))
+        .collect();
+    assert_eq!(items, expected, "{body}");
+    let withheld: Vec<(String, String, String)> = body["withheld"]["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|member| {
+            (
+                member["display_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                label(&member["scope"]),
+                member["reason_code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String, String)> = expected_withheld
+        .iter()
+        .map(|(name, scope, code)| ((*name).to_owned(), (*scope).to_owned(), (*code).to_owned()))
+        .collect();
+    assert_eq!(withheld, expected, "{body}");
+    assert_eq!(body["withheld"]["member_count"], expected_withheld.len());
+    assert_eq!(body["withheld"]["entry_count"], expected_withheld_entries);
+    // Each selector names the entry as the caller sees it.
+    let selectors_follow_display_names = body["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| {
+            let prefix = format!("{}::", item["display_name"].as_str().unwrap_or_default());
+            item["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |member| (prefix.clone(), member["selector"].clone()))
+        })
+        .chain(
+            body["withheld"]["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|member| {
+                    (
+                        format!("{}::", member["display_name"].as_str().unwrap_or_default()),
+                        member["selector"].clone(),
+                    )
+                }),
+        )
+        .all(|(prefix, selector)| selector.as_str().is_some_and(|s| s.starts_with(&prefix)));
+    assert!(selectors_follow_display_names, "{body}");
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+    Ok(())
+}
+
 /// Record one run of `digest` on `client` in the run evidence index, at
 /// second `second`, with client version `version`.
 async fn ran(
@@ -1125,8 +1460,8 @@ async fn ran(
         .await
 }
 
-fn at_second(second: i64) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp(second, 0).context("a valid time")
+fn at_second(second: i64) -> anyhow::Result<jiff::Timestamp> {
+    jiff::Timestamp::from_second(second).context("a valid time")
 }
 
 /// A Linux device that the offer rules offer the llama.cpp CUDA and CPU
@@ -1826,7 +2161,7 @@ async fn filters(#[case] query: &str, #[case] expected: &str) -> anyhow::Result<
         .await?;
     let apple = pipette_plan_types::DescriptorMember::new(
         serde_json::from_value(json!({"type":"apple_foundation"}))?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     store
         .create_entry(&a_descriptor_entry("Apple-1", Kind::HandMade, 100, apple)?)
@@ -2975,6 +3310,117 @@ async fn an_org_member_relabel_answers(
     Ok(())
 }
 
+#[rstest]
+#[case::removed("AcmeLM", json!({"member": "gguf::q8_0"}), StatusCode::OK)]
+#[case::model_key_shape("AcmeLM", json!({"member": "q8_0"}), StatusCode::BAD_REQUEST)]
+#[case::unknown_field("AcmeLM", json!({"member": "gguf::q8_0", "scope": "global"}), StatusCode::BAD_REQUEST)]
+#[case::missing("Missing", json!({"member": "gguf::q8_0"}), StatusCode::NOT_FOUND)]
+#[case::no_member("AcmeLM", json!({"member": "gguf::q2_k"}), StatusCode::NOT_FOUND)]
+#[case::tombstoned("DeadLM", json!({"member": "gguf::f16_q4_0"}), StatusCode::CONFLICT)]
+#[case::last_member("Fork", json!({"member": "macos-arm64"}), StatusCode::CONFLICT)]
+#[tokio::test]
+async fn an_org_member_removal_answers(
+    #[case] name: &str,
+    #[case] body: Value,
+    #[case] status: StatusCode,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, member) = renamable_org(state).await?;
+    let uri = format!("{base}/{name}/members/remove");
+    let reader = registered_user(state, &[]).await?;
+    set_user_org(state, &reader.1, Some(acme.clone())).await?;
+    let refused = signed_json(state, &reader, "POST", &uri, &body).await?;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let response = signed_json(state, &member, "POST", &uri, &body).await?;
+    assert_eq!(response.status(), status);
+    let removals: Vec<_> = state
+        .audit_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("audit store"))?
+        .list_events(
+            &AuditFilter {
+                org_id: Some(acme.clone()),
+                ..Default::default()
+            },
+            None,
+            NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+        )
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|event| match event.action {
+            pipette_plan_types::AuditAction::CatalogRemoveMember { member, .. } => Some(member),
+            pipette_plan_types::AuditAction::Http { .. }
+            | pipette_plan_types::AuditAction::Cli { .. }
+            | pipette_plan_types::AuditAction::CatalogRename { .. }
+            | pipette_plan_types::AuditAction::CatalogMerge { .. }
+            | pipette_plan_types::AuditAction::CatalogMoveToGlobal { .. }
+            | pipette_plan_types::AuditAction::FirstClerkSignIn { .. }
+            | pipette_plan_types::AuditAction::GroupPolicy { .. } => None,
+        })
+        .collect();
+    if status != StatusCode::OK {
+        assert!(removals.is_empty(), "{removals:?}");
+        return Ok(());
+    }
+    super::api_schema::assert_conforms("RemoveDescriptorMemberRequest", &body)?;
+    let entry = body_json(response).await?;
+    let selectors: Vec<&str> = entry["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|member| member["selector"].as_str())
+        .collect();
+    assert_eq!(selectors, ["AcmeLM::gguf::f16_q4_0"], "{entry}");
+    assert_eq!(removals, ["gguf::q8_0"]);
+    Ok(())
+}
+
+#[rstest]
+#[case::outside_editor(UserPermission::EditCatalog, StatusCode::NOT_FOUND, 2)]
+#[case::outside_administrator(UserPermission::EditAnyCatalog, StatusCode::OK, 1)]
+#[tokio::test]
+async fn an_outside_users_member_removal_respects_catalog_permissions(
+    #[case] permission: UserPermission,
+    #[case] status: StatusCode,
+    #[case] remaining: usize,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, _) = renamable_org(state).await?;
+    let beta = seed_org(state, "beta").await?.org_id;
+    let outsider = registered_user(state, &[permission]).await?;
+    set_user_org(state, &outsider.1, Some(beta)).await?;
+
+    let response = signed_json(
+        state,
+        &outsider,
+        "POST",
+        &format!("{base}/AcmeLM/members/remove"),
+        &json!({"member": "gguf::q8_0"}),
+    )
+    .await?;
+    assert_eq!(response.status(), status);
+    let entry = store_of(state)?
+        .get_entry(&CatalogScope::Org(acme), &CatalogName::try_new("AcmeLM")?)
+        .await?
+        .context("AcmeLM entry")?;
+    assert_eq!(entry.members.len(), remaining);
+    if status == StatusCode::OK {
+        let updated = body_json(response).await?;
+        assert_eq!(
+            updated["members"][0]["selector"],
+            "acme/AcmeLM::gguf::f16_q4_0"
+        );
+        assert_eq!(updated["members"].as_array().map(Vec::len), Some(1));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3067,6 +3513,8 @@ async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow
             pipette_plan_types::AuditAction::Http { .. }
             | pipette_plan_types::AuditAction::Cli { .. }
             | pipette_plan_types::AuditAction::CatalogMerge { .. }
+            | pipette_plan_types::AuditAction::CatalogRemoveMember { .. }
+            | pipette_plan_types::AuditAction::CatalogMoveToGlobal { .. }
             | pipette_plan_types::AuditAction::FirstClerkSignIn { .. }
             | pipette_plan_types::AuditAction::GroupPolicy { .. } => None,
         })

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt as _};
+use jiff::Timestamp;
 
 use pipette_core::config::Config;
 use pipette_core::dataset::{DatasetArtifact, ProbeState, ProbeVerdict, UpstreamIdentity};
@@ -370,7 +370,7 @@ async fn probe_upstream_pins(
         .any(|b| b.artifact.probe.state == ProbeState::Ok);
     let digests = built.iter().map(|b| &b.artifact.digest).collect::<Vec<_>>();
     let reached = reach(upstreams, &upstream, &digests, deadline, was_ok).await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let recorded = futures::stream::iter(built)
         .then(|mut built| {
             // Each artifact against its own pin: two entries may pin one upstream
@@ -762,7 +762,7 @@ async fn build_git(
         .dataset_cache
         .put_tar(&dataset.digest, &built.tar)
         .await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     Ok(DatasetArtifact {
         digest: dataset.digest.clone(),
         bytes: dataset.bytes,
@@ -826,7 +826,7 @@ async fn register(
         "upstream {state}: {}",
         detail.unwrap_or_default()
     );
-    let now = Utc::now();
+    let now = Timestamp::now();
     Ok(DatasetArtifact {
         digest: digest.clone(),
         bytes,

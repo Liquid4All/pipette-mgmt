@@ -163,7 +163,11 @@ fn keep_only_org(event: &mut AuditEvent, org_id: &OrgId) {
         // The keys are the account's own, which no other organization's id names.
         AuditAction::FirstClerkSignIn { .. }
         | AuditAction::CatalogRename { .. }
-        | AuditAction::CatalogMerge { .. } => {}
+        | AuditAction::CatalogMerge { .. }
+        | AuditAction::CatalogRemoveMember { .. } => {}
+        // The command lists the event under the organization that the action
+        // names, so a listing under another organization never shows it.
+        AuditAction::CatalogMoveToGlobal { .. } => {}
         // A group id, like a campaign target's, names no organization.
         AuditAction::GroupPolicy { .. } => {}
     }

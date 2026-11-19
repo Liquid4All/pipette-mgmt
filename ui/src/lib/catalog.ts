@@ -20,7 +20,8 @@ export const catalogEntryPath = (name: string) => pathOf({ page: "server-catalog
 
 const GLOBAL = "global";
 
-const entryHref = (entry: Pick<DescriptorEntryListRow, "scope" | "name" | "display_name">) =>
+/** The entry page of `entry`. A global entry links with `global/` also when the reader sees its bare name. */
+export const entryHref = (entry: Pick<DescriptorEntryListRow, "scope" | "name" | "display_name">) =>
   catalogEntryPath(entry.scope === GLOBAL ? `global/${entry.name}` : entry.display_name);
 
 export type Reader = Pick<OwnUserView, "org_id" | "org_slug" | "may">;
@@ -147,7 +148,7 @@ export const catalogTabSpecs = (scopeOf: ScopeOf):
 });
 
 /** A row's key in the list. A global entry and an org entry can have the same name. */
-export const catalogRowId = (row: DescriptorEntryListRow): string => `${row.scope}/${row.name}`;
+export const catalogRowId = (row: Pick<DescriptorEntryListRow, "scope" | "name">): string => `${row.scope}/${row.name}`;
 
 /** One model member of an entry page's table. */
 export interface ModelMemberRow {

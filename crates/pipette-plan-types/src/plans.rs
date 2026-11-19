@@ -1,7 +1,7 @@
 //! The `POST /plans/claim` lease and the `/api/v1/plans` bodies. A malformed
 //! stored body is leased as an [`UndecodableClaim`], which no device decodes.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -291,8 +291,10 @@ pub struct Counts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct JobExpiry {
-    pub earliest_expires_at: Option<DateTime<Utc>>,
-    pub latest_expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub earliest_expires_at: Option<Timestamp>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub latest_expires_at: Option<Timestamp>,
 }
 
 /// Why ingestion flagged a [`Warning`]'s jobs.
@@ -377,7 +379,8 @@ pub struct StarvedGroup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProgressSnapshot {
-    pub computed_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub computed_at: Timestamp,
     pub counts: Counts,
     pub starved_groups: Vec<StarvedGroup>,
 }
@@ -410,7 +413,8 @@ pub struct PlanView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<RevisionChange>,
     pub status: PlanStatus,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// The account the plan is attributed to; absent when no account filed it.
     /// Skipped rather than `null`: absence is a final answer here, where
     /// `null` below says "not computed yet".
@@ -438,7 +442,8 @@ pub struct PlanView {
     /// `null` until maintenance writes the first snapshot.
     pub progress_snapshot: Option<ProgressSnapshot>,
     /// When the plan latched `complete` or `cancelled`; `null` while it is live.
-    pub terminal_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub terminal_at: Option<Timestamp>,
 }
 
 impl PlanView {
@@ -469,7 +474,8 @@ pub struct PlanSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<RevisionChange>,
     pub status: PlanStatus,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// The account the plan is attributed to; absent when no account filed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]

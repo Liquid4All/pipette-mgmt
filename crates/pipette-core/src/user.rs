@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
@@ -32,7 +32,7 @@ pub struct User {
     #[serde(default)]
     pub account_type: UserAccountType,
     pub status: UserStatus,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The campaigns a service account reads, and the only ones: set, the
     /// account holds `read_plans` alone ([`crate::user_permission::Holder`]).
     /// Replaced, never removed, so a reader is never widened into a member.
@@ -59,7 +59,7 @@ impl User {
     /// re-checked.
     pub fn try_new(
         contact_email: ContactEmail,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Self, ContactEmailError> {
         Ok(Self {
             user_id: UserId::mint(),
@@ -75,7 +75,7 @@ impl User {
     /// operator admits it (`users approve`). Otherwise as [`Self::try_new`].
     pub fn requested(
         contact_email: ContactEmail,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Self, ContactEmailError> {
         Ok(Self {
             status: UserStatus::Pending,
@@ -95,11 +95,11 @@ pub struct UserKey {
     pub key_details: NonEmptyTrimmedString,
     /// When this key was added. Nothing branches on it, but a key nobody
     /// remembers adding is a compromise indicator a date makes visible.
-    pub added_at: DateTime<Utc>,
+    pub added_at: Timestamp,
     /// When the key stops signing, for a key made to sign in one browser; a
     /// machine's key has none. Kept after it passes, so the listing shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl From<UserKey> for pipette_plan_types::UserKey {
@@ -119,7 +119,7 @@ impl UserKey {
     pub fn new(
         public_key: PublicKeyHex,
         key_details: NonEmptyTrimmedString,
-        added_at: DateTime<Utc>,
+        added_at: Timestamp,
     ) -> Self {
         Self {
             key_id: UserKeyId::derive(&public_key),
@@ -131,7 +131,7 @@ impl UserKey {
     }
 
     /// Whether the key has stopped signing at `now`.
-    pub fn expired(&self, now: DateTime<Utc>) -> bool {
+    pub fn expired(&self, now: Timestamp) -> bool {
         self.expires_at.is_some_and(|at| at <= now)
     }
 }
@@ -168,7 +168,7 @@ mod tests {
     /// identity.
     #[test]
     fn key_details_do_not_change_a_key_id() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let laptop = UserKey::new(
             public_key(0x33)?,
             NonEmptyTrimmedString::try_new("work laptop")?,
@@ -185,7 +185,10 @@ mod tests {
     }
 
     fn user(email: &str) -> anyhow::Result<User> {
-        Ok(User::try_new(ContactEmail::try_new(email)?, Utc::now())?)
+        Ok(User::try_new(
+            ContactEmail::try_new(email)?,
+            Timestamp::now(),
+        )?)
     }
 
     /// A new account is active and carries a fresh id under the `user_` prefix

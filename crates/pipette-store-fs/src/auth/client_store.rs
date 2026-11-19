@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::client::Client;
 use pipette_core::client_permission::ClientPermissionSet;
@@ -103,7 +103,7 @@ impl ClientStore for LocalFsClientStore {
     async fn record_signature_migration(
         &self,
         client_id: &ClientId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: jiff::Timestamp,
     ) -> anyhow::Result<pipette_core::client::MigrationRecord> {
         let dir = self.signature_migration_dir.clone();
         let client_id = client_id.clone();
@@ -193,7 +193,7 @@ impl ClientStore for LocalFsClientStore {
                     ClientPreauthRejectionError::NotFound,
                 ));
             };
-            let now = Utc::now();
+            let now = Timestamp::now();
             let grant = match validate(&key, &secret, now) {
                 Ok(grant) => grant,
                 Err(rejection) => return Ok(ClientPreauthConsumeOutcome::Rejected(rejection)),
@@ -248,7 +248,7 @@ mod tests {
     //! The client store, over a tempdir.
 
     use anyhow::Context;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::client::Client;
     use pipette_core::client_permission::ClientPermissionSet;
@@ -315,7 +315,7 @@ mod tests {
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
             contact_email: pipette_plan_types::ContactEmail::try_new("test@example.com")?,
             status: pipette_core::client::ClientStatus::Pending,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: Default::default(),
             capabilities: Default::default(),
         };
@@ -477,7 +477,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = LocalFsClientStore::new(dir.path().to_path_buf());
         let client_id = ClientId::try_new("ev1_interrupted")?;
-        let at = Utc::now();
+        let at = Timestamp::now();
 
         let markers = dir.path().join("signature-migration");
         std::fs::create_dir_all(&markers)?;
@@ -616,7 +616,7 @@ mod tests {
                 default_permissions: None,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let key_id = minted.key.key_id.clone();
         store.put_client_preauth_key(&minted.key).await?;

@@ -23,8 +23,7 @@ One binary, `pipette-mgmt`, runs as these processes:
   identities, organizations, vault records) and the job queue.
 - `[storage]`: the object store (local filesystem or S3) for the catalog,
   submissions, the warehouse, vault blobs and the dataset cache.
-- `[auth_storage]`: the object-store identity records that `db import` and
-  `db export` copy.
+- `[auth_storage]`: the object-store keyspaces for the identity records.
 - `[eval_packages_storage]`: the eval corpora the scores service packs, read
   only; `[storage]` without it.
 - `[vault_storage]`: vault blobs and staged uploads; `[storage]` without it.

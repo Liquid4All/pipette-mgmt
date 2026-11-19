@@ -10,8 +10,8 @@
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use chrono::{DateTime, SecondsFormat, SubsecRound, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use rstest::rstest;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -66,7 +66,7 @@ async fn seed_leased(
     job: &JobId,
     expires_at: ExpiresAt,
     client: &ClientId,
-    expiry: chrono::DateTime<chrono::Utc>,
+    expiry: jiff::Timestamp,
 ) -> anyhow::Result<()> {
     seed_leased_body(state, job, expires_at, client, expiry, &json!({})).await
 }
@@ -77,7 +77,7 @@ async fn seed_leased_body(
     job: &JobId,
     expires_at: ExpiresAt,
     client: &ClientId,
-    expiry: chrono::DateTime<chrono::Utc>,
+    expiry: jiff::Timestamp,
     body: &Value,
 ) -> anyhow::Result<()> {
     pipette_web_testkit::seed_leased_until(
@@ -308,7 +308,7 @@ async fn test_claim_falls_through_a_gone_job_to_the_next_candidate() -> anyhow::
         .write_eligible(
             &client_id,
             &gone,
-            ExpiresAt::At(Utc::now() + chrono::Duration::hours(1)),
+            ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(1)),
         )
         .await?;
     let real = seed_eligible(&state, &client_id, "job-real", ExpiresAt::Never).await?;
@@ -330,8 +330,12 @@ async fn test_claim_204_when_the_marker_is_live_but_the_key_has_lapsed() -> anyh
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // Truncated to the second, the precision the stored spelling carries.
-    let now = Utc::now().trunc_subsecs(0);
-    let lapsed = ExpiresAt::At(now - chrono::Duration::hours(1));
+    let now = Timestamp::now().round(
+        jiff::TimestampRound::new()
+            .smallest(jiff::Unit::Second)
+            .mode(jiff::RoundMode::Trunc),
+    )?;
+    let lapsed = ExpiresAt::At(now - jiff::SignedDuration::from_hours(1));
     let job = pipette_web_testkit::seed_avail(
         state.todo_store.as_ref(),
         "job-1",
@@ -345,7 +349,7 @@ async fn test_claim_204_when_the_marker_is_live_but_the_key_has_lapsed() -> anyh
         .write_eligible(
             &client_id,
             &job,
-            ExpiresAt::At(now + chrono::Duration::days(30)),
+            ExpiresAt::At(now + jiff::SignedDuration::from_hours(30 * 24)),
         )
         .await?;
 
@@ -407,7 +411,11 @@ async fn test_claim_expires_at_comes_from_the_avail_key(
 
     // Relative to `now`: a passed key deadline makes the job ineligible. Truncated
     // to the second, the stored precision.
-    let deadline = (Utc::now() + chrono::Duration::days(1)).trunc_subsecs(0);
+    let deadline = (Timestamp::now() + jiff::SignedDuration::from_hours(24)).round(
+        jiff::TimestampRound::new()
+            .smallest(jiff::Unit::Second)
+            .mode(jiff::RoundMode::Trunc),
+    )?;
     let key_expiry = match key_expiry {
         KeyExpiry::Never => ExpiresAt::Never,
         KeyExpiry::Dated => ExpiresAt::At(deadline),
@@ -422,7 +430,7 @@ async fn test_claim_expires_at_comes_from_the_avail_key(
         BodyExpiry::Never => body["expires_at"] = json!("never"),
         BodyExpiry::Basic => body["expires_at"] = json!(ExpiresAt::At(deadline).to_string()),
         BodyExpiry::Rfc3339 => {
-            body["expires_at"] = json!(deadline.to_rfc3339_opts(SecondsFormat::Secs, true));
+            body["expires_at"] = json!(deadline.strftime("%Y-%m-%dT%H:%M:%SZ").to_string());
         }
         BodyExpiry::Unparseable => body["expires_at"] = json!("soon"),
         BodyExpiry::NonString => body["expires_at"] = json!(42),
@@ -522,7 +530,7 @@ async fn test_claim_idempotent_when_holding_single_lease() -> anyhow::Result<()>
     // The selected expiry gives the lease 90 seconds of life. The response gives the
     // window in seconds as `PTnS`.
     let job_a = job("job-a")?;
-    let expiry = Utc::now() + chrono::Duration::seconds(90);
+    let expiry = Timestamp::now() + jiff::SignedDuration::from_secs(90);
     seed_leased_body(
         state,
         &job_a,
@@ -573,14 +581,18 @@ async fn test_claim_hand_back_counts_the_held_lease_as_lost() -> anyhow::Result<
         &job_a,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() + chrono::Duration::seconds(90),
+        Timestamp::now() + jiff::SignedDuration::from_secs(90),
         &job_body("job-a"),
     )
     .await?;
     // One loss on an earlier lease.
     state
         .todo_store
-        .write_lost_lease(&job_a, &client_id, Utc::now() - chrono::Duration::hours(1))
+        .write_lost_lease(
+            &job_a,
+            &client_id,
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
+        )
         .await?;
 
     // The second loss; a repeat poll on the same lease adds nothing.
@@ -617,7 +629,7 @@ async fn test_claim_hand_back_records_no_loss_when_the_limit_is_zero() -> anyhow
         &job_a,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() + chrono::Duration::seconds(90),
+        Timestamp::now() + jiff::SignedDuration::from_secs(90),
         &job_body("job-a"),
     )
     .await?;
@@ -651,7 +663,7 @@ async fn seed_on_path(
                 &job("job-v")?,
                 ExpiresAt::Never,
                 client,
-                Utc::now() + chrono::Duration::seconds(90),
+                Timestamp::now() + jiff::SignedDuration::from_secs(90),
                 body,
             )
             .await?
@@ -749,16 +761,20 @@ async fn test_claim_hand_back_carries_the_envelope_and_the_lease_keys_deadline(
     // Truncated to the second, the precision the lease key carries.
     let expires_at = match key_expiry {
         KeyExpiry::Never => ExpiresAt::Never,
-        KeyExpiry::Dated => {
-            ExpiresAt::At((Utc::now() + chrono::Duration::days(1)).trunc_subsecs(0))
-        }
+        KeyExpiry::Dated => ExpiresAt::At(
+            (Timestamp::now() + jiff::SignedDuration::from_hours(24)).round(
+                jiff::TimestampRound::new()
+                    .smallest(jiff::Unit::Second)
+                    .mode(jiff::RoundMode::Trunc),
+            )?,
+        ),
     };
     seed_leased_body(
         &state,
         &job("job-a")?,
         expires_at,
         &client_id,
-        Utc::now() + chrono::Duration::seconds(90),
+        Timestamp::now() + jiff::SignedDuration::from_secs(90),
         &job_body("job-a"),
     )
     .await?;
@@ -789,14 +805,14 @@ async fn test_claim_hand_back_carries_the_envelope_and_the_lease_keys_deadline(
 async fn test_claim_hands_back_the_later_of_two_held_jobs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     for (job_id, secs) in [("job-a", 60), ("job-b", 120)] {
         seed_leased_body(
             &state,
             &job(job_id)?,
             ExpiresAt::Never,
             &client_id,
-            now + chrono::Duration::seconds(secs),
+            now + jiff::SignedDuration::from_secs(secs),
             &job_body(job_id),
         )
         .await?;
@@ -848,7 +864,7 @@ async fn test_claim_skips_job_leased_to_another_client() -> anyhow::Result<()> {
                 &job,
                 ExpiresAt::Never,
                 &other,
-                Utc::now() + chrono::Duration::hours(1)
+                Timestamp::now() + jiff::SignedDuration::from_hours(1)
             )
             .await?,
         pipette_store::ClaimResult::Claimed(_)
@@ -886,7 +902,7 @@ async fn test_claim_settles_a_lapsed_own_lease(
     };
     let state = &queue.state;
     let old_job = job("old-job")?;
-    let lapsed_at = Utc::now() - chrono::Duration::hours(1);
+    let lapsed_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     seed_leased_body(
         state,
         &old_job,
@@ -911,7 +927,7 @@ async fn test_claim_settles_a_lapsed_own_lease(
                     .write_lost_lease(
                         &old_job,
                         &client_id,
-                        lapsed_at - chrono::Duration::hours(hours),
+                        lapsed_at - jiff::SignedDuration::from_hours(hours),
                     )
                     .await?;
             }
@@ -1008,8 +1024,8 @@ async fn test_claim_prefers_soonest_expiring_job() -> anyhow::Result<()> {
 
     // The eligible listing is unordered. Both dates are in the future, so neither
     // is filtered as expired.
-    let soon = ExpiresAt::At(Utc::now() + chrono::Duration::hours(1));
-    let later = ExpiresAt::At(Utc::now() + chrono::Duration::days(30));
+    let soon = ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(1));
+    let later = ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(30 * 24));
 
     seed_eligible(&state, &client_id, "job-never", ExpiresAt::Never).await?;
     seed_eligible(&state, &client_id, "job-later", later).await?;
@@ -1028,8 +1044,8 @@ async fn test_claim_picks_within_soonest_expiry_tier() -> anyhow::Result<()> {
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // The pick within the soonest tier is random, so assert membership.
-    let soon = ExpiresAt::At(Utc::now() + chrono::Duration::hours(1));
-    let later = ExpiresAt::At(Utc::now() + chrono::Duration::days(30));
+    let soon = ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(1));
+    let later = ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(30 * 24));
 
     let mut tier: Vec<JobId> = Vec::new();
     for id in ["soon-a", "soon-b", "soon-c"] {
@@ -1056,7 +1072,7 @@ async fn test_claim_204_when_only_eligible_job_is_expired() -> anyhow::Result<()
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // Not yet swept from avail/, but an expired job is never handed out.
-    let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
+    let expired = ExpiresAt::At(Timestamp::now() - jiff::SignedDuration::from_hours(1));
     let job = seed_eligible(&state, &client_id, "job-1", expired).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/claim", &json!({})).await?;
@@ -1073,8 +1089,8 @@ async fn test_claim_skips_expired_job_and_claims_valid_one() -> anyhow::Result<(
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // An expired job ranks soonest, so without the expiry filter it would win.
-    let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
-    let valid = ExpiresAt::At(Utc::now() + chrono::Duration::days(7));
+    let expired = ExpiresAt::At(Timestamp::now() - jiff::SignedDuration::from_hours(1));
+    let valid = ExpiresAt::At(Timestamp::now() + jiff::SignedDuration::from_hours(7 * 24));
     seed_eligible(&state, &client_id, "job-expired", expired).await?;
     let good = seed_eligible(&state, &client_id, "job-valid", valid).await?;
 
@@ -1095,7 +1111,7 @@ async fn lease_expiry(
     state: &AppState,
     job: &JobId,
     client: &ClientId,
-) -> anyhow::Result<DateTime<Utc>> {
+) -> anyhow::Result<Timestamp> {
     state
         .todo_store
         .leases_for_client(client)
@@ -1115,7 +1131,7 @@ async fn test_heartbeat_renews_active_lease() -> anyhow::Result<()> {
     let state = &queue.state;
 
     let job = job("job-1")?;
-    let old = Utc::now() + chrono::Duration::seconds(30);
+    let old = Timestamp::now() + jiff::SignedDuration::from_secs(30);
     seed_leased(state, &job, ExpiresAt::Never, &client_id, old).await?;
 
     let resp = authed_put_empty(state, &key, &client_id, "/plans/job-1/heartbeat").await?;
@@ -1140,9 +1156,15 @@ async fn test_heartbeat_renews_a_held_lease_past_the_jobs_deadline() -> anyhow::
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
     // Truncated to the second, the precision the lease key carries.
-    let past = ExpiresAt::At((Utc::now() - chrono::Duration::hours(1)).trunc_subsecs(0));
+    let past = ExpiresAt::At(
+        (Timestamp::now() - jiff::SignedDuration::from_hours(1)).round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Second)
+                .mode(jiff::RoundMode::Trunc),
+        )?,
+    );
     let job = job("job-1")?;
-    let old = Utc::now() + chrono::Duration::seconds(30);
+    let old = Timestamp::now() + jiff::SignedDuration::from_secs(30);
     seed_leased(&state, &job, past, &client_id, old).await?;
 
     let resp = authed_put_empty(&state, &key, &client_id, "/plans/job-1/heartbeat").await?;
@@ -1195,11 +1217,15 @@ async fn renewal(
 /// renewal is refused `404` without renaming the lease, which would resurrect
 /// it mid-relinquish. Reclaim renews an expired held lease once the flag clears.
 #[rstest]
-#[case::heartbeat(chrono::Duration::seconds(30), Method::PUT, "/plans/job-1/heartbeat")]
-#[case::reclaim_held_lease(-chrono::Duration::hours(1), Method::POST, "/plans/job-1/reclaim")]
+#[case::heartbeat(
+    jiff::SignedDuration::from_secs(30),
+    Method::PUT,
+    "/plans/job-1/heartbeat"
+)]
+#[case::reclaim_held_lease(-jiff::SignedDuration::from_hours(1), Method::POST, "/plans/job-1/reclaim")]
 #[tokio::test]
 async fn test_renewal_gated_while_pending_reindex(
-    #[case] lease_offset: chrono::Duration,
+    #[case] lease_offset: jiff::SignedDuration,
     #[case] method: Method,
     #[case] path: &str,
 ) -> anyhow::Result<()> {
@@ -1211,7 +1237,7 @@ async fn test_renewal_gated_while_pending_reindex(
         &job,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() + lease_offset,
+        Timestamp::now() + lease_offset,
     )
     .await?;
     let before = lease_expiry(&state, &job, &client_id).await?;
@@ -1266,7 +1292,7 @@ async fn test_heartbeat_409_when_leased_to_another_client() -> anyhow::Result<()
         &job,
         ExpiresAt::Never,
         &other,
-        Utc::now() + chrono::Duration::hours(1),
+        Timestamp::now() + jiff::SignedDuration::from_hours(1),
     )
     .await?;
 
@@ -1348,7 +1374,7 @@ async fn test_reclaim_renews_own_held_lease() -> anyhow::Result<()> {
     // An expired but still-held lease, the canonical outage recovery: renewed
     // without an expiry check on the job.
     let job = job("job-1")?;
-    let old = Utc::now() - chrono::Duration::hours(1);
+    let old = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     seed_leased(state, &job, ExpiresAt::Never, &client_id, old).await?;
 
     let resp = authed_post(state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
@@ -1359,7 +1385,7 @@ async fn test_reclaim_renews_own_held_lease() -> anyhow::Result<()> {
 
     let renewed = lease_expiry(state, &job, &client_id).await?;
     assert!(
-        renewed > old && renewed > Utc::now(),
+        renewed > old && renewed > Timestamp::now(),
         "lease expiry {renewed} should have advanced into the future"
     );
     Ok(())
@@ -1374,14 +1400,20 @@ async fn test_reclaim_renews_a_held_lease_past_the_jobs_deadline() -> anyhow::Re
 
     // Truncated to the second, the precision the lease key carries. No avail/
     // entry and no marker, so only the in-progress path can answer 200.
-    let past = ExpiresAt::At((Utc::now() - chrono::Duration::hours(1)).trunc_subsecs(0));
+    let past = ExpiresAt::At(
+        (Timestamp::now() - jiff::SignedDuration::from_hours(1)).round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Second)
+                .mode(jiff::RoundMode::Trunc),
+        )?,
+    );
     let job = job("job-1")?;
     seed_leased(
         &state,
         &job,
         past,
         &client_id,
-        Utc::now() - chrono::Duration::hours(1),
+        Timestamp::now() - jiff::SignedDuration::from_hours(1),
     )
     .await?;
 
@@ -1396,7 +1428,7 @@ async fn test_reclaim_renews_a_held_lease_past_the_jobs_deadline() -> anyhow::Re
     assert_eq!(lease.job_id, job);
     assert_eq!(lease.client_id, client_id);
     assert!(
-        lease.lease_expiry > Utc::now(),
+        lease.lease_expiry > Timestamp::now(),
         "lease expiry {} should have advanced into the future",
         lease.lease_expiry
     );
@@ -1441,7 +1473,7 @@ async fn test_reclaim_409_when_leased_to_another_client() -> anyhow::Result<()> 
         &job,
         ExpiresAt::Never,
         &other,
-        Utc::now() + chrono::Duration::hours(1),
+        Timestamp::now() + jiff::SignedDuration::from_hours(1),
     )
     .await?;
     // Even with an eligible marker, the live foreign lease wins.
@@ -1518,7 +1550,7 @@ async fn test_reclaim_404_when_job_expired() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, key, client_id) = approved_client(dir.path()).await?;
 
-    let expired = ExpiresAt::At(Utc::now() - chrono::Duration::hours(1));
+    let expired = ExpiresAt::At(Timestamp::now() - jiff::SignedDuration::from_hours(1));
     let job = seed_eligible(&state, &client_id, "job-1", expired).await?;
 
     let resp = authed_post(&state, &key, &client_id, "/plans/job-1/reclaim", &json!({})).await?;
@@ -1576,7 +1608,7 @@ async fn test_a_settled_lapsed_lease_is_not_renewed_beside_a_grant(
         &job("job-b")?,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() - chrono::Duration::minutes(1),
+        Timestamp::now() - jiff::SignedDuration::from_mins(1),
         &job_body("job-b"),
     )
     .await?;
@@ -1612,7 +1644,7 @@ async fn test_reclaim_404_while_holding_another_lease() -> anyhow::Result<()> {
         &job("job-a")?,
         ExpiresAt::Never,
         &client_id,
-        Utc::now() + chrono::Duration::hours(1),
+        Timestamp::now() + jiff::SignedDuration::from_hours(1),
     )
     .await?;
     let second = seed_eligible(state, &client_id, "job-b", ExpiresAt::Never).await?;
@@ -1811,12 +1843,12 @@ async fn test_a_failure_report_forgets_the_last_grant(
         let body = job_body_with_model(job, path)?;
         seed_eligible_body(state, &client_id, job, ExpiresAt::Never, &body).await?;
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     let outcome = state
         .todo_store
         .claim_for_client(
             &client_id,
-            now + chrono::Duration::hours(1),
+            now + jiff::SignedDuration::from_hours(1),
             0,
             &[],
             None,
@@ -1837,8 +1869,8 @@ async fn test_a_failure_report_forgets_the_last_grant(
 const TEARDOWN_JOB_ID: &str = "job-550e8400-e29b-41d4-a716-446655440000";
 
 /// Generated, not a hardcoded date that would rot into the past.
-fn future_expiry() -> DateTime<Utc> {
-    Utc::now() + chrono::Duration::hours(1)
+fn future_expiry() -> Timestamp {
+    Timestamp::now() + jiff::SignedDuration::from_hours(1)
 }
 
 fn prefill_success_body(job_id: &str) -> Value {

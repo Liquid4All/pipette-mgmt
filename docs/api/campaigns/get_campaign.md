@@ -8,7 +8,7 @@ and with them answers the listing's row:
 
 | Query parameter | Meaning |
 |---|---|
-| `names=true` | `names`, the owner's address or handle ([names](../../httpapi.md#14-names)) |
+| `names=true` | `names`, the owner's address or display name ([names](../../httpapi.md#14-names)) |
 | `plan=true` | `plan`, as a [listing](list_campaigns.md) row carries it |
 
 The body is `NamedCampaignView`; unasked, it

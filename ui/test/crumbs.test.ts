@@ -9,6 +9,11 @@ describe("an organization's crumbs", () => {
     expect(orgTrail({ slug: "new", org_id: "org_new" })[1]).toEqual({ label: "new", href: "/app/orgs/org_new" });
   });
 
+  test("print the display name and link by handle", () => {
+    expect(orgTrail({ slug: "acme", org_id: "org_acme", display_name: "Acme Corp." })[1])
+      .toEqual({ label: "Acme Corp.", href: "/app/orgs/acme" });
+  });
+
   test("name the address's handle before it resolves", () => {
     expect(orgTrail("org_acme")[1]).toEqual({ label: "org_acme", href: "/app/orgs/org_acme" });
   });

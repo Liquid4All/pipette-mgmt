@@ -230,7 +230,7 @@ fn a_run_logs_each_live_plan() -> anyhow::Result<()> {
     let creating = PlanId::from_uuid(uuid::Uuid::from_u128(3));
     let quiet = PlanId::from_uuid(uuid::Uuid::from_u128(4));
     // A young plan, so that a `creating` plan is not stranded.
-    let created_at = chrono::Utc::now();
+    let created_at = jiff::Timestamp::now();
     let (outcome, logs) = capture_logs_at_level(tracing::Level::INFO, |runtime| {
         runtime.block_on(async {
             setup_benchmarks(dir.path())?;
@@ -372,7 +372,8 @@ fn a_run_counts_expired_bodies_and_resets_its_body_read_total() -> anyhow::Resul
                     .with_global_listings(),
             );
             let state = &queue.state;
-            let deadline = ExpiresAt::At(chrono::Utc::now() - chrono::Duration::hours(1));
+            let deadline =
+                ExpiresAt::At(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
             let body =
                 pipette_store_testkit::todo_job_body("job-expired", &[], "prefill_throughput_256");
             let expired = seed_avail(&*state.todo_store, "job-expired", deadline, &body).await?;

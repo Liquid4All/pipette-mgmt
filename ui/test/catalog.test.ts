@@ -7,7 +7,7 @@ import {
   ANY_DEVICE_LABEL, anyDeviceText, catalogEntryPath, catalogKindOf, catalogListQuery, catalogPath, catalogRowId,
   catalogSynonyms, catalogTable, catalogTabSpecs, catalogTabs, flavors, formatGroups, formatText, mayEdit,
   modelCatalogTable, modelMemberRows, offerWarning, parameterText, runText, scopeLabel, sharedParameters,
-  shortListSections, thisDeviceText, withheldSummary,
+  entryHref, shortListSections, thisDeviceText, withheldSummary,
   type Reader,
 } from "../src/lib/catalog";
 import { relabelError, renameError, stateActions } from "../src/lib/catalog-entry";
@@ -260,9 +260,10 @@ describe("the model catalog", () => {
 describe("a device's short list", () => {
   const list: DescriptorCatalogShortList = {
     items: [
-      { name: "llamacpp-v0.7.0", release_time: "2026-10-15T00:00:00Z", descriptor_kind: "runtime",
-        members: [row().members![0]!] },
-      { name: "AcmeLM-3B", release_time: "2026-10-01T00:00:00Z", descriptor_kind: "model",
+      { name: "llamacpp-v0.7.0", scope: "global", display_name: "llamacpp-v0.7.0", release_time: "2026-10-15T00:00:00Z",
+        descriptor_kind: "runtime", members: [row().members![0]!] },
+      { name: "AcmeLM-3B", scope: "global", display_name: "AcmeLM-3B", release_time: "2026-10-01T00:00:00Z",
+        descriptor_kind: "model",
         members: [modelMember("gguf", "q4_0", null), modelMember("openvino", "int4", null)] },
     ],
     next_cursor: null, unreadable: 0,
@@ -273,6 +274,14 @@ describe("a device's short list", () => {
     const sections = shortListSections(list);
     expect(sections.runtime.map((item) => item.name)).toEqual(["llamacpp-v0.7.0"]);
     expect(sections.model.map((item) => item.members.length)).toEqual([2]);
+  });
+
+  test.each([
+    { scope: "org_acme", name: "x", display_name: "x", expected: "x" },
+    { scope: "global", name: "x", display_name: "global/x", expected: "global/x" },
+    { scope: "global", name: "y", display_name: "y", expected: "global/y" },
+  ])("links the $scope entry $display_name to its own page", ({ expected, ...item }) => {
+    expect(entryHref(item)).toBe(catalogEntryPath(expected));
   });
 
   test("labels the evidence on every device as weaker", () => {

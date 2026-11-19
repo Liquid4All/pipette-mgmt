@@ -7,7 +7,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::model_params::ModelParams;
 use pipette_core::vault::VaultResource;
@@ -247,7 +247,7 @@ fn row(
         active_millions,
         note,
         caller.user.user_id.clone(),
-        Utc::now(),
+        Timestamp::now(),
     )
     .map_err(|e| AppError::BadRequest(e.to_string()))
 }
@@ -292,8 +292,9 @@ async fn write(
     Ok(params.into())
 }
 
-/// Fill the rows' empty parameter counts from the table. The function matches
-/// a row without a model against its job's model in `requested`.
+/// Set the rows' parameter counts from the table
+/// ([`ResultRow::fill_model_params`]). The function matches a row without a
+/// model against its job's model in `requested`.
 /// The function logs a failed read and preserves the rows, so the results remain
 /// available.
 pub(crate) async fn fill_model_params<'a>(
@@ -301,10 +302,8 @@ pub(crate) async fn fill_model_params<'a>(
     rows: impl Iterator<Item = &'a mut ResultRow>,
     requested: &HashMap<&JobId, &Model>,
 ) {
-    let empty: Vec<_> = rows
-        .filter(|row| row.model_params_total_millions.is_none())
-        .collect();
-    if empty.is_empty() {
+    let rows: Vec<_> = rows.collect();
+    if rows.is_empty() {
         return;
     }
     let table = match ModelParamTable::load(state.model_params_store.as_ref()).await {
@@ -315,7 +314,7 @@ pub(crate) async fn fill_model_params<'a>(
             return;
         }
     };
-    empty.into_iter().for_each(|row| {
+    rows.into_iter().for_each(|row| {
         let model = requested.get(&row.job_id).copied();
         row.fill_model_params(&table, model);
     });

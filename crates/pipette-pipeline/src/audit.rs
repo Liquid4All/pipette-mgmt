@@ -397,7 +397,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new(slug)?,
             NonEmptyTrimmedString::try_new(slug)?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         stores
             .orgs
@@ -496,7 +496,7 @@ mod tests {
             PrincipalOwner::Org {
                 org_id: org_id.clone(),
             },
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         stores
             .campaign_groups

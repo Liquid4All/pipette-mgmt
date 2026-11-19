@@ -673,6 +673,21 @@ pub(super) fn operations() -> Vec<Operation> {
         ),
         op(
             M::POST,
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/remove",
+            "remove_org_descriptor_member",
+            DescriptorCatalog,
+            gated!(EDIT_ORG_CATALOG),
+        )
+        .summary("Remove a member from a hand-made organization catalog entry")
+        .errors(&[409])
+        .body(json_body::<pt::RemoveDescriptorMemberRequest>())
+        .reply(
+            200,
+            "The entry without the member",
+            [json::<pt::DescriptorEntryListRow>()],
+        ),
+        op(
+            M::POST,
             "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/state",
             "change_org_descriptor_entry_state",
             DescriptorCatalog,
@@ -914,7 +929,7 @@ pub(super) fn operations() -> Vec<Operation> {
             Campaigns,
             gated!(ADMINISTER_CAMPAIGN),
         )
-        .summary("Rename, label or archive a campaign")
+        .summary("Rename, label, lock or archive a campaign")
         .errors(&[409])
         .body(json_body::<pt::UpdateCampaignRequest>())
         .reply(
@@ -975,6 +990,26 @@ pub(super) fn operations() -> Vec<Operation> {
         )
         .summary("List a campaign's plans, newest first")
         .reply(200, "The plans", [json::<pt::CampaignPlans>()]),
+        op(
+            M::GET,
+            "/api/v1/campaigns/{campaign_id}/tags",
+            "list_plan_tags",
+            Campaigns,
+            gated!(READ_CAMPAIGN),
+        )
+        .summary("List a campaign's plan tags, newest first")
+        .reply(200, "The tags", [json::<pt::PlanTags>()]),
+        op(
+            M::POST,
+            "/api/v1/campaigns/{campaign_id}/tags",
+            "create_plan_tag",
+            Campaigns,
+            gated!(FILE_PLANS),
+        )
+        .summary("Tag one of a campaign's plans")
+        .errors(&[409])
+        .body(json_body::<pt::CreatePlanTagRequest>())
+        .reply(201, "The tag", [json::<pt::PlanTag>()]),
         op(
             M::POST,
             "/api/v1/campaigns/{campaign_id}/plans",

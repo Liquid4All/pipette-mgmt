@@ -249,7 +249,7 @@ A body names accounts and organizations by id. A route that takes `names=true`
 [`GET /api/v1/plans`](api/plans/list_plans.md) and
 [`GET /api/v1/plans/{plan_id}`](api/plans/get_plan.md)) adds `names`, an object
 from each id to a readable name: an account's address, an organization's
-handle. It names only the owners of the records the body carries, never an id
+display name. It names only the owners of the records the body carries, never an id
 the query names, so it tells the caller nothing the body did not already. An
 id whose record is gone, or did not read, is left out, and the caller shows the
 id. A campaign's overview ([`GET /api/v1/campaigns/{campaign_id}/overview`](api/campaigns/get_campaign_overview.md))
@@ -1059,16 +1059,13 @@ Failure-code definitions:
   - A host check (battery, GPU driver) refused the run.
 - `device_not_ready`: The readiness wait timed out: the device stayed too hot
   or busy to measure. The pipette worker and pipette-ios-proxy send this with
-  `retriable: false` from the release after the one that sends `harness_error`,
-  so a cell that keeps every device too hot or busy fails once instead of going
-  round the fleet.
+  `retriable: false`, so a cell that keeps every device too hot or busy fails
+  once instead of going round the fleet.
 - `harness_error`: The client failed in one of these ways:
   - A vault fetch, an install or the spec failed.
   - A model was missing.
   - The submit failed.
   - A download or wait timed out.
-  - The readiness wait timed out, sent with `retriable: false` by a pipette
-    build from before `device_not_ready`.
 
 Example:
 
@@ -1830,7 +1827,7 @@ An account may ask for two more fields, which a device's read ignores:
 
 | Query parameter | Adds |
 |---|---|
-| `names=true` | `names`, the owner's address or handle ([§1.4](#14-names)) |
+| `names=true` | `names`, the owner's address or display name ([§1.4](#14-names)) |
 | `object=true` | `object`, whether the file is still stored, from a stat of it: `{"state": "present"}`, `{"state": "resized", "bytes": …}` for a file of another size than `bytes` (replaced behind the record), or `{"state": "missing"}`. A store that does not answer is a `500` |
 
 ### 2.18. `GET /vault/resources/{resource_id}/content`

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_core::benchmark;
@@ -31,7 +31,7 @@ pub trait SubmissionInputExt {
         self,
         client_id: ClientId,
         job_id: JobId,
-        submitted_at: DateTime<Utc>,
+        submitted_at: Timestamp,
         benchmark_type: BenchmarkType,
     ) -> Submission;
 }
@@ -54,7 +54,7 @@ impl SubmissionInputExt for SubmissionInput {
         self,
         client_id: ClientId,
         job_id: JobId,
-        submitted_at: DateTime<Utc>,
+        submitted_at: Timestamp,
         benchmark_type: BenchmarkType,
     ) -> Submission {
         match self {
@@ -653,7 +653,7 @@ pub struct SuccessSubmission {
     pub wire: SuccessInput,
     pub client_id: ClientId,
     pub job_id: JobId,
-    pub submitted_at: DateTime<Utc>,
+    pub submitted_at: Timestamp,
     pub benchmark_type: BenchmarkType,
     /// Canonical JSON with every `auth_token` dropped.
     #[serde(default)]
@@ -671,7 +671,7 @@ pub struct SuccessSubmission {
     /// sent, and on a copy whose chain of copies reaches a record that is gone
     /// or is not a success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_submitted_at: Option<DateTime<Utc>>,
+    pub run_submitted_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -680,7 +680,7 @@ pub struct FailureSubmission {
     pub wire: FailureInput,
     pub client_id: ClientId,
     pub job_id: JobId,
-    pub submitted_at: DateTime<Utc>,
+    pub submitted_at: Timestamp,
     pub benchmark_type: BenchmarkType,
     #[serde(default)]
     pub requested_model_flags: Option<String>,
@@ -1112,7 +1112,7 @@ pub fn system_failure_from_job_body(
     failure_reason: impl Into<String>,
     failure_code: FailureCode,
     failure_source: FailureSource,
-    submitted_at: DateTime<Utc>,
+    submitted_at: Timestamp,
 ) -> anyhow::Result<Submission> {
     let job_id = job_body
         .get("job_id")
@@ -1261,7 +1261,7 @@ pub async fn record_system_failure(
     failure_reason: impl Into<String>,
     failure_code: FailureCode,
     failure_source: FailureSource,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<CreateOutcome> {
     // Permanent: no catalog change makes this body recordable.
     let benchmark_id = job_body
@@ -2517,7 +2517,7 @@ parameter_decode_tokens = 256
                 "runtime": {"type": "llamacpp_cli_stock_tools", "flavor": "macos-arm64"},
             },
         });
-        let at = "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?;
+        let at = "2026-06-29T00:00:00Z".parse::<Timestamp>()?;
         let submission = system_failure_from_job_body(
             &job_body,
             BenchmarkType::PrefillThroughput,
@@ -2591,7 +2591,7 @@ parameter_decode_tokens = 256
             "Job expired before any client completed it",
             FailureCode::Unspecified,
             FailureSource::Expired,
-            "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
+            "2026-06-29T00:00:00Z".parse::<Timestamp>()?,
         )
         .await?;
 
@@ -2615,7 +2615,7 @@ parameter_decode_tokens = 256
             "Job expired before any client completed it",
             FailureCode::Unspecified,
             FailureSource::Expired,
-            "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
+            "2026-06-29T00:00:00Z".parse::<Timestamp>()?,
         )
         .await?;
         assert_eq!(outcome, CreateOutcome::Created);
@@ -2641,7 +2641,7 @@ parameter_decode_tokens = 256
             "expired",
             FailureCode::Unspecified,
             FailureSource::Expired,
-            "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
+            "2026-06-29T00:00:00Z".parse::<Timestamp>()?,
         )?;
         let Submission::Failure(f) = submission else {
             anyhow::bail!("expected a failure submission");
@@ -2686,7 +2686,7 @@ parameter_decode_tokens = 256
             "expired",
             FailureCode::Unspecified,
             FailureSource::Expired,
-            "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
+            "2026-06-29T00:00:00Z".parse::<Timestamp>()?,
         )?;
         let Submission::Failure(f) = submission else {
             anyhow::bail!("expected a failure submission");
@@ -2868,7 +2868,7 @@ parameter_decode_tokens = 256
             "expired",
             FailureCode::Unspecified,
             FailureSource::Expired,
-            "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?,
+            "2026-06-29T00:00:00Z".parse::<Timestamp>()?,
         )?;
         let Submission::Failure(f) = submission else {
             anyhow::bail!("expected a failure submission");
@@ -2900,7 +2900,7 @@ parameter_decode_tokens = 256
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("job body is a JSON object"))?
             .remove(omit);
-        let at = "2026-06-29T00:00:00Z".parse::<DateTime<Utc>>()?;
+        let at = "2026-06-29T00:00:00Z".parse::<Timestamp>()?;
         assert!(
             system_failure_from_job_body(
                 &job_body,
@@ -3248,7 +3248,7 @@ parameter_decode_tokens = 256
             let submission = input.into_submission(
                 ClientId::try_new("ev1_a")?,
                 JobId::new_unchecked("job-1"),
-                Utc::now(),
+                Timestamp::now(),
                 BenchmarkType::PrefillThroughput,
             );
             Ok(serde_json::to_value(&submission)?["device_time_ms"].as_i64())
@@ -3285,7 +3285,7 @@ parameter_decode_tokens = 256
         let Submission::Success(s) = input_body(false, extra)?.into_submission(
             ClientId::try_new("ev1_a")?,
             JobId::new_unchecked("job-1"),
-            Utc::now(),
+            Timestamp::now(),
             BenchmarkType::PrefillThroughput,
         ) else {
             anyhow::bail!("a success body became a failure");
@@ -3364,7 +3364,7 @@ parameter_decode_tokens = 256
         let submission = input.into_submission(
             ClientId::try_new("ev1_a")?,
             JobId::new_unchecked("job-1"),
-            Utc::now(),
+            Timestamp::now(),
             BenchmarkType::PrefillThroughput,
         );
         let output = match &submission {
@@ -3400,7 +3400,7 @@ parameter_decode_tokens = 256
         .into_submission(
             client_id.clone(),
             job_id.clone(),
-            Utc::now(),
+            Timestamp::now(),
             BenchmarkType::PrefillThroughput,
         );
         let body = serde_json::to_value(&submission)?;

@@ -374,8 +374,6 @@ pub enum FailureCode {
     /// - A model was missing.
     /// - The submit failed.
     /// - A download or wait timed out.
-    /// - The readiness wait timed out, sent with `retriable: false` by a
-    ///   pipette build from before [`Self::DeviceNotReady`].
     HarnessError,
 }
 

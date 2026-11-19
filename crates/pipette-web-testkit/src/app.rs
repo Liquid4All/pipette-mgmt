@@ -297,6 +297,7 @@ pub fn stores_of(state: &AppState) -> pipette_store::Stores {
         plans: state.plan_store.clone(),
         campaigns: state.campaign_store.clone(),
         campaign_groups: state.campaign_group_store.clone(),
+        plan_tags: state.plan_tag_store.clone(),
         model_params: state.model_params_store.clone(),
         audit: state.audit_store.clone(),
         descriptor_catalog: state.descriptor_catalog_store.clone(),

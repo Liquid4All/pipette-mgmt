@@ -135,8 +135,8 @@ async fn an_org_admin_onboards_a_device_with_a_preauth_key() -> anyhow::Result<(
     assert_eq!(minted["minted_by"], json!(admin.1.as_str()));
     assert_eq!(minted["note"], json!("rack 3"));
     assert!(minted.get("secret_hash").is_none(), "{minted}");
-    let expires_at: chrono::DateTime<chrono::Utc> = json_str(&minted, "expires_at")?.parse()?;
-    let hours = (expires_at - chrono::Utc::now()).num_hours();
+    let expires_at: jiff::Timestamp = json_str(&minted, "expires_at")?.parse()?;
+    let hours = expires_at.duration_since(jiff::Timestamp::now()).as_hours();
     assert!((6 * 24..=7 * 24).contains(&hours), "expires in {hours}h");
 
     // Listed by its id and its minter, never by its secret.
@@ -438,7 +438,7 @@ async fn the_listing_is_the_keys_naming_the_organization() -> anyhow::Result<()>
         }),
         None,
     ] {
-        let minted = pipette_core::client_preauth::mint(host_key(owner), chrono::Utc::now())?;
+        let minted = pipette_core::client_preauth::mint(host_key(owner), jiff::Timestamp::now())?;
         state
             .client_store
             .put_client_preauth_key(&minted.key)

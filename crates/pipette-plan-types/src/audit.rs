@@ -3,12 +3,13 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuditEventId, CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId, JobId, OrgId,
-    PlanId, PolicyKind, PrincipalOwner, UserId, UserKey, UserKeyId, VaultResourceId, empty_as_none,
+    AuditEventId, CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId,
+    DescriptorEntryCreator, JobId, OrgId, PlanId, PolicyKind, PrincipalOwner, UserId, UserKey,
+    UserKeyId, VaultResourceId, empty_as_none,
 };
 
 /// Who acted.
@@ -113,6 +114,23 @@ pub enum AuditAction {
         /// The keys of the members that the target entry already held.
         skipped: Vec<String>,
     },
+    /// A member removal from a hand-made entry. The request or command has its
+    /// own audit event; this one records the stored name and the removed member.
+    CatalogRemoveMember {
+        scope: CatalogScope,
+        name: CatalogName,
+        /// The key of the removed member, as `catalog list` prints it.
+        member: String,
+        digest: String,
+    },
+    /// A move of an org entry to global scope. The command has its own audit
+    /// event; this one records the organization, the stored name, and the
+    /// creator of the org entry. The global entry has `operator` as its creator.
+    CatalogMoveToGlobal {
+        org_id: OrgId,
+        name: CatalogName,
+        original_created_by: DescriptorEntryCreator,
+    },
     /// An account's first Clerk sign-in, when it already held keys: each was
     /// registered before its owner signed in.
     FirstClerkSignIn { prior_keys: Vec<UserKey> },
@@ -175,7 +193,8 @@ pub enum AuditTarget {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AuditEvent {
     pub event_id: AuditEventId,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     pub actor: AuditActor,
     pub action: AuditAction,
     pub outcome: AuditOutcome,
@@ -278,48 +297,73 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn a_catalog_rename_action_keeps_both_stored_names() -> anyhow::Result<()> {
-        let action = AuditAction::CatalogRename {
+    #[rstest::rstest]
+    #[case::rename(
+        AuditAction::CatalogRename {
             scope: CatalogScope::Org(OrgId::try_new("org_acme")?),
             old_name: CatalogName::try_new("Fork")?,
             new_name: CatalogName::try_new("Spoon")?,
-        };
-        let wire = serde_json::to_value(&action)?;
-        assert_eq!(
-            wire,
-            json!({
-                "type": "catalog_rename",
-                "scope": "org_acme",
-                "old_name": "Fork",
-                "new_name": "Spoon"
-            })
-        );
-        assert_eq!(serde_json::from_value::<AuditAction>(wire)?, action);
-        Ok(())
-    }
-
-    #[test]
-    fn a_catalog_merge_action_keeps_both_names_and_the_member_keys() -> anyhow::Result<()> {
-        let action = AuditAction::CatalogMerge {
+        },
+        json!({
+            "type": "catalog_rename",
+            "scope": "org_acme",
+            "old_name": "Fork",
+            "new_name": "Spoon"
+        })
+    )]
+    #[case::merge(
+        AuditAction::CatalogMerge {
             scope: CatalogScope::Global,
             old_name: CatalogName::try_new("AcmeLM-Typo")?,
             into_name: CatalogName::try_new("AcmeLM")?,
             moved: vec!["gguf::q8_0".to_owned()],
             skipped: vec!["gguf::q4_0".to_owned()],
-        };
+        },
+        json!({
+            "type": "catalog_merge",
+            "scope": "global",
+            "old_name": "AcmeLM-Typo",
+            "into_name": "AcmeLM",
+            "moved": ["gguf::q8_0"],
+            "skipped": ["gguf::q4_0"]
+        })
+    )]
+    #[case::remove_member(
+        AuditAction::CatalogRemoveMember {
+            scope: CatalogScope::Global,
+            name: CatalogName::try_new("AcmeLM")?,
+            member: "gguf::q4_0".to_owned(),
+            digest: "sha256:abc".to_owned(),
+        },
+        json!({
+            "type": "catalog_remove_member",
+            "scope": "global",
+            "name": "AcmeLM",
+            "member": "gguf::q4_0",
+            "digest": "sha256:abc"
+        })
+    )]
+    #[case::move_to_global(
+        AuditAction::CatalogMoveToGlobal {
+            org_id: OrgId::try_new("org_acme")?,
+            name: CatalogName::try_new("AcmeLM")?,
+            original_created_by: DescriptorEntryCreator::Account(UserId::try_new(
+                "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
+            )?),
+        },
+        json!({
+            "type": "catalog_move_to_global",
+            "org_id": "org_acme",
+            "name": "AcmeLM",
+            "original_created_by": "account:user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e"
+        })
+    )]
+    fn catalog_action_round_trips(
+        #[case] action: AuditAction,
+        #[case] expected_json: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let wire = serde_json::to_value(&action)?;
-        assert_eq!(
-            wire,
-            json!({
-                "type": "catalog_merge",
-                "scope": "global",
-                "old_name": "AcmeLM-Typo",
-                "into_name": "AcmeLM",
-                "moved": ["gguf::q8_0"],
-                "skipped": ["gguf::q4_0"]
-            })
-        );
+        assert_eq!(wire, expected_json);
         assert_eq!(serde_json::from_value::<AuditAction>(wire)?, action);
         Ok(())
     }
@@ -329,7 +373,7 @@ mod tests {
     fn an_event_reads_as_tagged_objects() -> anyhow::Result<()> {
         let event = AuditEvent {
             event_id: AuditEventId::try_new("audit_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
-            created_at: DateTime::from_timestamp(0, 0).unwrap_or_default(),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
             actor: AuditActor::Client {
                 client_id: ClientId::try_new("ev1_abc")?,
             },

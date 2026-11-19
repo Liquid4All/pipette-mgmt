@@ -5,10 +5,10 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use futures::stream;
 use futures::stream::StreamExt;
+use jiff::Timestamp;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 
@@ -287,7 +287,7 @@ pub(super) async fn record_signature_migration(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     client_id: &ClientId,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> anyhow::Result<MigrationRecord> {
     let path = signature_migration_path(prefix, client_id);
     let record = SignatureMigration { first_seen: at };

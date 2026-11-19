@@ -77,6 +77,8 @@ export interface ServerFilter {
 
 export interface TableSpec<R> {
   columns: TableColumn<R>[];
+  /** The sort the table shows when the address names none, as `TableState.sort` spells it. */
+  sort?: string;
   texts?: TextFilter<R>[];
   server?: ServerFilter[];
   choices?: ChoiceFilter<R>[];
@@ -92,9 +94,9 @@ export interface TableState {
   sort: string;
 }
 
-/** The state the address sets, a sort by a column the table lacks dropped. */
+/** The state the address sets, a sort by a column the table lacks dropped, the spec's sort where it names none. */
 export function tableState<R>(spec: TableSpec<R>, query: URLSearchParams): TableState {
-  const sort = query.get("sort") ?? "";
+  const sort = query.get("sort") || spec.sort || "";
   return {
     texts: Object.fromEntries([...spec.texts ?? [], ...spec.server ?? []].map(({ key }) =>
       [key, query.get(key)?.trim() ?? ""])),

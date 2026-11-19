@@ -82,11 +82,14 @@ impl std::fmt::Display for MlxSwiftStack {
 }
 
 /// Closed set of MLX build targets pipette tracks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display, strum::EnumIter,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "clap", clap(rename_all = "kebab-case"))]
+#[strum(serialize_all = "kebab-case")]
 pub enum MlxMacosPipetteFlavor {
     MacosArm64,
 }
@@ -112,6 +115,7 @@ mod tests {
         let parsed = toml::from_str::<Row>(&format!(r#"flavor = "{wire}""#)).ok();
         assert_eq!(parsed.map(|row| row.flavor), expected);
         if let Some(flavor) = expected {
+            assert_eq!(flavor.to_string(), wire);
             let emitted = toml::to_string(&Row { flavor })?;
             assert!(emitted.contains(wire), "emit missing {wire:?}: {emitted:?}");
         }

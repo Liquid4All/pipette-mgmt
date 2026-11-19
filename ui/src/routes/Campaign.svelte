@@ -25,6 +25,8 @@
   import CampaignLabels from "../lib/components/CampaignLabels.svelte";
   import CampaignRename from "../lib/components/CampaignRename.svelte";
   import CampaignArchive from "../lib/components/CampaignArchive.svelte";
+  import CampaignLock from "../lib/components/CampaignLock.svelte";
+  import PlanTagChips from "../lib/components/PlanTagChips.svelte";
   import CampaignTransfer from "../lib/components/CampaignTransfer.svelte";
   import LabelsInline from "../lib/components/LabelsInline.svelte";
   import Loaded from "../lib/components/Loaded.svelte";
@@ -38,6 +40,7 @@
   import { Loader } from "../lib/components/work.svelte";
   import PageHead from "../lib/components/PageHead.svelte";
   import { when } from "../lib/format";
+  import { orgName } from "../lib/orgs";
   import { ownedQuery, ownerBranch, underTrail } from "../lib/owned";
   import { here, redirect } from "../lib/route.svelte";
   import { campaignGroupLink, campaignLink, campaignPlanLink, type RouteOf } from "../lib/routes";
@@ -106,18 +109,20 @@
   });
 
   const view = $derived(page.data?.detail ?? null);
-  // The catalog organization's slug, read from the server for a reader that does not hold the organization already.
-  let lookedUp = $state<{ id: string; slug: string } | null>(null);
+  // The display name of the catalog organization. It comes from the server when the session does not know the organization.
+  let lookedUp = $state<{ id: string; name: string } | null>(null);
   $effect(() => {
     const org_id = view?.catalog_org_id;
     if (!org_id || session.knownOrg(org_id)) return;
     untrack(() => void session.resolveOrg(org_id).catch(() => null)
-      .then((org) => { if (org) lookedUp = { id: org_id, slug: org.slug }; }));
+      .then((org) => { if (org) lookedUp = { id: org_id, name: orgName(org) }; }));
   });
-  const slugOf = (org_id: string) =>
-    session.knownOrg(org_id)?.slug ?? (lookedUp?.id === org_id ? lookedUp.slug : null);
+  const nameOf = (org_id: string) => {
+    const known = session.knownOrg(org_id);
+    return known ? orgName(known) : lookedUp?.id === org_id ? lookedUp.name : null;
+  };
   // Where the reader may name the plan's runtimes in the catalog; the server decides whether it may.
-  const catalogOrg = $derived(view ? catalogOrgOf(view, slugOf) : null);
+  const catalogOrg = $derived(view ? catalogOrgOf(view, nameOf) : null);
   // What the owner's campaigns already use, which a label's inputs offer: a whole listing, so read only once an
   // editor opens, and once per owner. A failed read offers nothing.
   const known = new Loader<Map<string, string[]>>();
@@ -173,6 +178,10 @@
     <!-- The campaign's record: atop Revisions, or the page where no plan is drawn. -->
     {#snippet facts()}
       <div><dt>state</dt><dd>{stateOf(detail)}</dd></div>
+      {#if detail.state_note}<div><dt>state_note</dt><dd>{detail.state_note}</dd></div>{/if}
+      {#if detail.history[0]?.tags?.length}
+        <div><dt>current plan tags</dt><dd><PlanTagChips tags={detail.history[0].tags} /></dd></div>
+      {/if}
       <div><dt>owner</dt><dd><OwnerCell owner={detail.owner} names={detail.names ?? {}} /></dd></div>
       <div><dt>created_at</dt><dd>{when(detail.created_at)}</dd></div>
       <div><dt>updated_at</dt><dd>{when(detail.updated_at)}</dd></div>
@@ -201,7 +210,9 @@
       <CampaignRename title="Campaign name" name={detail.name}
                       save={(to) => updateCampaign(session.signer, detail.campaign_id, { name: to }).then(reread)} />
       <CampaignLabels {detail} {vocabulary} onopen={suggest} onchange={reread} />
-      <CampaignArchive {detail} onchange={reread} />
+      <CampaignLock {detail} onchange={reread} />
+      <!-- A locked campaign is unlocked before it is archived. -->
+      {#if stateOf(detail) !== "locked"}<CampaignArchive {detail} onchange={reread} />{/if}
     {/snippet}
     {#snippet transfer()}
       <CampaignTransfer {detail} onchange={reread} onhanded={handedOver} ondone={transferDone} />
@@ -209,6 +220,9 @@
 
     {#if stateOf(detail) === "archived"}
       <p class="notice">This campaign is archived, so the listings hide it.</p>
+    {:else if stateOf(detail) === "locked"}
+      <p class="notice">This campaign is locked: {detail.state_note}. Its plan is not revised or cancelled,
+        and the campaign is not deleted, until it is unlocked.</p>
     {/if}
     <!-- On every tab; nothing where there is no group, no label and the reader may add none. -->
     {#if detail.group || detail.may_administer || labelPairs(detail.labels).length}

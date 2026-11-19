@@ -2,7 +2,7 @@
 //! user belongs to, and who owns a device. Writing them is an authority: they
 //! scope members' grants and what their devices reach.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
@@ -26,7 +26,7 @@ pub struct Organization {
     /// `acme`. Free-text and mutable; nothing keys on it.
     pub display_name: NonEmptyTrimmedString,
     pub status: OrgStatus,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl From<Organization> for pipette_plan_types::Organization {
@@ -44,11 +44,7 @@ impl From<Organization> for pipette_plan_types::Organization {
 impl Organization {
     /// A new active organization under a freshly minted id. Infallible:
     /// [`OrgSlug`] has already folded the handle and refused an id-prefixed one.
-    pub fn new(
-        slug: OrgSlug,
-        display_name: NonEmptyTrimmedString,
-        created_at: DateTime<Utc>,
-    ) -> Self {
+    pub fn new(slug: OrgSlug, display_name: NonEmptyTrimmedString, created_at: Timestamp) -> Self {
         Self {
             org_id: OrgId::mint(),
             slug,
@@ -85,7 +81,7 @@ mod tests {
         Ok(Organization::new(
             OrgSlug::try_new("acme")?,
             NonEmptyTrimmedString::try_new("Acme Corp., Inc.")?,
-            Utc::now(),
+            Timestamp::now(),
         ))
     }
 
@@ -129,7 +125,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new(typed)?,
             NonEmptyTrimmedString::try_new("Acme Corp., Inc.")?,
-            Utc::now(),
+            Timestamp::now(),
         );
         assert_eq!(org.slug.as_str(), folded);
         assert_eq!(org.display_name.as_str(), "Acme Corp., Inc.");

@@ -9,7 +9,6 @@ use std::io::Write as _;
 use anyhow::Context;
 use arrow::array::Array;
 use axum::http::StatusCode;
-use chrono::Datelike;
 use futures::TryStreamExt;
 use httpmock::Method::POST;
 use httpmock::{HttpMockRequest, HttpMockResponse, MockServer};
@@ -406,8 +405,8 @@ async fn test_scorer_trims_device_model_runtime_fields() -> anyhow::Result<()> {
         .storage
         .data_dir()
         .ok_or_else(|| anyhow::anyhow!("expected local_fs config"))?;
-    let now = chrono::Utc::now();
-    let day_key = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let now = jiff::Timestamp::now();
+    let day_key = now.strftime("%Y-%m-%d").to_string();
     let partition = warehouse::warehouse_day_partition_dir(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
@@ -690,7 +689,7 @@ parameter_seed = 7
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("eval_test_pinned")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     assert!(partition.exists(), "expected a scored partition");
 
@@ -1006,7 +1005,7 @@ async fn test_vlm_eval_scoring_stamps_the_pinned_sampling_and_profile() -> anyho
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("vlm_eval_test_pinned")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     assert!(partition.exists(), "expected a scored partition");
 
@@ -1278,7 +1277,7 @@ async fn test_asr_eval_scoring_reports_wer_and_its_beams() -> anyhow::Result<()>
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("asr_eval_ls_clean_minicpm_o")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     let checked = assert_i32_column(&partition, "parameter_num_beams", Some(3))?;
     assert!(checked > 0, "the partition held no rows to check");
@@ -2039,7 +2038,7 @@ async fn test_eval_sample_results_404_for_failure_archived_unrecorded() -> anyho
     let (sk, client_id) = register_and_approve(&state).await?;
 
     // Four days back: its partition closed a day ago under the 72-hour window.
-    let submitted_at = chrono::Utc::now() - chrono::TimeDelta::days(4);
+    let submitted_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(4 * 24);
     let job_id = job("job-archived-failure")?;
     let stores = stores_of(&state);
     stores
@@ -2052,7 +2051,7 @@ async fn test_eval_sample_results_404_for_failure_archived_unrecorded() -> anyho
                 "benchmark_type": "eval",
                 "client_id": client_id.as_str(),
                 "job_id": job_id.as_str(),
-                "submitted_at": submitted_at.to_rfc3339(),
+                "submitted_at": submitted_at.to_string(),
                 "retriable": false,
                 "failure_reason": "runtime OOM",
             }),
@@ -2371,7 +2370,7 @@ async fn test_vl_throughput_scoring_canonicalizes_model_descriptor() -> anyhow::
         &warehouse_dir,
         &BenchmarkId::try_new("vl_throughput_384x384_32_64")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     assert!(partition.exists());
 
@@ -2589,7 +2588,7 @@ async fn test_asr_throughput_scores_and_records_its_token_counts() -> anyhow::Re
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("asr_throughput_9400ms_text1024_decode128")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     let rows = [
         ("observation_asr_throughput_prefill_tokens", Some(1161)),
@@ -2698,7 +2697,7 @@ async fn test_asr_max_memory_scores_a_peak_and_records_the_clip() -> anyhow::Res
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("asr_max_memory_9400ms_text1024_decode256")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     // A peak has no token observations; those belong to throughput.
     let rows = [
@@ -2806,7 +2805,7 @@ async fn test_decision_latency_scores_a_packed_batch_and_records_its_swap() -> a
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("decision_latency_text64_q3_bs64")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     let rows = [
         ("parameter_text_tokens", Some(64)),
@@ -2875,7 +2874,7 @@ async fn score_one_submission(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
     assert!(partition.exists(), "expected a scored partition");
     Ok((dir, partition))
@@ -3072,7 +3071,7 @@ async fn test_requested_and_effective_flags_both_reach_the_warehouse() -> anyhow
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
 
     let requested = r#"{"n_gpu_layers":99,"runtime_type":"llamacpp_cli_stock_tools"}"#;
@@ -3645,7 +3644,7 @@ async fn test_scorer_resolves_moe_params_from_catalog(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
 
     let mut total_seen = None;
@@ -3726,7 +3725,7 @@ async fn test_scorer_leaves_null_when_neither_catalog_nor_submission_has_values(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
         &client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     );
 
     let mut total_null = false;
@@ -4171,7 +4170,8 @@ async fn test_eval_in_the_score_queue_reads_as_scoring() -> anyhow::Result<()> {
         let submitted_at = body["submitted_at"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("submitted_at must be a string: {body}"))?;
-        chrono::DateTime::parse_from_rfc3339(submitted_at)
+        submitted_at
+            .parse::<jiff::Timestamp>()
             .with_context(|| format!("submitted_at is not RFC 3339: {submitted_at}"))?;
         for field in ["scored_at", "score_runtime_version", "metrics"] {
             assert_eq!(
@@ -4610,7 +4610,7 @@ fn today_partition(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new(benchmark_id)?,
         client_id,
-        &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        &jiff::Timestamp::now().strftime("%Y-%m-%d").to_string(),
     ))
 }
 
@@ -4932,9 +4932,9 @@ async fn test_synthetic_failure_records_its_source(
 
     let body = failure_job_body("job-1", "prefill_throughput_256", &[client_id.as_str()]);
     let expires_at = match retirement {
-        Retirement::Expired => {
-            pipette_plan_types::ExpiresAt::At(chrono::Utc::now() - chrono::Duration::days(1))
-        }
+        Retirement::Expired => pipette_plan_types::ExpiresAt::At(
+            jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24),
+        ),
         Retirement::AllClientsDenied | Retirement::LeaseLost => {
             pipette_plan_types::ExpiresAt::Never
         }
@@ -4951,11 +4951,15 @@ async fn test_synthetic_failure_records_its_source(
         }
         // Two leases already lost, and the current one has lapsed: the third.
         Retirement::LeaseLost => {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             for hours in [3, 2] {
                 state
                     .todo_store
-                    .write_lost_lease(&seeded, &client_id, now - chrono::Duration::hours(hours))
+                    .write_lost_lease(
+                        &seeded,
+                        &client_id,
+                        now - jiff::SignedDuration::from_hours(hours),
+                    )
                     .await?;
             }
             let claimed = state
@@ -4964,7 +4968,7 @@ async fn test_synthetic_failure_records_its_source(
                     &seeded,
                     expires_at,
                     &client_id,
-                    now - chrono::Duration::hours(1),
+                    now - jiff::SignedDuration::from_hours(1),
                 )
                 .await?;
             anyhow::ensure!(
@@ -5045,7 +5049,7 @@ async fn test_backlog_failure_body_resolves_its_source(
                 "benchmark_type": "prefill_throughput",
                 "client_id": client_id,
                 "job_id": job_id.as_str(),
-                "submitted_at": chrono::Utc::now().to_rfc3339(),
+                "submitted_at": jiff::Timestamp::now().to_string(),
                 "retriable": false,
                 "failure_reason": "a body written before failure_source existed",
             }),
@@ -5080,7 +5084,7 @@ async fn test_failure_past_the_lock_window_archives_unrecorded(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
-    let submitted_at = chrono::Utc::now() - chrono::TimeDelta::days(days_back);
+    let submitted_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * days_back);
     let client_id = pipette_plan_types::ClientId::try_new("ev1_backlog")?;
     let job_id = job("job-lock-window")?;
     let stores = stores_of(&state);
@@ -5094,7 +5098,7 @@ async fn test_failure_past_the_lock_window_archives_unrecorded(
                 "benchmark_type": "prefill_throughput",
                 "client_id": client_id.as_str(),
                 "job_id": job_id.as_str(),
-                "submitted_at": submitted_at.to_rfc3339(),
+                "submitted_at": submitted_at.to_string(),
                 "retriable": false,
                 "failure_reason": "runtime OOM",
             }),
@@ -5129,7 +5133,7 @@ async fn test_failure_past_the_lock_window_archives_unrecorded(
         &data_dir.join("warehouse/results"),
         &BenchmarkId::try_new("prefill_throughput_256")?,
         &client_id,
-        &submitted_at.format("%Y-%m-%d").to_string(),
+        &submitted_at.strftime("%Y-%m-%d").to_string(),
     );
     assert_eq!(
         partition.exists(),

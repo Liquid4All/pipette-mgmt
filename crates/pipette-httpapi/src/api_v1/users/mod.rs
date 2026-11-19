@@ -13,9 +13,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use chrono::Utc;
 use futures::stream;
 use futures::stream::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_permission::{
@@ -677,7 +677,7 @@ impl AccountAdmin {
         let created = User {
             account_type: request.account_type,
             campaign_scope: request.campaign_scope,
-            ..User::try_new(request.contact_email, Utc::now())
+            ..User::try_new(request.contact_email, Timestamp::now())
                 .map_err(|e| AppError::BadRequest(format!("invalid contact_email: {e}")))?
         };
         if let RosterScope::Org(own) = &self.scope {
@@ -989,7 +989,7 @@ impl AccountAdmin {
         user_id: &UserId,
     ) -> Result<Vec<UserPreauthKeyView>, AppError> {
         self.account(state, user_id).await?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut keys: Vec<UserPreauthKey> = naming(state, user_id).await?;
         keys.sort_by_key(|key| std::cmp::Reverse(key.created_at));
         Ok(keys.into_iter().map(|key| key.view(now)).collect())
@@ -1009,12 +1009,12 @@ impl AccountAdmin {
         let (target, _) = self.writable(state, user_id).await?;
         onboardable(state, self.as_caller(caller), user_id).await?;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut minted = user_preauth::mint(
             UserPreauthParams {
                 user_id: target.user_id.clone(),
                 usage: UserPreauthUsage::SingleUse,
-                expires_at: Some(now + chrono::Duration::days(i64::from(days))),
+                expires_at: Some(now + jiff::SignedDuration::from_hours(24 * i64::from(days))),
                 note: request.note,
             },
             now,

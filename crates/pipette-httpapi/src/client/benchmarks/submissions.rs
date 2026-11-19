@@ -7,8 +7,8 @@ use axum::extract::{FromRequestParts, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use pipette_core::benchmark::Benchmark;
@@ -291,7 +291,7 @@ fn validate_and_prepare_submission(
         input.into_submission(
             client_id.clone(),
             job_id,
-            Utc::now(),
+            Timestamp::now(),
             benchmark.benchmark_type(),
         ),
         client_supplied_job_id,
@@ -480,7 +480,7 @@ fn requested_flags_from_body(body: Option<&serde_json::Value>) -> RequestedFlags
 }
 
 /// The lease's key, which every renewal renames, and the job body read at it.
-pub(crate) type LeasedBody = (ExpiresAt, DateTime<Utc>, serde_json::Value);
+pub(crate) type LeasedBody = (ExpiresAt, Timestamp, serde_json::Value);
 
 pub(crate) async fn own_leased_body(
     todo: &dyn TodoStore,
@@ -500,7 +500,7 @@ async fn leased_body_at_current_key(
     job_id: &JobId,
     expires_at: ExpiresAt,
     client_id: &ClientId,
-    lease_expiry: DateTime<Utc>,
+    lease_expiry: Timestamp,
 ) -> anyhow::Result<Option<LeasedBody>> {
     if let Some(body) = todo
         .get_leased(job_id, expires_at, client_id, lease_expiry)
@@ -550,7 +550,7 @@ async fn bind_claim(
         todo,
         job_id,
         client_id,
-        state.config.lease_expiry_from(Utc::now()),
+        state.config.lease_expiry_from(Timestamp::now()),
     )
     .await?;
     // A lease that appeared after the read skipped the vault check.
@@ -590,7 +590,7 @@ async fn verify_claim(
     todo: &dyn TodoStore,
     job_id: &JobId,
     client_id: &ClientId,
-    new_expiry: DateTime<Utc>,
+    new_expiry: Timestamp,
 ) -> Result<ExpiresAt, AppError> {
     if todo.has_pending_reindex(client_id).await.map_err(|e| {
         AppError::Internal(format!(
@@ -675,7 +675,7 @@ async fn fail_larger_runs(
                     &failure.job_id,
                     &failure.wire.benchmark_id,
                     failure.wire.failure_code,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await?;
                 Ok(())
@@ -757,7 +757,7 @@ async fn own_lease(
     todo: &dyn TodoStore,
     client_id: &ClientId,
     job_id: &JobId,
-) -> anyhow::Result<Option<(ExpiresAt, chrono::DateTime<Utc>)>> {
+) -> anyhow::Result<Option<(ExpiresAt, jiff::Timestamp)>> {
     Ok(todo
         .leases_for_client(client_id)
         .await?
@@ -1198,7 +1198,7 @@ mod tests {
             "x",
             pipette_plan_types::FailureCode::Unspecified,
             pipette_plan_types::FailureSource::Client,
-            Utc::now(),
+            Timestamp::now(),
         )? {
             Submission::Failure(f) => Ok(f),
             Submission::Success(_) => {
@@ -1255,7 +1255,7 @@ mod tests {
             job.as_str(),
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
             &json!({"spec": {"benchmark": "prefill_throughput_256"}}),
         )
         .await?;
@@ -1313,7 +1313,7 @@ mod tests {
         };
         let client = ClientId::try_new("ev1_me")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
-        let locator_expiry = Utc::now() + chrono::Duration::hours(1);
+        let locator_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
 
         if plant_lease {
             seed_leased_until(
@@ -1329,7 +1329,11 @@ mod tests {
 
         if renew_after_locator {
             let renewed = todo
-                .renew_lease(&job, &client, locator_expiry + chrono::Duration::hours(1))
+                .renew_lease(
+                    &job,
+                    &client,
+                    locator_expiry + jiff::SignedDuration::from_hours(1),
+                )
                 .await?;
             assert!(
                 matches!(renewed, RenewLeaseResult::Renewed(_)),
@@ -1358,7 +1362,7 @@ mod tests {
         let client = ClientId::try_new("ev1_me")?;
         let job = JobId::new_unchecked("550e8400-e29b-41d4-a716-446655440000");
 
-        let old_expiry = Utc::now() - chrono::Duration::hours(2);
+        let old_expiry = Timestamp::now() - jiff::SignedDuration::from_hours(2);
         seed_leased_until(
             &todo,
             job.as_str(),
@@ -1369,7 +1373,7 @@ mod tests {
         )
         .await?;
 
-        let new_expiry = Utc::now() + chrono::Duration::hours(1);
+        let new_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         verify_claim(&todo, &job, &client, new_expiry).await?;
 
         let expiry = todo
@@ -1380,7 +1384,7 @@ mod tests {
             .map(|lease| lease.lease_expiry)
             .context("lease should still exist after renewal")?;
         assert!(
-            expiry > Utc::now(),
+            expiry > Timestamp::now(),
             "lease expiry should be renewed into the future"
         );
         Ok(())

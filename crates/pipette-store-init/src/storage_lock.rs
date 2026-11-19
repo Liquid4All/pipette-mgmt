@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use object_store::path::Path as ObjPath;
 use object_store::{
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
@@ -38,8 +38,8 @@ struct LockBody {
     holder: String,
     hostname: String,
     pid: u32,
-    acquired_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
+    acquired_at: Timestamp,
+    expires_at: Timestamp,
 }
 
 /// A held storage lock. Without [`StorageLock::release`], a drop still
@@ -235,7 +235,7 @@ fn local_info_line(holder: &str) -> String {
         holder,
         hostname(),
         std::process::id(),
-        Utc::now().to_rfc3339(),
+        Timestamp::now(),
     )
 }
 
@@ -261,13 +261,11 @@ async fn acquire_s3(
     ttl: Duration,
 ) -> anyhow::Result<StorageLock> {
     let token = uuid::Uuid::new_v4().to_string();
-    let ttl = i64::try_from(ttl.as_secs())
-        .ok()
-        .and_then(chrono::Duration::try_seconds)
-        .ok_or_else(|| anyhow::anyhow!("lock ttl {ttl:?} is out of range"))?;
+    let ttl = jiff::SignedDuration::try_from(ttl)
+        .map_err(|_| anyhow::anyhow!("lock ttl {ttl:?} is out of range"))?;
 
     for _ in 0..ACQUIRE_ATTEMPTS {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let body = LockBody {
             token: token.clone(),
             holder: holder.to_string(),
@@ -307,7 +305,7 @@ async fn acquire_s3(
                              clear it with `pipette-mgmt unlock --force`"
                     )
                 })?;
-                if existing.expires_at > Utc::now() {
+                if existing.expires_at > Timestamp::now() {
                     anyhow::bail!("{}", s3_held_message(&existing));
                 }
                 tracing::warn!(
@@ -404,7 +402,7 @@ async fn unlock_s3(
 
     let (holder, active) = match serde_json::from_slice::<LockBody>(&bytes) {
         Ok(body) => {
-            let expired = body.expires_at <= Utc::now();
+            let expired = body.expires_at <= Timestamp::now();
             println!(
                 "Storage mutate lock:\n  \
                  holder:      {}\n  \
@@ -415,8 +413,8 @@ async fn unlock_s3(
                 body.holder,
                 body.hostname,
                 body.pid,
-                body.acquired_at.to_rfc3339(),
-                body.expires_at.to_rfc3339(),
+                body.acquired_at,
+                body.expires_at,
                 if expired { "expired" } else { "active" },
             );
             if !expired && !force {
@@ -483,11 +481,7 @@ fn s3_held_message(body: &LockBody) -> String {
         "storage mutate lock is held by `{}` on {} (pid {}), acquired {}, lease expires {}. \
          Another `score` or `fix-*` command is running; wait for it to finish. If that \
          process is dead, clear the lock with `pipette-mgmt unlock`.",
-        body.holder,
-        body.hostname,
-        body.pid,
-        body.acquired_at.to_rfc3339(),
-        body.expires_at.to_rfc3339(),
+        body.holder, body.hostname, body.pid, body.acquired_at, body.expires_at,
     )
 }
 
@@ -593,8 +587,8 @@ mod tests {
         (Arc::new(InMemory::new()), ObjPath::from(LOCK_KEY))
     }
 
-    fn lock_body(holder: &str, token: &str, expires_in: chrono::Duration) -> LockBody {
-        let now = Utc::now();
+    fn lock_body(holder: &str, token: &str, expires_in: jiff::SignedDuration) -> LockBody {
+        let now = Timestamp::now();
         LockBody {
             token: token.to_string(),
             holder: holder.to_string(),
@@ -649,7 +643,7 @@ mod tests {
         write_raw_lock(
             &store,
             &path,
-            &lock_body("score", "old", chrono::Duration::hours(-1)),
+            &lock_body("score", "old", jiff::SignedDuration::from_hours(-1)),
         )
         .await?;
 
@@ -664,7 +658,11 @@ mod tests {
         write_raw_lock(
             &store,
             &path,
-            &lock_body("fix-message-type", "live", chrono::Duration::minutes(5)),
+            &lock_body(
+                "fix-message-type",
+                "live",
+                jiff::SignedDuration::from_mins(5),
+            ),
         )
         .await?;
 
@@ -682,7 +680,7 @@ mod tests {
         write_raw_lock(
             &store,
             &path,
-            &lock_body("score", "old", chrono::Duration::hours(-1)),
+            &lock_body("score", "old", jiff::SignedDuration::from_hours(-1)),
         )
         .await?;
 
@@ -724,7 +722,7 @@ mod tests {
             &lock_body(
                 "fix-thinking",
                 "someone-else",
-                chrono::Duration::minutes(30),
+                jiff::SignedDuration::from_mins(30),
             ),
         )
         .await?;
@@ -752,7 +750,7 @@ mod tests {
         write_raw_lock(
             &store,
             &path,
-            &lock_body("score", "old", chrono::Duration::hours(-1)),
+            &lock_body("score", "old", jiff::SignedDuration::from_hours(-1)),
         )
         .await?;
 

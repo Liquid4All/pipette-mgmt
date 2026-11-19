@@ -2,7 +2,7 @@
 //! and device.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff_sqlx::ToSqlx;
 use sqlx::FromRow;
 
 use pipette_plan_types::{ClientId, RunMark};
@@ -28,16 +28,20 @@ impl SqlRunEvidenceStore {
 struct Row {
     digest: String,
     client_id: String,
-    last_success_at: Option<DateTime<Utc>>,
+    last_success_at: Option<jiff_sqlx::Timestamp>,
     last_success_client_version: Option<String>,
-    last_failure_at: Option<DateTime<Utc>>,
+    last_failure_at: Option<jiff_sqlx::Timestamp>,
     last_failure_client_version: Option<String>,
 }
 
 impl Row {
     fn parse(self) -> anyhow::Result<RunEvidenceRow> {
-        let mark =
-            |at: Option<DateTime<Utc>>, client_version| at.map(|at| RunMark { at, client_version });
+        let mark = |at: Option<jiff_sqlx::Timestamp>, client_version| {
+            at.map(|at| RunMark {
+                at: at.to_jiff(),
+                client_version,
+            })
+        };
         Ok(RunEvidenceRow {
             client_id: ClientId::try_new(&self.client_id)?,
             digest: self.digest,
@@ -77,9 +81,9 @@ impl RunEvidenceStore for SqlRunEvidenceStore {
             let digests: Vec<&str> = chunk.iter().map(|r| r.digest.as_str()).collect();
             let clients: Vec<&str> = chunk.iter().map(|r| r.client_id.as_str()).collect();
             let side = |pick: fn(&RunEvidenceRow) -> &Option<RunMark>| {
-                let at: Vec<Option<DateTime<Utc>>> = chunk
+                let at: Vec<Option<jiff_sqlx::Timestamp>> = chunk
                     .iter()
-                    .map(|r| pick(r).as_ref().map(|m| m.at))
+                    .map(|r| pick(r).as_ref().map(|m| m.at.to_sqlx()))
                     .collect();
                 let version: Vec<Option<&str>> = chunk
                     .iter()
@@ -125,14 +129,14 @@ impl RunEvidenceStore for SqlRunEvidenceStore {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, SubsecRound};
+    use jiff::{SignedDuration, Timestamp};
 
     use super::*;
 
     fn run(
         digest: &str,
         client: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
         version: &str,
         failed: bool,
     ) -> anyhow::Result<RunEvidenceRow> {
@@ -147,7 +151,7 @@ mod tests {
         ))
     }
 
-    fn mark(at: DateTime<Utc>, version: &str) -> Option<RunMark> {
+    fn mark(at: Timestamp, version: &str) -> Option<RunMark> {
         Some(RunMark {
             at,
             client_version: Some(version.into()),
@@ -159,8 +163,15 @@ mod tests {
     {
         let test_db = crate::testing::test_db_or_skip!();
         let store = SqlRunEvidenceStore::new(test_db.db().clone());
-        let t0 = Utc::now().trunc_subsecs(6);
-        let (t1, t2) = (t0 + Duration::minutes(1), t0 + Duration::minutes(2));
+        let t0 = Timestamp::now().round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )?;
+        let (t1, t2) = (
+            t0 + SignedDuration::from_mins(1),
+            t0 + SignedDuration::from_mins(2),
+        );
         // One batch with two runs of one pair: the fold keeps the newer.
         store
             .upsert(&[

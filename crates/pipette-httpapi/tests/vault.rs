@@ -326,7 +326,7 @@ async fn revoked_vault_access_does_not_count_as_a_lost_hand_back() -> anyhow::Re
             .write_lost_lease(
                 &job,
                 &client,
-                chrono::Utc::now() - chrono::Duration::hours(hours),
+                jiff::Timestamp::now() - jiff::SignedDuration::from_hours(hours),
             )
             .await?;
     }
@@ -575,7 +575,7 @@ async fn a_claim_moves_past_a_vault_job_it_puts_back(
 
     let principal = if well_formed { org_id.as_str() } else { "" };
     // Sooner than `never`, so the vault job ranks first.
-    let soon = ExpiresAt::At(chrono::Utc::now() + chrono::Duration::days(1));
+    let soon = ExpiresAt::At(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24));
     let vault = seed_avail(
         state.todo_store.as_ref(),
         VAULT_JOB,
@@ -682,12 +682,12 @@ async fn a_rejected_vault_grant_leaves_no_cache_affinity(
         .todo_store
         .write_eligible(&client, &next, ExpiresAt::Never)
         .await?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let outcome = state
         .todo_store
         .claim_for_client(
             &client,
-            now + chrono::Duration::hours(1),
+            now + jiff::SignedDuration::from_hours(1),
             0,
             &[],
             None,

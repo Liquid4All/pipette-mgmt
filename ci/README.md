@@ -16,7 +16,7 @@ Run them all before pushing:
   request description.
 - `install-tool.sh`: downloads a pinned release tarball, verifies its SHA-256
   and installs the binary. It also holds the pins. Used by the `security`
-  workflow for `cargo-deny`, `cargo-machete` and `gitleaks`, and by `ci.yml`
+  workflow for `cargo-deny` and `gitleaks`, and by `ci.yml`
   for the `cargo-deny` that checks licenses.
 
 `lint.sh` runs every executable file in `ci/checks/` via its own shebang, so a
@@ -70,7 +70,7 @@ It runs on Linux runners only (it wants `sha256sum`).
 
 It takes a tool name and nothing else, because the version and digest of each
 tool are a table inside it. `cargo-deny` is installed by two workflows here, and
-the same three tools gate the other Pipette repositories; with the pins at the
+the same tools gate the other Pipette repositories; with the pins at the
 call sites, two of those copies drift and nobody notices. The file is meant to
 be identical across the repositories. [CONTRIBUTING.md](../CONTRIBUTING.md#securityyml) covers why the
 tools are pinned at all.

@@ -85,7 +85,7 @@ export function memberOffers(listed: readonly CampaignView[],
     .filter((row) => principalOf(row.owner) === principalOf(group.owner) && !members.has(row.campaign_id))
     .map((row) => ({
       value: row.campaign_id,
-      label: stateOf(row) === "archived" ? `${row.name} (archived)` : row.name,
+      label: stateOf(row) === "active" ? row.name : `${row.name} (${stateOf(row)})`,
       searchText: labelPairs(row.labels).map(labelText).join("\n"),
     }));
 }
@@ -153,7 +153,7 @@ const CHECKS: Record<PolicyKind, Check> = {
     finds: (rule) => `standard deviation is over ${rule.percent}% of its result${short(rule)
       ? `, or ${rule.short_repetition_percent}% where its repetitions average under ${rule.short_repetition_ms} ms`
       : ""}`,
-    still: "If it is still over, the job keeps its last result.",
+    still: "If it is still over, the job is marked failed.",
   },
   failed: {
     title: ({ codes }) => (codes ? `Failures by type (${anyOf(codes)})` : "Failures by type"),
@@ -338,24 +338,6 @@ export function togetherText({ rerun_job_ids, marked_job_ids, skipped }: MemberP
   const aside = Object.keys(skipped).length;
   return `${rerun_job_ids.length} re-run, ${marked_job_ids.length} marked failed${aside ? `, ${aside} skipped` : ""}`;
 }
-
-/** A policy that is on, on a member campaign: `triggered` while it flags a job or its re-runs wait, else cleared. */
-export interface PolicyMark {
-  kind: PolicyKind;
-  state: "cleared" | "triggered";
-}
-
-/** The policies that are on of a member campaign of a preview, in kind order. */
-export const policyMarks = (row: MemberPolicyPreview): PolicyMark[] =>
-  row.checks.filter((check) => check.on)
-    .map(({ kind }) => ({ kind, state: row.triggered.includes(kind) ? "triggered" : "cleared" }));
-
-/** `row`'s marks as one text, which the member table sorts and searches by. */
-export const marksText = (row: MemberPolicyPreview): string =>
-  policyMarks(row).map(({ kind, state }) => `${kind} ${state}`).join(", ");
-
-/** Whether every policy that is on has cleared a member campaign. */
-export const allCleared = (row: MemberPolicyPreview): boolean => !row.triggered.length;
 
 /**
  * The preview's table: a member campaign a row, named by `names`, and a check a column under its policy's title. Only a

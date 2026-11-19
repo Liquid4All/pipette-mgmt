@@ -3,14 +3,14 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::owners::PrincipalOwner;
 use crate::plans::{Answered, PlanDryRun, PlanFiled, PlanSummary, RestoredVariant, RevisionChange};
 use crate::{
     CampaignGroupId, CampaignId, Changed, ElapsedMillis, JobId, Labels, NonEmptyTrimmedString,
-    OrgId, PlanId, VaultPrincipalId,
+    OrgId, PlanId, PolicyKind, UserId, VaultPrincipalId,
 };
 
 /// A campaign.
@@ -36,26 +36,48 @@ pub struct Campaign {
     /// the work has run.
     #[serde(default, skip_serializing_if = "CampaignState::is_active")]
     pub state: CampaignState,
-    pub created_at: DateTime<Utc>,
+    /// Why the campaign is locked. Present only while `locked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_note: Option<NonEmptyTrimmedString>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// Moves with each write that changes the record: a filing that moves
     /// `current_plan_id`, a rename, a relabel, a state change and a hand-off.
-    pub updated_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub updated_at: Timestamp,
 }
 
-/// Whether a campaign is in use. An archived one is hidden from its readers'
-/// listings by default and takes no new plan until it is unarchived.
+/// Whether a campaign is in use. A locked or archived one takes no new plan
+/// until it is active again. A locked one also keeps its running plan and its
+/// record: neither is cancelled nor deleted. An archived one is hidden from its
+/// readers' listings by default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignState {
     #[default]
     Active,
+    Locked,
     Archived,
 }
 
 impl CampaignState {
     pub fn is_active(&self) -> bool {
         *self == Self::Active
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Locked => "locked",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+impl std::fmt::Display for CampaignState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -65,9 +87,10 @@ impl std::str::FromStr for CampaignState {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "active" => Ok(Self::Active),
+            "locked" => Ok(Self::Locked),
             "archived" => Ok(Self::Archived),
             other => Err(format!(
-                "unknown state `{other}`, expected `active` or `archived`"
+                "unknown state `{other}`, expected `active`, `locked` or `archived`"
             )),
         }
     }
@@ -83,9 +106,11 @@ pub struct CampaignGroup {
     pub name: NonEmptyTrimmedString,
     /// Whose group it is, and the owner a campaign needs to join it.
     pub owner: PrincipalOwner,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// Moves with a rename alone, not with a member joining or leaving.
-    pub updated_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub updated_at: Timestamp,
 }
 
 /// The plans a campaign has run, newest first. Ids rather than rows: a caller
@@ -100,6 +125,50 @@ pub struct CampaignPlans {
     pub superseded_plan_ids: Vec<PlanId>,
     /// The walk stopped at its ceiling with revisions still behind it.
     pub history_truncated: bool,
+    /// Every tag of the campaign, newest first, each naming its plan.
+    pub tags: Vec<PlanTag>,
+}
+
+/// An annotated tag: a name for one plan a campaign filed, with a message, its
+/// tagger and when it was made. Never changed once made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct PlanTag {
+    pub campaign_id: CampaignId,
+    /// Unique within the campaign.
+    pub name: NonEmptyTrimmedString,
+    pub plan_id: PlanId,
+    pub message: NonEmptyTrimmedString,
+    /// Who made it; absent for a `pipette-mgmt` command, as a plan's
+    /// `submitted_by` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tagger: Option<UserId>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
+}
+
+/// `POST /api/v1/campaigns/{campaign_id}/tags` request body. Unknown keys are
+/// refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreatePlanTagRequest {
+    /// A plan the campaign filed, current or superseded.
+    #[serde(deserialize_with = "crate::parsed")]
+    pub plan_id: PlanId,
+    /// 1 to 64 letters, digits, `.`, `_`, `-` or `/`. It does not start or end
+    /// with `.` or `/`, and holds no `..` or `//`.
+    pub name: NonEmptyTrimmedString,
+    /// At most 4096 characters.
+    pub message: NonEmptyTrimmedString,
+}
+
+/// The `GET /api/v1/campaigns/{campaign_id}/tags` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct PlanTags {
+    /// Newest first.
+    pub tags: Vec<PlanTag>,
 }
 
 /// A created campaign, and the report on its first plan.
@@ -235,13 +304,13 @@ pub enum CampaignAnswer {
 pub enum RevisionAnswer {
     Revised(CampaignRevised),
     DryRun(RevisionDryRun),
-    Unchanged(Changed<CampaignView>),
+    Unchanged(Box<Changed<CampaignView>>),
 }
 
 /// `PATCH /api/v1/campaigns/{campaign_id}` request body: each field present is
-/// set, `labels` as the whole set, `state` to archive or unarchive it. The
-/// owner has its own route, and no route changes the plan. Unknown fields are
-/// refused, so an `owner` sent here is a `400` rather than ignored.
+/// set, `labels` as the whole set, `state` to lock, archive or reactivate it.
+/// The owner has its own route, and no route changes the plan. Unknown fields
+/// are refused, so an `owner` sent here is a `400` rather than ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -253,6 +322,10 @@ pub struct UpdateCampaignRequest {
     pub labels: Option<Labels>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<CampaignState>,
+    /// Why the campaign is locked, at most 4096 characters. Required with
+    /// `"state": "locked"`, and only with it: any other state clears the note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_note: Option<NonEmptyTrimmedString>,
 }
 
 /// `PUT /api/v1/campaigns/{campaign_id}/owner` request body. Its own route,
@@ -392,6 +465,27 @@ pub struct CampaignView {
     /// document does not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<String>>,
+    /// Each policy of the campaign's group that is on, cleared or triggered,
+    /// in kind order, as queue-maintenance last found them. Only the listing
+    /// gives it, with `plan=true`. Absent for a campaign in no group, an
+    /// archived one, and one the policy pass has not read yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_checks: Option<Vec<PolicyCheck>>,
+    /// The tags of the plan the campaign runs, newest first. Only the listing
+    /// gives them, with `plan=true`. Absent for none, and without a
+    /// `[database]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_plan_tags: Vec<PlanTag>,
+}
+
+/// A policy that is on, on one campaign of its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct PolicyCheck {
+    pub kind: PolicyKind,
+    /// Its check flags a job of the campaign's plan, or its re-runs filed into
+    /// the campaign wait for their rows; else it is cleared.
+    pub triggered: bool,
 }
 
 /// The device time a set of plans spent, each job at its latest scoring run.
@@ -414,6 +508,9 @@ pub struct CampaignPlanRow {
     /// `null` when this reader may not read the plan, or its manifest is gone;
     /// its cancel marker is not read.
     pub plan: Option<PlanSummary>,
+    /// Its tags, newest first; absent for none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<PlanTag>,
 }
 
 /// The `GET /api/v1/campaigns/{campaign_id}/overview` body: the campaign, what
@@ -436,6 +533,9 @@ pub struct CampaignOverview {
     pub may_edit_variants: bool,
     /// The same for a re-run, which also needs the plan's content digests.
     pub may_rerun: bool,
+    /// Whether this reader may tag the campaign's plans: it may file into the
+    /// campaign, in any state, and the server has a `[database]`.
+    pub may_tag: bool,
     /// The organization where this reader may create a descriptor catalog
     /// entry for the campaign's descriptors. The organization is the owner, or
     /// the current organization of an owning user. The reader must belong to
@@ -633,13 +733,15 @@ pub struct CampaignListQuery {
         skip_serializing_if = "Option::is_none"
     )]
     pub plan_id: Option<PlanId>,
-    /// Narrow to the campaigns in this state; every state without one.
+    /// Narrow to the campaigns in these states, comma-separated; every state
+    /// without one.
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     #[serde(
         default,
-        deserialize_with = "crate::empty_as_none",
+        with = "crate::comma_list",
         skip_serializing_if = "Option::is_none"
     )]
-    pub state: Option<CampaignState>,
+    pub state: Option<Vec<CampaignState>>,
     /// Each row's `models`, the models its plan document names. Needs
     /// `plan=true`.
     #[serde(

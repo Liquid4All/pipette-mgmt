@@ -13,9 +13,9 @@ use axum::extract::State;
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, VARY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
 use futures::stream;
 use futures::stream::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -2297,7 +2297,7 @@ async fn jobs_of(
 
     let (offset, limit) = window.bounds(cells.len());
     let page = crate::list::page_of(cells, offset, limit);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let avail: HashMap<&JobId, &AvailEntry> = avail_entries
         .iter()
@@ -2489,7 +2489,7 @@ pub async fn explain_plan(
         state.client_store.as_ref(),
         state.tag_store.as_ref(),
         &plan_id,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await?;
 
@@ -2702,6 +2702,9 @@ pub(crate) async fn cancel(
     // `cancel_plans` is told which one it lacks.
     let campaign = PlanCampaign::read(state, user, rights, &manifest).await?;
     rights.require(cancel_grant(state, user, rights, &manifest, campaign.as_ref()).await?)?;
+    if let Some(campaign) = campaign.as_ref().and_then(|read| read.campaign.as_ref()) {
+        pipette_pipeline::campaign_admin::require_cancellable(campaign, plan_id)?;
+    }
 
     let outcome = request_cancel(state.plan_store.as_ref(), &manifest)
         .await

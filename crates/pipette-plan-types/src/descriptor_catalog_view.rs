@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -57,6 +57,22 @@ impl MemberSelector {
         let name = name.parse()?;
         let member_key = selector_member_key(key, entry.descriptor_kind())?;
         Ok(Self { name, member_key })
+    }
+}
+
+impl DescriptorMemberKey {
+    /// Read a member key in the form that `catalog list` prints. The entry's
+    /// descriptor kind determines the format:
+    ///
+    /// - `<flavor>` for a runtime member.
+    /// - `-` for a runtime member without a flavor.
+    /// - `<format>::<quantization>` for a model member.
+    pub fn parse_for_kind(key: &str, kind: DescriptorKind) -> Result<Self, SelectorError> {
+        let key = match (kind, key) {
+            (DescriptorKind::Runtime, "-") => None,
+            (_, key) => Some(key),
+        };
+        selector_member_key(key, kind)
     }
 }
 
@@ -147,7 +163,8 @@ pub struct DescriptorMemberView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offered_device_count: Option<usize>,
     pub digest: String,
-    pub added_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub added_at: Timestamp,
     pub descriptor: DescriptorMemberDescriptor,
     /// The descriptor as an inline table in a plan's runtimes or models array.
     pub plan_toml: String,
@@ -194,7 +211,8 @@ pub struct ClientRunEvidence {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AnyClientRunEvidence {
     /// The time of the last success on any device.
-    pub last_success_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub last_success_at: Option<Timestamp>,
     /// The number of devices with at least one success.
     pub devices_with_success: usize,
 }
@@ -204,7 +222,8 @@ pub struct AnyClientRunEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RunMark {
-    pub at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub at: Timestamp,
     pub client_version: Option<String>,
 }
 
@@ -230,8 +249,10 @@ pub struct DescriptorEntryListRow {
     pub display_name: String,
     pub kind: DescriptorEntryKind,
     pub state: DescriptorEntryState,
-    pub release_time: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub release_time: Timestamp,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     pub created_by: DescriptorEntryCreator,
     pub descriptor_kind: DescriptorKind,
     /// The descriptor types of the entry's members, each listed once. A runtime
@@ -243,14 +264,21 @@ pub struct DescriptorEntryListRow {
     pub members: Option<Vec<DescriptorMemberView>>,
 }
 
-/// One catalog entry offered to a named device. Each member carries its run
-/// evidence on this device.
+/// One global or caller's-org catalog entry offered to a named device. Each
+/// member carries its run evidence on this device.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DescriptorCatalogShortListItem {
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub name: CatalogName,
-    pub release_time: DateTime<Utc>,
+    /// `global`, or the id of the organization that owns the entry.
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub scope: CatalogScope,
+    /// The name as this caller sees it: bare, or `global/<name>` for a
+    /// global entry that the caller's organization shadows.
+    pub display_name: String,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub release_time: Timestamp,
     pub descriptor_kind: DescriptorKind,
     /// The members offered to the device. A runtime entry gives the one
     /// member that the device resolves. A model entry has no precedence, so it
@@ -279,6 +307,12 @@ pub enum DescriptorWithheldReasonCode {
 pub struct DescriptorWithheldMember {
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub name: CatalogName,
+    /// `global`, or the id of the organization that owns the entry.
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub scope: CatalogScope,
+    /// The name as this caller sees it: bare, or `global/<name>` for a
+    /// global entry that the caller's organization shadows.
+    pub display_name: String,
     pub selector: String,
     pub member_key: DescriptorMemberKey,
     pub reason_code: DescriptorWithheldReasonCode,
@@ -490,7 +524,7 @@ mod tests {
     };
 
     fn an_entry(kind: DescriptorKind) -> anyhow::Result<DescriptorEntry> {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let member = match kind {
             DescriptorKind::Runtime => {
                 DescriptorMember::new(Runtime::AppleFoundation(AppleFoundation::default()), at)?

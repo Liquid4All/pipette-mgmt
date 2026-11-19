@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_plan_types::{AuditAction, AuditActor, AuditEvent, AuditEventId, AuditOutcome};
 
@@ -17,7 +17,7 @@ pub const RETENTION_DAYS: u32 = 730;
 pub fn new_event(actor: AuditActor, action: AuditAction, outcome: AuditOutcome) -> AuditEvent {
     AuditEvent {
         event_id: AuditEventId::mint(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         actor,
         action,
         outcome,

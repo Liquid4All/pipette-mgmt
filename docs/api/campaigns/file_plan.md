@@ -82,7 +82,7 @@ The route also answers the errors every filing answers
 | 401 | Missing or invalid auth headers, or a device signed ([filing errors](../campaigns.md#errors)) |
 | 403 | The campaign is outside the caller's scope, or the caller lacks `submit_plans`. Checked again after an import, so a member who leaves the organization during it files nothing |
 | 404 | No such campaign. Checked before anything is ingested, and again after an import: a campaign that a delete removed during the import gets `404`, and nothing is staged |
-| 409 | The campaign is [archived](update_campaign.md): unarchive it first; nothing is filed, dry runs included. Or another filing moved the campaign, its owner changed, or a campaign delete removed it while this plan was filed: the plan does not become the head, and the server cancels it. Or the campaign changed its owner or its current plan during the import: nothing is staged; file the plan again |
+| 409 | The campaign is [locked or archived](update_campaign.md): unlock or unarchive it first; nothing is filed, dry runs included. Or another filing moved the campaign, its owner changed, or a campaign delete removed it while this plan was filed: the plan does not become the head, and the server cancels it. Or the campaign changed its owner or its current plan during the import: nothing is staged; file the plan again |
 | 413 | The body is over `plan_body_limit_bytes` ([request size limits](../../httpapi.md#12-request-size-limits)). Nothing is staged |
 | 415 | The `Content-Type` is missing, or is not `application/toml`: `send the plan as an application/toml plan document` |
 | 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |

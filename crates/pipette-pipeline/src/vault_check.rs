@@ -376,7 +376,7 @@ mod tests {
     fn catalog_member_digest_matches_the_pipeline(#[case] value: Value) -> anyhow::Result<()> {
         let runtime: pipette_plan_types::Runtime = serde_json::from_value(value)?;
         let member =
-            pipette_plan_types::DescriptorMember::new(runtime.clone(), chrono::Utc::now())?;
+            pipette_plan_types::DescriptorMember::new(runtime.clone(), jiff::Timestamp::now())?;
         assert_eq!(member.digest(), typed_descriptor_sha256(&runtime)?);
         Ok(())
     }

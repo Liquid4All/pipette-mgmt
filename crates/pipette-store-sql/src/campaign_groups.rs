@@ -1,28 +1,30 @@
 //! [`CampaignGroupStore`] on SQL: a group's JSON in `campaign_groups`, a
 //! `campaign_group_members` row per member, keyed by the campaign, with the
 //! policy pass's JSON state, a policy's JSON in `campaign_group_policies`,
-//! keyed by the group and kind, and a `campaign_group_rerun_results` row per
-//! re-run and kind that filed it.
+//! keyed by the group and kind, a `campaign_group_rerun_results` row per
+//! re-run and kind that filed it, and a member's JSON state on each job of
+//! its plan in `campaign_group_job_states`.
 
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff_sqlx::ToSqlx;
 use sqlx::FromRow;
 
-use pipette_core::campaign::{CampaignGroup, GroupPolicyState};
+use pipette_core::campaign::{CampaignGroup, GroupPolicyState, JobPolicyState};
 use pipette_plan_types::{
     CampaignGroupId, CampaignGroupPolicy, CampaignId, JobId, PlanId, PolicyRerun,
     PolicyRerunSummary,
 };
 use pipette_store::{
     CampaignGroupPage, CampaignGroupStore, CampaignInAnotherGroupError, EnabledPolicies,
-    GroupMember, UnreadableObjectError,
+    GroupMember, JobStateChanges, UnreadableObjectError,
 };
 
 use crate::db::SqlDatabase;
 use crate::listing::{self, Keyspace};
+use crate::retry::retry;
 
 const GROUPS: Keyspace = Keyspace {
     table: "campaign_groups",
@@ -319,21 +321,22 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
                 .bind(group_id.as_str())
             })
             .await?;
-        rows.into_iter()
-            .map(|(campaign_id, policy_state)| {
-                let policy_state = policy_state
-                    .map(|state| serde_json::from_str(&state))
-                    .transpose()
-                    .map_err(|e| UnreadableObjectError {
-                        key: format!("campaign_group_members/{campaign_id}"),
-                        reason: e.to_string(),
-                    });
-                anyhow::Ok(GroupMember {
-                    campaign_id: CampaignId::try_new(campaign_id)?,
-                    policy_state,
-                })
+        rows.into_iter().map(member).collect()
+    }
+
+    async fn member_states(&self, campaign_ids: &[CampaignId]) -> anyhow::Result<Vec<GroupMember>> {
+        let ids: Vec<&str> = campaign_ids.iter().map(CampaignId::as_str).collect();
+        let rows: Vec<(String, Option<String>)> = self
+            .db
+            .fetch_all("campaign_group_member_states", || {
+                sqlx::query_as(
+                    "SELECT campaign_id, policy_state FROM campaign_group_members
+                     WHERE campaign_id = ANY($1) ORDER BY campaign_id",
+                )
+                .bind(&ids)
             })
-            .collect()
+            .await?;
+        rows.into_iter().map(member).collect()
     }
 
     async fn set_policy_state(
@@ -341,21 +344,87 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
         group_id: &CampaignGroupId,
         campaign_id: &CampaignId,
         state: &GroupPolicyState,
+        job_states: &JobStateChanges,
     ) -> anyhow::Result<bool> {
         let body = serde_json::to_string(state)?;
-        let written = self
-            .db
-            .execute("set_campaign_group_policy_state", || {
-                sqlx::query(
+        let put_jobs: Vec<&str> = job_states.put.iter().map(|v| v.job_id.as_str()).collect();
+        let put_bodies = job_states
+            .put
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<String>, _>>()?;
+        let removed: Vec<&str> = job_states.removed.iter().map(JobId::as_str).collect();
+        let (db, campaign, group) = (&self.db, campaign_id.as_str(), group_id.as_str());
+        let (body, put_jobs, put_bodies, removed) = (&body, &put_jobs, &put_bodies, &removed);
+        retry("set_campaign_group_policy_state", move || {
+            Box::pin(async move {
+                let mut tx = db.begin().await?;
+                let written = sqlx::query(
                     "UPDATE campaign_group_members SET policy_state = $3
                      WHERE campaign_id = $1 AND group_id = $2",
                 )
+                .bind(campaign)
+                .bind(group)
+                .bind(body.as_str())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if written == 0 {
+                    return Ok(false);
+                }
+                if !removed.is_empty() {
+                    sqlx::query(
+                        "DELETE FROM campaign_group_job_states
+                         WHERE campaign_id = $1 AND job_id = ANY($2)",
+                    )
+                    .bind(campaign)
+                    .bind(removed)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if !put_jobs.is_empty() {
+                    sqlx::query(
+                        "INSERT INTO campaign_group_job_states (campaign_id, job_id, body)
+                         SELECT $1, * FROM UNNEST($2::text[], $3::text[])
+                         ON CONFLICT (campaign_id, job_id) DO UPDATE SET body = EXCLUDED.body",
+                    )
+                    .bind(campaign)
+                    .bind(put_jobs)
+                    .bind(put_bodies)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn job_states(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<Vec<JobPolicyState>> {
+        let rows: Vec<(String, String)> = self
+            .db
+            .fetch_all("campaign_group_job_states", || {
+                sqlx::query_as(
+                    "SELECT v.job_id, v.body FROM campaign_group_job_states v
+                     JOIN campaign_group_members m USING (campaign_id)
+                     WHERE v.campaign_id = $1 AND m.group_id = $2 ORDER BY v.job_id",
+                )
                 .bind(campaign_id.as_str())
                 .bind(group_id.as_str())
-                .bind(body.as_str())
             })
             .await?;
-        Ok(written > 0)
+        rows.into_iter()
+            .map(|(job_id, body)| {
+                serde_json::from_str(&body).with_context(|| {
+                    format!("campaign_group_job_states/{campaign_id}/{job_id} does not decode")
+                })
+            })
+            .collect()
     }
 
     async fn record_reruns(
@@ -376,7 +445,8 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
             text(|rerun| rerun.plan_id.as_str()),
             text(|rerun| rerun.benchmark_id.as_str()),
         );
-        let filed: Vec<DateTime<Utc>> = reruns.iter().map(|rerun| rerun.filed_at).collect();
+        let filed: Vec<jiff_sqlx::Timestamp> =
+            reruns.iter().map(|r| r.filed_at.to_sqlx()).collect();
         let attempts = reruns
             .iter()
             .map(|rerun| i32::try_from(rerun.attempt))
@@ -582,7 +652,7 @@ type Judgements<'r> = (
     Vec<Option<f64>>,
     Vec<Option<&'r str>>,
     Vec<Option<&'r str>>,
-    Vec<Option<DateTime<Utc>>>,
+    Vec<Option<jiff_sqlx::Timestamp>>,
 );
 
 fn judgements(reruns: &[PolicyRerun]) -> Judgements<'_> {
@@ -593,7 +663,10 @@ fn judgements(reruns: &[PolicyRerun]) -> Judgements<'_> {
             .iter()
             .map(|rerun| rerun.outcome.as_ref().map(|outcome| outcome.as_ref()))
             .collect(),
-        reruns.iter().map(|rerun| rerun.judged_at).collect(),
+        reruns
+            .iter()
+            .map(|r| r.judged_at.map(ToSqlx::to_sqlx))
+            .collect(),
     )
 }
 
@@ -605,7 +678,7 @@ struct RerunRow {
     rerun_job_id: String,
     rerun_of: String,
     plan_id: String,
-    filed_at: DateTime<Utc>,
+    filed_at: jiff_sqlx::Timestamp,
     attempt: i32,
     benchmark_id: String,
     model_key: Option<String>,
@@ -618,7 +691,7 @@ struct RerunRow {
     after: Option<f64>,
     after_code: Option<String>,
     outcome: Option<String>,
-    judged_at: Option<DateTime<Utc>>,
+    judged_at: Option<jiff_sqlx::Timestamp>,
 }
 
 impl RerunRow {
@@ -629,7 +702,7 @@ impl RerunRow {
             rerun_job_id: JobId::try_new(self.rerun_job_id)?,
             rerun_of: JobId::try_new(self.rerun_of)?,
             plan_id: PlanId::try_new(self.plan_id)?,
-            filed_at: self.filed_at,
+            filed_at: self.filed_at.to_jiff(),
             attempt: u32::try_from(self.attempt)?,
             benchmark_id: self.benchmark_id,
             model_key: self.model_key,
@@ -645,7 +718,7 @@ impl RerunRow {
             after: self.after,
             after_code: self.after_code,
             outcome: self.outcome.map(named).transpose()?,
-            judged_at: self.judged_at,
+            judged_at: self.judged_at.map(jiff_sqlx::Timestamp::to_jiff),
         })
     }
 }
@@ -655,11 +728,26 @@ fn named<T: serde::de::DeserializeOwned>(name: String) -> anyhow::Result<T> {
     Ok(serde_json::from_value(serde_json::Value::String(name))?)
 }
 
+/// A `campaign_group_members` row's campaign and policy state.
+fn member((campaign_id, policy_state): (String, Option<String>)) -> anyhow::Result<GroupMember> {
+    let policy_state = policy_state
+        .map(|state| serde_json::from_str(&state))
+        .transpose()
+        .map_err(|e| UnreadableObjectError {
+            key: format!("campaign_group_members/{campaign_id}"),
+            reason: e.to_string(),
+        });
+    Ok(GroupMember {
+        campaign_id: CampaignId::try_new(campaign_id)?,
+        policy_state,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use chrono::{Duration, SubsecRound, Utc};
+    use jiff::{SignedDuration, Timestamp};
 
     use pipette_core::campaign::{CampaignOwner, GroupFiling, NewCampaign, Refusal};
     use pipette_core::types::Mint;
@@ -676,7 +764,11 @@ mod tests {
     }
 
     fn a_group(name: &str) -> anyhow::Result<CampaignGroup> {
-        Ok(CampaignGroup::new(name.parse()?, an_owner(), Utc::now()))
+        Ok(CampaignGroup::new(
+            name.parse()?,
+            an_owner(),
+            Timestamp::now(),
+        ))
     }
 
     async fn a_stored_group(store: &SqlCampaignGroupStore) -> anyhow::Result<CampaignGroupId> {
@@ -687,7 +779,7 @@ mod tests {
 
     async fn a_campaign(db: &SqlDatabase) -> anyhow::Result<CampaignId> {
         let campaign = NewCampaign::new("nightly".parse()?, an_owner())
-            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+            .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
         SqlCampaignStore::new(db.clone())
             .put_campaign(&campaign)
             .await?;
@@ -705,7 +797,7 @@ mod tests {
         assert_eq!(listed, [first.clone(), second]);
 
         let id = &first.group_id;
-        let at = first.updated_at + Duration::seconds(5);
+        let at = first.updated_at + SignedDuration::from_secs(5);
         let renamed = CampaignGroup {
             name: "s26 ultra".parse()?,
             updated_at: at,
@@ -718,7 +810,7 @@ mod tests {
         let mut group = store.get_group(id).await?.context("the group is stored")?;
         assert!(group.rename(renamed.name.clone(), at));
         // The same name again changes nothing, so `updated_at` stays.
-        assert!(!group.rename(renamed.name.clone(), at + Duration::seconds(5)));
+        assert!(!group.rename(renamed.name.clone(), at + SignedDuration::from_secs(5)));
         assert!(store.update_group(&group).await?);
         assert_eq!(store.get_group(id).await?, Some(renamed));
 
@@ -785,7 +877,7 @@ mod tests {
         CampaignGroupPolicy {
             enabled: true,
             enabled_by: Some(UserId::mint()),
-            enabled_at: Some(Utc::now()),
+            enabled_at: Some(Timestamp::now()),
             ..policy.clone()
         }
     }
@@ -1027,9 +1119,9 @@ mod tests {
     }
 
     /// A member's state reads `None` until written, then as written, and is
-    /// reported by its row when it does not decode. A write for a campaign
-    /// that moved to another group lands nowhere, and the move dropped the
-    /// state.
+    /// reported by its row when it does not decode; its job states are written
+    /// with it. A write for a campaign that moved to another group lands
+    /// nowhere, and the move dropped the state and the job states.
     #[tokio::test]
     async fn a_policy_state_stays_with_its_membership() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
@@ -1046,23 +1138,53 @@ mod tests {
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let state = GroupPolicyState {
             policies: vec![turned_on(&PolicyKind::Spread.defaults(group.clone()))],
-            decided: BTreeSet::from([JobId::try_new("job-1")?]),
+            triggered: BTreeSet::from([PolicyKind::Spread]),
             filed: Some(GroupFiling {
                 plan_id: plan_id.clone(),
                 queued: BTreeSet::from([JobId::try_new("job-2")?]),
                 commit_unknown: true,
-                filed_at: Utc::now(),
+                filed_at: Timestamp::now(),
             }),
             refusal: Some(Refusal {
                 plan_id,
                 reason: "the deadline has passed".to_owned(),
                 build: "2026.11.11-ea3ce9a".to_owned(),
             }),
-            unreadable_at: Some(Utc::now()),
+            unreadable_at: Some(Timestamp::now()),
+            rules: 1,
         };
-        assert!(store.set_policy_state(&group, &a, &state).await?);
+        let job_state = |job: &str, flagged: &[PolicyKind]| -> anyhow::Result<JobPolicyState> {
+            Ok(JobPolicyState {
+                job_id: JobId::try_new(job)?,
+                flagged: flagged.iter().copied().collect(),
+                decided: true,
+                missing_params: BTreeSet::new(),
+                family: None,
+                failed: false,
+            })
+        };
+        let (kept, flagged) = (
+            job_state("job-1", &[])?,
+            job_state("job-2", &[PolicyKind::Spread])?,
+        );
+        let both = JobStateChanges {
+            put: vec![kept.clone(), flagged.clone()],
+            removed: Vec::new(),
+        };
+        assert!(store.set_policy_state(&group, &a, &state, &both).await?);
+        assert_eq!(
+            store.job_states(&group, &a).await?,
+            [kept.clone(), flagged.clone()]
+        );
+        let cleared = job_state("job-2", &[])?;
+        let changes = JobStateChanges {
+            put: vec![cleared.clone()],
+            removed: vec![kept.job_id.clone()],
+        };
+        assert!(store.set_policy_state(&group, &a, &state, &changes).await?);
+        assert_eq!(store.job_states(&group, &a).await?, [cleared]);
         sqlx::query(
-            r#"UPDATE campaign_group_members SET policy_state = '{"decided": 1}'
+            r#"UPDATE campaign_group_members SET policy_state = '{"triggered": 1}'
                WHERE campaign_id = $1"#,
         )
         .bind(b.as_str())
@@ -1073,12 +1195,25 @@ mod tests {
             states(&store, &group).await?,
             [(a.clone(), Ok(Some(state.clone()))), unreadable.clone()]
         );
+        // Read by campaign, whatever the group; a campaign in none is left out.
+        let outside = a_campaign(db).await?;
+        let read: Vec<StateRead> = store
+            .member_states(&[outside, b.clone(), a.clone()])
+            .await?
+            .into_iter()
+            .map(|member| (member.campaign_id, member.policy_state.map_err(|e| e.key)))
+            .collect();
+        assert_eq!(
+            read,
+            [(a.clone(), Ok(Some(state.clone()))), unreadable.clone()]
+        );
 
         store.remove_member(&group, &a).await?;
         store.add_members(&other, std::slice::from_ref(&a)).await?;
-        assert!(!store.set_policy_state(&group, &a, &state).await?);
-        assert_eq!(states(&store, &other).await?, [(a, Ok(None))]);
+        assert!(!store.set_policy_state(&group, &a, &state, &both).await?);
+        assert_eq!(states(&store, &other).await?, [(a.clone(), Ok(None))]);
         assert_eq!(states(&store, &group).await?, [unreadable]);
+        assert_eq!(store.job_states(&other, &a).await?, []);
         Ok(())
     }
 
@@ -1087,7 +1222,7 @@ mod tests {
     fn a_rerun(
         campaign_id: &CampaignId,
         job: &str,
-        filed_at: DateTime<Utc>,
+        filed_at: Timestamp,
         before: f64,
     ) -> anyhow::Result<PolicyRerun> {
         Ok(PolicyRerun {
@@ -1113,13 +1248,23 @@ mod tests {
         })
     }
 
-    fn judged(rerun: &PolicyRerun, outcome: RerunOutcome, after: Option<f64>) -> PolicyRerun {
-        PolicyRerun {
+    fn judged(
+        rerun: &PolicyRerun,
+        outcome: RerunOutcome,
+        after: Option<f64>,
+    ) -> anyhow::Result<PolicyRerun> {
+        Ok(PolicyRerun {
             after,
             outcome: Some(outcome),
-            judged_at: Some(Utc::now().trunc_subsecs(6)),
+            judged_at: Some(
+                Timestamp::now().round(
+                    jiff::TimestampRound::new()
+                        .smallest(jiff::Unit::Microsecond)
+                        .mode(jiff::RoundMode::Trunc),
+                )?,
+            ),
             ..rerun.clone()
-        }
+        })
     }
 
     /// A re-run waits until its outcome is written once: recording it again,
@@ -1132,7 +1277,11 @@ mod tests {
         let store = SqlCampaignGroupStore::new(db.clone());
         let (group, other) = (a_stored_group(&store).await?, a_stored_group(&store).await?);
         let (a, b) = (a_campaign(db).await?, a_campaign(db).await?);
-        let at = Utc::now().trunc_subsecs(6);
+        let at = Timestamp::now().round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )?;
         let swapped = a_rerun(&a, "job-1", at, 4096.0)?;
         let spread = PolicyRerun {
             kind: PolicyKind::Spread,
@@ -1169,8 +1318,8 @@ mod tests {
             [failed.clone(), spread.clone(), swapped.clone()]
         );
 
-        let cleared = judged(&swapped, RerunOutcome::Cleared, Some(0.0));
-        let flagged = judged(&swapped, RerunOutcome::Flagged, Some(4096.0));
+        let cleared = judged(&swapped, RerunOutcome::Cleared, Some(0.0))?;
+        let flagged = judged(&swapped, RerunOutcome::Flagged, Some(4096.0))?;
         assert_eq!(
             store
                 .judge_reruns(&group, std::slice::from_ref(&cleared))
@@ -1198,8 +1347,12 @@ mod tests {
         let store = SqlCampaignGroupStore::new(db.clone());
         let group = a_stored_group(&store).await?;
         let (a, b) = (a_campaign(db).await?, a_campaign(db).await?);
-        let at = Utc::now().trunc_subsecs(6);
-        let minutes = Duration::minutes;
+        let at = Timestamp::now().round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )?;
+        let minutes = SignedDuration::from_mins;
         let failed = a_rerun(&a, "job-6", at - minutes(5), 3072.0)?;
         let dropped = a_rerun(&a, "job-7", at - minutes(4), 8192.0)?;
         let waiting = a_rerun(&a, "job-1", at - minutes(3), 4096.0)?;
@@ -1224,11 +1377,11 @@ mod tests {
         ];
         assert_eq!(store.record_reruns(&group, &recorded).await?, 7);
         let outcomes = [
-            judged(&failed, RerunOutcome::Failed, None),
-            judged(&dropped, RerunOutcome::Dropped, None),
-            judged(&cleared, RerunOutcome::Cleared, Some(0.0)),
-            judged(&flagged, RerunOutcome::Flagged, Some(512.0)),
-            judged(&spread, RerunOutcome::Cleared, Some(2.0)),
+            judged(&failed, RerunOutcome::Failed, None)?,
+            judged(&dropped, RerunOutcome::Dropped, None)?,
+            judged(&cleared, RerunOutcome::Cleared, Some(0.0))?,
+            judged(&flagged, RerunOutcome::Flagged, Some(512.0))?,
+            judged(&spread, RerunOutcome::Cleared, Some(2.0))?,
         ];
         assert_eq!(store.judge_reruns(&group, &outcomes).await?, 5);
 

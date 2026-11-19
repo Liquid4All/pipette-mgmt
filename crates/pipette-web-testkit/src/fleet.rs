@@ -63,7 +63,7 @@ async fn seed_filter_fleet(state: &AppState) -> anyhow::Result<()> {
             client_details: NonEmptyTrimmedString::try_new("test")?,
             contact_email: ContactEmail::try_new("operator@example.com")?,
             status,
-            registered_at: chrono::Utc::now(),
+            registered_at: jiff::Timestamp::now(),
             device_profile: DeviceProfile {
                 device_name: os
                     .map(|_| NonEmptyTrimmedString::try_new("iPhone14,2"))

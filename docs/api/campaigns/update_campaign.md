@@ -1,6 +1,6 @@
 # `PATCH /api/v1/campaigns/{campaign_id}`
 
-Renames the campaign, sets its labels, or archives or unarchives it. Needs
+Renames the campaign, sets its labels, or locks, archives or reactivates it. Needs
 `submit_plans` for your own campaign, or `manage_orgs` for an organization's
 ([who may do what](../campaigns.md#who-may-do-what)).
 
@@ -19,8 +19,17 @@ console's listings unless their state filter asks for it, and
 takes no new plan: filing one, a variant edit, a document revision, a re-run, a
 recalculation and a revert are each a `409` until `active` unarchives it. The
 plan it runs keeps running. Every read, a rename, a relabel, a hand-off and a
-delete still work. The record carries `state` only while it is `archived`. It
+delete still work. The record carries `state` only while it is not `active`. It
 is the campaign's own state, beside the `status` of the plan it runs.
+
+`state` is also `locked`, which needs `state_note`: why the campaign is locked,
+at most 4096 characters. A locked campaign takes no new plan, as an archived
+one, and also refuses a cancel of the plan it runs and a delete; each `409`
+quotes the note. The listings show it. A rename, a relabel and a hand-off still
+work. `state_note` goes with `locked` alone, any other state clears it, and
+the record carries it only while locked. Sending `locked` again with another
+note replaces the note. A locked campaign is not archived directly: unlock it
+first.
 
 `name` is trimmed, non-empty and at most 4096 characters, as on a
 [create](create_campaign.md). A body with no field, or one asking for
@@ -38,7 +47,7 @@ again.
 | Status | When |
 |--------|------|
 | 200 | The campaign, and whether the write changed it |
-| 400 | `campaign_id` is not a campaign id; the body is not JSON, names another field, or carries an empty or overlong `name` or an unknown `state`; or `labels` breaks a tag rule (the message names the key where there is one) |
+| 400 | `campaign_id` is not a campaign id; the body is not JSON, names another field, or carries an empty or overlong `name` or an unknown `state`, `locked` without a `state_note`, or a `state_note` without `locked`; or `labels` breaks a tag rule (the message names the key where there is one) |
 | 403 | The caller may not administer the record ([who may do what](../campaigns.md#who-may-do-what)) |
 | 404 | No such campaign |
-| 409 | Another write changed the campaign while this edit was made: nothing was written; send it again |
+| 409 | Another write changed the campaign while this edit was made: nothing was written; send it again. Or the body archives a locked campaign |

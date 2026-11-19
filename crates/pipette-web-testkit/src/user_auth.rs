@@ -39,7 +39,7 @@ pub fn user_auth_headers(
         key_id,
         method,
         path,
-        chrono::Utc::now().to_rfc3339(),
+        jiff::Timestamp::now().to_string(),
     )
 }
 
@@ -74,7 +74,7 @@ pub fn user_key_only_headers(
     method: &str,
     path: &str,
 ) -> Result<Vec<(&'static str, String)>, getrandom::Error> {
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = jiff::Timestamp::now().to_string();
     let nonce = crate::auth::nonce()?;
     let signature = signing_key
         .sign(format!("v2\n{method}\n{path}\n{timestamp}\n\n{key_id}\n{nonce}").as_bytes());
@@ -90,7 +90,7 @@ pub fn user_key_only_headers(
 /// does, awaiting its first sign-in. `email` must be unique across the accounts
 /// a test creates.
 pub async fn create_user(state: &AppState, email: &str) -> anyhow::Result<User> {
-    let user = User::try_new(ContactEmail::try_new(email)?, chrono::Utc::now())?;
+    let user = User::try_new(ContactEmail::try_new(email)?, jiff::Timestamp::now())?;
     state
         .user_store
         .claim_user_email(user.contact_email.as_str(), &user.user_id)
@@ -113,7 +113,7 @@ pub async fn mint_user_preauth(state: &AppState, user_id: &UserId) -> anyhow::Re
             expires_at: None,
             note: None,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     state.user_store.put_user_preauth_key(&minted.key).await?;
     Ok(minted.token.expose().to_string())
@@ -311,7 +311,7 @@ pub fn rfc9421_headers(
         method,
         uri,
         body,
-        chrono::Utc::now().timestamp(),
+        jiff::Timestamp::now().as_second(),
     )
 }
 
@@ -451,12 +451,22 @@ pub async fn signed_empty(
 }
 
 /// An organization written straight to the store, for a test whose subject is
-/// what membership reaches rather than the route that creates one.
+/// what membership reaches rather than the route that creates one. Its display
+/// name is its slug.
 pub async fn seed_org(state: &AppState, slug: &str) -> anyhow::Result<Organization> {
+    seed_org_named(state, slug, slug).await
+}
+
+/// [`seed_org`] with a display name that differs from the slug.
+pub async fn seed_org_named(
+    state: &AppState,
+    slug: &str,
+    display_name: &str,
+) -> anyhow::Result<Organization> {
     let org = Organization::new(
         OrgSlug::try_new(slug)?,
-        NonEmptyTrimmedString::try_new(slug)?,
-        chrono::Utc::now(),
+        NonEmptyTrimmedString::try_new(display_name)?,
+        jiff::Timestamp::now(),
     );
     state
         .org_store

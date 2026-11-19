@@ -75,7 +75,8 @@ async fn test_submit_and_get_job() -> anyhow::Result<()> {
     let submitted_at = body["submitted_at"]
         .as_str()
         .context("submitted_at is a string")?;
-    chrono::DateTime::parse_from_rfc3339(submitted_at)
+    submitted_at
+        .parse::<jiff::Timestamp>()
         .with_context(|| format!("submitted_at is not RFC 3339: {submitted_at}"))?;
     // An unscored job spells its score fields as explicit nulls; `get` tells a
     // missing key from a null one.

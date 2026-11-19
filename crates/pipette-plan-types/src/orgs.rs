@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::campaigns::CampaignView;
@@ -46,7 +46,8 @@ pub struct Organization {
     /// What to print for a human; nothing keys on it.
     pub display_name: NonEmptyTrimmedString,
     pub status: OrgStatus,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
 }
 
 /// An organization as its listing, its read and its writes answer it: the
@@ -139,7 +140,8 @@ pub struct ClientPreauthKeyView {
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub org_id: OrgId,
     pub usage: ClientPreauthUsage,
-    pub expires_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub expires_at: Option<Timestamp>,
     /// It registers nothing, and `clients preauth prune` deletes it.
     pub expired: bool,
     /// A host-minted key's; empty, and absent, for every key minted here.
@@ -150,7 +152,8 @@ pub struct ClientPreauthKeyView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_permissions: Option<ClientPermissionSet>,
     pub note: Option<NonEmptyTrimmedString>,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
     /// Absent for a key the host minted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]

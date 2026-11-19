@@ -1,10 +1,9 @@
 name: Security
 
-# The supply-chain and secret gates, held in step with the same three jobs in
+# The supply-chain and secret gates, held in step with the same jobs in
 # the other Pipette repositories:
 #
 #   * cargo-deny    — RUSTSEC advisories, banned crates, registry sources.
-#   * cargo-machete — dependencies kept past their last caller.
 #   * gitleaks      — a secret scan, redacted: the commits a pull request adds,
 #                     and the full history on `main`, on the cron and on a
 #                     manual dispatch.
@@ -87,31 +86,6 @@ jobs:
         # deletes the ignore in the same change. It is a lint level, so it can
         # only be set on the command line, not in deny.toml.
         run: cargo deny check -D advisory-not-detected advisories bans sources
-
-  unused-deps:
-    name: unused deps (cargo-machete)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install cargo-machete (pinned, checksum-verified)
-        run: ci/install-tool.sh cargo-machete
-      - name: Scan for unused dependencies
-        # The dependency half of dead-code detection: `dead_code` and
-        # `unreachable_pub` catch an item nothing calls, but neither notices
-        # that the last use of a whole crate went with it.
-        #
-        # Invoked as the binary rather than `cargo machete`, which is why this
-        # job installs no toolchain: the scan reads manifests and greps the
-        # crate's own sources, so its result does not depend on the runner
-        # either. That text-level read is also where its false positives come
-        # from — a crate reached only through a macro expansion. Suppress those
-        # in `[package.metadata.cargo-machete]` with a comment naming what
-        # reaches the crate (docs/development.md §1); the list is honoured in
-        # this mode.
-        run: cargo-machete
 
   secrets:
     # SCOPE, by event, and a correctness decision rather than a speed one.

@@ -729,25 +729,24 @@ impl Default for MetricRow {
 
 /// Derive a `YYYY-MM-DD` day key from a microsecond-precision UTC timestamp.
 pub fn day_key_from_timestamp(timestamp_us: i64) -> anyhow::Result<String> {
-    use chrono::{DateTime, Utc};
-    let dt: DateTime<Utc> = DateTime::from_timestamp_micros(timestamp_us)
-        .ok_or_else(|| anyhow::anyhow!("invalid timestamp: {timestamp_us}"))?;
-    Ok(dt.format("%Y-%m-%d").to_string())
+    let dt = jiff::Timestamp::from_microsecond(timestamp_us)
+        .with_context(|| format!("invalid timestamp: {timestamp_us}"))?;
+    Ok(dt.strftime("%Y-%m-%d").to_string())
 }
 
 /// Whether the day partition holding `submitted_at` still accepts writes. The
 /// lock window runs from midnight UTC of the partition's day, so "open" holds
 /// for every row in it (`Config::warehouse_lock_age_secs` says why).
 pub fn day_partition_is_open(
-    submitted_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-    lock_age: chrono::TimeDelta,
+    submitted_at: jiff::Timestamp,
+    now: jiff::Timestamp,
+    lock_age: jiff::SignedDuration,
 ) -> bool {
-    let day_start = submitted_at
-        .date_naive()
-        .and_time(chrono::NaiveTime::MIN)
-        .and_utc();
-    now.signed_duration_since(day_start) < lock_age
+    let into_day = jiff::tz::Offset::UTC
+        .to_datetime(submitted_at)
+        .time()
+        .duration_since(jiff::civil::Time::midnight());
+    now.duration_since(submitted_at - into_day) < lock_age
 }
 
 /// New writes use `day=` partitions; legacy `month=` ones are only read (see
@@ -779,20 +778,14 @@ pub fn warehouse_month_partition_dir(
 
 /// A partition key's date: a `day=` key's own, a legacy `month=` key's **last
 /// day** (so the month overlaps any window one of its days would).
-fn partition_sort_date(key: &str) -> Option<chrono::NaiveDate> {
-    use chrono::{Datelike, NaiveDate};
+fn partition_sort_date(key: &str) -> Option<jiff::civil::Date> {
+    use jiff::civil::Date;
     if let Some(d) = key.strip_prefix("day=") {
-        return NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+        return Date::strptime("%Y-%m-%d", d).ok();
     }
     if let Some(m) = key.strip_prefix("month=") {
-        let first = NaiveDate::parse_from_str(&format!("{m}-01"), "%Y-%m-%d").ok()?;
-        // Last day of the month = day before the first of the next month.
-        let next_month = if first.month() == 12 {
-            NaiveDate::from_ymd_opt(first.year() + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1)
-        }?;
-        return next_month.pred_opt();
+        let first = Date::strptime("%Y-%m-%d", format!("{m}-01")).ok()?;
+        return Some(first.last_of_month());
     }
     None
 }
@@ -803,10 +796,10 @@ fn partition_sort_date(key: &str) -> Option<chrono::NaiveDate> {
 pub fn select_partitions_to_scan(
     keys: impl IntoIterator<Item = String>,
     read_days: u32,
-    today: chrono::NaiveDate,
+    today: jiff::civil::Date,
 ) -> Vec<String> {
-    let cutoff = today - chrono::Duration::days(i64::from(read_days));
-    let mut selected: Vec<(bool, chrono::NaiveDate, String)> = keys
+    let cutoff = today - jiff::Span::new().days(read_days);
+    let mut selected: Vec<(bool, jiff::civil::Date, String)> = keys
         .into_iter()
         .filter_map(|k| partition_sort_date(&k).map(|d| (k.starts_with("month="), d, k)))
         .filter(|(_, d, _)| *d >= cutoff)
@@ -2573,7 +2566,7 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[MetricRow]) -> anyhow::Result<Rec
 }
 
 pub struct JobMetrics {
-    pub scored_at: chrono::DateTime<chrono::Utc>,
+    pub scored_at: jiff::Timestamp,
     pub score_runtime_version: Option<String>,
     pub metrics: Vec<JobMetric>,
 }
@@ -2592,7 +2585,7 @@ impl JobMetrics {
             .iter()
             .filter(|r| r.scored_at == latest_scored_at)
             .collect();
-        let scored_at = chrono::DateTime::from_timestamp_micros(latest_scored_at)?;
+        let scored_at = jiff::Timestamp::from_microsecond(latest_scored_at).ok()?;
         let metrics = latest
             .iter()
             .filter_map(|r| {
@@ -2641,7 +2634,9 @@ pub fn read_metrics_for_job(
             by_key.insert(key.to_string(), entry.path());
         }
     }
-    let today = chrono::Utc::now().date_naive();
+    let today = jiff::Timestamp::now()
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .date();
     let selected = select_partitions_to_scan(by_key.keys().cloned(), read_days, today);
 
     let prefix = format!("{job_id}_");
@@ -2755,10 +2750,10 @@ mod tests {
         #[case] now: &str,
         #[case] want_open: bool,
     ) -> anyhow::Result<()> {
-        let submitted_at = submitted_at.parse::<chrono::DateTime<chrono::Utc>>()?;
-        let now = now.parse::<chrono::DateTime<chrono::Utc>>()?;
+        let submitted_at = submitted_at.parse::<jiff::Timestamp>()?;
+        let now = now.parse::<jiff::Timestamp>()?;
         assert_eq!(
-            day_partition_is_open(submitted_at, now, chrono::TimeDelta::hours(72)),
+            day_partition_is_open(submitted_at, now, jiff::SignedDuration::from_hours(72)),
             want_open
         );
         Ok(())
@@ -2771,7 +2766,7 @@ mod tests {
         assert!(day_partition_is_open(
             "2026-08-29T00:00:00Z".parse()?,
             "2026-08-27T12:00:00Z".parse()?,
-            chrono::TimeDelta::hours(72),
+            jiff::SignedDuration::from_hours(72),
         ));
         Ok(())
     }
@@ -3809,9 +3804,7 @@ mod tests {
 
     #[test]
     fn test_select_partitions_orders_and_windows() -> anyhow::Result<()> {
-        use chrono::NaiveDate;
-        let today =
-            NaiveDate::from_ymd_opt(2026, 6, 20).ok_or_else(|| anyhow::anyhow!("valid date"))?;
+        let today = jiff::civil::Date::new(2026, 6, 20)?;
         let keys = || {
             vec![
                 "day=2026-06-20".to_string(),
@@ -3918,7 +3911,7 @@ mod tests {
         assert_eq!(result.metrics[0].metric, "ttft");
         assert!((result.metrics[0].value - 34.7).abs() < 0.1);
         assert_eq!(result.metrics[1].metric, "prefill_throughput");
-        assert!(result.scored_at.timestamp() > 0);
+        assert!(result.scored_at.as_second() > 0);
         Ok(())
     }
 

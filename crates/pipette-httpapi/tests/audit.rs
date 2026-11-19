@@ -97,6 +97,8 @@ fn route_of(event: &AuditEvent) -> (&str, &str, u16) {
         | AuditAction::FirstClerkSignIn { .. }
         | AuditAction::CatalogRename { .. }
         | AuditAction::CatalogMerge { .. }
+        | AuditAction::CatalogRemoveMember { .. }
+        | AuditAction::CatalogMoveToGlobal { .. }
         | AuditAction::GroupPolicy { .. } => ("", "", 0),
     }
 }
@@ -715,7 +717,7 @@ async fn a_name_discloses_nothing_the_reader_cannot_read() -> anyhow::Result<()>
             .await?;
     let names = page["names"].as_object().context("names")?;
     let named = |id: &str| names.get(id).and_then(|name| name.as_str());
-    assert_eq!(named(acme.as_str()), Some("acme"));
+    assert_eq!(named(acme.as_str()), Some("Acme Labs"));
     assert_eq!(named(ours.campaign_id.as_str()), Some("Ours, renamed"));
     assert!(named(admin.1.as_str()).is_some_and(|address| address.contains('@')));
     assert!(

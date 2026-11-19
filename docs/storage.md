@@ -38,20 +38,22 @@ holds the records that each event names, with the account or device that
 acted.
 
 The descriptor catalog uses `descriptor_entries` and `descriptor_members`.
-Only `[database]` keeps these tables. `db import` and `db export` do not copy
-the catalog.
+Only `[database]` keeps these tables.
 
-Only `[database]` keeps the audit log. No object store keeps it, and
-`db import` and `db export` do not copy it. The server and the `pipette-mgmt`
+Only `[database]` keeps the audit log. No object store keeps it. The server and the `pipette-mgmt`
 commands only append events and never edit them. `audit prune` deletes the
 events that are older than the two-year retention.
 
-Campaign groups use four tables. `campaign_groups` holds each group's JSON body
+Campaign groups use five tables. `campaign_groups` holds each group's JSON body
 (name, owner and times) under its `group_id`. `campaign_group_members` holds a
 row for each member, keyed by `campaign_id`, so a campaign is in at most one
 group. The row's `policy_state` is the JSON that the policy pass of
 `queue-maintenance` keeps for the member, NULL until the pass first writes it,
-and it goes when the campaign leaves the group. `campaign_group_policies` holds
+and it goes when the campaign leaves the group. `campaign_group_job_states`
+holds the pass's JSON state of each job of the member's plan it read, keyed
+by `campaign_id` and `job_id`: the checks that flag it and whether the pass is
+done with it. They go with the member row, and the pass writes them in one
+transaction with `policy_state`. `campaign_group_policies` holds
 each policy's JSON body under its `group_id` and check `kind`, so a group has
 at most one policy per check. `campaign_group_rerun_results` holds a row for
 each re-run the policies filed, keyed by `group_id`, re-run job and `kind`,
@@ -59,8 +61,7 @@ with the check's value before and after
 ([re-run results](api/campaign-groups.md#re-run-results)).
 Deleting a group deletes its member rows, its policies and its re-run results
 and keeps the campaigns; deleting a campaign deletes its member row. Only
-`[database]` keeps these tables, and `db import` and `db export` do not copy
-them.
+`[database]` keeps these tables.
 
 The `local_fs` and S3 record stores are retiring (PIP-759) and kept for tests.
 Their keyspaces are the second tree in §2. A new record feature lands on SQL
@@ -154,7 +155,8 @@ data/
 On the retiring record stores (§1.1), the records are these keyspaces. In
 `[database]`, each has a table named after it, underscored, holding the same
 fields. The exceptions: `tags-index/` is one `client_tags` table, the `.spent`
-markers are `*_spent` tables, and a plan's job ids are in `plan_jobs`.
+markers are `*_spent` tables, and a plan's job ids are in `plan_job_spans`
+(§4.7).
 
 ```text
 [auth_storage]
@@ -1040,8 +1042,7 @@ was read, and the local filesystem compares under a lock on a `.lock` file
 beside the records. The retiring S3 record store reads, compares and writes with
 no lock, so two edits at once can both land there. Every
 edit moves `updated_at`, so a record never returns to an earlier value and the
-contents serve as the version. A create, and the copies `db import` and
-`db export` make, write blind.
+contents serve as the version. A create operation writes without a version check.
 
 A filing into a campaign (a plan through
 [`POST /api/v1/campaigns/{campaign_id}/plans`](api/campaigns/file_plan.md) or
@@ -1473,7 +1474,7 @@ and `job_sources`. It gives each `finished` run that has `run_flags` and the
 scope of the lookup, in
 descending `job_id` order. A minted id holds a UUIDv7, so this order follows
 the mint time to the millisecond. The order of other ids is their text order.
-It leaves out a job that a plan reran (`plan_jobs.rerun_of`), and a row with
+It leaves out a job that a plan reran (`plan_job_spans.rerun_of`), and a row with
 no scope. It gives at most the 32 newest runs of each cell. A cell gets a job
 for each device that ran it, so this limit bounds the read. A cell whose only
 answering run is older runs again.
@@ -1545,13 +1546,15 @@ the run ends. The row keeps these values:
 - An error summary.
 
 A `running` row with no
-finish time shows a run that did not finish. `db import` and `db export` do not
-copy these SQL-only rows.
+finish time shows a run that did not finish.
 
 The store ignores case when it compares names. It keeps the spelling for
-display. An entry can gain members only at the end. It cannot lose or reorder
+display. An entry gains members only at the end. A hand-made entry can lose a
+member, and the other members keep their positions. The store does not reorder
 members. A tombstone reserves its name permanently. The store cannot move a
-tombstoned entry to another state.
+tombstoned entry to another state. The store can move a live org entry and its
+member rows to the global scope in one transaction. The member rows follow the
+entry through the `ON UPDATE CASCADE` foreign key.
 
 The store compares the digest of each member with the digest of its typed
 runtime or model. A change to the serialized form of a runtime type or a model
@@ -1575,10 +1578,97 @@ rows, and before it marks the job processed. If the write fails, the scorer
 defers the job to the next run. Each side of a row keeps its newest run, so a
 replay changes nothing. `db backfill-run-evidence` makes the rows again from
 the warehouse ([cli.md](cli.md#pipette-mgmt-db-backfill-run-evidence---dry-run)).
-`db import` and `db export` do not copy these SQL-only rows.
 
 The catalog reads give each member the evidence of its digest and its verified
 alias ([the short list](api/descriptor-catalog/list_descriptor_catalog_for_device.md)).
+
+### 4.7. The plan job spans
+
+Migration `0042` adds `plan_job_spans` and `plan_lineages`. The spans are the
+record of plan membership. Three SQL reads use them: the manifest read, the
+read of rerun holders, and the cell-result read. The cell-result read excludes
+the rerun jobs. `put_plan` writes the lineage guard row, then the plan and its
+spans, in one transaction.
+
+Migration `0043` adds the `plan_job_rows` view for external readers. The view
+expands the spans with the range rule below. For each plan, it reads the open
+and the closed spans in two branches, as the manifest read does. On the
+production data of 2026-11-16, a full read of the view took 2.5 s. The view has
+seven columns:
+
+- `plan_id`
+- `job_id`
+- `ordinal`
+- `content_key`
+- `rerun_of`
+- `expired`
+- `outcome`
+
+The pipette-duckdb reader reads this view, with `SELECT` granted to its role. Its published `internal.plan_jobs` table keeps its name and
+columns ([the warehouse contract](#what-pipette-mgmt-reads-from-pipette-duckdb)).
+
+A lineage is the plans of one campaign. A plan with no campaign is a lineage of
+its own, named by its plan id. A plan id holds a UUIDv7, so the plan ids of a
+lineage sort in creation order.
+
+A `plan_job_spans` row says that a range of plans of a lineage lists a job with
+the same fields:
+
+- `from_plan` is the first plan of the range.
+- `to_plan` is the first later plan that does not list the job with these
+  fields. It is NULL while the newest plan of the lineage lists the job.
+- `ordinal` is the position of the job in the manifest's `job_ids`. It is
+  NULL for a job that only a per-job map of the manifest names.
+- `content_key`, `rerun_of` and `expired` are the job's values in the
+  manifest's `content_keys`, `rerun_of` and `expired_jobs` maps.
+- `outcome` is `finished` or `failed`, from the manifest's `settled_jobs`. It
+  is NULL until `queue-maintenance` reads the job's record.
+
+Plan `P` lists the job when the lineage matches,
+`from_plan <= P`, and `to_plan` is NULL or greater than `P`. Two spans of one
+job in one lineage do not overlap. Two adjacent spans of one job have different
+fields.
+
+A manifest read is one statement, so it sees one snapshot of the plan and its
+jobs. The statement has one branch for open spans and one for closed spans.
+Each branch bounds `to_plan`, so the head read uses `plan_job_spans_open` and
+reads no closed span.
+
+`put_plan` writes the spans in the transaction that writes `plans`. A plan
+whose job keeps its fields from the plan before it adds no row. The write
+starts with the lineage's `plan_lineages` row. Thus two writes of one lineage
+conflict, and the store runs the write that lost again.
+
+For a head-plan status refresh, the open-span branch of `SPANS_NEAR` uses
+`lineage = $1 AND to_plan IS NULL AND from_plan <= $2`. A local PostgreSQL
+17.11 check on 2026-11-16 confirmed use of `plan_job_spans_open` with
+`EXPLAIN (ANALYZE, BUFFERS)` and the default planner settings. The fixture
+used the migration's schema and indexes in temporary tables, followed by
+`ANALYZE`. It had 73,946 spans in the target lineage, with 2,595 open spans,
+and 100,000 open spans in other lineages. Closed spans ended before the head;
+the manifest listed all 2,595 open jobs and had no next plan.
+
+The actual `SPANS_NEAR` query returned 2,595 rows. Its open-span branch used:
+
+```text
+Bitmap Heap Scan on plan_job_spans (actual rows=2595 loops=1)
+  -> Bitmap Index Scan on plan_job_spans_open (actual rows=2595 loops=1)
+       Index Cond: ((lineage = 'campaign_synthetic'::text)
+                    AND (to_plan IS NULL) AND (from_plan <= <head plan id>))
+```
+
+This confirms the index choice for this synthetic fixture.
+
+The spans are the only record of plan membership. Migration `0044` drops the
+table `plan_jobs`, which held one row for each job of each plan. On 2026-11-16,
+it held 2,471,703 rows in 1,291 MB.
+
+A rollback of `0044` creates `plan_jobs` again and fills it from
+`plan_job_rows`. The fill reads the full view, so it can take minutes. The
+command `db migrate --to 43` ends when the fill ends. Start the build that added
+migration `0043` only after the command ends. The rollout and rollback rules
+are in operations.md [§3.7](operations.md#37-stop-the-writes-to-plan_jobs) and
+[§3.8](operations.md#38-drop-plan_jobs).
 
 ## 5. Warehouse contract
 
@@ -2534,10 +2624,9 @@ annotated example):
   (§1.1). A config without it fails to load.
 - `[storage]`: the object store for the catalog, submissions, the warehouse,
   eval sample results, blobs and the dataset cache. It also holds the record
-  keyspaces of §2 marked `[storage]` that `db import` reads and `db export`
-  writes.
+  keyspaces of §2 marked `[storage]`.
 - `[auth_storage]` (required): the record keyspaces of §2 marked
-  `[auth_storage]` that `db import` reads and `db export` writes.
+  `[auth_storage]`.
 - `[eval_packages_storage]`: the scores service's `scores-packages/`, which
   mgmt only reads. If absent, mgmt reads them from `[storage]`.
 

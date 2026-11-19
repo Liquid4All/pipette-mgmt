@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use pipette_plan_types::{
@@ -24,7 +24,7 @@ use crate::todo_filename::Lease;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressSnapshot {
     /// Dates `counts` and `starved` together.
-    pub computed_at: DateTime<Utc>,
+    pub computed_at: Timestamp,
     /// Six buckets that partition `job_ids`; an `expired_jobs` entry counts `failed` first.
     pub counts: Counts,
     /// Outstanding jobs matching no working client, grouped by identical
@@ -45,19 +45,19 @@ pub struct JobExpiry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpiredJob {
     #[serde(with = "past_horizon")]
-    pub horizon: DateTime<Utc>,
-    pub recorded_at: DateTime<Utc>,
+    pub horizon: Timestamp,
+    pub recorded_at: Timestamp,
 }
 
 /// A lapse's horizon in [`ExpiresAt`]'s compact form; `never` cannot have passed.
 mod past_horizon {
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
     use pipette_plan_types::ExpiresAt;
 
     pub(super) fn serialize<S: Serializer>(
-        at: &DateTime<Utc>,
+        at: &Timestamp,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         ExpiresAt::At(*at).serialize(serializer)
@@ -65,7 +65,7 @@ mod past_horizon {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<DateTime<Utc>, D::Error> {
+    ) -> Result<Timestamp, D::Error> {
         match ExpiresAt::deserialize(deserializer)? {
             ExpiresAt::At(at) => Ok(at),
             ExpiresAt::Never => Err(D::Error::custom("a lapse's horizon cannot be `never`")),
@@ -133,7 +133,7 @@ impl SettledOutcome {
 pub struct PlanManifest {
     pub plan_id: PlanId,
     pub status: PlanStatus,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The **user account** a plan is attributed to, or `None`: the HTTP routes
     /// record the signer, the `campaigns` commands record `None`. A record, not a
     /// proof: an older build let a `submit_any_plans` holder name any account. A
@@ -215,7 +215,7 @@ pub struct PlanManifest {
     /// When the plan latched a terminal status (`complete` / `cancelled`); set
     /// by `queue-maintenance`. `None` while non-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_at: Option<DateTime<Utc>>,
+    pub terminal_at: Option<Timestamp>,
 }
 
 /// The note of a plan and its revision change. A store keeps them apart from
@@ -252,7 +252,7 @@ pub struct PlanSummary {
     #[serde(skip)]
     pub change: Option<pipette_plan_types::RevisionChange>,
     pub status: PlanStatus,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Read as [`PlanManifest::submitted_by`] reads it.
     #[serde(default, deserialize_with = "lenient_submitter")]
     pub submitted_by: Option<UserId>,
@@ -315,7 +315,7 @@ pub struct PlanHeader {
     #[serde(skip)]
     pub change: Option<pipette_plan_types::RevisionChange>,
     pub status: PlanStatus,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(default, deserialize_with = "lenient_submitter")]
     pub submitted_by: Option<UserId>,
     #[serde(default)]
@@ -331,7 +331,7 @@ pub struct PlanHeader {
     #[serde(default)]
     pub progress_snapshot: Option<ProgressSnapshot>,
     #[serde(default)]
-    pub terminal_at: Option<DateTime<Utc>>,
+    pub terminal_at: Option<Timestamp>,
 }
 
 impl From<PlanManifest> for PlanHeader {
@@ -567,11 +567,11 @@ pub struct PlanExplanation {
     pub plan_id: PlanId,
     /// Every count below dates from this instant, so the snapshot's age is
     /// measured against it, not the render-time clock.
-    pub read_at: DateTime<Utc>,
+    pub read_at: Timestamp,
     /// When `queue-maintenance` last computed the plan's snapshot. `None` when
     /// no pass ran for this plan, which by itself explains a plan that reads
     /// `active` and runs nothing.
-    pub snapshot_computed_at: Option<DateTime<Utc>>,
+    pub snapshot_computed_at: Option<Timestamp>,
     pub census: JobCensus,
     pub fleet: FleetStanding,
     /// One entry per group of the cached snapshot, whatever the verdict: a
@@ -773,7 +773,7 @@ pub struct PlanLeases {
     pub lapsed: Vec<Lease>,
     /// The instant every deadline in the two lists is measured against: a lease
     /// lapsed by seconds and one lapsed by an hour mean different things.
-    pub read_at: DateTime<Utc>,
+    pub read_at: Timestamp,
 }
 
 impl PlanLeases {
@@ -785,7 +785,7 @@ impl PlanLeases {
     /// on `job_id` alone: a recycle and re-claim between two reads, or between
     /// two partition listings in the file store, put two clients on one job, and
     /// the later deadline names the holder.
-    pub fn new(leases: Vec<Lease>, now: DateTime<Utc>) -> Self {
+    pub fn new(leases: Vec<Lease>, now: Timestamp) -> Self {
         let latest: BTreeMap<JobId, Lease> =
             leases
                 .into_iter()
@@ -821,10 +821,8 @@ impl PlanLeases {
 /// Whether `stamp` is at least `gate` (`plan_creating_max_age_secs`) old at
 /// `now`: the one age rule ingestion and `queue-maintenance` share. A future
 /// stamp reads as young, the safe direction.
-pub fn past_gate(stamp: DateTime<Utc>, now: DateTime<Utc>, gate: std::time::Duration) -> bool {
-    now.signed_duration_since(stamp)
-        .to_std()
-        .is_ok_and(|age| age >= gate)
+pub fn past_gate(stamp: Timestamp, now: Timestamp, gate: std::time::Duration) -> bool {
+    std::time::Duration::try_from(now.duration_since(stamp)).is_ok_and(|age| age >= gate)
 }
 
 /// A well-formed `UserId` for the fixtures below: the type enforces the
@@ -850,7 +848,7 @@ pub fn sample_manifest(
     status: PlanStatus,
     with_snapshot: bool,
 ) -> anyhow::Result<PlanManifest> {
-    let created_at: DateTime<Utc> = "2026-07-20T17:55:00Z".parse()?;
+    let created_at: Timestamp = "2026-07-20T17:55:00Z".parse()?;
     Ok(PlanManifest {
         plan_id,
         status,
@@ -931,7 +929,7 @@ pub fn sample_manifest(
 pub fn starved_report(live_matches: &[usize], claimable: usize) -> PlanExplanation {
     PlanExplanation {
         plan_id: PlanId::from_uuid(uuid::Uuid::nil()),
-        read_at: Utc::now(),
+        read_at: Timestamp::now(),
         snapshot_computed_at: None,
         census: JobCensus {
             total: claimable,
@@ -966,7 +964,7 @@ pub fn starved_report(live_matches: &[usize], claimable: usize) -> PlanExplanati
             .collect(),
         starved_by_live_scan: false,
         verdict: SchedulingState::Starved,
-        leases: PlanLeases::new(vec![], Utc::now()),
+        leases: PlanLeases::new(vec![], Timestamp::now()),
     }
 }
 
@@ -1229,7 +1227,7 @@ mod tests {
         let manifest = PlanManifest {
             plan_id: PlanId::from_uuid(uuid::Uuid::nil()),
             status: PlanStatus::Creating,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             submitted_by: None,
             campaign_id: None,
             previous_plan_id: None,
@@ -1267,7 +1265,7 @@ mod tests {
     /// and `terminal_at` actually serializes when populated.
     #[test]
     fn manifest_full_roundtrip() -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let manifest = PlanManifest {
             plan_id: PlanId::from_uuid(uuid::Uuid::nil()),
             status: PlanStatus::Complete,
@@ -1440,12 +1438,12 @@ mod tests {
     /// A lease on `job` held by `client`, its deadline `minutes` from `now`. A
     /// negative offset seeds the strand that a stalled `queue-maintenance`
     /// leaves.
-    fn lease(client: &str, job: &str, minutes: i64, now: DateTime<Utc>) -> anyhow::Result<Lease> {
+    fn lease(client: &str, job: &str, minutes: i64, now: Timestamp) -> anyhow::Result<Lease> {
         Ok(Lease {
             job_id: JobId::new_unchecked(job),
             expires_at: ExpiresAt::Never,
             client_id: ClientId::try_new(client)?,
-            lease_expiry: now + chrono::Duration::minutes(minutes),
+            lease_expiry: now + jiff::SignedDuration::from_mins(minutes),
         })
     }
 
@@ -1520,7 +1518,7 @@ mod tests {
         #[case] expect_lapsed: &[(&str, &str)],
         #[case] expect_retained: Option<i64>,
     ) -> anyhow::Result<()> {
-        let now: DateTime<Utc> = "2026-09-04T12:00:00Z".parse()?;
+        let now: Timestamp = "2026-09-04T12:00:00Z".parse()?;
         let leases = PlanLeases::new(
             held.iter()
                 .map(|(client, job, minutes)| lease(client, job, *minutes, now))
@@ -1547,7 +1545,7 @@ mod tests {
             );
             assert_eq!(
                 held[0].lease_expiry,
-                now + chrono::Duration::minutes(minutes),
+                now + jiff::SignedDuration::from_mins(minutes),
                 "the collapse keeps the latest deadline"
             );
         }

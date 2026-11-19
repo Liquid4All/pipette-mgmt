@@ -133,6 +133,12 @@ data_dir = "./sample_data"
 # runtime_type = "llamacpp_cli_stock_tools"
 # flavor = "macos-x64"
 # requires = ["os:macos"]
+#
+## Desktop clients that have an installed MLX runtime report `runtime:mlx`.
+# [[descriptor_catalog.offer_rules]]
+# runtime_type = "mlx_macos_pipette"
+# flavor = "macos-arm64"
+# requires = ["os:macos", "runtime:mlx"]
 
 # Optional: pipette-duckdb, which plan and campaign results are read from.
 # [duckdb]

@@ -84,9 +84,19 @@ yanked = "deny"
 # stance above.
 unmaintained = "all"
 
-# Each entry's `reason` says why the crate is out of reach. An ignore that
-# outlives its reason is how a real advisory gets waved through.
-ignore = []
+# Each entry's `reason` records why the advisory is accepted and what must
+# change to remove the exception. An ignore that outlives its reason is how a
+# real advisory gets waved through.
+ignore = [
+    # A maintenance notice, with no patched version. Our code uses jiff; Arrow
+    # 60, Parquet 60 and object_store 0.14 still require chrono. Remove this
+    # exception when they drop it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no patched release; only Arrow 60, Parquet 60 and object_store 0.14 require it now. Removal needs upstream changes." },
+    # Also a maintenance notice. We do not depend on humantime directly:
+    # object_store 0.14.2 requires it. Remove this exception when object_store
+    # replaces it with a maintained parser.
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained with no patched release; required by object_store 0.14.2. Removal needs an upstream object_store change." },
+]
 
 # What may enter the graph at all, independently of license and advisory. No
 # crate is banned by name today; the gate that earns this section's place is

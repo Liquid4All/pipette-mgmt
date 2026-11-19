@@ -67,8 +67,13 @@ carries `campaign_id`, `name`, `owner`, `created_at`, `updated_at` and:
   to 256, each of letters, digits, spaces and `_ . : / = + - @`, with no space
   at either end, compared as written. Absent when nobody labelled the campaign.
   Nothing on the server reads a label.
-- `state`: `"archived"` on a campaign taken out of use, which takes no new
-  plan ([archiving](campaigns/update_campaign.md)). Absent while active.
+- `state`: `"locked"` on a campaign whose plan stays as it is, or `"archived"`
+  on one taken out of use. Neither takes a new plan
+  ([states](campaigns/update_campaign.md)). Absent while active.
+- `state_note`: why the campaign is locked. Present only while locked.
+
+A campaign's plans can carry [tags](campaigns/create_plan_tag.md): a name and a
+message on one plan, made once and never moved.
 
 A write replaces the whole record, and only if the record is still the one the
 server read, so a write never reverts a field it does not set, such as the plan

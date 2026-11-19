@@ -29,4 +29,4 @@
 
 <PageHead trail={orgTrail(org ?? route.org)} title="Benchmarks"
           action={page.data ? newBenchmarkAction(reader, page.data.read, org) : null} />
-<BenchmarkListing branch={{ kind: "org", slug: org?.slug ?? route.org }} path={pathOf(route)} of={page} />
+<BenchmarkListing branch={{ kind: "org", slug: org?.slug ?? route.org, display_name: org?.display_name }} path={pathOf(route)} of={page} />

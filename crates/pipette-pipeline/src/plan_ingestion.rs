@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
-use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use serde::Deserialize as _;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -34,8 +34,8 @@ use pipette_plan_types::{
 use pipette_store::{
     CellResult, CellScope, ClientStore, ContentKeyCas, ContentKeyClaim, ContentKeyRecord,
     ContentKeyVersion, CreateOutcome, JobJoin, OrgStore, PLAN_JOB_CONCURRENCY, PlanStore,
-    RecordedRun, Stores, SubmissionStore, TagStore, TodoStore, VaultStore, drain_clients,
-    warn_unreadable_clients,
+    RecordedRun, STORAGE_CONCURRENCY, Stores, SubmissionStore, TagStore, TodoStore, VaultStore,
+    drain_clients, warn_unreadable_clients,
 };
 
 use crate::content_key::{content_digest, merge_duplicates, mergeable};
@@ -1165,18 +1165,42 @@ async fn running_jobs(todo: &dyn TodoStore, jobs: &[JobId]) -> anyhow::Result<Ha
     if jobs.is_empty() {
         return Ok(HashSet::new());
     }
-    Ok(running(todo.leases_for_jobs(jobs).await?, Utc::now()))
+    Ok(running(todo.leases_for_jobs(jobs).await?, Timestamp::now()))
 }
 
 /// The jobs of `leases` a client is running at `now`: its lease has not
 /// lapsed, the queue's test, and the job's deadline has not passed, carry's
 /// test, so a job kept for its run can still be carried.
-fn running(leases: Vec<Lease>, now: DateTime<Utc>) -> HashSet<JobId> {
+fn running(leases: Vec<Lease>, now: Timestamp) -> HashSet<JobId> {
     leases
         .into_iter()
         .filter(|lease| lease.lease_expiry > now && !lease.expires_at.is_expired(now))
         .map(|lease| lease.job_id)
         .collect()
+}
+
+/// Carried jobs with a submission record or an active client lease.
+async fn protected_carries(
+    todo: &dyn TodoStore,
+    submissions: &dyn SubmissionStore,
+    jobs: &[JobId],
+) -> anyhow::Result<HashSet<JobId>> {
+    let mut recorded: HashSet<JobId> = futures::stream::iter(jobs.iter().cloned())
+        .map(|job_id| async move {
+            let has = submissions.has_record(&job_id).await?;
+            anyhow::Ok(has.then_some(job_id))
+        })
+        .buffer_unordered(STORAGE_CONCURRENCY)
+        .try_filter_map(|job_id| async move { Ok(job_id) })
+        .try_collect()
+        .await?;
+    let queued: Vec<JobId> = jobs
+        .iter()
+        .filter(|job_id| !recorded.contains(*job_id))
+        .cloned()
+        .collect();
+    recorded.extend(running_jobs(todo, &queued).await?);
+    Ok(recorded)
 }
 
 /// A unit that [`satisfy_from_earlier_runs`] gave an earlier finished job.
@@ -1227,6 +1251,26 @@ async fn satisfy_from_earlier_runs<'u>(
             (open && mergeable(body)).then(|| (index, body, crate::content_key::cell_digest(body)))
         })
         .collect();
+    // The carried jobs that stay are known before the cell read, so the read
+    // leaves out their cells: a revision carries most of its jobs, and each run
+    // of a cell comes back with its whole job source. The record check reads
+    // metadata only, as an eval record can be tens of MB.
+    let drawn = drawn_jobs(
+        eligible
+            .iter()
+            .filter_map(|(index, ..)| inherited.get(*index)),
+    );
+    let protected = protected_carries(todo, submissions, &drawn).await?;
+    let eligible: Vec<(usize, &Value, String)> = eligible
+        .into_iter()
+        .filter(|(index, ..)| {
+            !matches!(
+                inherited.get(*index),
+                Some(Inherited::Job(job_id))
+                    if protected.contains(job_id)
+            )
+        })
+        .collect();
     if eligible.is_empty() {
         return Ok(Vec::new());
     }
@@ -1248,22 +1292,6 @@ async fn satisfy_from_earlier_runs<'u>(
                 .push(result);
             by_cell
         });
-    let drawn = drawn_jobs(
-        eligible
-            .iter()
-            .filter(|(_, _, cell)| by_cell.contains_key(cell.as_str()))
-            .filter_map(|(index, ..)| inherited.get(*index)),
-    );
-    let recorded = if drawn.is_empty() {
-        HashMap::new()
-    } else {
-        submissions.find_outcomes(&drawn).await?
-    };
-    let queued: Vec<JobId> = drawn
-        .into_iter()
-        .filter(|job_id| !recorded.contains_key(job_id))
-        .collect();
-    let running = running_jobs(todo, &queued).await?;
     // A job this plan already holds answers no other unit.
     let held: HashSet<JobId> = inherited
         .iter()
@@ -1277,18 +1305,31 @@ async fn satisfy_from_earlier_runs<'u>(
             Inherited::Nothing => None,
         })
         .collect();
+    // A carry can start or finish while the cell read is pending. Refresh
+    // only carries with an answering result before replacing their runs.
+    let replacing = drawn_jobs(eligible.iter().filter_map(|(index, body, cell)| {
+        by_cell
+            .get(cell.as_str())
+            .is_some_and(|runs| {
+                runs.iter().any(|run| {
+                    !held.contains(&run.job_id)
+                        && matching::run_answers(&run.body, body, &run.run_flags)
+                })
+            })
+            .then(|| inherited.get(*index))
+            .flatten()
+    }));
+    let protected = protected_carries(todo, submissions, &replacing).await?;
     let (_, satisfied) = eligible.into_iter().fold(
         (held, Vec::new()),
         |(mut held, mut satisfied), (index, body, cell)| {
             let carried = match inherited.get(index) {
-                Some(Inherited::Job(job_id))
-                    if recorded.contains_key(job_id) || running.contains(job_id) =>
-                {
-                    return (held, satisfied);
-                }
                 Some(Inherited::Job(job_id)) => Some(job_id.clone()),
                 _ => None,
             };
+            if carried.as_ref().is_some_and(|job| protected.contains(job)) {
+                return (held, satisfied);
+            }
             let answering = by_cell.get(cell.as_str()).and_then(|runs| {
                 runs.iter().find(|run| {
                     !held.contains(&run.job_id)
@@ -1457,7 +1498,7 @@ pub struct PlanSubmission<J = Vec<(String, Value)>> {
 pub async fn validate_submission(
     ctx: &IngestContext<'_>,
     jobs: &[(String, Value)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), IngestError> {
     validate_into(ctx, jobs, now, &mut HashMap::new())
         .await
@@ -1469,7 +1510,7 @@ pub async fn validate_submission(
 async fn validate_into(
     ctx: &IngestContext<'_>,
     jobs: &[(String, Value)],
-    now: DateTime<Utc>,
+    now: Timestamp,
     seen: &mut HashMap<VaultResourceId, Option<vault_check::Seen>>,
 ) -> Result<Vec<Option<Value>>, IngestError> {
     let IngestContext {
@@ -1610,7 +1651,7 @@ pub async fn prepare_jobs(
     owner: &VaultOwner,
     mut jobs: Vec<(String, Value)>,
 ) -> Result<PreparedJobs, IngestError> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     lift_required(&mut jobs)?;
     let mut seen = HashMap::new();
     let aliases = validate_into(ctx, &jobs, now, &mut seen).await?;
@@ -1633,7 +1674,7 @@ pub(crate) async fn dry_run_jobs(
     ctx: &IngestContext<'_>,
     owner: &VaultOwner,
     mut jobs: Vec<(String, Value)>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(Vec<Value>, DryRunImports), IngestError> {
     lift_required(&mut jobs)?;
     let mut seen = HashMap::new();
@@ -1738,7 +1779,7 @@ pub async fn ingest_prepared(
     // An import can run for hours, so staging reads the clock again and refuses
     // an `expires_at` that passed during the import.
     let PreparedJobs { jobs, rewrites } = jobs;
-    let now = Utc::now();
+    let now = Timestamp::now();
     jobs.iter().enumerate().try_for_each(|(index, job)| {
         match job.body.get("expires_at").and_then(Value::as_str) {
             Some(s) if matches!(parse_expires_at(s), Some(ExpiresAt::At(at)) if at <= now) => {
@@ -1786,7 +1827,8 @@ pub async fn ingest_prepared(
             .is_some_and(|stored| stored.sha256() != submitted)
     });
 
-    let default_expiry = ExpiresAt::At(now + Duration::days(DEFAULT_EXPIRY_DAYS));
+    let default_expiry =
+        ExpiresAt::At(now + jiff::SignedDuration::from_hours(24 * DEFAULT_EXPIRY_DAYS));
 
     // Place every input on a job: a fresh mint, or one already running the
     // cell. This step owns every content-key write and membership marker, so
@@ -2730,7 +2772,7 @@ struct MergeContext<'a> {
     todo: &'a dyn TodoStore,
     submissions: &'a dyn SubmissionStore,
     plan_id: &'a PlanId,
-    now: DateTime<Utc>,
+    now: Timestamp,
     /// `plan_creating_max_age_secs`. One gate decides whether a content-key
     /// record whose job is not live belongs to an ingest that is still staging
     /// (leave it alone) or to one that provably died (take the digest over).
@@ -2836,7 +2878,7 @@ impl MergeContext<'_> {
             return Ok(carried(horizon, true));
         }
         match self.official_state(job_id).await? {
-            TargetState::Live(official) if !official.is_expired(Utc::now()) => {
+            TargetState::Live(official) if !official.is_expired(Timestamp::now()) => {
                 self.plans
                     .write_job_plan_marker(job_id, self.plan_id, horizon)
                     .await?;
@@ -2995,7 +3037,7 @@ impl MergeContext<'_> {
         };
         // A fresh clock: a long ingest can outlive the target's deadline, and the
         // stale clock would still join a lapsed entry.
-        if official.is_expired(Utc::now()) {
+        if official.is_expired(Timestamp::now()) {
             // The entry is past its deadline in place. The sweep will resolve it
             // to a synthetic failure, so it is dead already.
             return Ok(self.classify_absent(record));
@@ -3208,7 +3250,7 @@ fn validate_job(
     hf_model: Option<&Value>,
     catalog: &HashMap<BenchmarkId, Benchmark>,
     models: ModelCheck<'_>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), JobRejectionError> {
     let obj = body.as_object().ok_or(JobRejectionError::NotAnObject)?;
 
@@ -3805,9 +3847,7 @@ pub(crate) fn lift_required_in(body: &mut Value) -> Result<(), JobRejectionError
 fn parse_expires_at(s: &str) -> Option<ExpiresAt> {
     match s {
         "never" => Some(ExpiresAt::Never),
-        timestamp => DateTime::parse_from_rfc3339(timestamp)
-            .ok()
-            .map(|dt| ExpiresAt::At(dt.with_timezone(&Utc))),
+        timestamp => timestamp.parse::<jiff::Timestamp>().ok().map(ExpiresAt::At),
     }
 }
 
@@ -3972,6 +4012,7 @@ pub fn serialize_jobs_map<S: Serializer>(
 
 #[cfg(test)]
 mod tests {
+    use jiff::SignedDuration;
     use rstest::rstest;
     use serde_json::json;
 
@@ -4076,7 +4117,7 @@ mod tests {
             None,
             &catalog()?,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         ))
     }
 
@@ -4120,9 +4161,8 @@ mod tests {
     // that carries a huge one is cut to a bounded prefix.
     #[case::oversized_expires_at(json!({"requires":["os:macos"],"spec":spec_bench_1(),"expires_at":"x".repeat(5000)}), (|k| matches!(k, JobRejectionError::MalformedExpiresAt { value } if value.chars().count() == 121 && value.ends_with('…'))) as Kind)]
     #[case::past_expires_at(json!({"requires":["os:macos"],"spec":spec_bench_1(),"expires_at":"2020-01-01T00:00:00Z"}), (|k| matches!(k, JobRejectionError::PastExpiresAt { value } if value == "2020-01-01T00:00:00Z")) as Kind)]
-    // RFC 3339 allows any number of fractional digits, so a past value can be
-    // huge too.
-    #[case::oversized_past_expires_at(json!({"requires":["os:macos"],"spec":spec_bench_1(),"expires_at":format!("2020-01-01T00:00:00.{}Z", "0".repeat(5000))}), (|k| matches!(k, JobRejectionError::PastExpiresAt { value } if value.chars().count() == 121 && value.ends_with('…'))) as Kind)]
+    // A fraction past nanoseconds does not parse, however far in the past.
+    #[case::long_fraction_expires_at(json!({"requires":["os:macos"],"spec":spec_bench_1(),"expires_at":format!("2020-01-01T00:00:00.{}Z", "0".repeat(5000))}), (|k| matches!(k, JobRejectionError::MalformedExpiresAt { value } if value.chars().count() == 121 && value.ends_with('…'))) as Kind)]
     #[case::string_merge_duplicates(json!({"requires":["os:macos"],"spec":spec_bench_1(),"merge_duplicates":"false"}), (|k| matches!(k, JobRejectionError::MalformedMergeDuplicates { value } if value == "\"false\"")) as Kind)]
     #[case::numeric_merge_duplicates(json!({"requires":["os:macos"],"spec":spec_bench_1(),"merge_duplicates":0}), (|k| matches!(k, JobRejectionError::MalformedMergeDuplicates { value } if value == "0")) as Kind)]
     #[case::clients_not_an_array(json!({"requires":["os:macos"],"clients":"ev1_a","spec":spec_bench_1()}), (|k| matches!(k, JobRejectionError::ClientsNotAnArray)) as Kind)]
@@ -4279,7 +4319,7 @@ mod tests {
             None,
             &eval_catalog()?,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         match expected {
             None => anyhow::ensure!(checked.is_ok(), "{checked:?}"),
@@ -4399,7 +4439,7 @@ mod tests {
             None,
             &vlm_eval_catalog(&[])?,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         match expected {
             None => anyhow::ensure!(checked.is_ok(), "{checked:?}"),
@@ -4419,7 +4459,7 @@ mod tests {
         let catalog = vlm_eval_catalog(&[])?;
         let mut newer = vlm_job("vlm-mmstar-qwen", "LiquidAI", "LFM2.5-VL-3B-GGUF", None);
         newer["spec"]["runtime"] = json!({"type": "a_runtime_from_a_newer_client"});
-        let checked = validate_job(&newer, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&newer, None, &catalog, ModelCheck::none(), Timestamp::now());
         anyhow::ensure!(
             matches!(&checked, Err(JobRejectionError::OffRecipe { reason, .. })
                 if matches!(**reason, VlmEvalRecipeError::NotCovered { .. })),
@@ -4427,10 +4467,22 @@ mod tests {
         );
         let mut on_recipe = vlm_job("vlm-mmstar-qwen", "unsloth", "Qwen3.5-2B-GGUF", Some(true));
         on_recipe["spec"]["runtime"] = json!({"type": "a_runtime_from_a_newer_client"});
-        validate_job(&on_recipe, None, &catalog, ModelCheck::none(), Utc::now())?;
+        validate_job(
+            &on_recipe,
+            None,
+            &catalog,
+            ModelCheck::none(),
+            Timestamp::now(),
+        )?;
         let mut unreadable = vlm_job("vlm-mmstar-qwen", "unsloth", "Qwen3.5-2B-GGUF", Some(true));
         unreadable["spec"]["model"] = json!({"type": "a_model_kind_from_a_newer_client"});
-        let checked = validate_job(&unreadable, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(
+            &unreadable,
+            None,
+            &catalog,
+            ModelCheck::none(),
+            Timestamp::now(),
+        );
         anyhow::ensure!(
             matches!(
                 &checked,
@@ -4463,7 +4515,7 @@ mod tests {
             None,
             &vlm_eval_catalog(&[])?,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         if accepted {
             checked?;
@@ -4492,7 +4544,7 @@ mod tests {
             None,
             &vlm_eval_catalog(&[])?,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         anyhow::ensure!(
             matches!(&checked, Err(JobRejectionError::RecipeUnchecked { field: f, .. }) if *f == field),
@@ -4514,7 +4566,7 @@ mod tests {
         let rival = format!("family = \"Rival\"\nmodels = [{line}]\nenable_thinking = true");
         let catalog = vlm_eval_catalog(&[("vlm-mmstar-rival", "mmstar", rival.as_str())])?;
         let job = vlm_vllm_job("vlm-mmstar-qwen", "Qwen", "Qwen3.5-2B", Some(true));
-        let checked = validate_job(&job, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&job, None, &catalog, ModelCheck::none(), Timestamp::now());
         if ambiguous {
             anyhow::ensure!(
                 matches!(&checked, Err(JobRejectionError::AmbiguousRecipe(_))),
@@ -4550,7 +4602,13 @@ mod tests {
         private(&mut catalog, "vlm-mmstar-rival", &one)?;
         let job = |id: &str| vlm_job(id, "unsloth", "Qwen3.5-2B-GGUF", Some(true));
         let check = |catalog: &HashMap<BenchmarkId, Benchmark>, id: &str| {
-            validate_job(&job(id), None, catalog, ModelCheck::none(), Utc::now())
+            validate_job(
+                &job(id),
+                None,
+                catalog,
+                ModelCheck::none(),
+                Timestamp::now(),
+            )
         };
         // The public entry's filer cannot name the private one.
         check(&catalog, "vlm-mmstar-qwen")?;
@@ -4575,7 +4633,7 @@ mod tests {
     fn a_vlm_eval_recipe_reads_the_whole_model_and_its_origin() -> anyhow::Result<()> {
         let catalog = vlm_eval_catalog(&[])?;
         let check = |body: &Value, alias: Option<&Value>| {
-            validate_job(body, alias, &catalog, ModelCheck::none(), Utc::now())
+            validate_job(body, alias, &catalog, ModelCheck::none(), Timestamp::now())
         };
         let mut extra = vlm_job("vlm-mmstar-qwen", "unsloth", "Qwen3.5-2B-GGUF", Some(true));
         extra["spec"]["model"]["adapter"] = json!("lora.gguf");
@@ -4626,7 +4684,7 @@ mod tests {
             None,
             &catalog,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         let Err(rejection) = checked else {
             anyhow::bail!("the job ran under one of two recipes");
@@ -4642,7 +4700,7 @@ mod tests {
             None,
             &catalog,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         )?;
         Ok(())
     }
@@ -4745,7 +4803,7 @@ mod tests {
         use pipette_core::types::Mint;
 
         let catalog = asr_eval_catalog(&pipette_plan_types::OrgId::mint(), &[])?;
-        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Timestamp::now());
         match expected {
             None => anyhow::ensure!(checked.is_ok(), "{checked:?}"),
             Some(expected) => anyhow::ensure!(
@@ -4770,7 +4828,7 @@ mod tests {
             Some(false),
             "vlm_eval",
         );
-        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Timestamp::now());
         anyhow::ensure!(
             matches!(
                 &checked,
@@ -4804,7 +4862,13 @@ mod tests {
             )
         };
         let check = |catalog: &HashMap<BenchmarkId, Benchmark>, id: &str| {
-            validate_job(&job(id), None, catalog, ModelCheck::none(), Utc::now())
+            validate_job(
+                &job(id),
+                None,
+                catalog,
+                ModelCheck::none(),
+                Timestamp::now(),
+            )
         };
         // A public rival is ambiguous for the private entry's filer, who can
         // name both.
@@ -4878,7 +4942,7 @@ mod tests {
         use pipette_core::types::Mint;
 
         let catalog = asr_eval_catalog(&pipette_plan_types::OrgId::mint(), &[])?;
-        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&body, None, &catalog, ModelCheck::none(), Timestamp::now());
         match refused {
             None => checked.map(|_| ())?,
             Some(names) => {
@@ -4936,7 +5000,7 @@ mod tests {
             None,
             &catalog,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         );
         anyhow::ensure!(
             matches!(&on_vllm, Err(JobRejectionError::AsrEvalRuntime { .. }))
@@ -4952,7 +5016,7 @@ mod tests {
             None,
             &catalog,
             ModelCheck::none(),
-            Utc::now(),
+            Timestamp::now(),
         )?;
         Ok(())
     }
@@ -5003,7 +5067,7 @@ mod tests {
         }
         spec["benchmark"] = json!(id);
         let job = json!({"requires": ["os:macos"], "spec": spec});
-        let checked = validate_job(&job, None, &catalog, ModelCheck::none(), Utc::now());
+        let checked = validate_job(&job, None, &catalog, ModelCheck::none(), Timestamp::now());
         match expected {
             None => anyhow::ensure!(checked.is_ok(), "{checked:?}"),
             Some(kind) => anyhow::ensure!(
@@ -5251,7 +5315,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("d")?,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
             device_profile: DeviceProfile {
                 device_os_name: Some(NonEmptyTrimmedString::try_new(os)?),
                 ..Default::default()
@@ -6212,7 +6276,7 @@ mod tests {
             other => Err(anyhow::anyhow!("expected a job rejection, got {other:?}")),
         };
         let dry_run = refusal(
-            dry_run_jobs(&ctx, &owner, jobs.clone(), Utc::now())
+            dry_run_jobs(&ctx, &owner, jobs.clone(), Timestamp::now())
                 .await
                 .map(|_| ()),
         )?;
@@ -6342,7 +6406,7 @@ mod tests {
 
         // Claim it, then recycle the lease as queue-maintenance would.
         let client_id = ClientId::try_new("ev1_a")?;
-        let lease_expiry = Utc::now();
+        let lease_expiry = Timestamp::now();
         assert!(matches!(
             stores
                 .todo
@@ -6390,7 +6454,9 @@ mod tests {
         #[case] latest_is_never: bool,
     ) -> anyhow::Result<()> {
         let first_expires_at = first_in_days.map(|days| {
-            (Utc::now() + Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            (Timestamp::now() + jiff::SignedDuration::from_hours(24 * days))
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
         });
         let first_expires_at = first_expires_at.as_deref();
         let dir = tempfile::tempdir()?;
@@ -6691,7 +6757,7 @@ mod tests {
             MAX_JOBS,
             CREATING_MAX_AGE,
         );
-        validate_submission(&host, &jobs, Utc::now()).await?;
+        validate_submission(&host, &jobs, Timestamp::now()).await?;
 
         let filer = VaultScope::Own {
             user: UserId::try_new(USER_ADA)?,
@@ -6701,7 +6767,7 @@ mod tests {
             vault_scope: &filer,
             ..host
         };
-        let err = validate_submission(&filed, &jobs, Utc::now())
+        let err = validate_submission(&filed, &jobs, Timestamp::now())
             .await
             .err()
             .context("a resource outside the filer's reach is refused")?;
@@ -6826,14 +6892,14 @@ mod tests {
 
     /// `days` from now, cut to whole seconds so it survives an RFC 3339
     /// `expires_at` and an `avail/` key unchanged.
-    fn in_days(days: i64) -> DateTime<Utc> {
-        let at = Utc::now() + Duration::days(days);
-        DateTime::from_timestamp(at.timestamp(), 0).unwrap_or(at)
+    fn in_days(days: i64) -> Timestamp {
+        let at = Timestamp::now() + jiff::SignedDuration::from_hours(24 * days);
+        jiff::Timestamp::from_second(at.as_second()).unwrap_or(at)
     }
 
     /// `at` in the RFC 3339 form that a handoff `expires_at` carries.
-    fn rfc3339(at: DateTime<Utc>) -> String {
-        at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    fn rfc3339(at: Timestamp) -> String {
+        at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     /// The plans holding `job_id`, sorted so an assertion can name them.
@@ -6943,7 +7009,7 @@ mod tests {
             &stores,
             &content_digest(&cell_body("a", json!({}))),
             &incumbent,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         seed_avail(&stores, &incumbent, &cell_body("a", json!({})), deadline).await?;
@@ -7122,7 +7188,7 @@ mod tests {
         );
         let first =
             ingest_under(stores, CampaignMembership::first(&new), document()?, jobs).await?;
-        Ok((new.around(first.plan_id.clone(), Utc::now()), first))
+        Ok((new.around(first.plan_id.clone(), Timestamp::now()), first))
     }
 
     /// File `jobs` as a variant edit of `campaign` would: superseding the plan
@@ -8041,7 +8107,7 @@ mod tests {
             job_id.clone(),
             pipette_core::plan::ExpiredJob {
                 horizon: in_days(-1),
-                recorded_at: Utc::now(),
+                recorded_at: Timestamp::now(),
             },
         );
         stores.plans.put_plan(&manifest).await?;
@@ -8069,7 +8135,7 @@ mod tests {
                 job_id,
                 expires_at,
                 &ClientId::try_new("ev1_a")?,
-                Utc::now() + Duration::hours(1),
+                Timestamp::now() + SignedDuration::from_hours(1),
             )
             .await?;
         anyhow::ensure!(
@@ -8345,7 +8411,7 @@ mod tests {
             BTreeMap::from([(minted.clone(), again.clone())])
         );
 
-        campaign.advance(revision.plan_id, Utc::now());
+        campaign.advance(revision.plan_id, Timestamp::now());
         let recalculate = if recalculates_kept {
             BTreeSet::from([kept.clone()])
         } else {
@@ -8367,7 +8433,7 @@ mod tests {
         );
 
         finish_job(&*stores.submissions, &*stores.todo, &minted).await?;
-        campaign.advance(carried.plan_id, Utc::now());
+        campaign.advance(carried.plan_id, Timestamp::now());
         let twice = rerun(
             &stores,
             &campaign,
@@ -8804,7 +8870,7 @@ mod tests {
         // which claimed the digest may still be staging it. Both inputs decline
         // against it and leave it alone.
         let unqueued = JobId::from_uuid(uuid::Uuid::now_v7());
-        seed_content_key(&stores, &digest, &unqueued, Utc::now()).await?;
+        seed_content_key(&stores, &digest, &unqueued, Timestamp::now()).await?;
 
         let report = ingest(
             &stores,
@@ -8938,7 +9004,7 @@ mod tests {
 
         let incumbent = in_days(90);
         let want_horizon = match offset_days {
-            Some(days) => ExpiresAt::At(incumbent + Duration::days(days)),
+            Some(days) => ExpiresAt::At(incumbent + jiff::SignedDuration::from_hours(24 * days)),
             None => ExpiresAt::Never,
         };
         let second_expiry = match want_horizon {
@@ -9113,12 +9179,12 @@ mod tests {
         let first = JobId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
         let created_at = if age_out_record {
-            Utc::now() - Duration::days(1)
+            Timestamp::now() - SignedDuration::from_hours(24)
         } else {
-            Utc::now()
+            Timestamp::now()
         };
         seed_content_key(&stores, &content_digest(&body), &first, created_at).await?;
-        let lapsed = ExpiresAt::At(Utc::now() - Duration::days(1));
+        let lapsed = ExpiresAt::At(Timestamp::now() - SignedDuration::from_hours(24));
         seed_avail(&stores, &first, &body, lapsed).await?;
 
         let second = ingest(
@@ -9165,11 +9231,11 @@ mod tests {
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
-        seed_content_key(&stores, &digest, &target, Utc::now()).await?;
+        seed_content_key(&stores, &digest, &target, Timestamp::now()).await?;
 
         // The target sits in `avail/` under a deadline that lapsed half an hour
         // ago — after the ingest below started, before this input's placement.
-        let lapsed = ExpiresAt::At(Utc::now() - Duration::minutes(30));
+        let lapsed = ExpiresAt::At(Timestamp::now() - SignedDuration::from_mins(30));
         seed_avail(&stores, &target, &body, lapsed).await?;
 
         let context = MergeContext {
@@ -9178,7 +9244,7 @@ mod tests {
             submissions: stores.submissions.as_ref(),
             plan_id: &plan_id,
             // The ingest started an hour ago, when the target was still live.
-            now: Utc::now() - Duration::hours(1),
+            now: Timestamp::now() - SignedDuration::from_hours(1),
             creating_max_age: CREATING_MAX_AGE,
         };
         let (_, placed) = place_one(&context, &body, ExpiresAt::Never).await?;
@@ -9210,7 +9276,7 @@ mod tests {
                 &ContentKeyRecord {
                     job_id: unborn.clone(),
                     plan_id: owner.clone(),
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                 },
             )
             .await?;
@@ -9244,7 +9310,7 @@ mod tests {
             todo: stores.todo.as_ref(),
             submissions: stores.submissions.as_ref(),
             plan_id,
-            now: Utc::now(),
+            now: Timestamp::now(),
             creating_max_age: CREATING_MAX_AGE,
         }
     }
@@ -9269,7 +9335,7 @@ mod tests {
         stores: &Stores,
         digest: &str,
         job_id: &JobId,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> anyhow::Result<()> {
         stores
             .plans
@@ -9309,7 +9375,7 @@ mod tests {
             job_id: job.clone(),
             expires_at: ExpiresAt::Never,
             client_id: ClientId::try_new("ev1_race")?,
-            lease_expiry: Utc::now() + chrono::Duration::hours(1),
+            lease_expiry: Timestamp::now() + jiff::SignedDuration::from_hours(1),
         })
     }
 
@@ -9322,7 +9388,7 @@ mod tests {
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
-        seed_content_key(&stores, &digest, &target, Utc::now()).await?;
+        seed_content_key(&stores, &digest, &target, Timestamp::now()).await?;
         // The job is gone from the queue but its result is recorded, unreadable:
         // only its presence may be checked.
         stores
@@ -9362,7 +9428,7 @@ mod tests {
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
-        seed_content_key(&stores, &digest, &target, Utc::now()).await?;
+        seed_content_key(&stores, &digest, &target, Timestamp::now()).await?;
 
         let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
         observed.script_leases(vec![race_lease(&target)?]);
@@ -9406,7 +9472,7 @@ mod tests {
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let digest = content_digest(&cell_body("a", json!({})));
-        seed_content_key(&stores, &digest, &target, Utc::now()).await?;
+        seed_content_key(&stores, &digest, &target, Timestamp::now()).await?;
         if recorded {
             stores
                 .submissions
@@ -9441,7 +9507,13 @@ mod tests {
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
-        seed_content_key(&stores, &digest, &target, Utc::now() - Duration::days(1)).await?;
+        seed_content_key(
+            &stores,
+            &digest,
+            &target,
+            Timestamp::now() - SignedDuration::from_hours(24),
+        )
+        .await?;
 
         // Queue the target, then claim it, so it sits in `leased/` alone.
         stores.todo.write_tmp(&target, &body).await?;
@@ -9455,7 +9527,7 @@ mod tests {
                 &target,
                 ExpiresAt::Never,
                 &ClientId::try_new("ev1_a")?,
-                Utc::now() + Duration::hours(1),
+                Timestamp::now() + SignedDuration::from_hours(1),
             )
             .await?;
         assert!(
@@ -9490,7 +9562,7 @@ mod tests {
         job_id: JobId,
         expires_at: ExpiresAt,
         client_id: ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     }
 
     #[async_trait::async_trait]
@@ -9549,7 +9621,7 @@ mod tests {
         ) -> anyhow::Result<pipette_store::RedateResult> {
             Err(self.unexpected.record("redate_avail"))
         }
-        async fn restamp_avail_deadlines(&self, _now: DateTime<Utc>) -> anyhow::Result<u64> {
+        async fn restamp_avail_deadlines(&self, _now: Timestamp) -> anyhow::Result<u64> {
             Err(self.unexpected.record("restamp_avail_deadlines"))
         }
         async fn get_leased(
@@ -9557,7 +9629,7 @@ mod tests {
             _job_id: &JobId,
             _expires_at: ExpiresAt,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
         ) -> anyhow::Result<Option<Value>> {
             Err(self.unexpected.record("get_leased"))
         }
@@ -9565,7 +9637,7 @@ mod tests {
             &self,
             _job_id: &JobId,
             _client_id: &ClientId,
-            _new_expiry: DateTime<Utc>,
+            _new_expiry: Timestamp,
         ) -> anyhow::Result<pipette_store::RenewLeaseResult> {
             Err(self.unexpected.record("renew_lease"))
         }
@@ -9574,7 +9646,7 @@ mod tests {
             _job_id: &JobId,
             _expires_at: ExpiresAt,
             _client_id: &ClientId,
-            _expiry: DateTime<Utc>,
+            _expiry: Timestamp,
         ) -> anyhow::Result<()> {
             Err(self.unexpected.record("delete_lease"))
         }
@@ -9583,7 +9655,7 @@ mod tests {
             _job_id: &JobId,
             _expires_at: ExpiresAt,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
         ) -> anyhow::Result<ClaimResult> {
             Err(self.unexpected.record("claim_job"))
         }
@@ -9592,7 +9664,7 @@ mod tests {
             _job_id: &JobId,
             _expires_at: ExpiresAt,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
         ) -> anyhow::Result<pipette_store::RecycleResult> {
             Err(self.unexpected.record("recycle_lease"))
         }
@@ -9674,14 +9746,14 @@ mod tests {
             &self,
             _job_id: &JobId,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
         ) -> anyhow::Result<()> {
             Err(self.unexpected.record("write_lost_lease"))
         }
         async fn list_lost_leases(
             &self,
             _job_id: &JobId,
-        ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+        ) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
             Err(self.unexpected.record("list_lost_leases"))
         }
         async fn delete_lost_leases_for_job(&self, _job_id: &JobId) -> anyhow::Result<()> {
@@ -9707,13 +9779,10 @@ mod tests {
         async fn stamp_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
             Err(self.unexpected.record("stamp_liveness"))
         }
-        async fn read_liveness(
-            &self,
-            _client_id: &ClientId,
-        ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        async fn read_liveness(&self, _client_id: &ClientId) -> anyhow::Result<Option<Timestamp>> {
             Err(self.unexpected.record("read_liveness"))
         }
-        async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+        async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
             Err(self.unexpected.record("list_liveness"))
         }
         async fn delete_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
@@ -9740,12 +9809,12 @@ mod tests {
         async fn claim_for_client(
             &self,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
             _lost_lease_limit: usize,
             _passed_over: &[JobId],
             _checked_lease: Option<&pipette_core::todo_filename::Lease>,
             _cached: Option<&pipette_plan_types::CachedArtifacts>,
-            _now: DateTime<Utc>,
+            _now: Timestamp,
         ) -> anyhow::Result<pipette_store::ClaimOutcome> {
             Err(self.unexpected.record("claim_for_client"))
         }
@@ -9753,9 +9822,9 @@ mod tests {
             &self,
             _job_id: &JobId,
             _client_id: &ClientId,
-            _lease_expiry: DateTime<Utc>,
+            _lease_expiry: Timestamp,
             _lost_lease_limit: usize,
-            _now: DateTime<Utc>,
+            _now: Timestamp,
         ) -> anyhow::Result<pipette_store::ReclaimOutcome> {
             Err(self.unexpected.record("reclaim_for_client"))
         }
@@ -9820,7 +9889,7 @@ mod tests {
         async fn campaign_backlog(
             &self,
             _client_id: &ClientId,
-            _creating_before: DateTime<Utc>,
+            _creating_before: Timestamp,
         ) -> anyhow::Result<pipette_store::CampaignBacklog> {
             Err(self.unexpected.record("campaign_backlog"))
         }
@@ -9835,10 +9904,16 @@ mod tests {
         let target = JobId::from_uuid(uuid::Uuid::now_v7());
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let holder = ClientId::try_new("ev1_a")?;
-        let lease_expiry = Utc::now() + Duration::hours(1);
+        let lease_expiry = Timestamp::now() + SignedDuration::from_hours(1);
         let body = cell_body("a", json!({}));
         let digest = content_digest(&body);
-        seed_content_key(&stores, &digest, &target, Utc::now() - Duration::days(1)).await?;
+        seed_content_key(
+            &stores,
+            &digest,
+            &target,
+            Timestamp::now() - SignedDuration::from_hours(24),
+        )
+        .await?;
 
         // Queue the target with a readable deadline, then claim it, so it starts
         // in `leased/` alone.
@@ -9868,7 +9943,7 @@ mod tests {
             todo: &recycling,
             submissions: stores.submissions.as_ref(),
             plan_id: &plan_id,
-            now: Utc::now(),
+            now: Timestamp::now(),
             creating_max_age: CREATING_MAX_AGE,
         };
         let (_, placed) = place_one(&context, &body, ExpiresAt::Never).await?;
@@ -10881,9 +10956,9 @@ mod tests {
     /// passed, or it has none.
     #[test]
     fn a_job_runs_while_its_lease_and_its_deadline_hold() -> anyhow::Result<()> {
-        let now = Utc::now();
-        let ahead = now + Duration::minutes(5);
-        let behind = now - Duration::minutes(5);
+        let now = Timestamp::now();
+        let ahead = now + SignedDuration::from_mins(5);
+        let behind = now - SignedDuration::from_mins(5);
         let cases = [
             ("job-live", ahead, ExpiresAt::At(ahead), true),
             ("job-no-deadline", ahead, ExpiresAt::Never, true),
@@ -10952,6 +11027,332 @@ mod tests {
         let mut both = vec![first.plan_id.clone(), revision.plan_id.clone()];
         both.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(members(stores, &running).await?, both);
+        Ok(())
+    }
+
+    /// The earlier-run pass skips the cell of a carried job with a record or an
+    /// active client lease. A plan store that refuses the read shows whether
+    /// the pass made it.
+    #[rstest]
+    #[case::recorded("recorded", false)]
+    #[case::running("running", false)]
+    #[case::queued("queued", true)]
+    #[tokio::test]
+    async fn the_cell_read_leaves_out_a_carry_that_stays(
+        #[case] state: &str,
+        #[case] reads_the_cell: bool,
+    ) -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let body = cell_body("a", json!({}));
+        let filed = ingest(
+            stores,
+            &env.catalog,
+            None,
+            vec![("a.json".to_string(), body.clone())],
+        )
+        .await?;
+        let carried = only_job(&filed)?;
+        match state {
+            "recorded" => env.finish(&carried).await?,
+            "running" => lease(stores, &carried).await?,
+            _ => {}
+        }
+        let units = [Unit {
+            lead: 0,
+            horizon: ExpiresAt::Never,
+            candidate: JobId::new_unchecked("job-candidate"),
+            digest: crate::content_key::cell_digest(&body),
+        }];
+        let mut inherited = [Inherited::Job(carried)];
+
+        let satisfied = satisfy_from_earlier_runs(
+            &units,
+            |_| Some(&body),
+            &mut inherited,
+            &pipette_store_testkit::PlanStoreUnimplemented,
+            &*stores.todo,
+            &*stores.submissions,
+            &CellScope::User(UserId::try_new(USER_ADA)?),
+            &HashSet::new(),
+        )
+        .await;
+
+        match satisfied {
+            Ok(satisfied) => {
+                assert!(!reads_the_cell, "the pass did not read the cell");
+                assert!(satisfied.is_empty());
+            }
+            Err(error) => {
+                assert!(reads_the_cell, "{error:#}");
+                assert!(
+                    format!("{error:#}").contains("find_cell_results"),
+                    "{error:#}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    struct ProtectsCarryOnCellRead<'a> {
+        env: &'a SqlEnv,
+        carried: &'a JobId,
+        state: &'a str,
+    }
+
+    #[async_trait::async_trait]
+    impl PlanStore for ProtectsCarryOnCellRead<'_> {
+        async fn end_membership(
+            &self,
+            _job_id: &pipette_plan_types::JobId,
+            _plan_id: &pipette_plan_types::PlanId,
+        ) -> anyhow::Result<pipette_store::MembershipEnd> {
+            anyhow::bail!("end_membership: not implemented by this fake")
+        }
+        async fn join_job(
+            &self,
+            _job_id: &pipette_plan_types::JobId,
+            _plan_id: &pipette_plan_types::PlanId,
+            _expires_at: pipette_plan_types::ExpiresAt,
+        ) -> anyhow::Result<pipette_store::JobJoin> {
+            anyhow::bail!("join_job: not implemented by this fake")
+        }
+        async fn read_gc_candidates(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            anyhow::bail!("read_gc_candidates: not implemented by this fake")
+        }
+        async fn write_gc_candidates(
+            &self,
+            _candidates: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("write_gc_candidates: not implemented by this fake")
+        }
+
+        async fn put_plan(&self, _manifest: &PlanManifest) -> anyhow::Result<()> {
+            anyhow::bail!("put_plan: not implemented by this fake")
+        }
+        async fn get_plan(&self, _plan_id: &PlanId) -> anyhow::Result<Option<PlanManifest>> {
+            anyhow::bail!("get_plan: not implemented by this fake")
+        }
+        async fn list_matching_plans(
+            &self,
+            _filter: &pipette_store::PlanFilter,
+            _after: Option<&PlanId>,
+            _limit: NonZeroUsize,
+        ) -> anyhow::Result<pipette_store::PlanPage> {
+            anyhow::bail!("list_matching_plans: not implemented by this fake")
+        }
+        async fn write_cancel_marker(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
+            anyhow::bail!("write_cancel_marker: not implemented by this fake")
+        }
+        async fn has_cancel_marker(&self, _plan_id: &PlanId) -> anyhow::Result<bool> {
+            anyhow::bail!("has_cancel_marker: not implemented by this fake")
+        }
+        async fn list_cancel_markers(&self) -> anyhow::Result<Vec<PlanId>> {
+            anyhow::bail!("list_cancel_markers: not implemented by this fake")
+        }
+        async fn delete_cancel_marker(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
+            anyhow::bail!("delete_cancel_marker: not implemented by this fake")
+        }
+        async fn get_content_key(
+            &self,
+            _digest: &str,
+        ) -> anyhow::Result<Option<(ContentKeyRecord, ContentKeyVersion)>> {
+            anyhow::bail!("get_content_key: not implemented by this fake")
+        }
+        async fn create_content_key(
+            &self,
+            _digest: &str,
+            _record: &ContentKeyRecord,
+        ) -> anyhow::Result<ContentKeyClaim> {
+            anyhow::bail!("create_content_key: not implemented by this fake")
+        }
+        async fn replace_content_key(
+            &self,
+            _digest: &str,
+            _version: &ContentKeyVersion,
+            _record: &ContentKeyRecord,
+        ) -> anyhow::Result<ContentKeyCas> {
+            anyhow::bail!("replace_content_key: not implemented by this fake")
+        }
+        async fn delete_content_key(
+            &self,
+            _digest: &str,
+            _version: &ContentKeyVersion,
+        ) -> anyhow::Result<ContentKeyCas> {
+            anyhow::bail!("delete_content_key: not implemented by this fake")
+        }
+        async fn list_content_keys(
+            &self,
+        ) -> anyhow::Result<Vec<(String, ContentKeyRecord, ContentKeyVersion)>> {
+            anyhow::bail!("list_content_keys: not implemented by this fake")
+        }
+        async fn write_job_plan_marker(
+            &self,
+            _job_id: &JobId,
+            _plan_id: &PlanId,
+            _expires_at: ExpiresAt,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("write_job_plan_marker: not implemented by this fake")
+        }
+        async fn list_job_plan_markers(
+            &self,
+            _job_id: &JobId,
+        ) -> anyhow::Result<Vec<(PlanId, ExpiresAt)>> {
+            anyhow::bail!("list_job_plan_markers: not implemented by this fake")
+        }
+        async fn list_all_job_plan_markers(
+            &self,
+        ) -> anyhow::Result<Vec<pipette_store::JobPlanMarker>> {
+            anyhow::bail!("list_all_job_plan_markers: not implemented by this fake")
+        }
+        async fn delete_job_plan_marker(
+            &self,
+            _job_id: &JobId,
+            _plan_id: &PlanId,
+            _expires_at: ExpiresAt,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("delete_job_plan_marker: not implemented by this fake")
+        }
+        async fn put_plan_source(
+            &self,
+            _plan_id: &PlanId,
+            _source: &PlanSource,
+        ) -> anyhow::Result<CreateOutcome> {
+            anyhow::bail!("put_plan_source: not implemented by this fake")
+        }
+        async fn get_plan_source(&self, _plan_id: &PlanId) -> anyhow::Result<Option<PlanSource>> {
+            anyhow::bail!("get_plan_source: not implemented by this fake")
+        }
+        async fn delete_plan_source(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
+            anyhow::bail!("delete_plan_source: not implemented by this fake")
+        }
+        async fn write_pending_source_marker(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
+            anyhow::bail!("write_pending_source_marker: not implemented by this fake")
+        }
+        async fn list_pending_source_markers(
+            &self,
+        ) -> anyhow::Result<Vec<pipette_store::PendingSourceMarker>> {
+            anyhow::bail!("list_pending_source_markers: not implemented by this fake")
+        }
+        async fn delete_pending_source_marker(&self, _plan_id: &PlanId) -> anyhow::Result<()> {
+            anyhow::bail!("delete_pending_source_marker: not implemented by this fake")
+        }
+        async fn put_job_source(
+            &self,
+            _job_id: &JobId,
+            _body: &serde_json::Value,
+        ) -> anyhow::Result<CreateOutcome> {
+            anyhow::bail!("put_job_source: not implemented by this fake")
+        }
+        async fn get_job_source(
+            &self,
+            _job_id: &JobId,
+        ) -> anyhow::Result<Option<serde_json::Value>> {
+            anyhow::bail!("get_job_source: not implemented by this fake")
+        }
+        async fn put_job_plan_link(
+            &self,
+            _job_id: &JobId,
+            _plan_id: &PlanId,
+        ) -> anyhow::Result<CreateOutcome> {
+            anyhow::bail!("put_job_plan_link: not implemented by this fake")
+        }
+        async fn list_job_plan_links(&self, _job_id: &JobId) -> anyhow::Result<Vec<PlanId>> {
+            anyhow::bail!("list_job_plan_links: not implemented by this fake")
+        }
+        async fn put_job_cell(
+            &self,
+            _job_id: &JobId,
+            _cell_digest: &str,
+            _scope: &pipette_store::CellScope,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("put_job_cell: not implemented by this fake")
+        }
+        async fn find_cell_results(
+            &self,
+            cell_digests: &[String],
+            scope: &CellScope,
+        ) -> anyhow::Result<Vec<CellResult>> {
+            let results = self
+                .env
+                .stores
+                .plans
+                .find_cell_results(cell_digests, scope)
+                .await?;
+            anyhow::ensure!(!results.is_empty(), "the cell has an earlier result");
+            match self.state {
+                "recorded" => self.env.finish(self.carried).await?,
+                "running" => lease(&self.env.stores, self.carried).await?,
+                _ => {}
+            }
+            Ok(results)
+        }
+    }
+
+    /// A carry that starts or finishes during the cell read keeps its run.
+    #[rstest]
+    #[case::recorded("recorded", true)]
+    #[case::running("running", true)]
+    #[case::queued("queued", false)]
+    #[tokio::test]
+    async fn a_carry_protected_during_the_cell_read_stays(
+        #[case] state: &str,
+        #[case] stays: bool,
+    ) -> anyhow::Result<()> {
+        let Some(env) = sql_env().await? else {
+            return Ok(());
+        };
+        let stores = &env.stores;
+        let body = cell_body("a", json!({}));
+        let earlier = ingest_owned(
+            &env,
+            owner(USER_ADA)?,
+            vec![("a.json".to_string(), body.clone())],
+        )
+        .await?;
+        let earlier = only_job(&earlier)?;
+        env.finish(&earlier).await?;
+        let filed = ingest_owned(
+            &env,
+            owner(USER_ADA)?,
+            cells(&["a"], json!({"merge_duplicates": false})),
+        )
+        .await?;
+        let carried = only_job(&filed)?;
+        assert_ne!(carried, earlier);
+        let units = [Unit {
+            lead: 0,
+            horizon: ExpiresAt::Never,
+            candidate: JobId::new_unchecked("job-candidate"),
+            digest: crate::content_key::cell_digest(&body),
+        }];
+        let mut inherited = [Inherited::Job(carried.clone())];
+        let plans = ProtectsCarryOnCellRead {
+            env: &env,
+            carried: &carried,
+            state,
+        };
+        let satisfied = satisfy_from_earlier_runs(
+            &units,
+            |_| Some(&body),
+            &mut inherited,
+            &plans,
+            &*stores.todo,
+            &*stores.submissions,
+            &CellScope::User(UserId::try_new(USER_ADA)?),
+            &HashSet::new(),
+        )
+        .await?;
+
+        if stays {
+            assert!(satisfied.is_empty(), "a protected carry keeps its own run");
+            assert!(matches!(&inherited[0], Inherited::Job(job) if job == &carried));
+        } else {
+            assert_eq!(satisfied.len(), 1);
+            assert!(matches!(&inherited[0], Inherited::Satisfied(job) if job == &earlier));
+        }
         Ok(())
     }
 
@@ -11240,8 +11641,8 @@ mod tests {
             .todo
             .write_eligible_rows(&client, &[small.clone(), large])
             .await?;
-        let at = Utc::now();
-        let until = at + Duration::hours(1);
+        let at = Timestamp::now();
+        let until = at + SignedDuration::from_hours(1);
 
         let granted = stores
             .todo

@@ -26,16 +26,17 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use futures::TryStreamExt;
 use futures::stream;
 use futures::stream::StreamExt;
+use jiff::Timestamp;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion};
@@ -223,6 +224,7 @@ pub fn build_s3_stores(
         }),
         campaigns: Arc::new(S3CampaignStore::new(store.clone(), prefix.clone())),
         campaign_groups: None,
+        plan_tags: None,
         model_params: Arc::new(S3ModelParamsStore::new(store.clone(), prefix.clone())),
         audit: None,
         descriptor_catalog: None,
@@ -782,10 +784,10 @@ impl S3PlanStore {
 
     /// `object_store` returns absolute locations; callers want the leaf shape the
     /// filename parsers take.
-    async fn list_relative(&self, suffix: &str) -> anyhow::Result<Vec<(String, DateTime<Utc>)>> {
+    async fn list_relative(&self, suffix: &str) -> anyhow::Result<Vec<(String, Timestamp)>> {
         let prefix = obj_path(&self.prefix, suffix);
         let entries: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
-        Ok(entries
+        entries
             .into_iter()
             .filter_map(|meta| {
                 let relative = meta
@@ -796,7 +798,8 @@ impl S3PlanStore {
                     .to_string();
                 Some((relative, meta.last_modified))
             })
-            .collect())
+            .map(|(relative, at)| Ok((relative, Timestamp::try_from(SystemTime::from(at))?)))
+            .collect()
     }
 }
 
@@ -1639,10 +1642,10 @@ impl SubmissionStore for S3SubmissionStore {
         dry_run: bool,
     ) -> anyhow::Result<pipette_store::PruneSummary> {
         let prefix = obj_path(&self.prefix, "submissions/unverified/");
-        let older_than = chrono::Duration::from_std(older_than)
+        let older_than = jiff::SignedDuration::try_from(older_than)
             .map_err(|e| anyhow::anyhow!("prune age out of range: {e}"))?;
         // `LastModified`, matching the filesystem `mtime` on local_fs.
-        let cutoff = chrono::Utc::now() - older_than;
+        let cutoff = jiff::Timestamp::now() - older_than;
 
         let mut deleted = 0usize;
         let mut kept = 0usize;
@@ -1652,7 +1655,7 @@ impl SubmissionStore for S3SubmissionStore {
             if !is_json_key(meta.location.as_ref()) {
                 continue;
             }
-            if meta.last_modified < cutoff {
+            if Timestamp::try_from(SystemTime::from(meta.last_modified))? < cutoff {
                 if !dry_run {
                     self.store.delete(&meta.location).await?;
                 }
@@ -1825,7 +1828,9 @@ impl WarehouseStore for S3WarehouseStore {
                 Some((key, p))
             })
             .collect();
-        let today = chrono::Utc::now().date_naive();
+        let today = jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .date();
         let selected =
             warehouse::select_partitions_to_scan(by_key.keys().cloned(), self.read_days, today);
 
@@ -2480,6 +2485,7 @@ mod tests {
             plans: Arc::new(pipette_store_testkit::PlanStoreUnimplemented),
             campaigns: Arc::new(pipette_store_testkit::CampaignStoreUnimplemented),
             campaign_groups: None,
+            plan_tags: None,
             model_params: Arc::new(pipette_store_testkit::ModelParamsStoreUnimplemented),
             audit: None,
             descriptor_catalog: None,

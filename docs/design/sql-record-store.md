@@ -87,6 +87,25 @@ The note and the revision change of a plan are columns next to its body. A
 rewrite of the manifest does not change them. Only the SQL store keeps them.
 The object-store plan record has neither.
 
+### Plan membership
+
+SQL reads a manifest's jobs from `plan_job_spans`. A span belongs to the plan's
+campaign, or to the plan itself when it has no campaign. A span covers each
+plan id that is at least `from_plan` and less than `to_plan`. A NULL `to_plan`
+means that the span has no upper bound. The manifest query reads the plan and
+its jobs in one statement. Holder reads use the same bounds. A cell-result
+reuse excludes the jobs that a span's `rerun_of` lists.
+
+Migration `0043` adds the view `plan_job_rows`. The view lists one row for
+each job of each plan, for external readers. `put_plan` writes the lineage
+guard, the plan and its spans in one transaction. Migration `0044` drops the
+table `plan_jobs`, and its down script fills the table again from the view. A
+rollback needs a build that reads spans. For the schema and the rollout rules,
+see [storage.md](../storage.md#47-the-plan-job-spans) and
+[operations.md](../operations.md#38-drop-plan_jobs).
+
+### Other keyspaces
+
 The two `-index` keyspaces are tables whose primary key is the claimed value,
 so a constraint enforces the uniqueness. Listings that page keep the object
 stores' order, `{id}.json` in byte order, because the shared contract requires
@@ -94,8 +113,11 @@ it. That is also why the database must sort text in byte order
 (`LC_COLLATE 'C'`), and why the deployment stack creates no database: the operator
 creates `pipette_mgmt` with that collation by hand.
 
-Migrations only add, so an older binary runs on a newer schema after a
-rollback.
+A migration adds to the schema, or drops only what no supported rollback build
+uses. Thus an older binary runs on a newer schema after a rollback. For
+example, migration `0044` drops `plan_jobs`. The builds from PIP-904 on do not
+use the table. A build before PIP-904 writes it, so a rollback to that build
+first runs the down script of `0044`.
 
 ## Concurrency
 
@@ -159,7 +181,7 @@ columns without a JSON parse.
 ## Open
 
 - **Whole-manifest writes.** `put_plan` takes the whole manifest, so each
-  status refresh reads and compares every `plan_jobs` row of the plan. It also
+  status refresh reads and compares the spans that cover the plan. It also
   rewrites the `progress_snapshot` in the body. A store method that writes only
   the status and the snapshot would remove that work.
 - **`[auth_storage]` is required.** `serve` probes it for conditional PUT,

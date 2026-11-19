@@ -587,7 +587,7 @@ async fn consume_within(
     };
     let key: UserPreauthKey = serde_json::from_str(&body)
         .map_err(|e| unreadable(format!("user pre-auth key {key_id}"), e))?;
-    let grant = match pipette_core::user_preauth::validate(&key, secret, chrono::Utc::now()) {
+    let grant = match pipette_core::user_preauth::validate(&key, secret, jiff::Timestamp::now()) {
         Ok(grant) => grant,
         Err(rejection) => return Ok(UserPreauthConsumeOutcome::Rejected(rejection)),
     };
@@ -664,7 +664,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::Context;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use sqlx::AssertSqlSafe;
 
     use pipette_core::types::Mint;
@@ -690,7 +690,7 @@ mod tests {
 
     fn mint_key(
         usage: UserPreauthUsage,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
     ) -> anyhow::Result<(UserMintedKey, UserPreauthSecret)> {
         let minted = pipette_core::user_preauth::mint(
             UserPreauthParams {
@@ -699,7 +699,7 @@ mod tests {
                 expires_at,
                 note: None,
             },
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let (_, secret) = minted
             .token
@@ -712,7 +712,7 @@ mod tests {
         Ok(UserKey::new(
             crate::testing::public_key(byte)?,
             NonEmptyTrimmedString::try_new(details)?,
-            Utc::now(),
+            Timestamp::now(),
         ))
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
     async fn sql_user_preauth_rejections() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = users(&test_db);
-        let expired = Some(Utc::now() - chrono::Duration::seconds(1));
+        let expired = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
         let (minted, secret) = mint_key(UserPreauthUsage::SingleUse, expired)?;
         let key_id = minted.key.key_id.clone();
         store.put_user_preauth_key(&minted.key).await?;
@@ -1171,7 +1171,10 @@ mod tests {
         let store = users(&test_db);
         let robot = User {
             account_type: UserAccountType::Service,
-            ..User::try_new(ContactEmail::try_new("ops+ci@example.test")?, Utc::now())?
+            ..User::try_new(
+                ContactEmail::try_new("ops+ci@example.test")?,
+                Timestamp::now(),
+            )?
         };
         store.put_user(&robot).await?;
         let robot_id = robot.user_id.as_str();
@@ -1212,7 +1215,7 @@ mod tests {
         .await?;
         assert_eq!(store.get_user(&robot.user_id).await?, Some(disabled));
 
-        let person = User::try_new(ContactEmail::try_new("ops@example.test")?, Utc::now())?;
+        let person = User::try_new(ContactEmail::try_new("ops@example.test")?, Timestamp::now())?;
         plant(
             &test_db,
             "INSERT INTO users (user_id, body) VALUES ($1, $2)",
@@ -1232,7 +1235,10 @@ mod tests {
         let reader = User {
             account_type: UserAccountType::Service,
             campaign_scope: Some(BTreeSet::from([CampaignId::mint()])),
-            ..User::try_new(ContactEmail::try_new("ops+site@example.test")?, Utc::now())?
+            ..User::try_new(
+                ContactEmail::try_new("ops+site@example.test")?,
+                Timestamp::now(),
+            )?
         };
         store.put_user(&reader).await?;
         let reader_id = reader.user_id.as_str();
@@ -1280,7 +1286,10 @@ mod tests {
     async fn sql_records_keep_the_object_store_bodies() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = users(&test_db);
-        let user = User::try_new(ContactEmail::try_new("Operator@Example.test")?, Utc::now())?;
+        let user = User::try_new(
+            ContactEmail::try_new("Operator@Example.test")?,
+            Timestamp::now(),
+        )?;
         let user_id = user.user_id.as_str();
         store
             .claim_user_email(user.contact_email.as_str(), &user.user_id)
@@ -1340,7 +1349,10 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let store = users(&test_db);
 
-        let good = User::try_new(ContactEmail::try_new("good@example.test")?, Utc::now())?;
+        let good = User::try_new(
+            ContactEmail::try_new("good@example.test")?,
+            Timestamp::now(),
+        )?;
         store.put_user(&good).await?;
         let broken = UserId::mint();
         plant(

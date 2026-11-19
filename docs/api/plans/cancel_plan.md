@@ -53,4 +53,4 @@ already read.
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | The caller holds no cancel grant; or it holds only `cancel_plans`, and the plan is outside its scope ([permissions](#permissions)) or does not exist |
 | 404 | No such plan, for a caller that holds `cancel_any_plans` |
-| 409 | The plan is `complete`: every job reached a terminal state, so there is nothing to tear down |
+| 409 | The plan is `complete`: every job reached a terminal state, so there is nothing to tear down. Or it is the plan a [locked](../campaigns/update_campaign.md) campaign runs: the message quotes the lock note |

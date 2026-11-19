@@ -26,6 +26,7 @@
   import { DELETES, REJECT_DEVICE } from "../lib/danger";
   import { standing } from "../lib/fleet";
   import { when } from "../lib/format";
+  import { orgName } from "../lib/orgs";
   import { ownerOf } from "../lib/owners";
   import { toggled } from "../lib/rights";
   import { here, navigateFrom } from "../lib/route.svelte";
@@ -61,14 +62,14 @@
     const [kind, owner] = [ownerKind, ownerId];
     if (!owner || !named) return;
     const asked = kind === "org"
-      ? session.resolveOrg(owner).then((org) => org?.slug)
+      ? session.resolveOrg(owner).then((org) => (org ? orgName(org) : undefined))
       : accountOf(session.signer, owner).then((read) => read.contact_email);
     asked.then((name) => { if (name) names = { ...names, [owner]: name }; }).catch(() => {});
   });
   // The reader and the organizations the session holds are named without a roster read.
   const shownNames = $derived.by(() => {
     const held: Record<string, string> = {};
-    for (const org of session.known) if (org) held[org.org_id] = org.slug;
+    for (const org of session.known) if (org) held[org.org_id] = orgName(org);
     if (session.account) held[session.account.user_id] = session.account.contact_email;
     return { ...held, ...names };
   });

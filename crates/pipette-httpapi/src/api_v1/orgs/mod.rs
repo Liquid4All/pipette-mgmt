@@ -13,8 +13,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 
 use pipette_core::client::Client;
 use pipette_core::organization::{Organization, Ownership};
@@ -269,7 +269,7 @@ pub async fn create(
         None => NonEmptyTrimmedString::try_new(slug.as_str())
             .map_err(|e| AppError::Internal(format!("a slug is a non-empty string: {e}")))?,
     };
-    let org = Organization::new(slug, display_name, Utc::now());
+    let org = Organization::new(slug, display_name, Timestamp::now());
 
     match state
         .org_store

@@ -15,7 +15,7 @@
   import { Busy, Loader } from "../lib/components/work.svelte";
   import { orgTrail } from "../lib/crumbs";
   import { DELETES } from "../lib/danger";
-  import { administersOrg, type OrgRef } from "../lib/orgs";
+  import { administersOrg, orgName, type OrgRef } from "../lib/orgs";
   import { here, navigateFrom } from "../lib/route.svelte";
   import { orgLink, type RouteOf } from "../lib/routes";
   import { session } from "../lib/session.svelte";
@@ -78,7 +78,7 @@
   {#snippet children(entry)}
     <dl>
       <dt>benchmark_id</dt><dd class="id">{route.benchmark_id}</dd>
-      <dt>organization</dt><dd>{entry.org.slug} <span class="muted id">{entry.org.org_id}</span></dd>
+      <dt>organization</dt><dd>{orgName(entry.org)} <span class="muted id">{entry.org.org_id}</span></dd>
       <dt>benchmark_type</dt><dd>{entry.benchmark_type ?? "—"}</dd>
     </dl>
 

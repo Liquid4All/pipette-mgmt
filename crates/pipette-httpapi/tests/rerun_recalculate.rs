@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::Utc;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use httpmock::{Method::POST, Mock, MockServer};
+use jiff::Timestamp;
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -536,7 +536,7 @@ async fn test_answered_failed_takes_the_larger_runs_failed_unrun() -> anyhow::Re
                 smaller,
                 benchmark,
                 FailureCode::AttemptTimeout,
-                Utc::now(),
+                Timestamp::now(),
             )
             .await?;
             assert!(failed, "no failure written for {job}");

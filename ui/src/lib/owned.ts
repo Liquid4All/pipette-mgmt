@@ -5,14 +5,14 @@
 import { ME, orgTrail, type Crumb } from "./crumbs";
 import { handle } from "./format";
 import { pathOf, type OwnedPages, type Route } from "./routes";
-import type { OrgRef } from "./orgs";
+import { orgName, type OrgRef } from "./orgs";
 import type { OwnUserView, PrincipalOwner } from "./api-types";
 
 /** The records a listing reads: everything in reach, the reader's own, or one organization's. */
 export type OwnedScope = { kind: "all" } | { kind: "me" } | { kind: "org"; org_id: string };
 
 /** An owned listing as drawn: its scope, an organization's with the handle the page names it by. */
-export type OwnedBranch = Exclude<OwnedScope, { kind: "org" }> | { kind: "org"; org_id: string; slug: string };
+export type OwnedBranch = Exclude<OwnedScope, { kind: "org" }> | ({ kind: "org" } & OrgRef);
 
 /**
  * The query of `branch`'s listing, newest first as the classic listings are,
@@ -34,7 +34,7 @@ export function ownedQuery(branch: OwnedScope, extra: [string, string][], cursor
 export function ownedEmpty(branch: OwnedBranch, records: string): string {
   switch (branch.kind) {
     case "me": return `You own no ${records}.`;
-    case "org": return `${branch.slug} owns no ${records} you may see.`;
+    case "org": return `${orgName(branch)} owns no ${records} you may see.`;
     case "all": return `No ${records} you may see.`;
   }
 }

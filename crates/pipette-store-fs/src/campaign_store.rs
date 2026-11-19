@@ -132,7 +132,7 @@ fn write_record(dir: &Path, path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::campaign::{CampaignOwner, NewCampaign};
     use pipette_core::types::Mint;
@@ -147,7 +147,7 @@ mod tests {
                 user_id: UserId::mint(),
             },
         )
-        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now()))
+        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now()))
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ import type {
   ModelParams, ModelParamsPage,
   NamedAuditEventPage, NamedCampaignOverview, NamedCampaignView, NamedCampaignViewPage, NamedPlanJobs, NamedPlanView, NamedPlanViewPage, NamedVaultResourceDetail, NamedVaultResourceDetailPage, OrgBenchmarks,
   OrgOverview, OrgView, OrgViewPage, OwnUserView, OwnerMatches, OwnerType, PlanCancelRequested, PlanJob,
-  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RelabelDescriptorMemberRequest, RenameDescriptorEntryRequest, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest,
+  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RelabelDescriptorMemberRequest, RenameDescriptorEntryRequest, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest, CreatePlanTagRequest, PlanTag,
   SetClientOwnerRequest, SetUserOrgRequest, UpdateCampaignRequest, UpdateModelParamsRequest, UpdateOrgRequest, UpdatePlanRequest, UpdateUserRequest,
   UploadVaultResourcesRequest, UserDetail, UserKeyPage, UserKeyRegistered, UserPreauthKeyMinted, UserPreauthKeyViewPage, UserView, UserViewPage, VaultResourcesUploaded,
   VaultTypes,
@@ -223,7 +223,10 @@ export const catalogEntry = (signer: Signer, name: string, readFleet: boolean) =
   return signed<DescriptorEntryLookup>(signer, "GET", `/api/v1/descriptor-catalog/names?${query}`);
 };
 
-/** The pinned and active global entries that offer a member to the device `client_id`, and the withheld members. */
+/**
+ * The pinned and active entries of the global scope and the reader's organization that offer a member to the device
+ * `client_id`, and the withheld members.
+ */
 export const deviceCatalog = (signer: Signer, client_id: string) =>
   signed<DescriptorCatalogShortList>(signer, "GET",
     `/api/v1/descriptor-catalog/devices/${encodeURIComponent(client_id)}`);
@@ -604,6 +607,10 @@ export const updateCampaign = (signer: Signer, campaign_id: string, body: Update
 
 export const setCampaignOwner = (signer: Signer, campaign_id: string, body: SetCampaignOwnerRequest) =>
   signed<unknown>(signer, "PUT", campaignPath(campaign_id, "/owner"), body);
+
+/** Tags one plan the campaign filed; a name the campaign already has is a `409`. */
+export const createPlanTag = (signer: Signer, campaign_id: string, body: CreatePlanTagRequest) =>
+  signed<PlanTag>(signer, "POST", campaignPath(campaign_id, "/tags"), body);
 
 /** Whom the campaign may be handed to whose handle, address or id holds `q`. */
 export async function campaignOwners(signer: Signer, campaign_id: string, q: string) {

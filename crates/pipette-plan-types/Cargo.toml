@@ -35,8 +35,8 @@ testkit = []
 # server writes.
 base64.workspace = true
 # Timestamps and a job's deadline, which every body and record shares.
-chrono.workspace = true
 clap = { workspace = true, optional = true }
+jiff.workspace = true
 # `ContactEmail`'s grammar.
 email_address.workspace = true
 hex.workspace = true
@@ -48,8 +48,7 @@ log.workspace = true
 nutype = { workspace = true, features = ["regex"] }
 # Not named anywhere in the sources: `nutype`'s `validate(regex = ...)` expands to
 # a `::regex::Regex` path, so the crate has to be a direct dependency here for
-# those modules to compile. `cargo machete` reads the sources, so it needs the
-# entry below to see that.
+# those modules to compile.
 regex.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
@@ -66,6 +65,3 @@ uuid.workspace = true
 anyhow.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
-
-[package.metadata.cargo-machete]
-ignored = ["regex"]

@@ -5,14 +5,16 @@ use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::{DateTime, SubsecRound, Utc};
 use futures::TryStreamExt;
 use httpmock::{Method::POST, Mock, MockServer};
+use jiff::Timestamp;
 use rstest::rstest;
 use serde_json::{Value, json};
 
 use pipette_core::BUILD_VERSION;
-use pipette_core::campaign::{Campaign, CampaignOwner, GroupFiling, GroupPolicyState, Refusal};
+use pipette_core::campaign::{
+    Campaign, CampaignOwner, GroupFiling, GroupPolicyState, JobPolicyState, Refusal,
+};
 use pipette_core::organization::Organization;
 use pipette_core::plan::{JobExpiry, PlanManifest, SettledOutcome, sample_manifest};
 use pipette_core::user_permission::UserPermissionGroup;
@@ -22,7 +24,7 @@ use pipette_plan_types::{
     ExpiresAt, JobId, PlanId, PlanStatus, PolicyKind, PolicyRerun, RerunOutcome, UserPermission,
     UserStatus,
 };
-use pipette_store::AuditFilter;
+use pipette_store::{AuditFilter, JobStateChanges};
 use pipette_web_testkit::{
     UserSigner, body_json, created_campaign, json_str, put_idle_campaign_of, registered_user,
     seed_avail, seed_org, seeded_object_state, seeded_sql_state, set_user_org, set_user_status,
@@ -248,6 +250,93 @@ async fn a_group_is_created_read_renamed_and_deleted() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
     let (status, answer) = send(state, &owner, "GET", &uri, None).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    Ok(())
+}
+
+/// The campaign listing with `plan=true` shows each policy its member state
+/// was last read under, cleared or triggered. A campaign in no group, one the
+/// pass has not read, an archived one, and a listing without `plan=true` have
+/// no policy checks.
+#[tokio::test]
+async fn the_listing_shows_each_policy_cleared_or_triggered() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(sql) = seeded_sql_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &sql.state;
+    let owner = registered_user(state, OPERATOR).await?;
+    let group = created_group(state, &owner, json!({ "name": "aa-perf" })).await?;
+    let mut campaigns = futures::future::try_join_all(
+        (0..4).map(|_| put_idle_campaign_of(state, personal(&owner), "aa-perf")),
+    )
+    .await?;
+    campaigns.sort_by(|a, b| a.campaign_id.cmp(&b.campaign_id));
+    let [read, unread, archived, outside] = &mut campaigns[..] else {
+        anyhow::bail!("four campaigns");
+    };
+    let members = [&*read, &*unread, &*archived].map(|campaign| campaign.campaign_id.as_str());
+    added(state, &owner, &group, &members).await?;
+    let groups = state
+        .campaign_group_store
+        .as_deref()
+        .context("a [database] keeps campaign groups")?;
+    let group_id = CampaignGroupId::try_new(group.as_str())?;
+    let kept = GroupPolicyState {
+        policies: [PolicyKind::Swap, PolicyKind::Spread]
+            .map(|kind| CampaignGroupPolicy {
+                enabled: true,
+                ..kind.defaults(group_id.clone())
+            })
+            .to_vec(),
+        triggered: BTreeSet::from([PolicyKind::Spread]),
+        ..GroupPolicyState::default()
+    };
+    for campaign in [&*read, &*archived] {
+        let none = JobStateChanges::default();
+        let written = groups
+            .set_policy_state(&group_id, &campaign.campaign_id, &kept, &none)
+            .await?;
+        anyhow::ensure!(written, "{} is a member", campaign.campaign_id);
+    }
+    archived.state = pipette_plan_types::CampaignState::Archived;
+    state.campaign_store.put_campaign(archived).await?;
+
+    let checks = |listing: &Value| -> anyhow::Result<BTreeMap<String, Value>> {
+        listing["items"]
+            .as_array()
+            .context("the listing's items")?
+            .iter()
+            .map(|row| {
+                Ok((
+                    json_str(row, "campaign_id")?.to_owned(),
+                    row["policy_checks"].clone(),
+                ))
+            })
+            .collect()
+    };
+    let (status, listed) = send(state, &owner, "GET", "/api/v1/campaigns?plan=true", None).await?;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    crate::api_schema::assert_conforms("NamedCampaignViewPage", &listed)?;
+    let expected: BTreeMap<String, Value> = [
+        (
+            &*read,
+            json!([
+                { "kind": "swap", "triggered": false },
+                { "kind": "spread", "triggered": true },
+            ]),
+        ),
+        (&*unread, Value::Null),
+        (&*archived, Value::Null),
+        (&*outside, Value::Null),
+    ]
+    .into_iter()
+    .map(|(campaign, checks)| (campaign.campaign_id.to_string(), checks))
+    .collect();
+    assert_eq!(checks(&listed)?, expected);
+
+    let (status, plain) = send(state, &owner, "GET", "/api/v1/campaigns", None).await?;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert!(checks(&plain)?.values().all(Value::is_null), "{plain}");
     Ok(())
 }
 
@@ -686,7 +775,10 @@ fn default_policies(group_id: &str) -> Value {
     };
     let spread =
         json!({ "percent": 5.0, "short_repetition_ms": 1000.0, "short_repetition_percent": 10.0 });
-    let failed = json!({ "codes": { "runtime_error": 2, "device_error": 2, "unspecified": 2 } });
+    let failed = json!({ "codes": {
+        "runtime_error": 2, "device_error": 2, "unspecified": 2,
+        "device_not_ready": 1, "harness_error": 1, "out_of_memory": 1,
+    } });
     json!([
         policy("swap", 5, json!({})),
         policy("spread", 3, spread),
@@ -1139,7 +1231,7 @@ async fn a_turn_off_keeps_the_stored_values() -> anyhow::Result<()> {
         enabled: true,
         max_reruns: 0,
         enabled_by: Some(owner.1.clone()),
-        enabled_at: Some(Utc::now()),
+        enabled_at: Some(Timestamp::now()),
         ..stored.clone()
     };
     anyhow::ensure!(store.replace_policy(&stored, &unbudgeted).await?);
@@ -1819,7 +1911,6 @@ fn unread_member(campaign: &Campaign, state: &str) -> Value {
             check("model_params", false),
             check("smaller_failed", false),
         ],
-        "triggered": [],
         "rerun_job_ids": [],
         "marked_job_ids": [],
         "kept_job_count": 0,
@@ -1918,7 +2009,12 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
         .as_deref()
         .context("a [database] keeps campaign groups")?;
     let group_id = CampaignGroupId::try_new(group.as_str())?;
-    let waiting = a_rerun(&evaluated.campaign_id, "job-steady", Utc::now(), 4096.0)?;
+    let waiting = a_rerun(
+        &evaluated.campaign_id,
+        "job-steady",
+        Timestamp::now(),
+        4096.0,
+    )?;
     anyhow::ensure!(
         groups
             .record_reruns(&group_id, std::slice::from_ref(&waiting))
@@ -1952,7 +2048,6 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
     checked["earliest_deadline"] = json!(future);
     checked["checks"][0] = check_counts("swap", true, 1, 0, 1);
     checked["checks"][1] = check_counts("spread", true, 1, 1, 0);
-    checked["triggered"] = json!(["swap", "spread"]);
     checked["rerun_job_ids"] = json!(["job-spread"]);
     checked["marked_job_ids"] = json!(["job-swapped"]);
     checked["kept_job_count"] = json!(1);
@@ -2046,7 +2141,7 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
         plan_id: plan_id.clone(),
         queued,
         commit_unknown: false,
-        filed_at: Utc::now(),
+        filed_at: Timestamp::now(),
     };
     let kept = [
         (
@@ -2079,20 +2174,37 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
             &*decided,
             GroupPolicyState {
                 policies: acting,
-                decided: BTreeSet::from([JobId::try_new("job-swapped")?]),
                 ..GroupPolicyState::default()
             },
         ),
     ];
-    let written =
-        futures::future::try_join_all(kept.iter().map(|(campaign, kept)| {
-            groups.set_policy_state(&group_id, &campaign.campaign_id, kept)
-        }))
-        .await?;
+    // The pass is done with the decided member's job.
+    let done = JobStateChanges {
+        put: vec![JobPolicyState {
+            job_id: JobId::try_new("job-swapped")?,
+            flagged: BTreeSet::new(),
+            decided: true,
+            missing_params: BTreeSet::new(),
+            family: None,
+            failed: false,
+        }],
+        removed: Vec::new(),
+    };
+    let (group_ref, decided_id) = (&group_id, &decided.campaign_id);
+    let written = futures::future::try_join_all(kept.iter().map(|(campaign, kept)| {
+        let job_states = if campaign.campaign_id == *decided_id {
+            done.clone()
+        } else {
+            JobStateChanges::default()
+        };
+        async move {
+            groups
+                .set_policy_state(group_ref, &campaign.campaign_id, kept, &job_states)
+                .await
+        }
+    }))
+    .await?;
     anyhow::ensure!(written.iter().all(|written| *written), "{written:?}");
-    // The held member's swap re-run waits for its rows.
-    let rerun = a_rerun(&waiting.campaign_id, "job-a", Utc::now(), 4096.0)?;
-    anyhow::ensure!(groups.record_reruns(&group_id, &[rerun]).await? == 1);
     let swapped = answering(
         &duckdb,
         &["job-swapped"],
@@ -2131,9 +2243,6 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
     queue_held["missing_model_params"] = json!([
         { "key": "granite-4.2-8b", "row_count": 1, "job_count": 1 },
     ]);
-    // Swap reads no rows of a held member but has a re-run waiting; model
-    // params flags a job but is off.
-    queue_held["triggered"] = json!(["swap"]);
     let mut filing_held = held(&*unadvanced, "filing_not_advanced");
     filing_held["filing_plan_id"] = json!(not_advanced.as_str());
     filing_held["last_filing"] = last_filing(&kept[1].1);
@@ -2144,7 +2253,6 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
     read_again["answered_job_count"] = json!(1);
     read_again["earliest_deadline"] = json!(future);
     read_again["checks"][0] = check_counts("swap", true, 1, 1, 0);
-    read_again["triggered"] = json!(["swap"]);
     read_again["rerun_job_ids"] = json!(["job-swapped"]);
     assert_eq!(
         preview,
@@ -2198,7 +2306,7 @@ async fn the_preview_shows_rows_that_lack_model_params_and_the_last_filing() -> 
             plan_id: head.clone(),
             queued: BTreeSet::from([JobId::try_new("job-q4")?]),
             commit_unknown: false,
-            filed_at: Utc::now(),
+            filed_at: Timestamp::now(),
         }),
         ..GroupPolicyState::default()
     };
@@ -2209,7 +2317,12 @@ async fn the_preview_shows_rows_that_lack_model_params_and_the_last_filing() -> 
     let group_id = CampaignGroupId::try_new(group.as_str())?;
     anyhow::ensure!(
         groups
-            .set_policy_state(&group_id, &campaign.campaign_id, &kept)
+            .set_policy_state(
+                &group_id,
+                &campaign.campaign_id,
+                &kept,
+                &JobStateChanges::default()
+            )
             .await?
     );
     let q4 =
@@ -2330,7 +2443,6 @@ async fn the_preview_shows_a_failure_below_a_clean_larger_run() -> anyhow::Resul
         preview["members"][0]["checks"][2],
         check_counts("failed", true, 1, 1, 0)
     );
-    assert_eq!(preview["members"][0]["triggered"], json!(["failed"]));
     assert_eq!(
         preview["members"][0]["checks"][5],
         json!({
@@ -2398,7 +2510,12 @@ async fn the_preview_and_rerun_results_take_the_plan_reads_and_read_clients(
         .as_deref()
         .context("a [database] keeps campaign groups")?;
     let group_id = CampaignGroupId::try_new(team.as_str())?;
-    let rerun = a_rerun(&CampaignId::try_new(&idle)?, "job-1", Utc::now(), 4096.0)?;
+    let rerun = a_rerun(
+        &CampaignId::try_new(&idle)?,
+        "job-1",
+        Timestamp::now(),
+        4096.0,
+    )?;
     anyhow::ensure!(
         groups
             .record_reruns(&group_id, std::slice::from_ref(&rerun))
@@ -2468,7 +2585,7 @@ async fn the_preview_and_rerun_results_take_the_plan_reads_and_read_clients(
 fn a_rerun(
     campaign_id: &CampaignId,
     job: &str,
-    filed_at: DateTime<Utc>,
+    filed_at: Timestamp,
     before: f64,
 ) -> anyhow::Result<PolicyRerun> {
     Ok(PolicyRerun {
@@ -2477,7 +2594,11 @@ fn a_rerun(
         rerun_job_id: JobId::try_new(job)?,
         rerun_of: JobId::try_new(format!("{job}-before"))?,
         plan_id: PlanId::from_uuid(uuid::Uuid::now_v7()),
-        filed_at: filed_at.trunc_subsecs(6),
+        filed_at: filed_at.round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )?,
         attempt: 1,
         benchmark_id: "decode_throughput_512_100".to_owned(),
         model_key: None,
@@ -2519,8 +2640,8 @@ async fn the_rerun_results_sum_up_and_page_the_readable_members_reruns() -> anyh
     owner_written(state, &unread, personal(&member)).await?;
 
     let (read, unread) = (CampaignId::try_new(&read)?, CampaignId::try_new(&unread)?);
-    let at = Utc::now();
-    let minutes = chrono::Duration::minutes;
+    let at = Timestamp::now();
+    let minutes = jiff::SignedDuration::from_mins;
     let waiting = a_rerun(&read, "job-1", at - minutes(3), 4096.0)?;
     let cleared = a_rerun(&read, "job-2", at - minutes(2), 1024.0)?;
     let flagged = PolicyRerun {
@@ -2538,10 +2659,15 @@ async fn the_rerun_results_sum_up_and_page_the_readable_members_reruns() -> anyh
     let group_id = CampaignGroupId::try_new(team.as_str())?;
     let recorded = [waiting, cleared.clone(), flagged.clone(), theirs];
     anyhow::ensure!(groups.record_reruns(&group_id, &recorded).await? == 4);
+    let judged_at = at.round(
+        jiff::TimestampRound::new()
+            .smallest(jiff::Unit::Microsecond)
+            .mode(jiff::RoundMode::Trunc),
+    )?;
     let judged = |rerun: &PolicyRerun, outcome, after| PolicyRerun {
         after: Some(after),
         outcome: Some(outcome),
-        judged_at: Some(at.trunc_subsecs(6)),
+        judged_at: Some(judged_at),
         ..rerun.clone()
     };
     let outcomes = [

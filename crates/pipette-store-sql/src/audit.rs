@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use serde::{Deserialize, Serialize};
 use sqlx::AssertSqlSafe;
 
@@ -48,7 +49,7 @@ impl SqlAuditStore {
 #[derive(Serialize, Deserialize)]
 struct StoredEvent {
     event_id: AuditEventId,
-    at: DateTime<Utc>,
+    at: Timestamp,
     actor: AuditActor,
     action: AuditAction,
     outcome: AuditOutcome,
@@ -270,52 +271,61 @@ fn named_records(event: &AuditEvent) -> (Vec<String>, Vec<String>) {
         .unzip()
 }
 
+/// Append an event and its lookup rows inside the caller's transaction.
+pub(crate) async fn append_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &AuditEvent,
+) -> Result<(), sqlx::Error> {
+    let body = serde_json::to_string(&StoredEvent::from(event.clone()))
+        .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+    let (body, event_id) = (body.as_str(), event.event_id.as_str());
+    let (outcome, actor_type) = (event.outcome.as_ref(), event.actor.kind());
+    let actor_type = actor_type.as_ref();
+    let orgs: Vec<&str> = event.org_ids.iter().map(OrgId::as_str).collect();
+    let orgs = orgs.as_slice();
+    let (record_types, record_ids) = named_records(event);
+    let (record_types, record_ids) = (record_types.as_slice(), record_ids.as_slice());
+    sqlx::query(
+        "INSERT INTO audit_events (event_id, at, outcome, actor_type, body)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(event_id)
+    .bind(event.created_at.to_sqlx())
+    .bind(outcome)
+    .bind(actor_type)
+    .bind(body)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_event_orgs (org_id, event_id, outcome, actor_type)
+         SELECT org_id, $2, $3, $4 FROM unnest($1::text[]) AS org (org_id)",
+    )
+    .bind(orgs)
+    .bind(event_id)
+    .bind(outcome)
+    .bind(actor_type)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_event_records (record_type, record_id, event_id)
+         SELECT record_type, record_id, $3
+         FROM unnest($1::text[], $2::text[]) AS record (record_type, record_id)",
+    )
+    .bind(record_types)
+    .bind(record_ids)
+    .bind(event_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl AuditStore for SqlAuditStore {
     async fn append(&self, event: &AuditEvent) -> anyhow::Result<()> {
-        let body = serde_json::to_string(&StoredEvent::from(event.clone()))?;
-        let (body, event_id) = (body.as_str(), event.event_id.as_str());
-        let (outcome, actor_type) = (event.outcome.as_ref(), event.actor.kind());
-        let actor_type = actor_type.as_ref();
-        let orgs: Vec<&str> = event.org_ids.iter().map(OrgId::as_str).collect();
-        let orgs = orgs.as_slice();
-        let (record_types, record_ids) = named_records(event);
-        let (record_types, record_ids) = (record_types.as_slice(), record_ids.as_slice());
-        let db = &self.db;
         retry("append_audit_event", || {
-            Box::pin(async move {
-                let mut tx = db.begin().await?;
-                sqlx::query(
-                    "INSERT INTO audit_events (event_id, at, outcome, actor_type, body)
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(event_id)
-                .bind(event.created_at)
-                .bind(outcome)
-                .bind(actor_type)
-                .bind(body)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO audit_event_orgs (org_id, event_id, outcome, actor_type)
-                     SELECT org_id, $2, $3, $4 FROM unnest($1::text[]) AS org (org_id)",
-                )
-                .bind(orgs)
-                .bind(event_id)
-                .bind(outcome)
-                .bind(actor_type)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO audit_event_records (record_type, record_id, event_id)
-                     SELECT record_type, record_id, $3
-                     FROM unnest($1::text[], $2::text[]) AS record (record_type, record_id)",
-                )
-                .bind(record_types)
-                .bind(record_ids)
-                .bind(event_id)
-                .execute(&mut *tx)
-                .await?;
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                append_in_transaction(&mut tx, event).await?;
                 tx.commit().await
             })
         })
@@ -379,7 +389,7 @@ impl AuditStore for SqlAuditStore {
         }
     }
 
-    async fn prune_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn prune_before(&self, cutoff: Timestamp) -> anyhow::Result<u64> {
         let mut pruned = 0u64;
         loop {
             let deleted = self
@@ -390,7 +400,7 @@ impl AuditStore for SqlAuditStore {
                              SELECT event_id FROM audit_events WHERE at < $1
                              ORDER BY at LIMIT $2)",
                     )
-                    .bind(cutoff)
+                    .bind(cutoff.to_sqlx())
                     .bind(PRUNE_BATCH)
                 })
                 .await?;
@@ -401,11 +411,12 @@ impl AuditStore for SqlAuditStore {
         }
     }
 
-    async fn count_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn count_before(&self, cutoff: Timestamp) -> anyhow::Result<u64> {
         let (count,): (i64,) = self
             .db
             .fetch_one("count_audit_events", || {
-                sqlx::query_as("SELECT count(*) FROM audit_events WHERE at < $1").bind(cutoff)
+                sqlx::query_as("SELECT count(*) FROM audit_events WHERE at < $1")
+                    .bind(cutoff.to_sqlx())
             })
             .await?;
         Ok(u64::try_from(count)?)
@@ -767,7 +778,7 @@ mod tests {
         let store = SqlAuditStore::new(db.clone());
         let event = pipette_store_testkit::an_audit_event(&["org_a", "org_b"])?;
         store.append(&event).await?;
-        let cutoff = event.created_at + chrono::Duration::seconds(1);
+        let cutoff = event.created_at + jiff::SignedDuration::from_secs(1);
         assert_eq!(store.prune_before(cutoff).await?, 1);
         for table in ["audit_event_orgs", "audit_event_records"] {
             let left: i64 =

@@ -2,7 +2,7 @@
 //! test that uses them runs on every backend.
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_plan_types::{ClientId, ExpiresAt, JobId};
@@ -44,7 +44,7 @@ pub async fn seed_leased(
     client_id: &ClientId,
     body: &Value,
 ) -> anyhow::Result<JobId> {
-    let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+    let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     seed_leased_until(
         todo,
         job_id,
@@ -63,7 +63,7 @@ pub async fn seed_leased_until(
     job_id: &str,
     expires_at: ExpiresAt,
     client_id: &ClientId,
-    lease_expiry: DateTime<Utc>,
+    lease_expiry: Timestamp,
     body: &Value,
 ) -> anyhow::Result<JobId> {
     let job = seed_avail(todo, job_id, expires_at, body).await?;

@@ -5,8 +5,8 @@
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::{Duration, SubsecRound, Utc};
 use futures::TryStreamExt;
+use jiff::{SignedDuration, Timestamp};
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -831,7 +831,7 @@ async fn test_list_jobs_reports_every_lifecycle_state(
     // `running`: move its available entry into a live lease, as `claim` does.
     // The deadline comes from the queue row: ingestion stamps a default
     // expiry, and the claim names it.
-    let lease_expiry = Utc::now() + Duration::hours(1);
+    let lease_expiry = Timestamp::now() + SignedDuration::from_hours(1);
     let expires_at = state
         .todo_store
         .avail_for_jobs(std::slice::from_ref(running))
@@ -964,7 +964,7 @@ async fn seed_lease(
     state: &AppState,
     job_id: &JobId,
     client: &str,
-    expiry: chrono::DateTime<Utc>,
+    expiry: jiff::Timestamp,
     body: &Value,
 ) -> anyhow::Result<()> {
     let client = ClientId::try_new(client)?;
@@ -1004,7 +1004,7 @@ async fn test_a_lapsed_lease_reads_running() -> anyhow::Result<()> {
         &state,
         job_id,
         "ev1_a",
-        Utc::now() - Duration::minutes(1),
+        Timestamp::now() - SignedDuration::from_mins(1),
         &job_body,
     )
     .await?;
@@ -1018,7 +1018,7 @@ async fn test_a_lapsed_lease_reads_running() -> anyhow::Result<()> {
     assert_eq!(row["state"], json!("running"), "{body}");
     let expiry = pipette_web_testkit::json_str(&row["queue"]["lease"], "expires_at")?;
     assert!(
-        chrono::DateTime::parse_from_rfc3339(expiry)? < Utc::now(),
+        expiry.parse::<jiff::Timestamp>()? < Timestamp::now(),
         "a lapsed lease reported a future expiry: {expiry}"
     );
     Ok(())
@@ -1047,7 +1047,13 @@ async fn test_a_queued_job_past_its_deadline_reads_available_and_expired() -> an
         .context("the job is queued")?;
     state.todo_store.delete_avail_by_job(job_id).await?;
     // Whole seconds, as the `avail/` key keeps it.
-    let deadline = ExpiresAt::At((Utc::now() - Duration::hours(1)).trunc_subsecs(0));
+    let deadline = ExpiresAt::At(
+        (Timestamp::now() - SignedDuration::from_hours(1)).round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Second)
+                .mode(jiff::RoundMode::Trunc),
+        )?,
+    );
     pipette_web_testkit::seed_avail(
         state.todo_store.as_ref(),
         job_id.as_str(),
@@ -1094,8 +1100,12 @@ async fn test_a_lapsed_job_reads_failed_while_still_queued() -> anyhow::Result<(
     let job_id = &jobs[0];
 
     let lapse = ExpiredJob {
-        horizon: (Utc::now() - Duration::hours(2)).trunc_subsecs(0),
-        recorded_at: Utc::now(),
+        horizon: (Timestamp::now() - SignedDuration::from_hours(2)).round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Second)
+                .mode(jiff::RoundMode::Trunc),
+        )?,
+        recorded_at: Timestamp::now(),
     };
     let mut manifest = state
         .plan_store
@@ -1168,8 +1178,8 @@ async fn test_a_complete_plan_lists_the_queue_only_for_a_lapsed_job() -> anyhow:
     manifest.expired_jobs.insert(
         job_id.clone(),
         ExpiredJob {
-            horizon: Utc::now() - Duration::hours(2),
-            recorded_at: Utc::now(),
+            horizon: Timestamp::now() - SignedDuration::from_hours(2),
+            recorded_at: Timestamp::now(),
         },
     );
     state.plan_store.put_plan(&manifest).await?;

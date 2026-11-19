@@ -38,7 +38,7 @@ pub async fn owner_labels<'a>(
                     .org_store
                     .get_org(org_id)
                     .await
-                    .map(|org| org.map(|org| org.slug.to_string())),
+                    .map(|org| org.map(|org| org.display_name.to_string())),
             };
             named(owner.label(), read)
         })
@@ -148,13 +148,9 @@ pub async fn catalog_read_scope(
     caller: Caller<'_>,
 ) -> Result<CatalogReadScope, AppError> {
     let own_org = user_org(state, &caller.user.user_id).await?;
-    Ok(if caller.rights.holds(UserPermission::EditAnyCatalog) {
-        CatalogReadScope::EveryOrg { own_org }
-    } else {
-        match own_org {
-            Some(org_id) => CatalogReadScope::Org(org_id),
-            None => CatalogReadScope::Unaffiliated,
-        }
+    Ok(CatalogReadScope {
+        own_org,
+        every_org: caller.rights.holds(UserPermission::EditAnyCatalog),
     })
 }
 

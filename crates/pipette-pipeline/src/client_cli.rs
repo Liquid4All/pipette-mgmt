@@ -358,7 +358,7 @@ mod tests {
             client_details: NonEmptyTrimmedString::try_new("details")?,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
-            registered_at: chrono::Utc::now(),
+            registered_at: jiff::Timestamp::now(),
             device_profile: Default::default(),
             capabilities: flags.iter().map(|flag| flag.to_string()).collect(),
         })

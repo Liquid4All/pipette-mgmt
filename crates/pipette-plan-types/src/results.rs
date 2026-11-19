@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -164,9 +164,11 @@ pub struct ResultRow {
     /// detail.
     pub client_version: Option<String>,
     /// When the client submitted the run.
-    pub submitted_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub submitted_at: Option<Timestamp>,
     /// When the server scored the run.
-    pub scored_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub scored_at: Option<Timestamp>,
     /// The milliseconds the device spent on the job, as its client reported
     /// them; every row of one run carries the same value.
     pub device_time_ms: Option<ElapsedMillis>,
@@ -190,7 +192,8 @@ pub struct ResultRow {
     /// run that the copy scores again. `null` on a row scored before the
     /// warehouse recorded it, and on a re-scored copy whose chain of copies
     /// reaches a record that is gone or is not a success.
-    pub run_submitted_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub run_submitted_at: Option<Timestamp>,
     /// The version of the scoring service that scored the row: the
     /// `runtime_version` of its `POST /score` answer. Only an eval row has a
     /// value. It is `null` on every other row and on an eval row whose scoring

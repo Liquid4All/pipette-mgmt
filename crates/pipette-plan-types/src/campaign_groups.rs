@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -122,7 +122,8 @@ pub struct CampaignGroupPolicy {
     /// Who turned the policy on; `null` while it is off.
     pub enabled_by: Option<UserId>,
     /// When the policy was turned on; `null` while it is off.
-    pub enabled_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub enabled_at: Option<Timestamp>,
 }
 
 /// The most re-runs a policy gives a cell, so a cell's re-run chain fits the 16
@@ -146,13 +147,20 @@ impl PolicyKind {
             Self::Failed => (
                 0,
                 PolicySettings {
+                    // Another device may run a harness_error (a phone's failed
+                    // install, a client build that does not know the benchmark);
+                    // an out of memory may come from memory another process
+                    // holds; attempt_timeout is left out because every device
+                    // has the same limit.
                     codes: Some(
                         [
-                            FailureCode::RuntimeError,
-                            FailureCode::DeviceError,
-                            FailureCode::Unspecified,
+                            (FailureCode::RuntimeError, 2),
+                            (FailureCode::DeviceError, 2),
+                            (FailureCode::Unspecified, 2),
+                            (FailureCode::DeviceNotReady, 1),
+                            (FailureCode::HarnessError, 1),
+                            (FailureCode::OutOfMemory, 1),
                         ]
-                        .map(|code| (code, 2))
                         .into(),
                     ),
                     ..PolicySettings::default()
@@ -173,9 +181,10 @@ impl PolicyKind {
     }
 
     /// The fewest re-runs this kind's policy takes. A swap policy marks a cell
-    /// still flagged failed, so it acts with none; spread and ttft_over_e2e
-    /// keep the cell's result, so with none they would do nothing. Failed
-    /// takes 0, as its `settings.codes` holds its re-runs.
+    /// still flagged failed, so it acts with none; spread marks one too, after
+    /// at least 1 re-run; ttft_over_e2e keeps the cell's result, so with none
+    /// it would do nothing. Failed takes 0, as its `settings.codes` holds its
+    /// re-runs.
     pub fn min_reruns(self) -> u32 {
         match self {
             Self::Swap | Self::Failed | Self::ModelParams | Self::SmallerFailed => 0,
@@ -198,6 +207,16 @@ impl PolicyKind {
         match self {
             Self::Swap | Self::Spread | Self::Failed | Self::TtftOverE2e => true,
             Self::ModelParams | Self::SmallerFailed => false,
+        }
+    }
+
+    /// Whether this kind's policy marks a cell failed once its re-runs are
+    /// spent and its check still flags the cell; failed and ttft_over_e2e keep
+    /// the cell's result.
+    pub fn marks(self) -> bool {
+        match self {
+            Self::Swap | Self::Spread => true,
+            Self::Failed | Self::TtftOverE2e | Self::ModelParams | Self::SmallerFailed => false,
         }
     }
 
@@ -306,22 +325,21 @@ pub struct MemberPolicyPreview {
     /// The plan the campaign runs; `null` for none.
     pub plan_id: Option<PlanId>,
     pub state: PolicyMemberState,
-    /// The plan's jobs whose outcome queue-maintenance recorded; 0 unless
-    /// `state` is `evaluated` or `unreadable`.
+    /// The plan's jobs whose outcome queue-maintenance recorded, an eval's left
+    /// out, as no policy judges one; 0 unless `state` is `evaluated` or
+    /// `unreadable`.
     pub answered_job_count: usize,
     /// Answered jobs with no rows in pipette-duckdb yet, which wait.
     pub waiting_job_count: usize,
     /// The earliest deadline of the plan's jobs; `null` for none, and when
     /// `state` is neither `evaluated` nor `unreadable`.
-    pub earliest_deadline: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub earliest_deadline: Option<Timestamp>,
     /// Whether `earliest_deadline` had passed at the read. If the plan's
     /// document sets it, the server refuses a re-run of the plan.
     pub deadline_passed: bool,
     /// One per kind, in kind order.
     pub checks: Vec<PolicyCheckCounts>,
-    /// The policies that are on and flag a job of the plan, or whose re-runs
-    /// filed into the campaign wait for their rows; the others are cleared.
-    pub triggered: BTreeSet<PolicyKind>,
     /// The jobs the policies that are on would re-run.
     pub rerun_job_ids: BTreeSet<JobId>,
     /// The jobs they would mark failed.
@@ -384,7 +402,8 @@ pub struct ModelParamsGap {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PolicyFiling {
     pub plan_id: PlanId,
-    pub filed_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub filed_at: Timestamp,
     /// The jobs the plan holds that the plan it revised did not: its re-runs,
     /// its marks, and the lapsed cells it placed afresh.
     pub queued_job_count: usize,
@@ -514,7 +533,8 @@ pub struct PolicyRerun {
     pub rerun_of: JobId,
     /// The plan the filing filed.
     pub plan_id: PlanId,
-    pub filed_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub filed_at: Timestamp,
     /// The runs in a row the policy flagged, the replaced one included: 1 for
     /// a job's first re-run, 2 for a re-run of a re-run.
     pub attempt: u32,
@@ -547,7 +567,8 @@ pub struct PolicyRerun {
     pub after_code: Option<String>,
     /// `null` while the re-run waits for its rows.
     pub outcome: Option<RerunOutcome>,
-    pub judged_at: Option<DateTime<Utc>>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>", extend("format" = "date-time")))]
+    pub judged_at: Option<Timestamp>,
 }
 
 /// What a re-run's check reads on its rows, at the threshold it was filed at,
@@ -619,6 +640,9 @@ mod tests {
             (FailureCode::RuntimeError, 2),
             (FailureCode::DeviceError, 2),
             (FailureCode::Unspecified, 2),
+            (FailureCode::DeviceNotReady, 1),
+            (FailureCode::HarnessError, 1),
+            (FailureCode::OutOfMemory, 1),
         ]);
         assert_eq!(
             limits,

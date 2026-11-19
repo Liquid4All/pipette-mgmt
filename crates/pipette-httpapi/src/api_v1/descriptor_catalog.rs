@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use axum::{Json, extract::State, http::StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::{
     client::{Client, ClientStatus},
@@ -27,7 +27,8 @@ use pipette_plan_types::{
     DescriptorMemberSummary, DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery,
     DescriptorWithheldMember, DescriptorWithheldReasonCode, DescriptorWithheldReport, ListPage,
     ModelKey, ModelType, OrgId, QualifiedCatalogName, RelabelDescriptorMemberRequest,
-    RenameDescriptorEntryRequest, Runtime, RuntimeType, UserPermission, VaultEntry,
+    RemoveDescriptorMemberRequest, RenameDescriptorEntryRequest, Runtime, RuntimeType,
+    UserPermission, VaultEntry,
 };
 use pipette_store::{
     CatalogEntryKey, ClientListing, DescriptorCatalogStore, DescriptorEntryFilter, RunEvidenceRow,
@@ -37,7 +38,7 @@ use pipette_store::{
 
 use crate::{
     api_v1::orgs::{OrgPath, require_in_scope, roster_reach},
-    auth::{ActiveUser, Caller},
+    auth::{ActiveUser, Caller, user_org},
     error::AppError,
     extract::{ApiJson, ApiPath, ApiQuery, Parsed},
     list::{list_cursor, list_limit, page_filtered},
@@ -70,10 +71,10 @@ pub async fn edit_reach(state: &AppState, caller: Caller<'_>) -> Result<RosterSc
 /// Convert the read scope to a roster scope. The handler uses it to refuse an
 /// organization that the caller cannot read.
 fn roster_scope(read: &CatalogReadScope) -> RosterScope {
-    match read {
-        CatalogReadScope::Unaffiliated => RosterScope::Unaffiliated,
-        CatalogReadScope::Org(org_id) => RosterScope::Org(org_id.clone()),
-        CatalogReadScope::EveryOrg { .. } => RosterScope::Fleet,
+    match (&read.own_org, read.every_org) {
+        (_, true) => RosterScope::Fleet,
+        (Some(org_id), false) => RosterScope::Org(org_id.clone()),
+        (None, false) => RosterScope::Unaffiliated,
     }
 }
 
@@ -367,7 +368,7 @@ pub async fn create_org_descriptor_entry(
         &scope,
         body,
         DescriptorEntryCreator::Account(caller.user.user_id.clone()),
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .map_err(write_error)?;
@@ -401,7 +402,7 @@ pub async fn add_org_descriptor_member(
         &scope,
         &name,
         body,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .map_err(write_error)?;
@@ -473,6 +474,40 @@ pub async fn relabel_org_descriptor_member(
     .await
     .map_err(write_error)?;
     Ok(Json(written_row(&state, entry, shown).await?))
+}
+
+// POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/members/remove
+pub async fn remove_org_descriptor_member(
+    State(state): State<AppState>,
+    active: ActiveUser,
+    ApiPath((Parsed(org_id), Parsed(name))): ApiPath<(Parsed<OrgId>, Parsed<CatalogName>)>,
+    ApiJson(body): ApiJson<RemoveDescriptorMemberRequest>,
+) -> Result<Json<DescriptorEntryListRow>, AppError> {
+    let caller = active.caller();
+    let scope = write_scope(&state, caller, org_id).await?;
+    let store = catalog(&state)?;
+    let shown = write_display_name(&state, store, caller, &scope, &name).await?;
+    let removed =
+        descriptor_catalog_admin::remove_entry_member(store, &scope, &name, &body.member, false)
+            .await
+            .map_err(write_error)?;
+    let targets = match &scope {
+        CatalogScope::Global => BTreeSet::new(),
+        CatalogScope::Org(org_id) => BTreeSet::from([AuditTarget::Org {
+            org_id: org_id.clone(),
+        }]),
+    };
+    crate::audit::append(
+        &state,
+        AuditActor::User {
+            user_id: active.user.user_id.clone(),
+            key_id: active.key_id.clone(),
+        },
+        removed.audit_action(&scope),
+        targets,
+    )
+    .await;
+    Ok(Json(written_row(&state, removed.entry, shown).await?))
 }
 
 // POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/state
@@ -645,13 +680,14 @@ fn withheld_reason_code(reason: &OfferError) -> DescriptorWithheldReasonCode {
     }
 }
 
-/// Every pinned and active global entry, newest release first, and the number
-/// of unreadable entries.
+/// Every pinned and active entry in `scopes`, newest release first, and the
+/// number of unreadable entries.
 async fn short_list_entries(
     store: &dyn DescriptorCatalogStore,
+    scopes: BTreeSet<CatalogScope>,
 ) -> Result<(Vec<DescriptorEntry>, usize), AppError> {
     let filter = DescriptorEntryFilter {
-        scopes: [CatalogScope::Global].into(),
+        scopes,
         states: BTreeSet::from([DescriptorEntryState::Pinned, DescriptorEntryState::Active]),
         ..Default::default()
     };
@@ -680,19 +716,13 @@ async fn short_list_entries(
     Ok((entries, unreadable))
 }
 
-/// The short list names entries with the bare name: it holds global entries
-/// only.
-fn bare_name(entry: &DescriptorEntry) -> QualifiedCatalogName {
-    QualifiedCatalogName {
-        qualifier: None,
-        name: entry.name.clone(),
-    }
-}
+/// One short-list entry and its name as the caller sees it.
+type Shown = (DescriptorEntry, QualifiedCatalogName);
 
 /// Split the offer verdicts of `entry`'s members into the offered members and
 /// the withheld records.
 fn split_verdicts<'a>(
-    entry: &DescriptorEntry,
+    entry: &Shown,
     verdicts: impl Iterator<Item = (&'a DescriptorMember, Result<(), OfferError>)>,
 ) -> (Vec<&'a DescriptorMember>, Vec<DescriptorWithheldMember>) {
     let (offered, refused): (Vec<_>, Vec<_>) = verdicts.partition(|(_, verdict)| verdict.is_ok());
@@ -710,26 +740,29 @@ fn split_verdicts<'a>(
 }
 
 fn withheld_member(
-    entry: &DescriptorEntry,
+    (entry, shown): &Shown,
     member: &DescriptorMember,
     reason: &OfferError,
 ) -> DescriptorWithheldMember {
     let member_key = member.key();
     DescriptorWithheldMember {
         name: entry.name.clone(),
-        selector: descriptor_names::member_selector(&bare_name(entry), &member_key),
+        scope: entry.scope.clone(),
+        display_name: shown.to_string(),
+        selector: descriptor_names::member_selector(shown, &member_key),
         member_key,
         reason_code: withheld_reason_code(reason),
         reason: reason.to_string(),
     }
 }
 
-/// The pinned and active catalog entries that offer a member to one device.
-/// A runtime entry gives the member that the device resolves. A model entry
-/// gives every member that a runtime member offered to the device can load.
+/// The pinned and active catalog entries, of the global scope and the caller's
+/// organization, that offer a member to one device. A runtime entry gives the
+/// member that the device resolves. A model entry gives every member that a
+/// runtime member offered to the device can load.
 pub async fn list_descriptor_catalog_for_device(
     State(state): State<AppState>,
-    _user: ActiveUser,
+    user: ActiveUser,
     ApiPath(Parsed(client_id)): ApiPath<Parsed<ClientId>>,
 ) -> Result<Json<DescriptorCatalogShortList>, AppError> {
     tracing::Span::current().record("target_client_id", tracing::field::display(&client_id));
@@ -747,21 +780,36 @@ pub async fn list_descriptor_catalog_for_device(
         .map_err(AppError::internal)?;
     let tags = FleetTags::new(tags.into_iter().map(|tag| (client_id.clone(), tag)));
     let config = &state.config.descriptor_catalog;
-    let (entries, unreadable) = short_list_entries(store).await?;
-    let (runtime_entries, model_entries): (Vec<_>, Vec<_>) = entries
+    // The short list answers what the caller can name in a plan, so a holder
+    // of `edit_any_catalog` gets its own organization only.
+    let read = CatalogReadScope::own(user_org(&state, &user.caller().user.user_id).await?);
+    let scopes = read
+        .readable_scopes(state.org_store.as_ref())
+        .await
+        .map_err(AppError::internal)?;
+    let (entries, unreadable) = short_list_entries(store, scopes.clone()).await?;
+    let view = name_view(&state, store, read.clone(), &scopes)
+        .await?
+        .with_entries(&entries);
+    let (runtime_entries, model_entries): (Vec<Shown>, Vec<Shown>) = entries
         .into_iter()
-        .partition(|entry| entry.descriptor_kind() == DescriptorKind::Runtime);
-    let parameters = parameter_rows(&state, model_entries.iter()).await;
+        .filter_map(|entry| {
+            let shown = view.display_name(&entry.scope, &entry.name)?;
+            Some((entry, shown))
+        })
+        .partition(|(entry, _)| entry.descriptor_kind() == DescriptorKind::Runtime);
+    let parameters = parameter_rows(&state, model_entries.iter().map(|(entry, _)| entry)).await;
     // Each offered entry with the members that it gives the device.
-    let mut chosen: Vec<(&DescriptorEntry, Vec<&DescriptorMember>)> = Vec::new();
+    let mut chosen: Vec<(&Shown, Vec<&DescriptorMember>)> = Vec::new();
     let mut withheld = Vec::new();
     let mut withheld_entries = 0usize;
     // Every runtime member offered to the device, not only the resolved
     // ones: a model member is offered if any of them can load it.
     let mut offered: Vec<Runtime> = Vec::new();
-    for entry in &runtime_entries {
+    for shown in &runtime_entries {
+        let (entry, _) = shown;
         let (accepted, refused) = split_verdicts(
-            entry,
+            shown,
             entry.members.iter().map(|member| {
                 let verdict = descriptor_offer::offer(config, member, &client, &tags);
                 (member, verdict)
@@ -774,14 +822,15 @@ pub async fn list_descriptor_catalog_for_device(
         );
         withheld.extend(refused);
         match descriptor_offer::resolve(entry, config, &client, &tags) {
-            Resolution::Resolved(member) => chosen.push((entry, vec![member])),
+            Resolution::Resolved(member) => chosen.push((shown, vec![member])),
             Resolution::Withheld(_) => withheld_entries += 1,
         }
     }
     let runtime_items = chosen.len();
-    for entry in &model_entries {
+    for shown in &model_entries {
+        let (entry, _) = shown;
         let (loadable, refused) = split_verdicts(
-            entry,
+            shown,
             entry.members.iter().filter_map(|member| {
                 member
                     .model()
@@ -793,7 +842,7 @@ pub async fn list_descriptor_catalog_for_device(
             withheld_entries += 1;
             continue;
         }
-        chosen.push((entry, loadable));
+        chosen.push((shown, loadable));
     }
     // Evidence is read for the offered members only. It never selects one.
     let digests = chosen
@@ -804,22 +853,17 @@ pub async fn list_descriptor_catalog_for_device(
     let evidence = Evidence::read(&state, digests, Some(client_id.clone())).await?;
     let items = chosen
         .iter()
-        .map(|(entry, members)| {
+        .map(|((entry, shown), members)| {
             Ok(DescriptorCatalogShortListItem {
                 name: entry.name.clone(),
+                scope: entry.scope.clone(),
+                display_name: shown.to_string(),
                 release_time: entry.release_time,
                 descriptor_kind: entry.descriptor_kind(),
                 members: members
                     .iter()
                     .map(|member| {
-                        member_view(
-                            &state,
-                            &bare_name(entry),
-                            member,
-                            None,
-                            evidence.as_ref(),
-                            &parameters,
-                        )
+                        member_view(&state, shown, member, None, evidence.as_ref(), &parameters)
                     })
                     .collect::<Result<Vec<_>, AppError>>()?,
             })
@@ -831,6 +875,8 @@ pub async fn list_descriptor_catalog_for_device(
         members: withheld,
     };
     tracing::debug!(
+        org_id = ?read.own_org,
+        org_items = items.iter().filter(|item| item.scope != CatalogScope::Global).count(),
         runtime_items,
         model_items = items.len() - runtime_items,
         offered_runtime_members = offered.len(),

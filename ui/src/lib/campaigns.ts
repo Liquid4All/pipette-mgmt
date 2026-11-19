@@ -6,7 +6,7 @@
 import { ApiError, type IngestProgress } from "./api";
 import type { Crumb } from "./crumbs";
 import { doneOf, duration, textOrder } from "./format";
-import type { OrgRef } from "./orgs";
+import { orgName, ownOrg, type OrgRef } from "./orgs";
 import { ownedQuery, ownerBranch, ownerName, principalOf, underTrail, type OwnedBranch, type OwnedScope } from "./owned";
 import { bytesText, doneShare } from "./plans";
 import { reaches } from "./rights";
@@ -14,7 +14,7 @@ import { campaignLink, campaignPlanLink, pathOf, type OwnedPages } from "./route
 import type { TableSpec } from "./table";
 import { percent } from "./upload";
 import type {
-  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanStatus, PlanSummary, PlanView, PlannedImport,
+  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanStatus, PlanSummary, PlanView, PolicyCheck, PlannedImport,
   PrincipalOwner, RevisionDryRun, UpdateCampaignRequest,
 } from "./api-types";
 
@@ -50,15 +50,26 @@ export const phaseOf = (status: PlanStatus): Phase =>
   (status === "complete" || status === "cancelled" ? status : "active");
 
 /** Every campaign status a listing filters on. */
-const CAMPAIGN_STATUSES = ["active", "complete", "cancelled", "not_started", "archived"];
+const CAMPAIGN_STATUSES = ["active", "complete", "cancelled", "not_started", "locked", "archived"];
 
 /**
- * A campaign's status: `archived` once archived, else its plan's phase, `not_started` before its first plan and
+ * A campaign's status: `locked` or `archived` while so, else its plan's phase, `not_started` before its first plan and
  * `""` where the reader may not read it.
  */
 export const campaignStatus = (row: CampaignView): string =>
-  (stateOf(row) === "archived" ? "archived"
+  (stateOf(row) !== "active" ? stateOf(row)
     : row.plan ? phaseOf(row.plan.status) : row.current_plan_id ? "" : "not_started");
+
+/** A policy check's word: `triggered` while its check flags a job or its re-runs wait, else `cleared`. */
+export const checkState = ({ triggered }: PolicyCheck): "cleared" | "triggered" => (triggered ? "triggered" : "cleared");
+
+/** A campaign's policy checks as one text, which the listing sorts and searches by; null in no group. */
+const checksText = (row: CampaignView): string | null =>
+  row.policy_checks?.map((check) => `${check.kind} ${checkState(check)}`).join(", ") ?? null;
+
+/** Whether a campaign's group policies are all `cleared` or any `triggered`; none in no group. */
+export const checksState = (row: CampaignView): string[] =>
+  (row.policy_checks ? [row.policy_checks.some((check) => check.triggered) ? "triggered" : "cleared"] : []);
 
 /** A campaign's own state, beside its plan's status; a record never archived carries none. */
 export const stateOf = (row: Pick<CampaignView, "state">): CampaignState => row.state ?? "active";
@@ -220,14 +231,16 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
       { key: "name", label: "name", raw: (row) => row.name },
       ...(owners ? [{ key: "owner", label: "owner", raw: owner }] : []),
       { key: "status", label: "status", raw: campaignStatus },
+      { key: "policies", label: "policies", raw: checksText },
       { key: "progress", label: "progress", raw: (row) => doneShare(row.plan?.counts) },
       { key: "labels", label: "labels", raw: (row) => labelPairs(row.labels).map(labelText).join(", ") || null },
       { key: "created_at", label: "created_at", raw: (row) => row.created_at, as: "time" },
       { key: "updated_at", label: "updated_at", raw: (row) => row.updated_at, as: "time" },
     ],
     texts: [
-      { key: "q", label: "search", placeholder: "campaign id, name, label or model", wide: true,
-        texts: (row) => [row.campaign_id, row.name, ...labelPairs(row.labels).map(labelText), ...row.models ?? []] },
+      { key: "q", label: "search", placeholder: "campaign id, name, label, model or tag", wide: true,
+        texts: (row) => [row.campaign_id, row.name, ...labelPairs(row.labels).map(labelText), ...row.models ?? [],
+                        ...(row.current_plan_tags ?? []).map((tag) => tag.name)] },
     ],
     // `campaignQuery` sends the plan id and the state; the listing reads a job id's plans itself. Either id finds
     // its campaigns, superseded or archived, so the state is held at all beside one.
@@ -235,13 +248,15 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
       { key: "plan_id", label: "plan id", placeholder: "current or superseded", wide: true },
       ...(jobs ? [{ key: "job_id", label: "job id", placeholder: "in a current or superseded plan", wide: true }] : []),
       { key: "state", label: "state",
-        options: [{ value: "", label: "active" }, { value: "archived", label: "archived" }, { value: "all", label: "all" }],
+        options: [{ value: "", label: "active or locked" }, { value: "locked", label: "locked" },
+                  { value: "archived", label: "archived" }, { value: "all", label: "all" }],
         ...(byId ? { held: { value: "all", why: jobs ? "A plan id or a job id finds its campaigns in every state."
                                                      : "A plan id finds its campaign in every state." } } : {}) },
     ],
     choices: [
       { key: "status", label: "status", values: (row) => [campaignStatus(row)],
         name: (value) => value.replaceAll("_", " "), order: CAMPAIGN_STATUSES },
+      { key: "policies", label: "policies", values: checksState },
       { key: "label", label: "labels", values: (row) => labelPairs(row.labels).map(labelText) },
       ...(owners ? [{ key: "owner", label: "owner", values: (row: CampaignView) => [principalOf(row.owner)],
                       name: (id: string) => names[id] ?? id }] : []),
@@ -255,7 +270,7 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
  * Otherwise, select campaigns in `state`. Use `all` to include every state.
  */
 export const campaignQuery = (branch: OwnedBranch, cursor: string | null, limit: string, planId = "",
-                              state: CampaignState | "all" = "active"): string =>
+                              state = "active,locked"): string =>
   ownedQuery(branch, [["plan", "true"], ["models", "true"], ...(planId ? [["plan_id", planId] as [string, string]]
     : state === "all" ? [] : [["state", state] as [string, string]])], cursor, limit);
 
@@ -273,7 +288,7 @@ export async function jobCampaigns(read: Promise<{ plans: Pick<PlanSummary, "cam
 export function soughtEmpty(branch: OwnedBranch, sought: string): string {
   switch (branch.kind) {
     case "me": return `You own no campaign that holds ${sought}.`;
-    case "org": return `${branch.slug} owns no campaign you may see that holds ${sought}.`;
+    case "org": return `${orgName(branch)} owns no campaign you may see that holds ${sought}.`;
     case "all": return `No campaign you may see holds ${sought}.`;
   }
 }
@@ -306,8 +321,9 @@ export interface OwnerOption {
 /** The owners the form offers: the reader, and the organization it belongs to. */
 export function newCampaignOwners(reader: OwnUserView): OwnerOption[] {
   const org = reader.may.file_plans && reader.org_id ? reader.org_id : null;
+  const own = ownOrg(reader);
   return [{ value: "", label: "me" },
-    ...(org ? [{ value: org, label: `${reader.org_slug ?? org} (organization)` }] : [])];
+    ...(org ? [{ value: org, label: `${own ? orgName(own) : org} (organization)` }] : [])];
 }
 
 /** The owner `?owner=` chooses: one the form offers, else the reader. */

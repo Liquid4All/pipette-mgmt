@@ -3,7 +3,7 @@
 // forms send. Each gate reads what the server says the reader may do; the routes still decide.
 
 import { textOrder } from "./format";
-import { administersOrg } from "./orgs";
+import { administersOrg, orgName, type OrgRef } from "./orgs";
 import { EXPIRY_DAYS, mintBody } from "./preauth";
 import type { BarTab } from "./bar";
 import { legacyOrgFilter, pathOf, userLink, type Page } from "./routes";
@@ -29,7 +29,7 @@ const known = (name: string): name is UserPermission => Object.hasOwn(VOCABULARY
 export type RosterBranch =
   | { kind: "all" }
   | { kind: "server" }
-  | { kind: "org"; org_id: string; slug: string };
+  | ({ kind: "org" } & OrgRef);
 
 /** The branch's accounts, by address, as the classic `accounts::browse` listed them. */
 export const rosterRows = (rows: UserView[], branch: RosterBranch): UserView[] =>
@@ -72,7 +72,7 @@ export function rosterTable(branch: RosterBranch, orgOf: (org_id: string) => str
 /** What an empty listing says, as `users.html` words it. */
 export function rosterEmpty(branch: RosterBranch): string {
   switch (branch.kind) {
-    case "org": return `Nobody belongs to ${branch.slug}.`;
+    case "org": return `Nobody belongs to ${orgName(branch)}.`;
     case "server": return "Every account belongs to an organization.";
     case "all": return "No accounts you may see.";
   }

@@ -15,7 +15,7 @@ Crates offering a choice of license are recorded under the option elected in
 | License | Crates |
 | --- | --- |
 | Apache License 2.0 (`Apache-2.0`) | 245 |
-| MIT License (`MIT`) | 77 |
+| MIT License (`MIT`) | 80 |
 | Unicode License v3 (`Unicode-3.0`) | 20 |
 | BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`) | 13 |
 | ISC License (`ISC`) | 4 |
@@ -9159,6 +9159,9 @@ Applies to:
 - byteorder 1.5.0 — https://github.com/BurntSushi/byteorder
 - csv-core 0.1.13 — https://github.com/BurntSushi/rust-csv
 - csv 1.4.0 — https://github.com/BurntSushi/rust-csv
+- jiff-core 1.0.0 — https://github.com/BurntSushi/jiff
+- jiff-sqlx 1.0.0 — https://github.com/BurntSushi/jiff
+- jiff 1.0.0 — https://github.com/BurntSushi/jiff
 - memchr 2.8.3 — https://github.com/BurntSushi/memchr
 - walkdir 2.5.0 — https://github.com/BurntSushi/walkdir
 

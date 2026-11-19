@@ -726,7 +726,7 @@ async fn test_the_backlog_follows_the_queue() -> anyhow::Result<()> {
         outside(1)
     );
 
-    let lease_expiry = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let lease_expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5);
     assert!(matches!(
         state
             .todo_store
@@ -841,7 +841,7 @@ async fn test_campaign_backlog_uses_the_configured_creating_age(
     let campaign = put_idle_campaign(&state, &user.1, "Creating").await?;
     let plan = PlanManifest {
         campaign_id: Some(campaign.clone()),
-        created_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        created_at: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
         ..sample_manifest(
             PlanId::from_uuid(uuid::Uuid::now_v7()),
             PlanStatus::Creating,

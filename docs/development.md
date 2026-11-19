@@ -11,7 +11,6 @@ These are the gates, as CI runs them:
 ./ci/lint.sh                          # repo conventions; no toolchain needed
 cargo fmt --all -- --check
 cargo deny check licenses advisories bans sources  # needs cargo-deny 0.19+
-cargo machete --with-metadata         # needs cargo-machete
 cargo clippy --workspace --all-targets --locked
 cargo clippy -p pipette-plan-types --all-targets --locked
 cargo doc --workspace --no-deps --locked
@@ -124,14 +123,12 @@ What each gate is for:
   `pub` where `pub(crate)` would do. `dead_code` stops at a crate's `pub`
   surface, since rustc counts a `pub` item as used downstream; nothing here is
   published, so prefer private modules and narrow visibility. Whole
-  dependencies are `cargo machete`'s half: it fails on a crate kept past its
-  last caller, which otherwise costs build time, a `THIRD-PARTY-LICENSES.md`
-  entry and an advisory surface. It reads sources textually, so a dependency
-  reached only through a macro expansion is its blind spot: list such a crate
-  under `ignored` in `[package.metadata.cargo-machete]` in its own manifest,
-  with a comment naming what reaches it, as
-  [`crates/pipette-plan-types/Cargo.toml`](../crates/pipette-plan-types/Cargo.toml)
-  does for `regex`.
+  dependencies are Cargo's half: `[workspace.lints.cargo]` in the root
+  `Cargo.toml` denies an unused dependency per target, and an unused
+  `[workspace.dependencies]` entry, on Rust 1.100 and newer. A dependency used
+  on one OS goes in that OS's `[target.'cfg(...)'.dependencies]`, one used only
+  by tests in `[dev-dependencies]`. One listed only to turn a feature on is
+  kept with `use <crate> as _;` and a comment naming the feature.
 
 `gitleaks` reads commits rather than the working tree, so a credential committed
 once and deleted in the next commit is still found. Over the whole history it

@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_core::benchmark::{Benchmark, CatalogLoad};
-use pipette_core::campaign::{Campaign, CampaignGroup, GroupPolicyState};
+use pipette_core::campaign::{Campaign, CampaignGroup, GroupPolicyState, JobPolicyState};
 use pipette_core::client::{Client, MigrationRecord, SignatureMigration, recorded_run_flags};
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_core::client_preauth::{
@@ -41,14 +41,15 @@ use pipette_core::warehouse::{JobMetrics, MetricRow};
 use pipette_plan_types::{
     AuditActorKind, AuditEventId, AuditOutcome, AuditTarget, BenchmarkId, CachedArtifacts,
     CampaignGroupId, CampaignGroupPolicy, CampaignId, ClientId, ClientOwner, ClientPreauthKeyId,
-    ExpiresAt, FirstClerkSignIn, IdError, JobId, ModelKey, OrgId, PlanId, PlanStatus, PolicyRerun,
-    PolicyRerunSummary, PublicKeyHex, RuntimeOutput, Sha256, Tag, UserId, UserKeyId,
+    ExpiresAt, FirstClerkSignIn, IdError, JobId, ModelKey, OrgId, PlanId, PlanStatus, PlanTag,
+    PolicyRerun, PolicyRerunSummary, PublicKeyHex, RuntimeOutput, Sha256, Tag, UserId, UserKeyId,
     UserPreauthKeyId, VaultResourceId,
 };
 use pipette_plan_types::{
-    AuditEvent, CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind,
-    DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberKey, EntryError,
-    ModelFormat, ModelType, NonEmptyVec, QuantizationLabel, RunMark, RuntimeType,
+    AuditEvent, CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryCreator,
+    DescriptorEntryKind, DescriptorEntryState, DescriptorKind, DescriptorMember,
+    DescriptorMemberKey, EntryError, ModelFormat, ModelType, NonEmptyVec, QuantizationLabel,
+    RunMark, RuntimeType,
 };
 
 /// Where a job sits in the pipeline. The variant names are the wire strings
@@ -381,7 +382,7 @@ pub trait ClientStore: Send + Sync {
     async fn record_signature_migration(
         &self,
         client_id: &ClientId,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<MigrationRecord>;
 
     /// Every recorded migration, for a display column, so unreadable entries
@@ -1083,7 +1084,7 @@ pub struct VaultBlob {
     pub key: VaultObjectKey,
     pub bytes: u64,
     /// The backend's modification time.
-    pub modified: DateTime<Utc>,
+    pub modified: Timestamp,
 }
 pub type CampaignPage = Page<Campaign, CampaignId>;
 pub type CampaignGroupPage = Page<CampaignGroup, CampaignGroupId>;
@@ -1106,7 +1107,7 @@ pub struct JobHolder {
     pub job_id: JobId,
     pub plan_id: PlanId,
     /// The plan's `created_at`.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The job that `job_id` runs again in this plan.
     pub rerun_of: Option<JobId>,
 }
@@ -1227,6 +1228,19 @@ pub trait CampaignStore: Send + Sync {
     async fn delete_campaign(&self, campaign_id: &CampaignId) -> anyhow::Result<()>;
 }
 
+/// Annotated tags on campaigns' plans, unique by name within a campaign and
+/// never changed. Deleting a campaign removes its tags. SQL keeps them; no
+/// object store does.
+#[async_trait]
+pub trait PlanTagStore: Send + Sync {
+    /// `false`, writing nothing, when the campaign already has a tag of that
+    /// name.
+    async fn create_tag(&self, tag: &PlanTag) -> anyhow::Result<bool>;
+
+    /// The tags of each of `campaign_ids`, newest first.
+    async fn campaign_tags(&self, campaign_ids: &[CampaignId]) -> anyhow::Result<Vec<PlanTag>>;
+}
+
 /// Campaign groups, their members, their policies and the re-runs those filed.
 /// A campaign is in at most one group, and deleting a campaign removes its
 /// membership. SQL keeps them; no object store does.
@@ -1298,14 +1312,29 @@ pub trait CampaignGroupStore: Send + Sync {
     /// Each member of the group, in campaign id order, with its policy state.
     async fn policy_states(&self, group_id: &CampaignGroupId) -> anyhow::Result<Vec<GroupMember>>;
 
-    /// `false`, writing nothing, when the campaign is not a member of the
-    /// group, as after a move to another group.
+    /// The policy states of those of `campaign_ids` that are members of a
+    /// group, in campaign id order.
+    async fn member_states(&self, campaign_ids: &[CampaignId]) -> anyhow::Result<Vec<GroupMember>>;
+
+    /// Write `state` and `job_states` together, so the member's job states are
+    /// always those of its state's policies. `false`, writing nothing, when
+    /// the campaign is not a member of the group, as after a move to another
+    /// group.
     async fn set_policy_state(
         &self,
         group_id: &CampaignGroupId,
         campaign_id: &CampaignId,
         state: &GroupPolicyState,
+        job_states: &JobStateChanges,
     ) -> anyhow::Result<bool>;
+
+    /// The member's job states, in job id order. A row that does not decode
+    /// fails the read.
+    async fn job_states(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<Vec<JobPolicyState>>;
 
     /// Record `reruns`, re-runs the group's policies filed, keeping a row
     /// already recorded for a re-run job and kind as it is. The rows written.
@@ -1354,6 +1383,14 @@ pub struct EnabledPolicies {
     /// that group. Keyed as [`CampaignGroupStore::list_policies`] names the
     /// row.
     pub unreadable: Vec<(CampaignGroupId, UnreadableObjectError)>,
+}
+
+/// The job state rows a [`CampaignGroupStore::set_policy_state`] writes: `put`
+/// replaces a job's row or adds it, `removed` deletes one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct JobStateChanges {
+    pub put: Vec<JobPolicyState>,
+    pub removed: Vec<JobId>,
 }
 
 /// A member campaign of a group, as [`CampaignGroupStore::policy_states`]
@@ -1435,10 +1472,10 @@ pub trait AuditStore: Send + Sync {
     ) -> anyhow::Result<AuditPage>;
 
     /// Delete every event from before `cutoff`, returning how many went.
-    async fn prune_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64>;
+    async fn prune_before(&self, cutoff: Timestamp) -> anyhow::Result<u64>;
 
     /// How many events are from before `cutoff`: a prune's dry run.
-    async fn count_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64>;
+    async fn count_before(&self, cutoff: Timestamp) -> anyhow::Result<u64>;
 }
 
 /// The result when the store inserts a catalog entry. A live or tombstoned entry holds
@@ -1607,6 +1644,73 @@ pub fn merge_outcome(
     }
 }
 
+/// The outcome of a removal of the member `key` from `entry`, as the entry
+/// stands. [`DescriptorCatalogStore::remove_member`] writes the `Removed`
+/// result, and a dry run shows it.
+pub fn remove_outcome(
+    entry: Option<DescriptorEntry>,
+    key: &DescriptorMemberKey,
+) -> RemoveMemberOutcome {
+    let Some(entry) = entry else {
+        return RemoveMemberOutcome::NoSuchEntry;
+    };
+    if entry.state == DescriptorEntryState::Tombstoned {
+        return RemoveMemberOutcome::Tombstoned;
+    }
+    if entry.kind != DescriptorEntryKind::HandMade {
+        return RemoveMemberOutcome::ImporterKind(entry.kind);
+    }
+    // An entry holds at most one member for each key.
+    let (removed, kept): (Vec<_>, Vec<_>) = entry
+        .members
+        .into_inner()
+        .into_iter()
+        .partition(|member| &member.key() == key);
+    let Some(member) = removed.into_iter().next() else {
+        return RemoveMemberOutcome::NoSuchMember;
+    };
+    match NonEmptyVec::try_new(kept) {
+        Ok(members) => RemoveMemberOutcome::Removed {
+            entry: DescriptorEntry { members, ..entry },
+            member: Box::new(member),
+        },
+        Err(_) => RemoveMemberOutcome::LastMember,
+    }
+}
+
+/// The outcome of a move of the org entry `entry` to global scope, as the
+/// entry stands. `global_holder` is the global entry with the same name key,
+/// live or tombstoned. [`DescriptorCatalogStore::move_entry_to_global`] writes
+/// the `Moved` result, and a dry run shows it.
+pub fn move_to_global_outcome(
+    entry: Option<DescriptorEntry>,
+    global_holder: Option<(CatalogName, DescriptorEntryState)>,
+) -> MoveToGlobalOutcome {
+    let Some(mut entry) = entry else {
+        return MoveToGlobalOutcome::NoSuchEntry;
+    };
+    if entry.state == DescriptorEntryState::Tombstoned {
+        return MoveToGlobalOutcome::Tombstoned;
+    }
+    if let Some((name, state)) = global_holder {
+        return MoveToGlobalOutcome::GlobalNameTaken { name, state };
+    }
+    let global = CatalogScope::Global;
+    let creator = DescriptorEntryCreator::Operator;
+    let checked = DescriptorEntry::validate_scope_members(&global, &entry.members).and_then(|()| {
+        DescriptorEntry::validate_identity(&global, entry.kind, &creator, entry.descriptor_kind())
+    });
+    if let Err(error) = checked {
+        return MoveToGlobalOutcome::GlobalScope(error);
+    }
+    entry.scope = global;
+    let original_creator = std::mem::replace(&mut entry.created_by, creator);
+    MoveToGlobalOutcome::Moved {
+        entry,
+        original_creator,
+    }
+}
+
 /// Put the members of `source` after the members of `target`. A source member
 /// with the digest and the key of a target member is already in the target,
 /// so the merge skips it. The result passes
@@ -1644,6 +1748,48 @@ pub enum RelabelOutcome {
     SameLabel,
     /// Another member with the same format holds the new label.
     LabelTaken,
+}
+
+/// The outcome of a member removal from a hand-made entry. The other members
+/// keep their positions and digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveMemberOutcome {
+    /// The entry without the member, and the member that the store removed.
+    /// The member uses `Box` to avoid the `clippy::large_enum_variant` diagnostic.
+    Removed {
+        entry: DescriptorEntry,
+        member: Box<DescriptorMember>,
+    },
+    NoSuchEntry,
+    Tombstoned,
+    /// The importer owns the members of a stable or daily entry.
+    ImporterKind(DescriptorEntryKind),
+    NoSuchMember,
+    /// The member is the only member of the entry. An entry always has at
+    /// least one member.
+    LastMember,
+}
+
+/// The outcome of a move of an org entry to global scope. The members keep
+/// their positions and digests, and the org name is free after the move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveToGlobalOutcome {
+    /// The entry in global scope, with `operator` as its creator, and the
+    /// creator that the org entry had.
+    Moved {
+        entry: DescriptorEntry,
+        original_creator: DescriptorEntryCreator,
+    },
+    NoSuchEntry,
+    Tombstoned,
+    /// A live or tombstoned global entry holds the name.
+    GlobalNameTaken {
+        name: CatalogName,
+        state: DescriptorEntryState,
+    },
+    /// A global entry cannot hold the entry, for example because a member
+    /// names a vault source.
+    GlobalScope(EntryError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1780,8 +1926,8 @@ pub struct DigestHit {
     pub member_key: DescriptorMemberKey,
 }
 
-/// Only `[database]` keeps catalog records. A caller can add members only at the
-/// end of an entry.
+/// Only `[database]` keeps catalog records. A caller adds members at the end of
+/// an entry, and can remove a member from a hand-made entry.
 #[async_trait]
 pub trait DescriptorCatalogStore: Send + Sync {
     /// Serialize an importer's stable ranking and writes with operator state changes.
@@ -1843,6 +1989,25 @@ pub trait DescriptorCatalogStore: Send + Sync {
         from: &QuantizationLabel,
         to: &QuantizationLabel,
     ) -> anyhow::Result<RelabelOutcome>;
+    /// Remove the member with `key` from the hand-made entry `name`.
+    /// [`remove_outcome`] gives the result. The other members keep their
+    /// positions. The check and the write are one atomic step.
+    async fn remove_member(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        key: &DescriptorMemberKey,
+    ) -> anyhow::Result<RemoveMemberOutcome>;
+    /// Move the entry `name` of the organization `org` to global scope, with
+    /// its members. [`move_to_global_outcome`] gives the result. The check,
+    /// move, and audit event recording `actor` and the original creator are
+    /// one atomic step. An audit write failure leaves the entry unchanged.
+    async fn move_entry_to_global(
+        &self,
+        org: &OrgId,
+        name: &CatalogName,
+        actor: &pipette_plan_types::AuditActor,
+    ) -> anyhow::Result<MoveToGlobalOutcome>;
     async fn get_entry(
         &self,
         scope: &CatalogScope,
@@ -1892,13 +2057,13 @@ pub trait CatalogImportRunStore: Send + Sync {
         id: &str,
         command: &str,
         target_name: Option<&CatalogName>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<()>;
 
     async fn finish_run(
         &self,
         id: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
         finish: &CatalogImportRunFinish,
     ) -> anyhow::Result<()>;
 }
@@ -1987,8 +2152,8 @@ fn keep_newer(kept: &mut Option<RunMark>, run: Option<RunMark>) {
 #[cfg(test)]
 #[test]
 fn a_run_evidence_fold_keeps_the_newest_run_of_each_side() -> anyhow::Result<()> {
-    let t0 = DateTime::<Utc>::UNIX_EPOCH;
-    let t1 = t0 + chrono::Duration::minutes(1);
+    let t0 = jiff::Timestamp::UNIX_EPOCH;
+    let t1 = t0 + jiff::SignedDuration::from_mins(1);
     let client = ClientId::try_new("ev1_a")?;
     let run = |digest: &str, failed, at, version: &str| {
         RunEvidenceRow::of_run(
@@ -2735,7 +2900,7 @@ pub struct CellResult {
 pub struct PendingSourceMarker {
     pub plan_id: PlanId,
     /// Backend modification time, which the GC's age gate reads.
-    pub written_at: DateTime<Utc>,
+    pub written_at: Timestamp,
 }
 
 /// Which job owns a content digest. Past `plan_creating_max_age_secs` from
@@ -2744,7 +2909,7 @@ pub struct PendingSourceMarker {
 pub struct ContentKeyRecord {
     pub job_id: JobId,
     pub plan_id: PlanId,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A handle on the exact bytes of a content-key record, for a CAS. A version
@@ -2797,7 +2962,7 @@ pub struct JobPlanMarker {
     pub plan_id: PlanId,
     pub expires_at: ExpiresAt,
     /// Backend modification time, which the GC's age gate reads.
-    pub written_at: DateTime<Utc>,
+    pub written_at: Timestamp,
 }
 
 #[derive(Debug)]
@@ -3006,7 +3171,7 @@ pub trait TodoStore: Send + Sync {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<Option<serde_json::Value>>;
 
     /// Heartbeat: atomically rename the client's lease to `new_expiry`. The
@@ -3015,7 +3180,7 @@ pub trait TodoStore: Send + Sync {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        new_expiry: DateTime<Utc>,
+        new_expiry: Timestamp,
     ) -> anyhow::Result<RenewLeaseResult>;
 
     /// Idempotent.
@@ -3024,7 +3189,7 @@ pub trait TodoStore: Send + Sync {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        expiry: DateTime<Utc>,
+        expiry: Timestamp,
     ) -> anyhow::Result<()>;
 
     // ── avail/ → leased/ (claim) ─────────────────────────────────────────
@@ -3035,7 +3200,7 @@ pub trait TodoStore: Send + Sync {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<ClaimResult>;
 
     /// Returns the client's live lease or grants a lease on a free eligible job. A free
@@ -3068,12 +3233,12 @@ pub trait TodoStore: Send + Sync {
     async fn claim_for_client(
         &self,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&Lease>,
         cached: Option<&CachedArtifacts>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ClaimOutcome>;
 
     /// Renews the client's lease on `job_id` to `lease_expiry`. If the client
@@ -3089,9 +3254,9 @@ pub trait TodoStore: Send + Sync {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ReclaimOutcome>;
 
     // ── avail/ → avail/ (re-date) ───────────────────────────────────────────
@@ -3109,7 +3274,7 @@ pub trait TodoStore: Send + Sync {
     /// horizon among its member plans that has not passed at `now`, `never`
     /// after every date. A plan's horizon is the latest of its markers. A leased
     /// job and a job with no such member keep theirs. Returns the jobs changed.
-    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64>;
+    async fn restamp_avail_deadlines(&self, now: Timestamp) -> anyhow::Result<u64>;
 
     // ── leased/ → avail/ (lease recycle) ────────────────────────────────────
     /// Atomic rename back to the exact key the job was claimed from; a pure
@@ -3119,7 +3284,7 @@ pub trait TodoStore: Send + Sync {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<RecycleResult>;
 
     /// Forgets the artifacts of the last job granted to `client_id` if that job
@@ -3239,13 +3404,10 @@ pub trait TodoStore: Send + Sync {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<()>;
     /// Oldest first; foreign names are skipped.
-    async fn list_lost_leases(
-        &self,
-        job_id: &JobId,
-    ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>>;
+    async fn list_lost_leases(&self, job_id: &JobId) -> anyhow::Result<Vec<(ClientId, Timestamp)>>;
     /// Idempotent.
     async fn delete_lost_leases_for_job(&self, job_id: &JobId) -> anyhow::Result<()>;
     async fn list_lost_lease_jobs(&self) -> anyhow::Result<Vec<JobId>>;
@@ -3300,7 +3462,7 @@ pub trait TodoStore: Send + Sync {
     async fn campaign_backlog(
         &self,
         client_id: &ClientId,
-        creating_before: DateTime<Utc>,
+        creating_before: Timestamp,
     ) -> anyhow::Result<CampaignBacklog>;
 
     // ── liveness/ ───────────────────────────────────────────────────────────
@@ -3308,9 +3470,9 @@ pub trait TodoStore: Send + Sync {
     /// last-seen time; on S3 the server's clock sets it, so replicas agree.
     /// The database store writes only while the client record exists.
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()>;
-    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>>;
+    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<Timestamp>>;
     /// One listing, no body read; a name that is not a client id is warned and skipped.
-    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>>;
+    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, Timestamp)>>;
     /// Idempotent.
     async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()>;
 }
@@ -3343,6 +3505,8 @@ pub struct Stores {
     pub campaigns: Arc<dyn CampaignStore>,
     /// `None` without a `[database]`: no object store keeps campaign groups.
     pub campaign_groups: Option<Arc<dyn CampaignGroupStore>>,
+    /// `None` without a `[database]`: no object store keeps plan tags.
+    pub plan_tags: Option<Arc<dyn PlanTagStore>>,
     pub model_params: Arc<dyn ModelParamsStore>,
     /// `None` without a `[database]`: no object store keeps the audit log.
     pub audit: Option<Arc<dyn AuditStore>>,

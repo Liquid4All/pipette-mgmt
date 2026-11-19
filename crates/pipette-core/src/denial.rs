@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
@@ -46,7 +46,7 @@ const UNREADABLE_REASON: &str = "reason unreadable";
 pub struct DenialRecord {
     /// When the server accepted the failure report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub denied_at: Option<DateTime<Utc>>,
+    pub denied_at: Option<Timestamp>,
     /// The client's `failure_reason`, cut to [`MAX_STORED_REASON_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
@@ -62,7 +62,7 @@ pub struct DenialRecord {
 
 impl DenialRecord {
     pub fn new(
-        denied_at: DateTime<Utc>,
+        denied_at: Timestamp,
         failure_reason: &str,
         failure_code: FailureCode,
         client_version: Option<&str>,
@@ -223,11 +223,11 @@ struct ReasonGroup {
     clients: Vec<String>,
     /// The shown text of the most recent reason in the group, and its time.
     /// `None` for a group that holds no reason.
-    latest: Option<(Option<DateTime<Utc>>, String)>,
+    latest: Option<(Option<Timestamp>, String)>,
 }
 
 impl ReasonGroup {
-    fn add(&mut self, client_id: &ClientId, at: Option<DateTime<Utc>>, shown: Option<String>) {
+    fn add(&mut self, client_id: &ClientId, at: Option<Timestamp>, shown: Option<String>) {
         self.clients.push(client_id.to_string());
         if let Some(shown) = shown
             && self.latest.as_ref().is_none_or(|(latest, _)| at > *latest)
@@ -668,7 +668,7 @@ mod tests {
                 Ok(DeniedClient {
                     client_id: ClientId::try_new(client_id)?,
                     record: Some(DenialRecord::new(
-                        Utc::now(),
+                        Timestamp::now(),
                         &reason(pid),
                         FailureCode::Unspecified,
                         None,
@@ -726,7 +726,7 @@ mod tests {
     fn new_caps_the_stored_fields() -> anyhow::Result<()> {
         let long = "x".repeat(MAX_STORED_REASON_BYTES * 2);
         let record = DenialRecord::new(
-            Utc::now(),
+            Timestamp::now(),
             &long,
             FailureCode::OutOfMemory,
             Some("1.4.2"),

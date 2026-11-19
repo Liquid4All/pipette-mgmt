@@ -1621,7 +1621,7 @@ mod tests {
             "{limit}"
         );
         anyhow::ensure!(
-            lifetime.contains(&format!("{} days", MAX_KEY_LIFETIME.num_days())),
+            lifetime.contains(&format!("{} days", MAX_KEY_LIFETIME.as_hours() / 24)),
             "{lifetime}"
         );
         Ok(())

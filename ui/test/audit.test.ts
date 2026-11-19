@@ -72,7 +72,7 @@ describe("the filters", () => {
 });
 
 describe("a row", () => {
-  const names = { user_1: "ana@acme.example", ev1_a: "bos-17pro-1", org_1: "acme", campaign_1: "nightly" };
+  const names = { user_1: "ana@acme.example", ev1_a: "bos-17pro-1", org_1: "Acme Corp.", campaign_1: "nightly" };
 
   test("an actor reads by its name, linked to its page, the id on hover", () => {
     expect(actorShown({ type: "user", user_id: "user_1", key_id: "userkey_1" }, names)).toEqual({
@@ -117,6 +117,20 @@ describe("a row", () => {
       .toBe("pipette-mgmt orgs create");
   });
 
+  test("a catalog removal shows the member and entry, with its scope and digest on hover", () => {
+    expect(actionShown({ action: { type: "catalog_remove_member", name: "AcmeLM", scope: "global",
+                                   member: "gguf::q4_0", digest: "digest_a" }, outcome: "succeeded" }))
+      .toEqual({ text: "Removed catalog member gguf::q4_0 from AcmeLM",
+                 title: "global: AcmeLM\ngguf::q4_0: digest_a", status: null });
+  });
+
+  test("a move to global scope shows the entry and organization, with the original creator on hover", () => {
+    expect(actionShown({ action: { type: "catalog_move_to_global", name: "AcmeLM", org_id: "org_acme",
+                                   original_created_by: "account:user_a" }, outcome: "succeeded" }))
+      .toEqual({ text: "Moved catalog entry AcmeLM from org_acme to global scope",
+                 title: "org_acme: AcmeLM\ncreated by account:user_a", status: null });
+  });
+
   test("a first Clerk sign-in reads as the keys the account held, each on hover", () => {
     const key = (key_id: string, key_details: string) =>
       ({ key_id, key_details, public_key: "00", added_at: "2026-10-01T00:00:00Z" });
@@ -158,7 +172,7 @@ describe("a row", () => {
       .toEqual({ text: "nightly", href: "/app/campaigns/campaign_1", title: "campaign_1", id: false });
     expect(targetShown({ type: "job", job_id: "job-1" }, named))
       .toEqual({ text: "job-1", href: null, title: undefined, id: true });
-    expect(targetHref({ type: "org", org_id: "org_1" }, named)).toBe("/app/orgs/acme");
+    expect(targetHref({ type: "org", org_id: "org_1" }, named)).toBe("/app/orgs/org_1");
     expect(targetHref({ type: "vault_resource", resource_id: "vault_1" }, named)).toBe("/app/vault/vault_1");
     expect(targetHref({ type: "user", user_id: "user_1" }, named)).toBe("/app/users/user_1");
     expect(targetHref({ type: "client", client_id: "ev1_a" }, named)).toBe("/app/clients/ev1_a");

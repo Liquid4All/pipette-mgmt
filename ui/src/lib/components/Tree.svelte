@@ -1,6 +1,6 @@
 <script lang="ts">
   // The classic console's tree (`static/templates/layout.html`), leaf for leaf.
-  import { administersOrg, ownOrg, type OrgRef } from "../orgs";
+  import { administersOrg, orgName, ownOrg, type OrgRef } from "../orgs";
   import { here } from "../route.svelte";
   import { match, orgLink, orgOf, pathOf } from "../routes";
   import { session } from "../session.svelte";
@@ -55,11 +55,11 @@
       {#each branches as { org, open } (org.org_id)}
         {#if open}
           <li>
-            <span class="org">{org.slug}</span>
+            <span class="org">{orgName(org)}</span>
             <ul>{@render leaves(orgLeaves(org, readsOf(org)))}</ul>
           </li>
         {:else}
-          <li><a href={orgLink(org)}>{org.slug}</a></li>
+          <li><a href={orgLink(org)}>{orgName(org)}</a></li>
         {/if}
       {/each}
     </ul>

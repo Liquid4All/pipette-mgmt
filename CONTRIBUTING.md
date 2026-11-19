@@ -139,16 +139,15 @@ merges.
 | Job | Runs | What it does |
 |-----|------|--------------|
 | `supply chain (cargo-deny)` | PR, push, daily | `cargo deny check -D advisory-not-detected advisories bans sources` against [`deny.toml`](deny.toml). `check licenses` stays in `ci.yml`, next to the attribution it produces |
-| `unused deps (cargo-machete)` | PR, push, daily | `cargo-machete`: a dependency kept past its last caller |
 | `secrets (gitleaks)` | PR, push, daily | `gitleaks git --redact` over the commits a pull request adds, and over the whole history on `main` and on the cron. Allowlist in [`.gitleaks.toml`](.gitleaks.toml) |
 
-The three install their tools from pinned release tarballs whose SHA-256
+The two install their tools from pinned release tarballs whose SHA-256
 [`ci/install-tool.sh`](ci/install-tool.sh) verifies, rather than resolving
 whatever is latest: a gate that changes version on its own can start failing,
 or quietly stop finding things, on someone else's release day. Nothing bumps
 those pins for you. They are a table in that script, which `ci.yml` also reads
 for the `cargo-deny` behind the license check, and which the other Pipette
-repositories carry verbatim with the same three jobs, so a change here is a
+repositories carry verbatim with the same jobs, so a change here is a
 change to make in each of them.
 
 The `security.yml` jobs are not inside `build-complete`, which can only

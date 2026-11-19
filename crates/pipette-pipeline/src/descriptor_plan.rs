@@ -286,7 +286,7 @@ fn member_keys(entry: &DescriptorEntry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rstest::rstest;
     use serde_json::json;
 
@@ -346,7 +346,7 @@ requires = ["os:ios"]
                         "repository_version": "b1",
                         "flavor": flavor
                     }))?,
-                    Utc::now(),
+                    Timestamp::now(),
                 )?)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -355,8 +355,8 @@ requires = ["os:ios"]
             CatalogName::try_new("llama")?,
             DescriptorEntryKind::Stable,
             DescriptorEntryState::Active,
-            Utc::now(),
-            Utc::now(),
+            Timestamp::now(),
+            Timestamp::now(),
             DescriptorEntryCreator::ImporterLlamacpp,
             NonEmptyVec::try_new(members)?,
         )?;
@@ -435,7 +435,7 @@ requires = ["os:ios"]
                 "repository_version": "b1",
                 "flavor": "ios-arm64"
             }))?,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let flag = member
             .app_build_flag()
@@ -445,8 +445,8 @@ requires = ["os:ios"]
             CatalogName::try_new("llama")?,
             DescriptorEntryKind::HandMade,
             DescriptorEntryState::Active,
-            Utc::now(),
-            Utc::now(),
+            Timestamp::now(),
+            Timestamp::now(),
             DescriptorEntryCreator::Operator,
             NonEmptyVec::try_new(vec![member])?,
         )?;
@@ -648,15 +648,15 @@ requires = ["os:ios"]
                 "principal_id": "org_1"
             }))?,
             QuantizationLabel::try_new("q4_0")?,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         let entry = DescriptorEntry::new(
             CatalogScope::Org(OrgId::try_new("org_1")?),
             CatalogName::try_new("model")?,
             DescriptorEntryKind::HandMade,
             DescriptorEntryState::Active,
-            Utc::now(),
-            Utc::now(),
+            Timestamp::now(),
+            Timestamp::now(),
             DescriptorEntryCreator::Operator,
             NonEmptyVec::try_new(vec![member])?,
         )?;

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use chrono::{TimeZone, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -845,7 +845,7 @@ async fn test_recycled_lease_is_reindexed() -> anyhow::Result<()> {
 
     // The lease outlives this run, so the recycle below is ours, not the
     // expired-lease pass's.
-    let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+    let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let claimed = state
         .todo_store
         .claim_job(&job, ExpiresAt::Never, &holder, lease_expiry)
@@ -1090,7 +1090,7 @@ async fn test_deferred_reindex_settles_when_leased_job_recycles(
     run_qm(state).await?;
     assert_eq!(eligible_jobs(state, &client).await?, vec![job.clone()]);
 
-    let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+    let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let claimed = state
         .todo_store
         .claim_job(&job, ExpiresAt::Never, &other, lease_expiry)
@@ -1131,11 +1131,11 @@ async fn test_deferred_reindex_settles_when_leased_job_recycles(
 /// A live lease is left alone and an expired one recycled; either way the job
 /// is live, so its eligible marker survives the GC sweep.
 #[rstest]
-#[case::live_lease(chrono::Duration::hours(1), false)]
-#[case::expired_lease(-chrono::Duration::minutes(1), true)]
+#[case::live_lease(jiff::SignedDuration::from_hours(1), false)]
+#[case::expired_lease(-jiff::SignedDuration::from_mins(1), true)]
 #[tokio::test]
 async fn test_leased_job_survives_sweep_and_recycles_on_expiry(
-    #[case] lease_offset: chrono::Duration,
+    #[case] lease_offset: jiff::SignedDuration,
     #[case] expect_recycled: bool,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1158,7 +1158,12 @@ async fn test_leased_job_survives_sweep_and_recycles_on_expiry(
 
     let claimed = state
         .todo_store
-        .claim_job(&job, ExpiresAt::Never, &client, Utc::now() + lease_offset)
+        .claim_job(
+            &job,
+            ExpiresAt::Never,
+            &client,
+            Timestamp::now() + lease_offset,
+        )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
 
@@ -1196,10 +1201,7 @@ async fn test_expired_job_with_unrecordable_body_is_deleted(
     let state = &queue.state;
 
     let (_, client) = register_and_approve(state).await?;
-    let deadline = Utc
-        .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
+    let deadline = "2020-01-02T03:04:05Z".parse::<jiff::Timestamp>()?;
     let job = seed_avail(
         state.todo_store.as_ref(),
         "job-1",
@@ -1250,10 +1252,7 @@ async fn test_expired_job_teardown(
     let state = &queue.state;
 
     let (_, client) = register_and_approve(state).await?;
-    let deadline = Utc
-        .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
+    let deadline = "2020-01-02T03:04:05Z".parse::<jiff::Timestamp>()?;
     let mut body = expirable_body("job-1", &[&client]);
     if let Some(benchmark_id) = benchmark_override {
         body["spec"]["benchmark"] = json!(benchmark_id);
@@ -1322,10 +1321,7 @@ async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Resu
     let state = &queue.state;
 
     let (_, client) = register_and_approve(state).await?;
-    let deadline = Utc
-        .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
+    let deadline = "2020-01-02T03:04:05Z".parse::<jiff::Timestamp>()?;
     let mut body = expirable_body("job-1", &[&client]);
     body["expires_at"] = json!(ExpiresAt::At(deadline).to_string());
     let job = seed_avail(
@@ -1342,7 +1338,7 @@ async fn test_expired_lease_on_expired_job_resolves_in_one_run() -> anyhow::Resu
             &job,
             ExpiresAt::At(deadline),
             &client,
-            Utc::now() - chrono::Duration::minutes(1),
+            Timestamp::now() - jiff::SignedDuration::from_mins(1),
         )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
@@ -1406,7 +1402,7 @@ async fn test_stale_lease_for_recorded_job_deleted_not_recycled() -> anyhow::Res
             &job,
             ExpiresAt::Never,
             &client,
-            Utc::now() - chrono::Duration::minutes(1),
+            Timestamp::now() - jiff::SignedDuration::from_mins(1),
         )
         .await?;
     assert!(matches!(claimed, ClaimResult::Claimed(_)));
@@ -1460,7 +1456,7 @@ async fn lose_lease(
     client: &ClientId,
     minutes_ago: i64,
 ) -> anyhow::Result<()> {
-    let lapsed = Utc::now() - chrono::Duration::minutes(minutes_ago);
+    let lapsed = Timestamp::now() - jiff::SignedDuration::from_mins(minutes_ago);
     let claimed = state
         .todo_store
         .claim_job(job, ExpiresAt::Never, client, lapsed)
@@ -1573,10 +1569,7 @@ async fn test_expired_job_with_existing_record_not_overwritten(
     let state = &queue.state;
 
     let (_, client) = register_and_approve(state).await?;
-    let deadline = Utc
-        .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("ambiguous or invalid datetime"))?;
+    let deadline = "2020-01-02T03:04:05Z".parse::<jiff::Timestamp>()?;
     let job = seed_avail(
         state.todo_store.as_ref(),
         "job-1",
@@ -2047,7 +2040,7 @@ fn plan_manifest(plan_id: &PlanId, status: PlanStatus, job_ids: &[&JobId]) -> Pl
         plan_warnings: Vec::new(),
         plan_id: plan_id.clone(),
         status,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         submitted_by: None,
         benchmark_types: Default::default(),
         job_ids: job_ids.iter().map(|j| (*j).clone()).collect(),
@@ -2123,7 +2116,7 @@ async fn test_cancel_marker_tears_down_avail_and_leased_jobs() -> anyhow::Result
     run_qm(state).await?;
     assert!(eligible_jobs(state, &client).await?.contains(&queued));
 
-    let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+    let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     state
         .todo_store
         .claim_job(&running, ExpiresAt::Never, &client, lease_expiry)
@@ -2214,7 +2207,7 @@ async fn test_teardown_makes_the_holders_next_heartbeat_404() -> anyhow::Result<
             &running,
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
 
@@ -2269,7 +2262,7 @@ async fn test_a_result_submitted_before_teardown_lands() -> anyhow::Result<()> {
             &running,
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
 
@@ -2335,7 +2328,7 @@ async fn test_a_result_submitted_after_teardown_404s_and_writes_nothing() -> any
             &running,
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
 
@@ -2452,7 +2445,7 @@ async fn test_plan_stays_cancelling_until_teardown_finishes() -> anyhow::Result<
         &expirable_body("job-stuck", &[&client]),
     )
     .await?;
-    let lease_expiry = Utc::now() + chrono::Duration::hours(1);
+    let lease_expiry = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     state
         .todo_store
         .claim_job(&job, ExpiresAt::Never, &client, lease_expiry)
@@ -2610,7 +2603,7 @@ async fn test_marker_for_terminal_plan_is_collected_without_touching_status(
     let state = &queue.state;
 
     let plan_id = test_plan_id();
-    let stamped = Utc::now() - chrono::Duration::days(1);
+    let stamped = Timestamp::now() - jiff::SignedDuration::from_hours(24);
     let manifest = PlanManifest {
         created_at: stamped,
         terminal_at: Some(stamped),
@@ -2745,7 +2738,7 @@ async fn test_terminal_plan_is_kept_however_old(
     let plan_id = test_plan_id();
     let job_id = JobId::from_uuid(uuid::Uuid::from_u128(7));
     let job_source = json!({ "job_id": job_id.as_str() });
-    let ancient = Utc::now() - chrono::Duration::days(3650);
+    let ancient = Timestamp::now() - jiff::SignedDuration::from_hours(3650 * 24);
     let source = pipette_core::plan::PlanSource::new("benchmarks = [\"mmlu\"]\n".to_string())?;
     let terminal_at = stamped.then_some(ancient);
     let manifest = PlanManifest {
@@ -2800,7 +2793,7 @@ async fn test_an_old_live_plan_is_kept() -> anyhow::Result<()> {
     let state = &queue.state;
     let (_, client) = register_and_approve(state).await?;
 
-    let ancient = Utc::now() - chrono::Duration::days(365);
+    let ancient = Timestamp::now() - jiff::SignedDuration::from_hours(365 * 24);
 
     let job = seed_avail(
         state.todo_store.as_ref(),
@@ -3351,7 +3344,7 @@ async fn test_leased_job_keeps_plan_active_without_a_matching_client() -> anyhow
             &job,
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
 
@@ -3712,7 +3705,7 @@ async fn test_plan_index_gc_waits_for_the_age_gate_and_a_second_sighting() -> an
             &pipette_store::ContentKeyRecord {
                 job_id: dead.clone(),
                 plan_id: owner.clone(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
             },
         )
         .await?;
@@ -3900,7 +3893,7 @@ async fn test_one_result_advances_both_plans_holding_the_job() -> anyhow::Result
             &shared,
             ExpiresAt::Never,
             &client,
-            Utc::now() + chrono::Duration::hours(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
         )
         .await?;
     let mut body = valid_submission("prefill_throughput_256");
@@ -3930,12 +3923,12 @@ async fn test_one_result_advances_both_plans_holding_the_job() -> anyhow::Result
 
 // ─── per-plan job expirations ───────────────────────────────────────────────
 
-fn lapsed() -> ExpiresAt {
-    ExpiresAt::At(Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap())
+fn lapsed() -> anyhow::Result<ExpiresAt> {
+    Ok(ExpiresAt::At("2020-01-02T03:04:05Z".parse()?))
 }
 
-fn distant() -> ExpiresAt {
-    ExpiresAt::At(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap())
+fn distant() -> anyhow::Result<ExpiresAt> {
+    Ok(ExpiresAt::At("2099-01-01T00:00:00Z".parse()?))
 }
 
 async fn lapse_of(
@@ -3968,7 +3961,7 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
     let shared = seed_avail(
         state.todo_store.as_ref(),
         "job-shared",
-        lapsed(),
+        lapsed()?,
         &expirable_body("job-shared", &[&client]),
     )
     .await?;
@@ -3977,15 +3970,15 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
     let solo = seed_avail(
         state.todo_store.as_ref(),
         "job-solo",
-        distant(),
+        distant()?,
         &expirable_body("job-solo", &[&client]),
     )
     .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
-    seed_membership(state, &shared, &sooner, lapsed()).await?;
-    seed_membership(state, &shared, &later, distant()).await?;
-    seed_membership(state, &solo, &sooner, distant()).await?;
+    seed_membership(state, &shared, &sooner, lapsed()?).await?;
+    seed_membership(state, &shared, &later, distant()?).await?;
+    seed_membership(state, &solo, &sooner, distant()?).await?;
     seed_plan(
         state,
         &plan_manifest(&sooner, PlanStatus::Active, &[&shared, &solo]),
@@ -4001,7 +3994,7 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
 
     run_qm(state).await?;
 
-    assert_eq!(lapse_of(state, &sooner, &shared).await?, Some(lapsed()));
+    assert_eq!(lapse_of(state, &sooner, &shared).await?, Some(lapsed()?));
     let sooner_manifest = read_plan(state, &sooner).await?;
     assert_eq!(sooner_manifest.status, PlanStatus::Active);
     let counts = sooner_manifest
@@ -4026,9 +4019,10 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
         (1, 1, 0)
     );
 
+    let expires_at = distant()?;
     let entry = |job_id: &JobId| AvailEntry {
         job_id: job_id.clone(),
-        expires_at: distant(),
+        expires_at,
     };
     let mut want = vec![entry(&shared), entry(&solo)];
     want.sort_by(|a, b| a.job_id.cmp(&b.job_id));
@@ -4037,7 +4031,7 @@ async fn test_a_lapsed_member_re_dates_the_job_for_its_other_plan() -> anyhow::R
     markers.sort();
     assert_eq!(
         markers,
-        vec![(shared, distant()), (solo, distant())],
+        vec![(shared, distant()?), (solo, distant()?)],
         "the eligible markers follow the re-dated key in the same run"
     );
     Ok(())
@@ -4058,14 +4052,14 @@ async fn test_the_last_member_horizon_lapsing_retires_the_job() -> anyhow::Resul
     let shared = seed_avail(
         state.todo_store.as_ref(),
         "job-shared",
-        lapsed(),
+        lapsed()?,
         &expirable_body("job-shared", &[&client]),
     )
     .await?;
     let first = test_plan_id();
     let second = other_plan_id();
     for plan_id in [&first, &second] {
-        seed_membership(state, &shared, plan_id, lapsed()).await?;
+        seed_membership(state, &shared, plan_id, lapsed()?).await?;
         seed_plan(
             state,
             &plan_manifest(plan_id, PlanStatus::Active, &[&shared]),
@@ -4086,7 +4080,7 @@ async fn test_the_last_member_horizon_lapsing_retires_the_job() -> anyhow::Resul
     assert!(members(state, &shared).await?.is_empty());
 
     for plan_id in [&first, &second] {
-        assert_eq!(lapse_of(state, plan_id, &shared).await?, Some(lapsed()));
+        assert_eq!(lapse_of(state, plan_id, &shared).await?, Some(lapsed()?));
         let manifest = read_plan(state, plan_id).await?;
         assert_eq!(
             manifest.status,
@@ -4116,14 +4110,14 @@ async fn test_a_plan_completes_when_its_last_job_lapses() -> anyhow::Result<()> 
     let shared = seed_avail(
         state.todo_store.as_ref(),
         "job-shared",
-        lapsed(),
+        lapsed()?,
         &expirable_body("job-shared", &[&client]),
     )
     .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
-    seed_membership(state, &shared, &sooner, lapsed()).await?;
-    seed_membership(state, &shared, &later, distant()).await?;
+    seed_membership(state, &shared, &sooner, lapsed()?).await?;
+    seed_membership(state, &shared, &later, distant()?).await?;
     seed_plan(
         state,
         &plan_manifest(&sooner, PlanStatus::Active, &[&shared]),
@@ -4175,8 +4169,8 @@ async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
     .await?;
     let sooner = test_plan_id();
     let later = other_plan_id();
-    seed_membership(state, &shared, &sooner, lapsed()).await?;
-    seed_membership(state, &shared, &later, distant()).await?;
+    seed_membership(state, &shared, &sooner, lapsed()?).await?;
+    seed_membership(state, &shared, &later, distant()?).await?;
     seed_plan(
         state,
         &plan_manifest(&sooner, PlanStatus::Active, &[&shared]),
@@ -4192,7 +4186,7 @@ async fn test_a_lapse_outranks_a_live_lease() -> anyhow::Result<()> {
 
     run_qm(state).await?;
 
-    assert_eq!(lapse_of(state, &sooner, &shared).await?, Some(lapsed()));
+    assert_eq!(lapse_of(state, &sooner, &shared).await?, Some(lapsed()?));
     let counts = read_plan(state, &sooner)
         .await?
         .progress_snapshot
@@ -4238,7 +4232,7 @@ async fn test_a_recorded_job_is_never_recorded_as_lapsed() -> anyhow::Result<()>
 
     // The plan's horizon has since passed, but the answer arrived first.
     let plan_id = test_plan_id();
-    seed_membership(state, &done, &plan_id, lapsed()).await?;
+    seed_membership(state, &done, &plan_id, lapsed()?).await?;
     seed_plan(
         state,
         &plan_manifest(&plan_id, PlanStatus::Active, &[&done]),
@@ -4281,7 +4275,7 @@ async fn test_a_replaced_plan_leaving_moves_the_job_to_the_revisions_horizon() -
     let carried = seed_avail(
         state.todo_store.as_ref(),
         "job-carried",
-        distant(),
+        distant()?,
         &expirable_body("job-carried", &[&client]),
     )
     .await?;
@@ -4294,7 +4288,7 @@ async fn test_a_replaced_plan_leaving_moves_the_job_to_the_revisions_horizon() -
     .await?;
     let replaced = test_plan_id();
     let revision = other_plan_id();
-    seed_membership(state, &carried, &replaced, distant()).await?;
+    seed_membership(state, &carried, &replaced, distant()?).await?;
     seed_membership(state, &carried, &revision, revised).await?;
     seed_membership(state, &due_between, &revision, between).await?;
     seed_plan(
@@ -4347,13 +4341,13 @@ async fn test_a_joiner_with_an_earlier_horizon_lowers_the_row_next_run() -> anyh
     let job = seed_avail(
         state.todo_store.as_ref(),
         "job-joined",
-        distant(),
+        distant()?,
         &expirable_body("job-joined", &[&client]),
     )
     .await?;
     let minter = test_plan_id();
     let joiner = other_plan_id();
-    seed_membership(state, &job, &minter, distant()).await?;
+    seed_membership(state, &job, &minter, distant()?).await?;
     seed_plan(
         state,
         &plan_manifest(&minter, PlanStatus::Active, &[&job]),
@@ -4379,7 +4373,7 @@ async fn test_a_joiner_with_an_earlier_horizon_lowers_the_row_next_run() -> anyh
             .await?,
         vec![AvailEntry {
             job_id: job.clone(),
-            expires_at: distant()
+            expires_at: distant()?
         }]
     );
 
@@ -4413,21 +4407,21 @@ async fn test_a_marker_naming_a_superseded_deadline_is_collected_at_once() -> an
     let job = seed_avail(
         state.todo_store.as_ref(),
         "job-1",
-        distant(),
+        distant()?,
         &expirable_body("job-1", &[&client]),
     )
     .await?;
     // The residue of a re-date whose run died before the index passes ran.
     state
         .todo_store
-        .write_eligible(&client, &job, lapsed())
+        .write_eligible(&client, &job, lapsed()?)
         .await?;
 
     run_qm(state).await?;
 
     assert_eq!(
         state.todo_store.list_eligible_for_client(&client).await?,
-        vec![(job, distant())],
+        vec![(job, distant()?)],
         "only the marker naming the job's current key survives"
     );
     Ok(())
@@ -4449,7 +4443,7 @@ async fn queue_register_claim_and_recycle() -> anyhow::Result<()> {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let claimed: Value = serde_json::from_slice(&bytes)?;
     assert_eq!(claimed["job_id"], job.as_str());
-    let expired = Utc::now() - chrono::Duration::hours(1);
+    let expired = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     assert_eq!(
         state.todo_store.renew_lease(&job, &client, expired).await?,
         RenewLeaseResult::Renewed(ExpiresAt::Never)

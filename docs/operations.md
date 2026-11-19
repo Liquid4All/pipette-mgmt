@@ -364,13 +364,16 @@ member:
   file a revision with a document the server takes, such as one with a later
   `expires_at`.
 - **A job that waits for rows** (`jobs_waiting_for_rows`): an answered job
-  with no rows in pipette-duckdb yet, read again on every run. Its rows land
-  once a scoring run has scored the result, every 5 minutes with the crons
-  above, and pipette-duckdb has published them. An eval that failed every
-  scoring pass is parked, and gets no rows until it is retried
-  ([storage.md §4](storage.md#4-submission-contract)): list
-  `submissions/score-queue/parked/`, then move the body back to `to_do/` and
-  delete its `failures/` entry.
+  with no rows in pipette-duckdb yet, whose submission body gives no re-run.
+  Each run reads its body and its rows again. The cron jobs above score results
+  every 5 minutes. The rows become available after pipette-duckdb publishes
+  them. An eval's job never waits here: the
+  policies judge no eval ([policies](api/campaign-groups.md#policies)). The
+  Re-run candidates have a second body read before filing. If the body changed
+  or disappeared, the job waits for the next run. The
+  `WARN` `queue-maintenance: a flagged submission body or its vault names did
+  not read; the job waits for its rows` names a job whose body gives a re-run
+  that the run did not file, because the body or vault read failed.
 - **Result rows that lack model params** (`models_missing_params`), while the
   group's `model_params` policy is on: the `INFO` `queue-maintenance: result
   rows lack model params` names the campaign, the `key` an entry for the model
@@ -425,7 +428,10 @@ carrying its figures as fields:
   `members_not_reached` within the 60 s, the `members_unreadable` and
   `members_skipped`, the `revisions` with their `rerun_jobs` and `marked_jobs`,
   the `reruns_recorded` for them and the `reruns_judged`, whose outcome the run
-  recorded, `jobs_waiting_for_rows`, `members_waiting_for_devices`,
+  recorded, `jobs_waiting_for_rows`, the `body_reads` of submission bodies for
+  answered jobs with no rows (including the second reads of re-run candidates),
+  the `body_reruns` that those bodies re-ran in
+  revisions that advanced, `members_waiting_for_devices`,
   `filings_not_advanced`, the `cancel_markers_written` on them,
   `filings_stopped` by someone stopping the plan they revise, `refused_heads`,
   `other_owner_members`, `jobs_left_for_good`, `models_missing_params`, the
@@ -434,6 +440,10 @@ carrying its figures as fields:
   run's start, the queue passes included. A pass that cannot read the policies
   logs no line. Alert when `run_duration_ms` passes 5 minutes: such a run holds
   back the next one's lease recycling.
+- `queue-maintenance: a campaign group filing re-runs a job on the rows of its
+  submission body`, once per job that a revision that advanced re-runs before
+  pipette-duckdb has its rows: the `group_id`, the `campaign_id`, the `job_id`
+  and the revision's plan (`filed`).
 - `queue-maintenance: result rows lack model params`, once per key and member
   campaign while the group's `model_params` policy is on: the `campaign_id`,
   the `key` an entry would take, and the `rows` and `jobs` read this run that
@@ -561,6 +571,98 @@ files re-runs and records none.
    without one it exits naming it. It prints the filings it read and the rows it
    recorded. A run that fails can run again: a second run records only the
    rows still missing.
+
+### 3.7. Stop the writes to `plan_jobs`
+
+The table `plan_job_spans` records plan membership
+([storage.md §4.7](storage.md#47-the-plan-job-spans)). This release stops the
+writes to `plan_jobs` and removes the span backfill command. The release has no
+migration. The `plan_jobs` table stays in the schema until a later release
+drops it.
+
+Before the deploy:
+
+- Confirm that the `pipette-mgmt` service reads spans in production and that
+  no read fails.
+- Confirm that the pipette-duckdb reader reads `plan_job_rows` in production.
+  Revoke `SELECT ON public.plan_jobs` from the pipette-duckdb reader role, then
+  run one pipette-duckdb refresh. The refresh must succeed and publish the
+  plans. If it fails, the reader still reads `plan_jobs`: grant the privilege
+  again and do not deploy.
+- Run `db backfill-plan-job-spans --dry-run` with the deployed release. The
+  command must exit 0 and report no lineage that differs. If the command fails
+  or does not run, do not deploy. This run is the last valid comparison with
+  `plan_jobs`.
+
+Deploy the release. Wait until no task of the previous build runs. During a
+rolling deploy, old tasks can still write `plan_jobs`. Confirm that a new
+campaign revision reads back correctly. Then run this query for it:
+
+```sql
+SELECT count(*) FROM plan_jobs WHERE plan_id = '<new-plan-id>';
+```
+
+The count must be 0. After the next refresh of pipette-duckdb, confirm that it
+publishes the new plan.
+
+After this deploy, do not run the span backfill command from an older release.
+The `plan_jobs` rows do not follow the plans, so the command would replace the
+correct spans with stale data. After this deploy, the spans have no second
+record to compare with. The `put_plan` tests are the only check of the span
+writes.
+
+To roll back, deploy the release that added migration `0043`. That release
+reads spans and writes both tables. No database step is necessary. The
+rollback release writes the `plan_jobs` rows of each plan that it writes. The
+other `plan_jobs` rows stay stale, and nothing reads them.
+
+- Do not roll back to a build that reads `plan_jobs`.
+- Do not run the span backfill command after a rollback.
+- Do not move the schema below migration `0042`. Its down script drops
+  `plan_job_spans`, which is the only record of plan membership.
+
+The down script of migration `0043` drops the `plan_job_rows` view and its
+grant. Each time `0043` runs again, grant `SELECT ON public.plan_job_rows`
+again to the role pipette-duckdb reads the database with.
+
+The release of [§3.8](#38-drop-plan_jobs) drops `plan_jobs`.
+
+### 3.8. Drop `plan_jobs`
+
+This release adds migration `0044`, which drops the table `plan_jobs`. The
+table `plan_job_spans` records plan membership
+([storage.md §4.7](storage.md#47-the-plan-job-spans)).
+
+Before the migration:
+
+- Confirm that each active task uses the release of [§3.7](#37-stop-the-writes-to-plan_jobs)
+  or a later release. A task of an older build writes `plan_jobs`, and that write
+  fails after the drop.
+- Confirm that a rollback to a build before the release of §3.7 is not
+  necessary.
+
+To deploy the release:
+
+1. Run `db migrate`. The active tasks do not use the table.
+2. Deploy the release.
+3. Record the sizes in PIP-900. Compare them with the 1,291 MB and 2,471,703
+   rows of `plan_jobs` on 2026-11-16:
+
+   ```sql
+   SELECT pg_size_pretty(pg_database_size(current_database())) AS database,
+          pg_size_pretty(pg_total_relation_size('plan_job_spans')) AS spans,
+          (SELECT count(*) FROM plan_job_spans) AS span_rows;
+   ```
+
+To roll back:
+
+- To the release of §3.7, deploy it. Its schema check accepts a newer schema,
+  and it does not use `plan_jobs`.
+- To the release that added migration `0043`, first run `db migrate --to 43`
+  with this release. The command creates `plan_jobs` again and fills it from
+  `plan_job_rows`. The fill can take minutes. Deploy only after the command
+  ends. The rules of §3.7 for that release then apply.
+- Do not roll back to a build that reads `plan_jobs`.
 
 ## 4. Reprocessing
 

@@ -481,16 +481,15 @@ doubt, choose `retriable: true`: a wrongly-retriable job is bounded by its
 fleet on one device's say-so.
 
 One exception: a device that never gets fit to measure. When its readiness wait
-times out, the pipette worker and pipette-ios-proxy send `harness_error` with
-`retriable: false`, and a later release sends `device_not_ready` instead. Older
-builds send the timeout as retriable, the worker as `device_error` and
-pipette-ios-proxy with no code. Retried, a cell that keeps every device too hot
+times out, the pipette worker and pipette-ios-proxy send `device_not_ready`
+with `retriable: false`. Older builds send the timeout as retriable, the worker
+as `device_error` and pipette-ios-proxy with no code. Retried, a cell that keeps every device too hot
 or busy, such as a model too large for the phone, goes round the whole fleet
 and then waits out its `expires_at`.
 
 Besides an `attempt_timeout`, a permanent vault refusal and the unworkable jobs
 above, the pipette worker sends these with `retriable: false`: a readiness
-timeout as `harness_error` (`device_not_ready` from a later release), a runtime
+timeout as `device_not_ready`, a runtime
 that crashed, overran or refused the model or an operation as `runtime_error`,
 one that ran out of memory as `out_of_memory`, and a llama.cpp peak-memory cell
 it has no memory reader for on that OS as `harness_error`. Faults of the device

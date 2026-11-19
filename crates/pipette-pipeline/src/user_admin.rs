@@ -3,7 +3,7 @@
 //! share, and the account a Clerk sign-in creates.
 
 use anyhow::Context;
-use chrono::Utc;
+use jiff::Timestamp;
 
 use pipette_core::user::User;
 use pipette_core::user_permission::UserPermissionSet;
@@ -136,7 +136,7 @@ pub async fn provision(
     org_id: &OrgId,
     permissions: &[UserPermission],
 ) -> anyhow::Result<Provisioned> {
-    let user = User::try_new(email, Utc::now())?;
+    let user = User::try_new(email, Timestamp::now())?;
     if let EmailClaim::Taken(holder) = users
         .claim_user_email(user.contact_email.as_str(), &user.user_id)
         .await?
@@ -183,7 +183,7 @@ async fn undo_provision(users: &dyn UserStore, orgs: &dyn OrgStore, user: &User)
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::types::Mint;
     use pipette_core::user_permission::UserPermissionGroup;
@@ -208,8 +208,8 @@ mod tests {
     #[tokio::test]
     async fn a_claim_naming_another_account_is_left_alone() -> anyhow::Result<()> {
         let (_dir, stores) = stores()?;
-        let stale = User::try_new(ContactEmail::try_new("op@example.test")?, Utc::now())?;
-        let current = User::try_new(ContactEmail::try_new("op@example.test")?, Utc::now())?;
+        let stale = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
+        let current = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
         stores.users.put_user(&stale).await?;
         stores.users.put_user(&current).await?;
         assert_eq!(
@@ -279,7 +279,7 @@ mod tests {
             let key = UserKey::new(
                 public_key.clone(),
                 NonEmptyTrimmedString::try_new("laptop")?,
-                Utc::now(),
+                Timestamp::now(),
             );
             stores.users.put_user_key(holder, &key).await?;
             let digest = digest_of(&public_key);
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn the_membership_and_the_sign_in_mark_go_with_the_account() -> anyhow::Result<()> {
         let (_dir, stores) = stores()?;
-        let user = User::try_new(ContactEmail::try_new("op@example.test")?, Utc::now())?;
+        let user = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
         stores.users.put_user(&user).await?;
         stores
             .orgs
@@ -400,7 +400,7 @@ mod tests {
             .mark_user_awaiting_sign_in(&user.user_id)
             .await?;
         let first = FirstClerkSignIn {
-            at: Utc::now(),
+            at: Timestamp::now(),
             prior_keys: Vec::new(),
         };
         stores

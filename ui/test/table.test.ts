@@ -7,7 +7,8 @@ import { ORG_TABLE } from "../src/lib/orgs";
 import { planTable } from "../src/lib/plans";
 import { vaultTable } from "../src/lib/vault";
 import {
-  choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, rowCount, sortBy, statePairs, tableState,
+  ariaSort, choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, rowCount, sortBy, statePairs,
+  tableState,
   tableView, toggledIn, withCursor, type CursorPage, type Picks, type TableSpec,
 } from "../src/lib/table";
 import { PickedColumns } from "../src/lib/picked.svelte";
@@ -164,14 +165,21 @@ describe("the listings' tables", () => {
     // Progress reads as the plan's jobs finished, failed and running of all; a campaign with no plan, or none
     // counted, has none to print.
     expect(rows.map(progressText)).toEqual(["5 · 0 · 0 / 10", "—", "10 · 0 · 0 / 10"]);
-    // One box searches the id, the name and the labels; a campaign has no id box of its own.
-    const named = [{ ...row("campaign_1", 5, "active"), name: "nightly" }, { ...row("campaign_2", 5, "active"), name: "24b-perf" }];
+    // One box searches the id, the name, the labels and the head's tags; a campaign has no id box of its own.
+    const tag = { campaign_id: "campaign_2", name: "release/2026.11", plan_id: "plan-campaign_2", message: "shipped",
+                  tagger: "user_1", created_at: "2026-10-01T00:00:00Z" };
+    const named = [{ ...row("campaign_1", 5, "active"), name: "nightly" },
+                   { ...row("campaign_2", 5, "active"), name: "24b-perf", current_plan_tags: [tag] }];
     const found = (query: string) => tableView(spec, tableState(spec, new URLSearchParams(query)), named).map((r) => r.campaign_id);
-    expect([found("q=NIGHT"), found("q=paign_2"), found("id=campaign_1")])
-      .toEqual([["campaign_1"], ["campaign_2"], ["campaign_1", "campaign_2"]]);
-    expect(spec.texts).toMatchObject([{ key: "q", label: "search", placeholder: "campaign id, name, label or model", wide: true }]);
+    expect([found("q=NIGHT"), found("q=paign_2"), found("q=release"), found("id=campaign_1")])
+      .toEqual([["campaign_1"], ["campaign_2"], ["campaign_2"], ["campaign_1", "campaign_2"]]);
+    expect(spec.texts).toMatchObject([{ key: "q", label: "search", placeholder: "campaign id, name, label, model or tag", wide: true }]);
     expect(ids("status=not_started")).toEqual(["c2"]);
     expect(choicesOf(spec, rows, {}).status!.map((c) => c.label)).toEqual(["active", "complete", "not started"]);
+    // A locked campaign's status is `locked` whatever its plan runs, as an archived one's is `archived`.
+    const locked: CampaignView = { ...row("c4", 5, "active"), state: "locked", state_note: "release" };
+    expect(tableView(spec, tableState(spec, new URLSearchParams("status=locked")), [...rows, locked])
+      .map((r) => r.campaign_id)).toEqual(["c4"]);
     expect(choicesOf(spec, rows, {}).owner).toEqual([{ value: "org_a", label: "Acme", count: 3 }]);
     // A choice the address holds that no row has is offered under its name, so it can be unchecked.
     const started = choicesOf(spec, [rows[0]!, rows[2]!], { status: ["active", "not_started"], owner: ["org_gone"] });
@@ -188,6 +196,15 @@ describe("the listings' tables", () => {
     const org = (slug: string, member_count: number) => ({ slug, member_count }) as OrgView;
     expect(tableView(ORG_TABLE, tableState(ORG_TABLE, new URLSearchParams("sort=-member_count")),
                      [org("a", 2), org("b", 9)]).map((o) => o.slug)).toEqual(["b", "a"]);
+    // With no sort in the address, the organizations sort by display name, and its header says so.
+    const named = (slug: string, display_name: string) => ({ slug, display_name }) as OrgView;
+    const plain = tableState(ORG_TABLE, new URLSearchParams());
+    expect(plain.sort).toBe("display_name");
+    expect(ariaSort(plain.sort, "display_name")).toBe("ascending");
+    expect(tableView(ORG_TABLE, plain, [named("a", "Zeta"), named("z", "Alpha")]).map((o) => o.slug))
+      .toEqual(["z", "a"]);
+    // A click past descending returns to that order.
+    expect(nextSort("-display_name", "display_name")).toBe("");
     const device = (client_id: string, device_os_name: string) =>
       ({ client_id, device_os_name, permissions: [], reindex_pending: false }) as unknown as ClientListRow;
     const devices = deviceTable(false, {}, 0);
@@ -199,7 +216,7 @@ describe("the listings' tables", () => {
     const specs: Record<string, TableSpec<never>> = {
       campaign_id: campaignTable({}, true), plan_id: planTable({}, true), org_id: ORG_TABLE,
       client_id: deviceTable(true, {}, 0), user_id: rosterTable({ kind: "all" }, () => null),
-      resource_id: vaultTable({}, "model"), benchmark_id: benchmarkTable(true),
+      resource_id: vaultTable({}, "model"), benchmark_id: benchmarkTable([]),
     };
     for (const [id, spec] of Object.entries(specs)) {
       expect(spec.columns[0]).toMatchObject({ key: id, label: id });

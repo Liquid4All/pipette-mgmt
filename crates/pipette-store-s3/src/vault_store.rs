@@ -4,6 +4,7 @@
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -226,11 +227,17 @@ impl VaultStore for S3VaultStore {
                     .as_ref()
                     .strip_prefix(under.as_str())
                     .and_then(|key| VaultObjectKey::try_new(key.to_string()).ok());
-                futures::future::ready(Ok(key.map(|key| VaultBlob {
-                    key,
-                    bytes: meta.size,
-                    modified: meta.last_modified,
-                })))
+                let modified = SystemTime::from(meta.last_modified);
+                futures::future::ready(
+                    key.map(|key| {
+                        Ok(VaultBlob {
+                            key,
+                            bytes: meta.size,
+                            modified: jiff::Timestamp::try_from(modified)?,
+                        })
+                    })
+                    .transpose(),
+                )
             })
             .try_collect()
             .await

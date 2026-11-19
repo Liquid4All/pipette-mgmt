@@ -88,6 +88,7 @@ pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::ChangeDescriptorEntryStateRequest>();
     generator.subschema_for::<crate::RenameDescriptorEntryRequest>();
     generator.subschema_for::<crate::RelabelDescriptorMemberRequest>();
+    generator.subschema_for::<crate::RemoveDescriptorMemberRequest>();
     generator.subschema_for::<crate::RegisterUserKeyRequest>();
     generator.subschema_for::<crate::AddUserKeyRequest>();
     generator.subschema_for::<crate::RegisterClerkUserKeyRequest>();
@@ -106,6 +107,7 @@ pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::UpdateCampaignRequest>();
     generator.subschema_for::<crate::UpdatePlanRequest>();
     generator.subschema_for::<crate::SetCampaignOwnerRequest>();
+    generator.subschema_for::<crate::CreatePlanTagRequest>();
     generator.subschema_for::<crate::RerunJobsRequest>();
     generator.subschema_for::<crate::RecalculateJobsRequest>();
     generator.subschema_for::<crate::RevertCampaignRequest>();

@@ -67,16 +67,16 @@
       {/snippet}
       <div class="settings">
         <DangerZone>
-          <DangerRow title="Rename this organization" ask={`Rename ${view.slug}?`} pending="Renaming…"
+          <DangerRow title="Rename this organization" ask={`Rename ${view.display_name}?`} pending="Renaming…"
                      phrase={ORG.rename} fields={name} run={() => save(view)}
                      text="Changes the name listings and this page show. The handle is the organization's index key and does not change: one that needs another is a new organization." />
           {#if view.may_delete}
             {#if view.status === "active"}
-              <DangerRow title="Disable this organization" ask={`Disable ${view.slug}?`} pending="Disabling…"
+              <DangerRow title="Disable this organization" ask={`Disable ${view.display_name}?`} pending="Disabling…"
                          phrase={ORG.disabled} run={() => setStatus(view)}
                          text="Marks a wound-down organization: it takes no new member, and its members keep their access until their accounts are disabled." />
             {:else}
-              <DangerRow title="Enable this organization" ask={`Enable ${view.slug}?`} pending="Enabling…"
+              <DangerRow title="Enable this organization" ask={`Enable ${view.display_name}?`} pending="Enabling…"
                          phrase={ORG.active} run={() => setStatus(view)} text="Takes new members again." />
             {/if}
           {/if}

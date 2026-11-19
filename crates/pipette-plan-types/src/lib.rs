@@ -139,7 +139,7 @@ pub use descriptor_catalog::{
 pub use descriptor_catalog_write::{
     AddDescriptorMemberRequest, ChangeDescriptorEntryStateRequest, CreateDescriptorEntryRequest,
     DescriptorEntryAction, ModelMemberRequest, RelabelDescriptorMemberRequest,
-    RenameDescriptorEntryRequest,
+    RemoveDescriptorMemberRequest, RenameDescriptorEntryRequest,
 };
 
 mod vault_artifact;
@@ -321,10 +321,10 @@ pub use campaigns::{
     Campaign, CampaignAnswer, CampaignCreated, CampaignDocument, CampaignGroup, CampaignListQuery,
     CampaignOverview, CampaignOverviewQuery, CampaignPlanDocumentQuery, CampaignPlanRow,
     CampaignPlans, CampaignReadQuery, CampaignRevised, CampaignState, CampaignVariants,
-    CampaignView, CreateCampaignQuery, DeviceTimeTotal, HeldJob, RecalculateJobsRequest,
-    RerunJobsQuery, RerunJobsRequest, RevertCampaignQuery, RevertCampaignRequest,
-    ReviseCampaignQuery, Revised, RevisionAnswer, RevisionBase, RevisionDryRun, RevisionPreview,
-    SetCampaignOwnerRequest, UpdateCampaignRequest,
+    CampaignView, CreateCampaignQuery, CreatePlanTagRequest, DeviceTimeTotal, HeldJob, PlanTag,
+    PlanTags, PolicyCheck, RecalculateJobsRequest, RerunJobsQuery, RerunJobsRequest,
+    RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery, Revised, RevisionAnswer,
+    RevisionBase, RevisionDryRun, RevisionPreview, SetCampaignOwnerRequest, UpdateCampaignRequest,
 };
 
 mod campaign_groups;

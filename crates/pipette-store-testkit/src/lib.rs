@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use sha2::Digest;
 
 use pipette_core::audit::{RETENTION_DAYS, new_event};
@@ -126,7 +126,7 @@ impl TodoStore for TodoStoreUnimplemented {
     ) -> anyhow::Result<RedateResult> {
         anyhow::bail!("redate_avail: not implemented by this fake")
     }
-    async fn restamp_avail_deadlines(&self, _now: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn restamp_avail_deadlines(&self, _now: Timestamp) -> anyhow::Result<u64> {
         anyhow::bail!("restamp_avail_deadlines: not implemented by this fake")
     }
     async fn list_leases(&self) -> anyhow::Result<Vec<Lease>> {
@@ -137,7 +137,7 @@ impl TodoStore for TodoStoreUnimplemented {
         _job_id: &JobId,
         _expires_at: ExpiresAt,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         anyhow::bail!("get_leased: not implemented by this fake")
     }
@@ -145,7 +145,7 @@ impl TodoStore for TodoStoreUnimplemented {
         &self,
         _job_id: &JobId,
         _client_id: &ClientId,
-        _new_expiry: DateTime<Utc>,
+        _new_expiry: Timestamp,
     ) -> anyhow::Result<RenewLeaseResult> {
         anyhow::bail!("renew_lease: not implemented by this fake")
     }
@@ -154,7 +154,7 @@ impl TodoStore for TodoStoreUnimplemented {
         _job_id: &JobId,
         _expires_at: ExpiresAt,
         _client_id: &ClientId,
-        _expiry: DateTime<Utc>,
+        _expiry: Timestamp,
     ) -> anyhow::Result<()> {
         anyhow::bail!("delete_lease: not implemented by this fake")
     }
@@ -163,7 +163,7 @@ impl TodoStore for TodoStoreUnimplemented {
         _job_id: &JobId,
         _expires_at: ExpiresAt,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
     ) -> anyhow::Result<ClaimResult> {
         anyhow::bail!("claim_job: not implemented by this fake")
     }
@@ -172,7 +172,7 @@ impl TodoStore for TodoStoreUnimplemented {
         _job_id: &JobId,
         _expires_at: ExpiresAt,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
     ) -> anyhow::Result<RecycleResult> {
         anyhow::bail!("recycle_lease: not implemented by this fake")
     }
@@ -250,14 +250,14 @@ impl TodoStore for TodoStoreUnimplemented {
         &self,
         _job_id: &JobId,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
     ) -> anyhow::Result<()> {
         anyhow::bail!("write_lost_lease: not implemented by this fake")
     }
     async fn list_lost_leases(
         &self,
         _job_id: &JobId,
-    ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+    ) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
         anyhow::bail!("list_lost_leases: not implemented by this fake")
     }
     async fn delete_lost_leases_for_job(&self, _job_id: &JobId) -> anyhow::Result<()> {
@@ -283,10 +283,10 @@ impl TodoStore for TodoStoreUnimplemented {
     async fn stamp_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
         anyhow::bail!("stamp_liveness: not implemented by this fake")
     }
-    async fn read_liveness(&self, _client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>> {
+    async fn read_liveness(&self, _client_id: &ClientId) -> anyhow::Result<Option<Timestamp>> {
         anyhow::bail!("read_liveness: not implemented by this fake")
     }
-    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
         anyhow::bail!("list_liveness: not implemented by this fake")
     }
     async fn delete_liveness(&self, _client_id: &ClientId) -> anyhow::Result<()> {
@@ -307,12 +307,12 @@ impl TodoStore for TodoStoreUnimplemented {
     async fn claim_for_client(
         &self,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
         _lost_lease_limit: usize,
         _passed_over: &[JobId],
         _checked_lease: Option<&Lease>,
         _cached: Option<&CachedArtifacts>,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> anyhow::Result<ClaimOutcome> {
         anyhow::bail!("claim_for_client: not implemented by this fake")
     }
@@ -320,9 +320,9 @@ impl TodoStore for TodoStoreUnimplemented {
         &self,
         _job_id: &JobId,
         _client_id: &ClientId,
-        _lease_expiry: DateTime<Utc>,
+        _lease_expiry: Timestamp,
         _lost_lease_limit: usize,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> anyhow::Result<ReclaimOutcome> {
         anyhow::bail!("reclaim_for_client: not implemented by this fake")
     }
@@ -374,7 +374,7 @@ impl TodoStore for TodoStoreUnimplemented {
     async fn campaign_backlog(
         &self,
         _client_id: &ClientId,
-        _creating_before: DateTime<Utc>,
+        _creating_before: Timestamp,
     ) -> anyhow::Result<CampaignBacklog> {
         anyhow::bail!("campaign_backlog: not implemented by this fake")
     }
@@ -556,11 +556,11 @@ impl AuditStore for CapturingAuditStore {
         anyhow::bail!("list_events: not implemented by this fake")
     }
 
-    async fn prune_before(&self, _: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn prune_before(&self, _: Timestamp) -> anyhow::Result<u64> {
         anyhow::bail!("prune_before: not implemented by this fake")
     }
 
-    async fn count_before(&self, _: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn count_before(&self, _: Timestamp) -> anyhow::Result<u64> {
         anyhow::bail!("count_before: not implemented by this fake")
     }
 }
@@ -752,8 +752,8 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let client_id = ClientId::try_new("ev1_migrating")?;
-    let first = Utc::now();
-    let later = first + chrono::TimeDelta::seconds(60);
+    let first = Timestamp::now();
+    let later = first + jiff::SignedDuration::from_secs(60);
 
     assert!(!store.has_signature_migration(&client_id).await?);
     assert_eq!(
@@ -803,7 +803,7 @@ pub async fn assert_user_preauth_store_contract(
             expires_at: None,
             note: None,
         },
-        Utc::now(),
+        Timestamp::now(),
     )?;
     let key_id = minted.key.key_id.clone();
     let (_, secret) = minted
@@ -881,7 +881,7 @@ pub async fn assert_user_preauth_store_contract(
             expires_at: None,
             note: None,
         },
-        Utc::now(),
+        Timestamp::now(),
     )?;
     let multi_id = multi.key.key_id.clone();
     let (_, multi_secret) = multi
@@ -1130,7 +1130,7 @@ pub async fn assert_user_key_store_roundtrip(
         Ok(UserKey::new(
             PublicKeyHex::try_new(hex::encode([byte; PublicKeyHex::BYTE_LEN]))?,
             NonEmptyTrimmedString::try_new(details)?,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         ))
     };
 
@@ -1164,7 +1164,7 @@ pub async fn assert_user_key_store_roundtrip(
     let renamed = UserKey::new(
         laptop.public_key.clone(),
         NonEmptyTrimmedString::try_new("the laptop, renamed")?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert_eq!(renamed.key_id, laptop.key_id, "the id is the key's digest");
     store.put_user_key(user_id, &renamed).await?;
@@ -1306,7 +1306,7 @@ pub async fn assert_user_account_store_roundtrip(store: &dyn UserStore) -> anyho
     use pipette_plan_types::UserStatus;
 
     let email = ContactEmail::try_new("operator@example.com")?;
-    let user = User::try_new(email.clone(), Utc::now())?;
+    let user = User::try_new(email.clone(), Timestamp::now())?;
     let user_id = user.user_id.clone();
 
     // An account that does not exist is `None`, not an error: the record is the
@@ -1335,7 +1335,7 @@ pub async fn assert_user_account_store_roundtrip(store: &dyn UserStore) -> anyho
     assert_eq!(store.list_users().await?, vec![user.clone()]);
 
     // A second account cannot take the address, and is told which one has it.
-    let other = User::try_new(email.clone(), Utc::now())?;
+    let other = User::try_new(email.clone(), Timestamp::now())?;
     assert_eq!(
         store
             .claim_user_email(email.as_str(), &other.user_id)
@@ -1433,13 +1433,13 @@ pub async fn assert_user_first_clerk_sign_in_roundtrip(
     let (user_id, other) = (UserId::mint(), UserId::mint());
     assert_eq!(store.get_user_first_clerk_sign_in(&user_id).await?, None);
 
-    let at = DateTime::from_timestamp(1_800_000_000, 0).context("a valid instant")?;
+    let at = jiff::Timestamp::from_second(1_800_000_000).context("a valid instant")?;
     let first = FirstClerkSignIn {
         at,
         prior_keys: vec![UserKeyId::try_new("userkey_0195c3e2a4f37b8c")?],
     };
     let later = FirstClerkSignIn {
-        at: at + chrono::TimeDelta::days(1),
+        at: at + jiff::SignedDuration::from_hours(24),
         prior_keys: Vec::new(),
     };
     assert!(
@@ -1479,7 +1479,7 @@ pub async fn assert_users_are_not_clients(
     use pipette_core::user::User;
     use pipette_plan_types::ContactEmail;
 
-    let user = User::try_new(ContactEmail::try_new("op@example.com")?, Utc::now())?;
+    let user = User::try_new(ContactEmail::try_new("op@example.com")?, Timestamp::now())?;
     users
         .claim_user_email(user.contact_email.as_str(), &user.user_id)
         .await?;
@@ -1574,7 +1574,7 @@ pub async fn assert_client_preauth_store_roundtrip(store: &dyn ClientStore) -> a
     use pipette_plan_types::NonEmptyTrimmedString;
     use pipette_plan_types::PermissionName;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let params = |usage, expires_at| ClientPreauthParams {
         usage,
         expires_at,
@@ -2321,8 +2321,8 @@ pub async fn assert_content_key_roundtrip(store: &dyn PlanStore) -> anyhow::Resu
     let record = |n: u32| ContentKeyRecord {
         job_id: JobId::from_uuid(uuid::Uuid::from_u128(n.into())),
         plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(n.into())),
-        created_at: DateTime::from_timestamp(1_780_000_000 + i64::from(n), 0)
-            .unwrap_or_else(Utc::now),
+        created_at: jiff::Timestamp::from_second(1_780_000_000 + i64::from(n))
+            .unwrap_or_else(|_| jiff::Timestamp::now()),
     };
 
     // An unclaimed digest reads as absent, and lists as nothing.
@@ -2439,9 +2439,7 @@ pub async fn assert_job_plan_marker_roundtrip(store: &dyn PlanStore) -> anyhow::
     let solo = JobId::from_uuid(uuid::Uuid::from_u128(2));
     let first = PlanId::from_uuid(uuid::Uuid::from_u128(10));
     let second = PlanId::from_uuid(uuid::Uuid::from_u128(11));
-    let soon = ExpiresAt::At(
-        DateTime::from_timestamp(1_780_000_000, 0).ok_or_else(|| anyhow::anyhow!("timestamp"))?,
-    );
+    let soon = ExpiresAt::At(jiff::Timestamp::from_second(1_780_000_000)?);
 
     // A job with no membership reads as empty rather than as an error.
     assert!(store.list_job_plan_markers(&shared).await?.is_empty());
@@ -2826,7 +2824,7 @@ pub fn local_fs_remove_job_plan_link(
 pub async fn assert_pending_source_marker_roundtrip(store: &dyn PlanStore) -> anyhow::Result<()> {
     let first = PlanId::from_uuid(uuid::Uuid::from_u128(30));
     let second = PlanId::from_uuid(uuid::Uuid::from_u128(31));
-    let before = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let before = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(1);
 
     assert!(store.list_pending_source_markers().await?.is_empty());
 
@@ -3031,7 +3029,7 @@ pub fn a_vault_upload(
         NonEmptyTrimmedString::try_new(name)?,
         owner,
         artifact.map(|_, file| FoundBlob { file, bytes: 4096 }),
-        Utc::now(),
+        Timestamp::now(),
     )?)
 }
 
@@ -3099,7 +3097,7 @@ pub fn vault_resource_for(
         NonEmptyTrimmedString::try_new("private checkpoint")?,
         owner,
         artifact.map(|_, file| FoundBlob { file, bytes }),
-        Utc::now(),
+        Timestamp::now(),
     )?
     .pop()
     .context("an upload of one file makes one record")
@@ -3337,7 +3335,13 @@ pub async fn assert_vault_store_roundtrip(store: &dyn VaultStore) -> anyhow::Res
         anyhow::bail!("one blob was written: {listed:?}");
     };
     assert_eq!((&blob.key, blob.bytes), (&key, len));
-    assert!((Utc::now() - blob.modified).num_minutes().abs() < 5);
+    assert!(
+        Timestamp::now()
+            .duration_since(blob.modified)
+            .as_mins()
+            .abs()
+            < 5
+    );
     // Writing the same bytes again is harmless: the key says what they are.
     assert_eq!(
         store.put_blob(&key, &sha256, blob_body(VAULT_BLOB)).await?,
@@ -3835,13 +3839,13 @@ pub async fn assert_audit_store_contract(store: &dyn AuditStore) -> anyhow::Resu
         );
     }
 
-    let retention = chrono::Duration::days(i64::from(RETENTION_DAYS));
+    let retention = jiff::SignedDuration::from_hours(24 * i64::from(RETENTION_DAYS));
     let old = AuditEvent {
-        created_at: Utc::now() - retention - chrono::Duration::days(70),
+        created_at: Timestamp::now() - retention - jiff::SignedDuration::from_hours(70 * 24),
         ..an_audit_event(&["org_a"])?
     };
     store.append(&old).await?;
-    let cutoff = Utc::now() - retention;
+    let cutoff = Timestamp::now() - retention;
     assert_eq!(store.count_before(cutoff).await?, 1);
     assert_eq!(store.prune_before(cutoff).await?, 1);
     assert_eq!(store.count_before(cutoff).await?, 0);
@@ -3861,7 +3865,7 @@ pub fn a_model_params(key: &str, total_millions: i32) -> anyhow::Result<ModelPar
         None,
         None,
         UserId::mint(),
-        Utc::now(),
+        Timestamp::now(),
     )?)
 }
 
@@ -3880,7 +3884,7 @@ pub async fn assert_model_params_store_roundtrip(
             "MoE: card states 1.5B active",
         )?),
         UserId::mint(),
-        Utc::now(),
+        Timestamp::now(),
     )?;
     assert!(store.get_model_params(&vault.key).await?.is_none());
     store.put_model_params(&vault).await?;
@@ -3942,7 +3946,7 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
             user_id: UserId::mint(),
         },
     )
-    .around(plan_id.clone(), Utc::now());
+    .around(plan_id.clone(), Timestamp::now());
     let campaign_id = campaign.campaign_id.clone();
 
     // A campaign that does not exist is `None`, not an error.
@@ -3959,16 +3963,19 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
     // Rename, labels and hand-off are whole-record writes that move neither the
     // id they are addressed by nor the head the campaign is on.
     let org_id = OrgId::mint();
-    campaign.rename(NonEmptyTrimmedString::try_new("Nightly LFM2")?, Utc::now());
+    campaign.rename(
+        NonEmptyTrimmedString::try_new("Nightly LFM2")?,
+        Timestamp::now(),
+    );
     campaign.set_labels(
         serde_json::from_value(serde_json::json!({"study": "lfm2", "Device": "S26 Ultra"}))?,
-        Utc::now(),
+        Timestamp::now(),
     );
     campaign.set_owner(
         CampaignOwner::Org {
             org_id: org_id.clone(),
         },
-        Utc::now(),
+        Timestamp::now(),
     );
     store.put_campaign(&campaign).await?;
 
@@ -3995,7 +4002,7 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
                 user_id: UserId::mint(),
             },
         )
-        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now())
+        .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now())
     };
     store.put_campaign(&blank).await?;
     assert_eq!(
@@ -4066,7 +4073,7 @@ pub async fn assert_campaign_replace_is_conditional(
             user_id: UserId::mint(),
         },
     )
-    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
     let updated = Campaign {
         name: NonEmptyTrimmedString::try_new("Nightly EU")?,
         ..campaign.clone()
@@ -4126,7 +4133,7 @@ pub async fn assert_racing_campaign_replaces_land_once(
             user_id: UserId::mint(),
         },
     )
-    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Utc::now());
+    .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
     store.put_campaign(&campaign).await?;
     let read = store
         .get_campaign(&campaign.campaign_id)
@@ -4801,8 +4808,8 @@ where
             client_details: NonEmptyTrimmedString::try_new("details")?,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
-            registered_at: DateTime::from_timestamp(1_800_000_000 - i64::from(nth), 0)
-                .unwrap_or_else(Utc::now),
+            registered_at: jiff::Timestamp::from_second(1_800_000_000 - i64::from(nth))
+                .unwrap_or_else(|_| jiff::Timestamp::now()),
             device_profile: Default::default(),
             capabilities: Default::default(),
         })
@@ -4956,7 +4963,7 @@ pub async fn assert_org_store_roundtrip(store: &dyn OrgStore) -> anyhow::Result<
     let org = Organization::new(
         slug.clone(),
         NonEmptyTrimmedString::try_new("Acme Corp., Inc.")?,
-        Utc::now(),
+        Timestamp::now(),
     );
     let org_id = org.org_id.clone();
 
@@ -4989,7 +4996,7 @@ pub async fn assert_org_store_roundtrip(store: &dyn OrgStore) -> anyhow::Result<
     let other = Organization::new(
         slug.clone(),
         NonEmptyTrimmedString::try_new("Acme Impostor")?,
-        Utc::now(),
+        Timestamp::now(),
     );
     assert_eq!(
         store.claim_org_slug(slug.as_str(), &other.org_id).await?,
@@ -5127,7 +5134,7 @@ pub async fn assert_dataset_cache_store_roundtrip(
         "the tar must stream back unchanged"
     );
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut artifact: DatasetArtifact = serde_json::from_value(serde_json::json!({
         "digest": digest,
         "bytes": body.len(),
@@ -5200,7 +5207,7 @@ pub fn a_member(
     }))?;
     Ok(pipette_plan_types::DescriptorMember::new(
         runtime,
-        Utc::now(),
+        Timestamp::now(),
     )?)
 }
 
@@ -5234,7 +5241,7 @@ pub fn a_model_member(
     Ok(pipette_plan_types::DescriptorMember::new_model(
         serde_json::from_value(model)?,
         pipette_plan_types::QuantizationLabel::try_new(quantization)?,
-        Utc::now(),
+        Timestamp::now(),
     )?)
 }
 
@@ -5248,7 +5255,7 @@ pub fn a_descriptor_entry(
     use pipette_plan_types::{
         CatalogName, DescriptorEntry, DescriptorEntryCreator, DescriptorEntryState, NonEmptyVec,
     };
-    let at = DateTime::<Utc>::from_timestamp(release_second, 0).context("valid release time")?;
+    let at = jiff::Timestamp::from_second(release_second).context("valid release time")?;
     Ok(DescriptorEntry::new(
         pipette_plan_types::CatalogScope::Global,
         CatalogName::try_new(name)?,
@@ -6050,7 +6057,7 @@ pub async fn assert_descriptor_catalog_store_contract(
         AppendOutcome::NoSuchEntry
     );
     let other_runtime = serde_json::from_value(serde_json::json!({"type":"apple_foundation"}))?;
-    let other_member = pipette_plan_types::DescriptorMember::new(other_runtime, Utc::now())?;
+    let other_member = pipette_plan_types::DescriptorMember::new(other_runtime, Timestamp::now())?;
     assert_eq!(
         store
             .append_members(
@@ -6169,7 +6176,7 @@ pub async fn assert_descriptor_catalog_store_contract(
 
     let flavorless = pipette_plan_types::DescriptorMember::new(
         serde_json::from_value(serde_json::json!({"type":"apple_foundation"}))?,
-        DateTime::<Utc>::from_timestamp(100, 0).context("valid added time")?,
+        jiff::Timestamp::from_second(100).context("valid added time")?,
     )?;
     let plain = a_descriptor_entry("plain-1", Kind::HandMade, 50, flavorless.clone())?;
     assert_eq!(
@@ -6451,7 +6458,7 @@ pub async fn assert_descriptor_catalog_store_contract(
 /// `live_c1` before the liveness round trip.
 pub async fn assert_todo_store_contract(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     assert_todo_job_contract(store, now).await.context("jobs")?;
     assert_todo_targeted_reads(store, now)
@@ -6480,12 +6487,9 @@ pub async fn assert_todo_store_contract(
 
 /// The job half of the queue contract. Each piece uses its own namespace.
 /// Give `now` a sub-second part to check timestamp normalization.
-pub async fn assert_todo_job_contract(
-    store: &dyn TodoStore,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
+pub async fn assert_todo_job_contract(store: &dyn TodoStore, now: Timestamp) -> anyhow::Result<()> {
     anyhow::ensure!(
-        now.timestamp_subsec_nanos() != 0,
+        now.subsec_nanosecond() != 0,
         "the contract needs a `now` with a sub-second part, got {now}"
     );
     assert_todo_tmp_and_promote(store, now)
@@ -6541,18 +6545,18 @@ fn of_client(piece: &str, id: &str) -> bool {
 }
 
 /// `at` without its sub-second part: the precision of every queue key.
-fn whole_second(at: DateTime<Utc>) -> DateTime<Utc> {
-    chrono::SubsecRound::trunc_subsecs(at, 0)
+fn whole_second(at: Timestamp) -> Timestamp {
+    at - jiff::SignedDuration::from_nanos(i64::from(at.subsec_nanosecond()))
 }
 
 /// A job deadline `days` after `now`, in whole seconds as ingestion writes it.
-fn todo_deadline(now: DateTime<Utc>, days: i64) -> ExpiresAt {
-    ExpiresAt::At(whole_second(now) + chrono::TimeDelta::days(days))
+fn todo_deadline(now: Timestamp, days: i64) -> ExpiresAt {
+    ExpiresAt::At(whole_second(now) + jiff::SignedDuration::from_hours(24 * days))
 }
 
 /// A lease that expires five minutes after `now`, with the sub-second part of `now`.
-fn todo_lease(now: DateTime<Utc>) -> DateTime<Utc> {
-    now + chrono::TimeDelta::minutes(5)
+fn todo_lease(now: Timestamp) -> Timestamp {
+    now + jiff::SignedDuration::from_mins(5)
 }
 
 fn todo_body(job_id: &JobId, expires_at: ExpiresAt) -> serde_json::Value {
@@ -6587,7 +6591,7 @@ async fn claim(
     job_id: &JobId,
     expires_at: ExpiresAt,
     client_id: &ClientId,
-    lease_expiry: DateTime<Utc>,
+    lease_expiry: Timestamp,
 ) -> anyhow::Result<serde_json::Value> {
     match store
         .claim_job(job_id, expires_at, client_id, lease_expiry)
@@ -6640,7 +6644,7 @@ async fn leased_of(store: &dyn TodoStore, piece: &str) -> anyhow::Result<Vec<Lea
 /// staged body. A promote with no staged body is an error.
 pub async fn assert_todo_tmp_and_promote(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("promote", "job")?;
     let exp = todo_deadline(now, 30);
@@ -6669,10 +6673,7 @@ pub async fn assert_todo_tmp_and_promote(
 /// `list_avail_entries` is in byte order of the job ID, and the deadline has
 /// no effect on the order. `order-B` sorts before `order-b`, as upper case
 /// sorts before lower case in byte order.
-pub async fn assert_todo_avail_order(
-    store: &dyn TodoStore,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
+pub async fn assert_todo_avail_order(store: &dyn TodoStore, now: Timestamp) -> anyhow::Result<()> {
     let never = todo_job("order", "B")?;
     let dated = todo_job("order", "a")?;
     let last = todo_job("order", "b")?;
@@ -6703,7 +6704,7 @@ pub async fn assert_todo_avail_order(
 /// that is a prefix of another does not match the longer one.
 pub async fn assert_todo_job_scoped_reads(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let mine = todo_job("scope", "job")?;
     let longer = todo_job("scope", "job1")?;
@@ -6738,7 +6739,7 @@ pub async fn assert_todo_job_scoped_reads(
 /// body. A second claim finds nothing to move.
 pub async fn assert_todo_claim_then_gone(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("claim", "job")?;
     let client = todo_client("claim", "c1")?;
@@ -6805,12 +6806,12 @@ pub async fn assert_todo_claim_then_gone(
 /// lease is `NotFound`, whether it is queued or absent.
 pub async fn assert_todo_renew_branches(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let client = todo_client("renew", "c1")?;
     let other = todo_client("renew", "c2")?;
     let old = todo_lease(now);
-    let new = old + chrono::TimeDelta::minutes(5);
+    let new = old + jiff::SignedDuration::from_mins(5);
 
     // The dated case catches a renewal that writes a constant `never`.
     let mut renewed: Vec<Lease> = futures::stream::iter([
@@ -6878,7 +6879,7 @@ pub async fn assert_todo_renew_branches(
 /// A recycle puts the job back at the exact `avail/` key that the claim took.
 /// The deadline comes from the lease key. The body names another deadline,
 /// and the recycle ignores it. A recycle of a job that the store does not hold is `Gone`.
-pub async fn assert_todo_recycle(store: &dyn TodoStore, now: DateTime<Utc>) -> anyhow::Result<()> {
+pub async fn assert_todo_recycle(store: &dyn TodoStore, now: Timestamp) -> anyhow::Result<()> {
     let client = todo_client("recycle", "c1")?;
     let lease = todo_lease(now);
     for (name, exp) in [
@@ -6915,7 +6916,7 @@ pub async fn assert_todo_recycle(store: &dyn TodoStore, now: DateTime<Utc>) -> a
 /// `avail/` holds the job exactly once.
 pub async fn assert_todo_lost_recycle_race(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("race", "job")?;
     let client = todo_client("race", "c1")?;
@@ -6943,11 +6944,11 @@ pub async fn assert_todo_lost_recycle_race(
 /// finds the lease.
 pub async fn assert_todo_sub_second_lease_round_trip(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let client = todo_client("subsec", "c1")?;
     // Its own sub-second part, whatever `now` holds.
-    let raw = whole_second(todo_lease(now)) + chrono::TimeDelta::nanoseconds(123_456_789);
+    let raw = whole_second(todo_lease(now)) + jiff::SignedDuration::from_nanos(123_456_789);
     let job = todo_job("subsec", "job")?;
     let exp = todo_deadline(now, 7);
     let body = enqueue(store, &job, exp).await?;
@@ -6965,7 +6966,7 @@ pub async fn assert_todo_sub_second_lease_round_trip(
     assert_eq!(store.get_avail_by_job(&job).await?, None);
 
     let renewed_job = todo_job("subsec", "renewed")?;
-    let renewed = raw + chrono::TimeDelta::milliseconds(150_500);
+    let renewed = raw + jiff::SignedDuration::from_millis(150_500);
     enqueue(store, &renewed_job, ExpiresAt::Never).await?;
     claim(store, &renewed_job, ExpiresAt::Never, &client, raw).await?;
     assert_eq!(
@@ -6985,7 +6986,7 @@ pub async fn assert_todo_sub_second_lease_round_trip(
 /// A redate moves the queued job to a new deadline and keeps the body. After
 /// the redate, the key and the body name different deadlines. A redate from a
 /// stale `from`, of a leased job, or of an absent job is `Gone`.
-pub async fn assert_todo_redate(store: &dyn TodoStore, now: DateTime<Utc>) -> anyhow::Result<()> {
+pub async fn assert_todo_redate(store: &dyn TodoStore, now: Timestamp) -> anyhow::Result<()> {
     let job = todo_job("redate", "job")?;
     let from = todo_deadline(now, 7);
     let to = todo_deadline(now, 14);
@@ -7048,7 +7049,7 @@ pub async fn assert_todo_redate(store: &dyn TodoStore, now: DateTime<Utc>) -> an
 /// Each delete of something the store does not hold succeeds.
 pub async fn assert_todo_job_idempotent_deletes(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("absent", "job")?;
     let client = todo_client("absent", "c1")?;
@@ -7101,7 +7102,7 @@ async fn denied_of(store: &dyn TodoStore) -> anyhow::Result<Vec<(JobId, ClientId
 /// the other jobs' denials.
 pub async fn assert_todo_denied_round_trip(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("denied", "job")?;
     let job2 = todo_job("denied", "job2")?;
@@ -7215,12 +7216,12 @@ pub async fn assert_todo_pending_reindex_round_trip(store: &dyn TodoStore) -> an
 /// oldest first. A lost lease lists its expiry in whole seconds.
 pub async fn assert_todo_lost_leases_round_trip(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let job = todo_job("lost", "job")?;
     let (a, b) = (todo_client("lost", "a")?, todo_client("lost", "b")?);
     let late = whole_second(now);
-    let early = late - chrono::TimeDelta::minutes(10);
+    let early = late - jiff::SignedDuration::from_mins(10);
     enqueue(store, &job, ExpiresAt::Never).await?;
     let lost_jobs = || async {
         anyhow::Ok(
@@ -7267,7 +7268,7 @@ pub async fn assert_todo_liveness_round_trip(store: &dyn TodoStore) -> anyhow::R
     };
     assert!(store.read_liveness(&client).await?.is_none());
 
-    let before = Utc::now() - chrono::TimeDelta::seconds(1);
+    let before = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     store.stamp_liveness(&client).await?;
     let seen = store
         .read_liveness(&client)
@@ -7294,7 +7295,7 @@ pub async fn assert_todo_liveness_round_trip(store: &dyn TodoStore) -> anyhow::R
 /// clients' markers, and a single delete keeps the client's other markers.
 pub async fn assert_todo_eligible_index(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
     let (c1, c2) = (todo_client("elig", "c1")?, todo_client("elig", "c2")?);
     let (j1, j2) = (todo_job("elig", "j1")?, todo_job("elig", "j2")?);
@@ -7342,10 +7343,7 @@ pub async fn assert_todo_eligible_index(
 /// The method deletes a staged body when its age reaches `age`, unless a
 /// promote consumed it. It returns the count. A younger body stays staged. The
 /// earlier pieces consume each body they stage, so this body is the only one.
-pub async fn assert_todo_stale_tmp(
-    store: &dyn TodoStore,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
+pub async fn assert_todo_stale_tmp(store: &dyn TodoStore, now: Timestamp) -> anyhow::Result<()> {
     let job = todo_job("stale", "job")?;
     store
         .write_tmp(&job, &todo_body(&job, todo_deadline(now, 10)))
@@ -7365,15 +7363,18 @@ pub async fn assert_todo_stale_tmp(
 /// Targeted reads preserve row metadata and exclude unrelated jobs and clients.
 pub async fn assert_todo_targeted_reads(
     store: &dyn TodoStore,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<()> {
-    use chrono::SubsecRound;
-    let now = now.trunc_subsecs(0);
+    let now = now.round(
+        jiff::TimestampRound::new()
+            .smallest(jiff::Unit::Second)
+            .mode(jiff::RoundMode::Trunc),
+    )?;
     let first = ClientId::try_new("ev1_targeted_a")?;
     let other = ClientId::try_new("ev1_targeted_b")?;
     let missing = JobId::try_new("targeted-missing")?;
     let body = serde_json::json!({});
-    let expired = ExpiresAt::At(now - chrono::Duration::hours(1));
+    let expired = ExpiresAt::At(now - jiff::SignedDuration::from_hours(1));
     let available = seed_avail(store, "targeted-available", ExpiresAt::Never, &body).await?;
     let old = seed_avail(store, "targeted-expired", expired, &body).await?;
     let live = seed_leased_until(
@@ -7381,7 +7382,7 @@ pub async fn assert_todo_targeted_reads(
         "targeted-live",
         ExpiresAt::Never,
         &first,
-        now + chrono::Duration::hours(1),
+        now + jiff::SignedDuration::from_hours(1),
         &body,
     )
     .await?;
@@ -7390,7 +7391,7 @@ pub async fn assert_todo_targeted_reads(
         "targeted-lapsed",
         expired,
         &first,
-        now - chrono::Duration::minutes(1),
+        now - jiff::SignedDuration::from_mins(1),
         &body,
     )
     .await?;
@@ -7399,7 +7400,7 @@ pub async fn assert_todo_targeted_reads(
         "targeted-unrelated",
         ExpiresAt::Never,
         &other,
-        now + chrono::Duration::hours(1),
+        now + jiff::SignedDuration::from_hours(1),
         &body,
     )
     .await?;
@@ -7446,11 +7447,14 @@ pub async fn assert_todo_targeted_reads(
     assert_eq!(lapsed_lease.job_id, lapsed);
     assert_eq!(
         lapsed_lease.lease_expiry,
-        now - chrono::Duration::minutes(1)
+        now - jiff::SignedDuration::from_mins(1)
     );
     assert_eq!(lapsed_lease.expires_at, expired);
     assert_eq!(live_lease.job_id, live);
-    assert_eq!(live_lease.lease_expiry, now + chrono::Duration::hours(1));
+    assert_eq!(
+        live_lease.lease_expiry,
+        now + jiff::SignedDuration::from_hours(1)
+    );
     assert_eq!(store.leases_for_client(&other).await?.len(), 1);
     assert!(
         store

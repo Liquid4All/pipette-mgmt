@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::Context;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::benchmark::Benchmark;
@@ -25,6 +25,7 @@ use pipette_store::{JobState, PlanStore, ScoreQueueStage, Stores, SubmissionReco
 
 use crate::model_audit::UnresolvedRows;
 use crate::model_params::{ModelEntry, ModelParamTable};
+use crate::plan_results::ResultRow;
 use crate::scoring_service;
 use crate::scoring_service::{ScoreRequest, ScoreRequestSample, ScoringError};
 pub use crate::submission::{FailureSubmission, Submission, SuccessSubmission};
@@ -982,9 +983,10 @@ async fn score_submission(
             // does no catalog lookup, so a body whose benchmark is gone drains
             // too.
             // `Config::validate` caps this well inside `i64`.
-            let lock_age =
-                chrono::TimeDelta::seconds(i64::try_from(config.warehouse_lock_age_secs.get())?);
-            if warehouse::day_partition_is_open(f.submitted_at, Utc::now(), lock_age) {
+            let lock_age = jiff::SignedDuration::from_secs(i64::try_from(
+                config.warehouse_lock_age_secs.get(),
+            )?);
+            if warehouse::day_partition_is_open(f.submitted_at, Timestamp::now(), lock_age) {
                 let names = VaultNames::read(
                     stores,
                     &f.job_id,
@@ -1066,11 +1068,7 @@ impl CanonicalConfig {
     /// vault `custom_label` from `labels`, as `fix-vault-labels` does.
     fn new(raw: RawConfig<'_>, labels: &Fill) -> Self {
         let hash = |s: &Option<String>| s.as_deref().map(pipette_core::canonical_json::sha256_hex);
-        // A filled descriptor comes back canonical.
-        let descriptor = |reported: &str| {
-            let (filled, _) = labels.value(reported);
-            filled.unwrap_or_else(|| pipette_core::canonical_json::canonicalize_str(reported))
-        };
+        let descriptor = |reported: &str| labelled(labels, reported);
 
         let model_descriptor = raw.model_descriptor.map(descriptor);
         // Behind an alias every vault source is an import, which takes no label.
@@ -1141,7 +1139,7 @@ async fn score_success(
         benchmark_type = %benchmark.benchmark_type(),
         "deriving metrics"
     );
-    let scored_at = Utc::now();
+    let scored_at = Timestamp::now();
     let derived =
         derive_metrics(benchmark, &submission, config, http_client, eval_response).await?;
     let metrics = &derived.metrics;
@@ -1164,9 +1162,9 @@ async fn score_success(
         model_vault_descriptor,
     );
 
-    let day_key = warehouse::day_key_from_timestamp(submission.submitted_at.timestamp_micros())?;
+    let day_key = warehouse::day_key_from_timestamp(submission.submitted_at.as_microsecond())?;
     let benchmark_type = benchmark.benchmark_type();
-    let submitted_at_us = submission.submitted_at.timestamp_micros();
+    let submitted_at_us = submission.submitted_at.as_microsecond();
     // A copy carries the time of the device run it scores; any other
     // submission is that run.
     let run_submitted_at_us = submission
@@ -1177,8 +1175,8 @@ async fn score_success(
                 .is_none()
                 .then_some(submission.submitted_at)
         })
-        .map(|at| at.timestamp_micros());
-    let scored_at_us = scored_at.timestamp_micros();
+        .map(|at| at.as_microsecond());
+    let scored_at_us = scored_at.as_microsecond();
 
     // VL and ASR throughput record their token counts as observation columns on
     // every metric row, not as metrics, each type under its own pair.
@@ -1477,7 +1475,7 @@ async fn score_success(
 /// A failure body whose day partition is closed to writes: carried out of
 /// `incoming/` with no rows, never recorded.
 fn archive_locked_failure(failure: FailureSubmission) -> anyhow::Result<ScoredJob> {
-    let day_key = warehouse::day_key_from_timestamp(failure.submitted_at.timestamp_micros())?;
+    let day_key = warehouse::day_key_from_timestamp(failure.submitted_at.as_microsecond())?;
     tracing::info!(
         job_id = %failure.job_id,
         benchmark_id = %failure.wire.benchmark_id,
@@ -1515,9 +1513,9 @@ fn record_failure(
     let (benchmark_params, benchmark_params_sha256) = benchmark_params_columns(benchmark)?;
 
     let source = failure_source(&failure);
-    let day_key = warehouse::day_key_from_timestamp(failure.submitted_at.timestamp_micros())?;
-    let submitted_at_us = failure.submitted_at.timestamp_micros();
-    let scored_at_us = Utc::now().timestamp_micros();
+    let day_key = warehouse::day_key_from_timestamp(failure.submitted_at.as_microsecond())?;
+    let submitted_at_us = failure.submitted_at.as_microsecond();
+    let scored_at_us = Timestamp::now().as_microsecond();
 
     // `benchmark_flags` and `client_configuration` are the two a failure cannot
     // fill: `FailureInput` has no such fields.
@@ -1714,6 +1712,161 @@ fn failure_source(failure: &FailureSubmission) -> Option<FailureSource> {
     })
 }
 
+/// `reported`, canonical, with its vault `custom_label` from `labels`. A
+/// filled descriptor comes back canonical.
+fn labelled(labels: &Fill, reported: &str) -> String {
+    let (filled, _) = labels.value(reported);
+    filled.unwrap_or_else(|| pipette_core::canonical_json::canonicalize_str(reported))
+}
+
+/// The rows that the campaign group policy checks read, built from
+/// `submission` as the scorer builds them, with its benchmark from `catalog`
+/// and `names` read for it. A row
+/// holds the metric, its value and unit, the failure, the model descriptors,
+/// and the parameters and observations that the checks read. Its other
+/// columns are empty. `None` for an eval's success, which the scoring service
+/// scores. A measurement that the body lacks is an error.
+pub(crate) fn policy_rows(
+    catalog: &HashMap<BenchmarkId, Benchmark>,
+    submission: &Submission,
+    names: &VaultNames,
+) -> anyhow::Result<Option<Vec<ResultRow>>> {
+    let benchmark_id = match submission {
+        Submission::Success(success) => &success.wire.benchmark_id,
+        Submission::Failure(failure) => &failure.wire.benchmark_id,
+    };
+    let benchmark = catalog
+        .get(benchmark_id)
+        .ok_or_else(|| anyhow::anyhow!("benchmark {benchmark_id} not in catalog"))?;
+    let parameters: BTreeMap<String, Value> = [
+        ("prefill_tokens", get_param_prefill_tokens(benchmark)),
+        ("decode_tokens", get_param_decode_tokens(benchmark)),
+        (
+            "batch_size",
+            benchmark.parameter_batch_size().map(BatchSize::as_i32),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_owned(), Value::from(value?))))
+    .collect();
+    let (job_id, reported, metrics, failure, observations) = match submission {
+        Submission::Success(success) => {
+            let Derivation::Measured(metrics) = derivation(&benchmark.def, success)? else {
+                return Ok(None);
+            };
+            let wire = &success.wire;
+            let prefill = match benchmark.def {
+                BenchmarkDefinition::VlThroughput(_) => wire
+                    .prompt_tokens
+                    .map(|tokens| ("vl_throughput_prefill_tokens", i32::from(tokens))),
+                BenchmarkDefinition::AsrThroughput(_) => wire
+                    .asr_prompt_tokens
+                    .map(|tokens| ("asr_throughput_prefill_tokens", i32::from(tokens))),
+                BenchmarkDefinition::PrefillThroughput(_)
+                | BenchmarkDefinition::DecodeThroughput(_)
+                | BenchmarkDefinition::EndToEndLatency(_)
+                | BenchmarkDefinition::MaxMemoryUsage(_)
+                | BenchmarkDefinition::Eval(_)
+                | BenchmarkDefinition::VlMaxMemory(_)
+                | BenchmarkDefinition::AsrMaxMemory(_)
+                | BenchmarkDefinition::VlmEval(_)
+                | BenchmarkDefinition::AsrEval(_)
+                | BenchmarkDefinition::VlSpecDecode(_)
+                | BenchmarkDefinition::DecisionLatency(_)
+                | BenchmarkDefinition::DecisionMaxMemory(_) => None,
+            };
+            let observations: BTreeMap<String, Value> = wire
+                .observation_max_swap_bytes
+                .map(|bytes| ("max_swap_bytes", Value::from(i64::from(bytes))))
+                .into_iter()
+                .chain(prefill.map(|(key, tokens)| (key, Value::from(tokens))))
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect();
+            let metrics: Vec<(String, Option<f32>, Option<f32>, String)> = metrics
+                .into_iter()
+                .map(|m| (m.metric, Some(m.value), m.value_stddev, m.unit))
+                .collect();
+            (
+                &success.job_id,
+                wire.model_descriptor.as_deref(),
+                metrics,
+                None,
+                observations,
+            )
+        }
+        Submission::Failure(failure) => {
+            let speculative = resolved_speculation(
+                &benchmark.def,
+                failure.wire.runtime_flags.as_ref().map(AsRef::as_ref),
+            );
+            let metrics = intended_metrics_of(&benchmark.def, speculative)
+                .iter()
+                .map(|(metric, unit)| ((*metric).to_owned(), None, None, (*unit).to_owned()))
+                .collect();
+            (
+                &failure.job_id,
+                failure.wire.model_descriptor.as_deref(),
+                metrics,
+                Some((
+                    failure.wire.failure_reason.as_str().to_owned(),
+                    failure_source(failure),
+                    failure.wire.failure_code,
+                )),
+                BTreeMap::new(),
+            )
+        }
+    };
+    let (model_descriptor, model_vault_descriptor) =
+        recorded_model(reported, names.alias.as_deref());
+    let model_descriptor = model_descriptor.map(|reported| labelled(&names.labels, reported));
+    let model_vault_descriptor =
+        model_vault_descriptor.map(pipette_core::canonical_json::canonicalize_str);
+    let rows = metrics
+        .into_iter()
+        .map(|(metric, value, value_stddev, unit)| ResultRow {
+            job_id: job_id.clone(),
+            benchmark_id: benchmark_id.to_string(),
+            benchmark_type: benchmark.benchmark_type().to_string(),
+            metric,
+            value,
+            value_stddev,
+            unit,
+            failed: Some(failure.is_some()),
+            failed_reason: failure.as_ref().map(|(reason, ..)| reason.clone()),
+            model_descriptor: model_descriptor.clone(),
+            model_descriptor_sha256: None,
+            runtime_descriptor: None,
+            runtime_descriptor_sha256: None,
+            model_vault_descriptor: model_vault_descriptor.clone(),
+            model_flags: None,
+            runtime_flags: None,
+            benchmark_flags: None,
+            requested_model_flags: None,
+            requested_runtime_flags: None,
+            requested_benchmark_flags: None,
+            eval_metadata: None,
+            client_extras: None,
+            parameters: parameters.clone(),
+            observations: observations.clone(),
+            client_id: None,
+            device_name: None,
+            device: BTreeMap::new(),
+            client_version: None,
+            submitted_at: None,
+            scored_at: None,
+            device_time_ms: None,
+            failure_source: failure.as_ref().and_then(|(_, source, _)| *source),
+            failure_code: failure.as_ref().map(|(.., code)| *code),
+            rescored_from: None,
+            run_submitted_at: None,
+            score_runtime_version: None,
+            model_params_total_millions: None,
+            model_params_active_millions: None,
+        })
+        .collect();
+    Ok(Some(rows))
+}
+
 /// The model parameter table for one scoring pass, plus the models it could not
 /// resolve, so the pass closes by naming what to add.
 ///
@@ -1814,12 +1967,38 @@ const MAX_LABELLED_RESOURCES: usize = 8;
 
 /// What the vault records behind one submission's descriptors give its rows.
 #[derive(Default)]
-struct VaultNames {
+pub(crate) struct VaultNames {
     alias: Option<String>,
     labels: Fill,
 }
 
 impl VaultNames {
+    /// [`Self::read`] for a stored `submission`, as the scorer reads it.
+    pub(crate) async fn of(stores: &Stores, submission: &Submission) -> anyhow::Result<Self> {
+        match submission {
+            Submission::Success(success) => {
+                Self::read(
+                    stores,
+                    &success.job_id,
+                    success.rescored_from.as_ref(),
+                    success.wire.model_descriptor.as_deref(),
+                    success.wire.runtime_descriptor.as_deref(),
+                )
+                .await
+            }
+            Submission::Failure(failure) => {
+                Self::read(
+                    stores,
+                    &failure.job_id,
+                    None,
+                    failure.wire.model_descriptor.as_deref(),
+                    failure.wire.runtime_descriptor.as_deref(),
+                )
+                .await
+            }
+        }
+    }
+
     /// A record that is gone labels nothing; a failed read is an error, so the
     /// job waits for a run that can read it. `rescored_from` names the job a
     /// copy's descriptors were reported for.
@@ -2430,108 +2609,19 @@ async fn derive_metrics(
     http_client: &reqwest::Client,
     eval_response: Option<scoring_service::ScoreResponse>,
 ) -> anyhow::Result<DerivedResult> {
-    match &benchmark.def {
-        BenchmarkDefinition::PrefillThroughput(PrefillThroughputBenchmark {
-            parameter_prefill_tokens,
-            ..
-        }) => {
-            let prefill_time_ms: f32 =
-                require(submission.wire.prefill_time_ms, "prefill_time_ms")?.into();
-            let stddev = submission.wire.prefill_time_ms_stddev.map(f32::from);
-            let throughput =
-                parameter_prefill_tokens.into_inner() as f32 / prefill_time_ms * 1000.0;
-            let throughput_stddev = stddev.map(|s| throughput * s / prefill_time_ms);
-            Ok(DerivedResult {
-                metrics: vec![
-                    DerivedMetric {
-                        metric: "ttft".to_string(),
-                        value: prefill_time_ms,
-                        value_stddev: stddev,
-                        unit: "ms".to_string(),
-                    },
-                    DerivedMetric {
-                        metric: "prefill_throughput".to_string(),
-                        value: throughput,
-                        value_stddev: throughput_stddev,
-                        unit: "tokens/sec".to_string(),
-                    },
-                ],
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
-        }
-        BenchmarkDefinition::DecodeThroughput(DecodeThroughputBenchmark {
-            parameter_decode_tokens,
-            ..
-        }) => {
-            let decode_time_ms: f32 =
-                require(submission.wire.decode_time_ms, "decode_time_ms")?.into();
-            let stddev = submission.wire.decode_time_ms_stddev.map(f32::from);
-            let throughput = parameter_decode_tokens.into_inner() as f32 / decode_time_ms * 1000.0;
-            let throughput_stddev = stddev.map(|s| throughput * s / decode_time_ms);
-            Ok(DerivedResult {
-                metrics: vec![DerivedMetric {
-                    metric: "decode_throughput".to_string(),
-                    value: throughput,
-                    value_stddev: throughput_stddev,
-                    unit: "tokens/sec".to_string(),
-                }],
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
-        }
-        BenchmarkDefinition::EndToEndLatency(_) => {
-            let total_time_ms: f32 =
-                require(submission.wire.total_time_ms, "total_time_ms")?.into();
-            Ok(DerivedResult {
-                metrics: vec![DerivedMetric {
-                    metric: "end_to_end_latency".to_string(),
-                    value: total_time_ms,
-                    value_stddev: submission.wire.total_time_ms_stddev.map(f32::from),
-                    unit: "ms".to_string(),
-                }],
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
-        }
-        BenchmarkDefinition::MaxMemoryUsage(_)
-        | BenchmarkDefinition::VlMaxMemory(_)
-        | BenchmarkDefinition::AsrMaxMemory(_)
-        | BenchmarkDefinition::DecisionMaxMemory(_) => {
-            let max_host =
-                i64::from(require(submission.wire.max_host_bytes, "max_host_bytes")?) as f32;
-            let mut metrics = vec![DerivedMetric {
-                metric: "max_host_usage".to_string(),
-                value: max_host,
-                value_stddev: None,
-                unit: "bytes".to_string(),
-            }];
-            metrics.extend(
-                [
-                    (submission.wire.max_gpu_bytes, "max_gpu_usage"),
-                    (submission.wire.max_npu_bytes, "max_npu_usage"),
-                ]
-                .into_iter()
-                .filter_map(|(opt, name)| {
-                    opt.map(|v| DerivedMetric {
-                        metric: name.to_string(),
-                        value: i64::from(v) as f32,
-                        value_stddev: None,
-                        unit: "bytes".to_string(),
-                    })
-                }),
-            );
-            Ok(DerivedResult {
+    let scored = match derivation(&benchmark.def, submission)? {
+        Derivation::Measured(metrics) => {
+            return Ok(DerivedResult {
                 metrics,
                 eval_sample_results: None,
                 score_runtime_version: None,
                 eval_metadata: None,
-            })
+            });
         }
-        BenchmarkDefinition::Eval(EvalBenchmark {
+        Derivation::Scored(scored) => scored,
+    };
+    match scored {
+        ScoredBenchmark::Eval(EvalBenchmark {
             parameter_eval_id,
             parameter_dataset_name,
             ..
@@ -2594,13 +2684,122 @@ async fn derive_metrics(
         }
         // Held to one answer to each sample on the rows as stored, before
         // anything reads them.
-        BenchmarkDefinition::VlmEval(vlm) => {
+        ScoredBenchmark::VlmEval(vlm) => {
             answered_every_sample(&benchmark.def, submission)?;
             score_vlm_eval(vlm, submission, config, http_client, eval_response).await
         }
-        BenchmarkDefinition::AsrEval(asr) => {
+        ScoredBenchmark::AsrEval(asr) => {
             answered_every_sample(&benchmark.def, submission)?;
             score_asr_eval(asr, submission, config, http_client, eval_response).await
+        }
+    }
+}
+
+/// How the metrics of a benchmark come from a success body.
+enum Derivation<'b> {
+    /// The body's measurements give the metrics.
+    Measured(Vec<DerivedMetric>),
+    /// The scoring service scores the body's completions.
+    Scored(ScoredBenchmark<'b>),
+}
+
+/// A benchmark that the scoring service scores.
+enum ScoredBenchmark<'b> {
+    Eval(&'b EvalBenchmark),
+    VlmEval(&'b VlmEvalBenchmark),
+    AsrEval(&'b AsrEvalBenchmark),
+}
+
+/// The [`Derivation`] of `submission`'s metrics under `def`. It derives a
+/// measured benchmark's metrics from the body, and calls no service. A
+/// measurement that the body lacks is an error.
+fn derivation<'b>(
+    def: &'b BenchmarkDefinition,
+    submission: &SuccessSubmission,
+) -> anyhow::Result<Derivation<'b>> {
+    match def {
+        BenchmarkDefinition::Eval(eval) => Ok(Derivation::Scored(ScoredBenchmark::Eval(eval))),
+        BenchmarkDefinition::VlmEval(vlm) => Ok(Derivation::Scored(ScoredBenchmark::VlmEval(vlm))),
+        BenchmarkDefinition::AsrEval(asr) => Ok(Derivation::Scored(ScoredBenchmark::AsrEval(asr))),
+        BenchmarkDefinition::PrefillThroughput(PrefillThroughputBenchmark {
+            parameter_prefill_tokens,
+            ..
+        }) => {
+            let prefill_time_ms: f32 =
+                require(submission.wire.prefill_time_ms, "prefill_time_ms")?.into();
+            let stddev = submission.wire.prefill_time_ms_stddev.map(f32::from);
+            let throughput =
+                parameter_prefill_tokens.into_inner() as f32 / prefill_time_ms * 1000.0;
+            let throughput_stddev = stddev.map(|s| throughput * s / prefill_time_ms);
+            Ok(Derivation::Measured(vec![
+                DerivedMetric {
+                    metric: "ttft".to_string(),
+                    value: prefill_time_ms,
+                    value_stddev: stddev,
+                    unit: "ms".to_string(),
+                },
+                DerivedMetric {
+                    metric: "prefill_throughput".to_string(),
+                    value: throughput,
+                    value_stddev: throughput_stddev,
+                    unit: "tokens/sec".to_string(),
+                },
+            ]))
+        }
+        BenchmarkDefinition::DecodeThroughput(DecodeThroughputBenchmark {
+            parameter_decode_tokens,
+            ..
+        }) => {
+            let decode_time_ms: f32 =
+                require(submission.wire.decode_time_ms, "decode_time_ms")?.into();
+            let stddev = submission.wire.decode_time_ms_stddev.map(f32::from);
+            let throughput = parameter_decode_tokens.into_inner() as f32 / decode_time_ms * 1000.0;
+            let throughput_stddev = stddev.map(|s| throughput * s / decode_time_ms);
+            Ok(Derivation::Measured(vec![DerivedMetric {
+                metric: "decode_throughput".to_string(),
+                value: throughput,
+                value_stddev: throughput_stddev,
+                unit: "tokens/sec".to_string(),
+            }]))
+        }
+        BenchmarkDefinition::EndToEndLatency(_) => {
+            let total_time_ms: f32 =
+                require(submission.wire.total_time_ms, "total_time_ms")?.into();
+            Ok(Derivation::Measured(vec![DerivedMetric {
+                metric: "end_to_end_latency".to_string(),
+                value: total_time_ms,
+                value_stddev: submission.wire.total_time_ms_stddev.map(f32::from),
+                unit: "ms".to_string(),
+            }]))
+        }
+        BenchmarkDefinition::MaxMemoryUsage(_)
+        | BenchmarkDefinition::VlMaxMemory(_)
+        | BenchmarkDefinition::AsrMaxMemory(_)
+        | BenchmarkDefinition::DecisionMaxMemory(_) => {
+            let max_host =
+                i64::from(require(submission.wire.max_host_bytes, "max_host_bytes")?) as f32;
+            let mut metrics = vec![DerivedMetric {
+                metric: "max_host_usage".to_string(),
+                value: max_host,
+                value_stddev: None,
+                unit: "bytes".to_string(),
+            }];
+            metrics.extend(
+                [
+                    (submission.wire.max_gpu_bytes, "max_gpu_usage"),
+                    (submission.wire.max_npu_bytes, "max_npu_usage"),
+                ]
+                .into_iter()
+                .filter_map(|(opt, name)| {
+                    opt.map(|v| DerivedMetric {
+                        metric: name.to_string(),
+                        value: i64::from(v) as f32,
+                        value_stddev: None,
+                        unit: "bytes".to_string(),
+                    })
+                }),
+            );
+            Ok(Derivation::Measured(metrics))
         }
         BenchmarkDefinition::VlThroughput(VlThroughputBenchmark {
             parameter_decode_tokens,
@@ -2619,12 +2818,10 @@ async fn derive_metrics(
             // The prefill length (image + text + template) and its image-only
             // part are observations, not metrics; score_success records them off
             // the wire.
-            Ok(DerivedResult {
-                metrics: prompt_decode_metrics(&times, parameter_decode_tokens.into_inner()),
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
+            Ok(Derivation::Measured(prompt_decode_metrics(
+                &times,
+                parameter_decode_tokens.into_inner(),
+            )))
         }
         BenchmarkDefinition::AsrThroughput(AsrThroughputBenchmark {
             parameter_decode_tokens,
@@ -2640,21 +2837,14 @@ async fn derive_metrics(
                 total_ms: run.total_time_ms.map(f32::from),
                 total_ms_stddev: run.total_time_ms_stddev.map(f32::from),
             };
-            Ok(DerivedResult {
-                metrics: prompt_decode_metrics(&times, parameter_decode_tokens.into_inner()),
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
+            Ok(Derivation::Measured(prompt_decode_metrics(
+                &times,
+                parameter_decode_tokens.into_inner(),
+            )))
         }
         BenchmarkDefinition::VlSpecDecode(_) => {
             let run = submission.wire.vl_spec_decode_counters()?;
-            Ok(DerivedResult {
-                metrics: vl_spec_decode_metrics(&run),
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
+            Ok(Derivation::Measured(vl_spec_decode_metrics(&run)))
         }
         BenchmarkDefinition::DecisionLatency(DecisionBenchmark {
             parameter_batch_size,
@@ -2686,12 +2876,7 @@ async fn derive_metrics(
                     unit: "requests/sec".to_string(),
                 });
             }
-            Ok(DerivedResult {
-                metrics,
-                eval_sample_results: None,
-                score_runtime_version: None,
-                eval_metadata: None,
-            })
+            Ok(Derivation::Measured(metrics))
         }
     }
 }
@@ -4433,6 +4618,302 @@ mod tests {
         Ok(())
     }
 
+    /// The columns of a row that the campaign group policy checks read.
+    #[derive(Debug, PartialEq)]
+    struct Checked {
+        metric: String,
+        value: Option<f32>,
+        value_stddev: Option<f32>,
+        unit: String,
+        failed: Option<bool>,
+        failure_source: Option<FailureSource>,
+        failure_code: Option<pipette_plan_types::FailureCode>,
+        model_descriptor: Option<String>,
+        model_vault_descriptor: Option<String>,
+        parameters: BTreeMap<String, Value>,
+        observations: BTreeMap<String, Value>,
+    }
+
+    /// The `parameter_*` and `observation_*` columns that the checks read,
+    /// without the prefix, as pipette-duckdb names them.
+    const CHECKED_PARAMETERS: [&str; 3] = ["prefill_tokens", "decode_tokens", "batch_size"];
+    const CHECKED_OBSERVATIONS: [&str; 3] = [
+        "max_swap_bytes",
+        "vl_throughput_prefill_tokens",
+        "asr_throughput_prefill_tokens",
+    ];
+
+    fn non_null(columns: [(&str, Option<Value>); 3]) -> BTreeMap<String, Value> {
+        columns
+            .into_iter()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?)))
+            .collect()
+    }
+
+    impl From<&MetricRow> for Checked {
+        fn from(row: &MetricRow) -> Self {
+            let [prefill, decode, batch] = CHECKED_PARAMETERS;
+            let [swap, vl, asr] = CHECKED_OBSERVATIONS;
+            Self {
+                metric: row.metric.clone(),
+                value: row.value,
+                value_stddev: row.value_stddev,
+                unit: row.unit.clone(),
+                failed: row.failed,
+                failure_source: row.failure_source,
+                failure_code: row.failure_code,
+                model_descriptor: row.model_descriptor.clone(),
+                model_vault_descriptor: row.model_vault_descriptor.clone(),
+                parameters: non_null([
+                    (prefill, row.parameter_prefill_tokens.map(Value::from)),
+                    (decode, row.parameter_decode_tokens.map(Value::from)),
+                    (batch, row.parameter_batch_size.map(Value::from)),
+                ]),
+                observations: non_null([
+                    (swap, row.observation_max_swap_bytes.map(Value::from)),
+                    (
+                        vl,
+                        row.observation_vl_throughput_prefill_tokens
+                            .map(Value::from),
+                    ),
+                    (
+                        asr,
+                        row.observation_asr_throughput_prefill_tokens
+                            .map(Value::from),
+                    ),
+                ]),
+            }
+        }
+    }
+
+    impl From<&ResultRow> for Checked {
+        fn from(row: &ResultRow) -> Self {
+            let pick = |columns: &BTreeMap<String, Value>, keys: [&str; 3]| {
+                columns
+                    .iter()
+                    .filter(|(key, _)| keys.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            };
+            Self {
+                metric: row.metric.clone(),
+                value: row.value,
+                value_stddev: row.value_stddev,
+                unit: row.unit.clone(),
+                failed: row.failed,
+                failure_source: row.failure_source,
+                failure_code: row.failure_code,
+                model_descriptor: row.model_descriptor.clone(),
+                model_vault_descriptor: row.model_vault_descriptor.clone(),
+                parameters: pick(&row.parameters, CHECKED_PARAMETERS),
+                observations: pick(&row.observations, CHECKED_OBSERVATIONS),
+            }
+        }
+    }
+
+    const VAULT_MODEL: &str = r#"{"type":"gguf_text","source":"vault_url","url":"/vault/resources/vault_1/content","principal_id":"org_1"}"#;
+    const PUBLIC_ALIAS: &str = r#"{"type":"gguf_text","source":"huggingface","org":"LiquidAI","repo_name":"LFM2-700M-GGUF","path":"m.gguf"}"#;
+
+    /// The policy rows of a body hold what the scorer's rows hold in each
+    /// column that the checks read, for a success and for a failure.
+    #[rstest]
+    #[case::prefill(prefill_benchmark()?.def, json!({"prefill_time_ms": 34.7, "prefill_time_ms_stddev": 2.5}))]
+    #[case::decode(
+        BenchmarkDefinition::DecodeThroughput(DecodeThroughputBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_prefill_tokens: NonNegativeCount::try_new(512)?,
+            parameter_decode_tokens: PositiveCount::try_new(100)?,
+            parameter_batch_size: BatchSize::one(),
+        }),
+        json!({"decode_time_ms": 500.0, "decode_time_ms_stddev": 40.0}),
+    )]
+    #[case::end_to_end(
+        BenchmarkDefinition::EndToEndLatency(EndToEndLatencyBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_prefill_tokens: NonNegativeCount::try_new(512)?,
+            parameter_decode_tokens: PositiveCount::try_new(100)?,
+            parameter_batch_size: BatchSize::one(),
+        }),
+        json!({"total_time_ms": 900.0, "total_time_ms_stddev": 12.0}),
+    )]
+    #[case::max_memory(
+        BenchmarkDefinition::MaxMemoryUsage(MaxMemoryUsageBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_prefill_tokens: NonNegativeCount::try_new(256)? }),
+        json!({"max_host_bytes": 1_000_000_000_i64, "max_gpu_bytes": 500_000_000_i64}),
+    )]
+    #[case::vl_max_memory(
+        BenchmarkDefinition::VlMaxMemory(VlMaxMemoryBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_image_width: PositiveCount::try_new(512)?,
+            parameter_image_height: PositiveCount::try_new(512)?,
+            parameter_text_tokens: NonNegativeCount::try_new(32)?,
+            parameter_decode_tokens: None,
+            parameter_num_images: NonNegativeCount::try_new(1)?,
+        }),
+        json!({"max_host_bytes": 1_000_000_000_i64}),
+    )]
+    #[case::asr_max_memory(
+        BenchmarkDefinition::AsrMaxMemory(AsrMaxMemoryBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_audio_duration_ms: AudioDurationMillis::try_new(9400)?,
+            parameter_audio_sample_rate_hz: AudioSampleRate::try_new(16_000)?,
+            parameter_audio_channels: AudioChannels::try_new(1)?,
+            parameter_text_tokens: NonNegativeCount::try_new(1024)?,
+            parameter_decode_tokens: AsrDecodeTokens::try_new(256)?,
+        }),
+        json!({"max_host_bytes": 1_000_000_000_i64}),
+    )]
+    #[case::vl_throughput(
+        BenchmarkDefinition::VlThroughput(VlThroughputBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_image_width: PositiveCount::try_new(512)?,
+            parameter_image_height: PositiveCount::try_new(512)?,
+            parameter_text_tokens: NonNegativeCount::try_new(32)?,
+            parameter_decode_tokens: PositiveCount::try_new(100)?,
+            parameter_num_images: NonNegativeCount::try_new(1)?,
+        }),
+        json!({"prompt_tokens": 300, "image_tokens": 256, "prompt_ms": 120.0, "prompt_ms_stddev": 9.0, "predicted_ms": 400.0, "predicted_ms_stddev": 30.0, "total_time_ms": 530.0}),
+    )]
+    #[case::asr_throughput(
+        BenchmarkDefinition::AsrThroughput(AsrThroughputBenchmark {
+            benchmark_id: BenchmarkId::try_new("parity")?,
+            parameter_audio_duration_ms: AudioDurationMillis::try_new(9400)?,
+            parameter_audio_sample_rate_hz: AudioSampleRate::try_new(16_000)?,
+            parameter_audio_channels: AudioChannels::try_new(1)?,
+            parameter_text_tokens: NonNegativeCount::try_new(0)?,
+            parameter_decode_tokens: AsrDecodeTokens::try_new(128)?,
+        }),
+        json!({"asr_prompt_tokens": 137, "asr_audio_tokens": 118, "asr_prompt_ms": 83.3, "asr_predicted_ms": 129.4}),
+    )]
+    #[case::vl_spec_decode_off(vl_spec_decode_benchmark()?.def, vl_spec_decode_wire(false))]
+    #[case::vl_spec_decode_on(vl_spec_decode_benchmark()?.def, vl_spec_decode_wire(true))]
+    #[case::decision_latency(
+        BenchmarkDefinition::DecisionLatency(decision_benchmark("decision_latency_text64_q3", 1)?),
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_request_ms_stddev": 3.0}),
+    )]
+    #[case::decision_latency_batched(
+        BenchmarkDefinition::DecisionLatency(decision_benchmark("decision_latency_text64_q3_bs64", 64)?),
+        json!({"decision_latency_request_ms": 41.5, "decision_latency_batch_ms": 820.0, "decision_latency_batch_ms_stddev": 25.0}),
+    )]
+    #[case::decision_max_memory(
+        BenchmarkDefinition::DecisionMaxMemory(decision_benchmark("decision_max_memory_text64_q3", 1)?),
+        json!({"max_host_bytes": 1_000_000_000_i64}),
+    )]
+    #[tokio::test]
+    async fn test_policy_rows_hold_what_the_scorer_rows_hold_for_the_checks(
+        #[case] def: BenchmarkDefinition,
+        #[case] measurements: Value,
+    ) -> anyhow::Result<()> {
+        let benchmark = Benchmark { org_id: None, def };
+        let benchmark_id = benchmark.benchmark_id().clone();
+        let catalog = HashMap::from([(benchmark_id.clone(), benchmark.clone())]);
+        let names = || VaultNames {
+            alias: Some(PUBLIC_ALIAS.to_string()),
+            ..VaultNames::default()
+        };
+        let checked = |rows: &[ResultRow]| rows.iter().map(Checked::from).collect::<Vec<_>>();
+
+        let mut body = measurements;
+        body.as_object_mut()
+            .context("the measurements are a JSON object")?
+            .extend([
+                ("benchmark_id".to_string(), json!(benchmark_id.as_str())),
+                ("model_descriptor".to_string(), json!(VAULT_MODEL)),
+                ("observation_max_swap_bytes".to_string(), json!(4096)),
+            ]);
+        let success = test_submission(body)?;
+        let body_rows = policy_rows(
+            &catalog,
+            &Submission::Success(Box::new(test_submission(serde_json::to_value(&success)?)?)),
+            &names(),
+        )?
+        .context("a measured benchmark gives policy rows")?;
+        let model_table = crate::model_params::ModelParamTable::default();
+        let models = PassTable::new(&model_table);
+        let scored = score_success(
+            &Config::default(),
+            &catalog,
+            &models,
+            &test_client()?,
+            success,
+            None,
+            &names(),
+        )
+        .await?;
+        assert_eq!(
+            checked(&body_rows),
+            scored
+                .metric_rows
+                .iter()
+                .map(Checked::from)
+                .collect::<Vec<_>>()
+        );
+
+        let failure = json!({
+            "benchmark_type": benchmark.benchmark_type().to_string(),
+            "retriable": false,
+            "failure_reason": "OOM",
+            "model_descriptor": VAULT_MODEL,
+        });
+        let recorded = failure_rows(benchmark.clone(), failure.clone(), Some(PUBLIC_ALIAS))?;
+        let mut failure_body = failure;
+        failure_body
+            .as_object_mut()
+            .context("the failure body is a JSON object")?
+            .extend([
+                ("benchmark_id".to_string(), json!(benchmark_id.as_str())),
+                ("client_id".to_string(), json!("test")),
+                ("job_id".to_string(), json!("test")),
+                ("submitted_at".to_string(), json!("2026-01-01T00:00:00Z")),
+            ]);
+        let failure_rows = policy_rows(
+            &catalog,
+            &Submission::Failure(Box::new(serde_json::from_value(failure_body)?)),
+            &names(),
+        )?
+        .context("a failure gives policy rows")?;
+        assert_eq!(
+            checked(&failure_rows),
+            recorded.iter().map(Checked::from).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// The scoring service scores an eval, so its body gives no policy rows.
+    #[test]
+    fn test_an_eval_body_gives_no_policy_rows() -> anyhow::Result<()> {
+        let benchmark = Benchmark {
+            org_id: None,
+            def: BenchmarkDefinition::Eval(EvalBenchmark {
+                benchmark_id: BenchmarkId::try_new("parity")?,
+                parameter_eval_id: "e1".into(),
+                parameter_dataset_name: "d1".to_string(),
+                parameter_max_tokens: PositiveCount::try_new(128)?,
+                parameter_max_context: None,
+                parameter_mcq_choices: None,
+                parameter_temperature: None,
+                parameter_top_p: None,
+                parameter_top_k: None,
+                parameter_min_p: None,
+                parameter_seed: None,
+                samples: None,
+            }),
+        };
+        let catalog = HashMap::from([(benchmark.benchmark_id().clone(), benchmark)]);
+        let submission = test_submission(json!({
+            "benchmark_id": "parity",
+            "completions": [{"id": "s1", "completion": "a"}],
+        }))?;
+        let rows = policy_rows(
+            &catalog,
+            &Submission::Success(Box::new(submission)),
+            &VaultNames::default(),
+        )?;
+        assert!(rows.is_none());
+        Ok(())
+    }
+
     #[test]
     fn test_a_failure_row_records_the_alias() -> anyhow::Result<()> {
         let benchmark = prefill_benchmark()?;
@@ -4490,10 +4971,7 @@ mod tests {
 
         assert!(!rows.is_empty());
         let expected_run = expected_run
-            .map(|at| {
-                at.parse::<chrono::DateTime<Utc>>()
-                    .map(|at| at.timestamp_micros())
-            })
+            .map(|at| at.parse::<jiff::Timestamp>().map(|at| at.as_microsecond()))
             .transpose()?;
         rows.iter().for_each(|r| {
             assert_eq!(r.rescored_from.as_deref(), source);
@@ -6740,8 +7218,7 @@ mod tests {
                 ClientId::try_new("c1")?,
                 false,
                 pipette_plan_types::RunMark {
-                    at: chrono::DateTime::from_timestamp_micros(1_000_000)
-                        .context("a valid time")?,
+                    at: jiff::Timestamp::from_microsecond(1_000_000).context("a valid time")?,
                     client_version: Some("v1".to_string()),
                 },
             )]
@@ -6938,7 +7415,7 @@ mod tests {
     #[case::measured(json!({ "prefill_time_ms": 34.7 }))]
     #[case::failed(json!({
         "message_type": "failure",
-        "submitted_at": Utc::now().to_rfc3339(),
+        "submitted_at": Timestamp::now().to_string(),
         "retriable": false,
         "failure_reason": "OOM",
     }))]
@@ -7190,7 +7667,7 @@ mod tests {
                     "no client claimed the job",
                     pipette_plan_types::FailureCode::Unspecified,
                     FailureSource::Expired,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await?;
             }
@@ -7503,12 +7980,13 @@ mod tests {
         let submissions = stores.submissions.as_ref();
         submissions.write_processed(&device, &recorded).await?;
         let source = if copied {
-            crate::recalculation::answer_from(submissions, &device, &copy, Utc::now()).await?;
+            crate::recalculation::answer_from(submissions, &device, &copy, Timestamp::now())
+                .await?;
             copy
         } else {
             device
         };
-        crate::recalculation::answer_from(submissions, &source, &job, Utc::now()).await?;
+        crate::recalculation::answer_from(submissions, &source, &job, Timestamp::now()).await?;
         let copy = submissions.find_job(&job).await?.context("no copy")?.body;
         let score = json!({
             "runtime_version": "scorer-1",

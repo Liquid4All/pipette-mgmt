@@ -79,7 +79,7 @@ impl ClerkInstance {
     /// The claims the template issues for `email` now: verified, for this
     /// console, from this instance.
     pub fn claims(&self, email: &str) -> Value {
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         json!({
             "azp": CLERK_ORIGIN,
             "aud": self.jwt_template,

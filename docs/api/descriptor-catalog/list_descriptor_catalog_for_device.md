@@ -6,9 +6,9 @@ List the catalog members offered to a registered device. The caller needs
 
 The response is one whole list. `items` contains pinned and active entries
 only: first the runtime entries, then the model entries, each newest release
-first. Each item has the entry's `name`, `release_time`, `descriptor_kind`
-and `members`. Each member contains its selector, structured `member_key`,
-digest, and full descriptor.
+first. Each item has the entry's `name`, `scope`, `display_name`,
+`release_time`, `descriptor_kind` and `members`. Each member contains its
+selector, structured `member_key`, digest, and full descriptor.
 
 - **A runtime entry** gives one member: the first member in precedence that
   the device's stored flags and assigned tags satisfy. `member_key.flavor` is
@@ -16,10 +16,24 @@ digest, and full descriptor.
 - **A model entry** gives every member that the catalog offers to the
   device. A model has no offer rules. The catalog offers a model member to the
   device if it offers the device a runtime member that can load the model.
-  Every offered member of a pinned or active runtime entry counts. This
-  includes a member that precedence does not select. A model entry has no
-  precedence, so the list does not select one member. Each model member also
-  gives its `model_key` and `parameters`.
+  Every offered member of a pinned or active runtime entry in the list counts,
+  from either scope. This includes a member that precedence does not select.
+  A model entry has no precedence, so the list does not select one member.
+  Each model member also gives its `model_key` and `parameters`.
+
+The list contains the entries of two scopes:
+
+- the global scope;
+- the caller's organization, if the caller belongs to one.
+
+A holder of `edit_any_catalog` gets its own organization only, because the
+list tells what the caller can name in a plan. `scope` is `global`, or the id
+of the caller's organization. `display_name` is the name as the caller sees it.
+
+An entry of the caller's organization shows its bare name. A global entry
+shows its bare name too, unless the caller's organization has a live entry
+with the same name. Then the global entry shows as `global/<name>`. Each
+selector starts with the `display_name`.
 
 Each member also gives its run `evidence`. The evidence tells what happened
 when the member ran. It never selects an entry or a member. It is about the
@@ -51,8 +65,8 @@ not be read.
 `withheld` reports members that the device cannot use, including members of
 entries that still offer another member. `member_count` counts those members;
 `entry_count` counts pinned or active entries with no offered member. Each
-record in `members` gives the entry name, selector, member key, reason code,
-and readable reason. The reason codes are:
+record in `members` gives the entry name, `scope`, `display_name`, selector,
+member key, reason code, and readable reason. The reason codes are:
 
 - `no_rule`: no offer rule exists for the runtime member's flavor.
 - `unsupported`: offer rules do not support the runtime member's type.

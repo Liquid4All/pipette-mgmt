@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use chrono::{TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_permission::UserPermissionGroup;
@@ -32,7 +32,7 @@ use crate::state::AppState;
 
 /// How long a key registered through Clerk signs. The token proved a sign-in,
 /// not a machine, so the key lapses like a session rather than staying for good.
-pub const CLERK_KEY_LIFETIME: TimeDelta = TimeDelta::days(7);
+pub const CLERK_KEY_LIFETIME: SignedDuration = SignedDuration::from_hours(7 * 24);
 
 // POST /api/v1/users/register/clerk
 //
@@ -44,7 +44,7 @@ pub async fn register_clerk_key(
     ApiJson(body): ApiJson<RegisterClerkUserKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let user = clerk_account(&state, &audit, &headers).await?;
-    let expires_at = Utc::now() + CLERK_KEY_LIFETIME;
+    let expires_at = Timestamp::now() + CLERK_KEY_LIFETIME;
     let key = register_key(
         &state,
         &user,
@@ -98,7 +98,7 @@ async fn record_first_sign_in(
         .filter(|key| key.key_id != *signed_in)
         .collect();
     let first = FirstClerkSignIn {
-        at: Utc::now(),
+        at: Timestamp::now(),
         prior_keys: prior.iter().map(|key| key.key_id.clone()).collect(),
     };
     if !users
@@ -139,7 +139,7 @@ async fn clerk_account(
             tracing::warn!("refused a Clerk sign-in: no Bearer token");
             AppError::Unauthorized("missing Authorization: Bearer header".into())
         })?;
-    let email = clerk.verify(jwt.trim(), &state.replay_cache, Utc::now())?;
+    let email = clerk.verify(jwt.trim(), &state.replay_cache, Timestamp::now())?;
     // Before the account lookup: an instance shared with other apps vouches for
     // addresses this deployment does not admit, accounts included.
     if !clerk.admits(&email) {

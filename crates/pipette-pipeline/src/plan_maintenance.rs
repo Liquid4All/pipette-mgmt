@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::client::Client;
@@ -112,7 +112,7 @@ pub(crate) async fn tear_down_plans(
     membership: &Membership,
     avail: Vec<AvailEntry>,
     leases: Vec<Lease>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> anyhow::Result<TeardownOutcome> {
     let doomed: Vec<(&PlanManifest, Cause)> = manifests
@@ -268,7 +268,7 @@ impl Cause {
 fn teardown_cause(
     manifest: &PlanManifest,
     markers: &HashSet<PlanId>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> Option<Cause> {
     match manifest.status {
@@ -284,12 +284,10 @@ fn teardown_cause(
         {
             Some(Cause::Cancelled)
         }
-        // A future `created_at` fails `to_std` and reads as not stranded, the
-        // safe direction.
+        // A future `created_at` has no unsigned age and reads as not stranded,
+        // the safe direction.
         PlanStatus::Creating
-            if now
-                .signed_duration_since(manifest.created_at)
-                .to_std()
+            if Duration::try_from(now.duration_since(manifest.created_at))
                 .is_ok_and(|age| age >= creating_max_age) =>
         {
             Some(Cause::CreatingStranded)
@@ -315,7 +313,7 @@ pub(crate) async fn record_member_lapses(
     markers: &[JobPlanMarker],
     cancel_markers: &HashSet<PlanId>,
     stranded: &HashSet<PlanId>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> usize {
     let horizons: BTreeMap<(&PlanId, &JobId), ExpiresAt> =
@@ -410,8 +408,8 @@ async fn record_one_lapse(
     markers: &[JobPlanMarker],
     plan_id: &PlanId,
     job_id: &JobId,
-    horizon: DateTime<Utc>,
-    now: DateTime<Utc>,
+    horizon: Timestamp,
+    now: Timestamp,
 ) -> anyhow::Result<Option<PlanManifest>> {
     let Some(mut manifest) = plans.get_plan(plan_id).await? else {
         return Ok(None);
@@ -501,7 +499,7 @@ pub(crate) async fn reconcile_plans(
     fallback: &HashSet<JobId>,
     denied: &[(JobId, ClientId)],
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> anyhow::Result<ReconcileReport> {
     let avail_by_job: HashMap<&JobId, &AvailEntry> = avail.iter().map(|a| (&a.job_id, a)).collect();
@@ -616,7 +614,7 @@ async fn reconcile_one_plan(
     bodies: &mut HashMap<AvailEntry, Value>,
     settled: &mut HashMap<JobId, SettledOutcome>,
     report: &mut ReconcileReport,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> anyhow::Result<()> {
     // A terminal latch is final: a late marker is collected, `status` untouched.
@@ -816,14 +814,14 @@ async fn timed<T>(slot: &mut Duration, work: impl std::future::Future<Output = T
 /// past `plan_creating_max_age_secs`. A future `created_at` reads as young.
 fn ingest_may_overwrite(
     manifest: &PlanManifest,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> bool {
     let overwritable = matches!(
         manifest.status,
         PlanStatus::Creating | PlanStatus::Cancelling | PlanStatus::Cancelled
     );
-    let age = now.signed_duration_since(manifest.created_at).to_std();
+    let age = Duration::try_from(now.duration_since(manifest.created_at));
     overwritable && !matches!(age, Ok(age) if age >= creating_max_age)
 }
 
@@ -837,8 +835,8 @@ fn decide_status(
     outstanding_empty: bool,
     retired_this_pass: bool,
     any_matched: bool,
-    now: DateTime<Utc>,
-) -> (PlanStatus, Option<DateTime<Utc>>) {
+    now: Timestamp,
+) -> (PlanStatus, Option<Timestamp>) {
     if ending && outstanding_empty && !retired_this_pass {
         (PlanStatus::Cancelled, Some(now))
     } else if ending {
@@ -975,7 +973,7 @@ pub(crate) async fn gc_plan_index(
     markers: &[JobPlanMarker],
     live_ids: &HashSet<JobId>,
     prior: &HashSet<String>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> PlanIndexGc {
     let plan_jobs: HashMap<&PlanId, HashSet<&JobId>> = manifests
@@ -1094,7 +1092,7 @@ pub(crate) async fn gc_plan_index(
 pub(crate) async fn gc_pending_plan_sources(
     plans: &dyn PlanStore,
     prior: &HashSet<String>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     creating_max_age: Duration,
 ) -> (HashSet<String>, usize) {
     let mut next = HashSet::new();
@@ -1189,7 +1187,7 @@ mod tests {
         #[case] expected: PlanStatus,
         #[case] stamped: bool,
     ) -> anyhow::Result<()> {
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let (status, terminal_at) = decide_status(
             ending,
             outstanding_empty,
@@ -1377,12 +1375,12 @@ mod tests {
 
     #[tokio::test]
     async fn marker_arm_runs_when_the_content_key_listing_fails() -> anyhow::Result<()> {
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let marker = JobPlanMarker {
             job_id: JobId::from_uuid(uuid::Uuid::from_u128(1)),
             plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(2)),
             expires_at: ExpiresAt::Never,
-            written_at: now - chrono::Duration::hours(1),
+            written_at: now - jiff::SignedDuration::from_hours(1),
         };
         // The prior run staged the marker's key, so this run may collect it.
         let prior = HashSet::from([format!(
@@ -1467,7 +1465,7 @@ mod tests {
                 .await?;
         }
         let client = pipette_plan_types::ClientId::try_new("holder")?;
-        let lease_expiry: DateTime<Utc> = "2026-06-01T00:30:00Z".parse()?;
+        let lease_expiry: Timestamp = "2026-06-01T00:30:00Z".parse()?;
         let leases = if claimed {
             anyhow::ensure!(
                 matches!(
@@ -1495,7 +1493,7 @@ mod tests {
             }]
         };
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let manifest = PlanManifest {
             plan_id: cancelling.clone(),
             status: PlanStatus::Cancelling,
@@ -1586,7 +1584,7 @@ mod tests {
             .write_job_plan_marker(&job_id, &holder, ExpiresAt::Never)
             .await?;
 
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let manifest = PlanManifest {
             plan_id: settled.clone(),
             status: PlanStatus::Cancelled,
@@ -1696,7 +1694,7 @@ mod tests {
         }
 
         let creating_max_age = Duration::from_secs(21_600);
-        let now = Utc::now() + chrono::Duration::hours(if old { 7 } else { 0 });
+        let now = Timestamp::now() + jiff::SignedDuration::from_hours(if old { 7 } else { 0 });
         let key = format!("{PLAN_INDEX_KEY_PREFIX}plan-sources-pending/{plan_id}");
         let prior: HashSet<String> = seen_last_run.then(|| key.clone()).into_iter().collect();
 
@@ -1928,15 +1926,15 @@ mod tests {
             },
             pipette_store_testkit::no_queue(),
         )?;
-        let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse()?;
-        let horizon = ExpiresAt::At("2026-05-01T00:00:00Z".parse::<DateTime<Utc>>()?);
+        let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
+        let horizon = ExpiresAt::At("2026-05-01T00:00:00Z".parse::<Timestamp>()?);
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(7));
         let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(1));
         let manifest = PlanManifest {
             plan_id: plan_id.clone(),
             status: PlanStatus::Active,
             // Past the ingest window, so the overwrite rule does not defer.
-            created_at: now - chrono::Duration::days(1),
+            created_at: now - jiff::SignedDuration::from_hours(24),
             submitted_by: None,
             campaign_id: None,
             previous_plan_id: None,
@@ -2010,7 +2008,7 @@ mod tests {
             &markers,
             &HashSet::new(),
             &HashSet::new(),
-            now + chrono::Duration::hours(1),
+            now + jiff::SignedDuration::from_hours(1),
             Duration::from_secs(21_600),
         )
         .await;
@@ -2155,8 +2153,8 @@ mod tests {
                 expired_jobs.insert(
                     job_id.clone(),
                     ExpiredJob {
-                        horizon: Utc::now() - chrono::Duration::hours(1),
-                        recorded_at: Utc::now(),
+                        horizon: Timestamp::now() - jiff::SignedDuration::from_hours(1),
+                        recorded_at: Timestamp::now(),
                     },
                 );
             }
@@ -2484,8 +2482,8 @@ mod tests {
             expired_jobs: BTreeMap::from([(
                 failed.clone(),
                 ExpiredJob {
-                    horizon: Utc::now() - chrono::Duration::hours(1),
-                    recorded_at: Utc::now(),
+                    horizon: Timestamp::now() - jiff::SignedDuration::from_hours(1),
+                    recorded_at: Timestamp::now(),
                 },
             )]),
             ..settled

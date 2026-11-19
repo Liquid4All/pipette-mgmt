@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use pipette_core::client::{
     Client, MigrationRecord, SignatureMigration, parse_client_or_self_heal,
@@ -293,7 +293,7 @@ impl ClientStore for SqlClientStore {
     async fn record_signature_migration(
         &self,
         client_id: &ClientId,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> anyhow::Result<MigrationRecord> {
         // In the body, not a `timestamptz`, which would drop the nanoseconds.
         let body = serde_json::to_string_pretty(&SignatureMigration { first_seen: at })?;
@@ -545,7 +545,7 @@ impl ClientStore for SqlClientStore {
                 let key: ClientPreauthKey =
                     serde_json::from_str(&body).map_err(|e| sqlx::Error::Decode(e.into()))?;
                 // A rejection writes nothing, so it never spends the key.
-                let grant = match validate(&key, secret, Utc::now()) {
+                let grant = match validate(&key, secret, Timestamp::now()) {
                     Ok(grant) => grant,
                     Err(rejection) => return Ok(ClientPreauthConsumeOutcome::Rejected(rejection)),
                 };
@@ -644,7 +644,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use anyhow::Context;
-    use chrono::{TimeDelta, Utc};
+    use jiff::{SignedDuration, Timestamp};
 
     use pipette_core::client::{Client, MigrationRecord};
     use pipette_core::client_permission::{ClientPermissionSet, StoredClientPermission};
@@ -1009,7 +1009,7 @@ mod tests {
             )
             .await?;
         clients
-            .record_signature_migration(&client_id, Utc::now())
+            .record_signature_migration(&client_id, Timestamp::now())
             .await?;
         clients.put_client(&record).await?;
 
@@ -1203,7 +1203,7 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
         let clients = SqlClientStore::new(db.clone());
-        let minted = mint(single_use(), Utc::now())?;
+        let minted = mint(single_use(), Timestamp::now())?;
         let (key_id, secret) = minted
             .token
             .parse_parts()
@@ -1237,7 +1237,7 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
         let clients = SqlClientStore::new(db.clone());
-        let minted = mint(single_use(), Utc::now())?;
+        let minted = mint(single_use(), Timestamp::now())?;
         let (key_id, secret) = minted
             .token
             .parse_parts()
@@ -1265,11 +1265,11 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let clients = SqlClientStore::new(test_db.db().clone());
         let client_id = ClientId::try_new("ev1_racing")?;
-        let base = Utc::now();
+        let base = Timestamp::now();
         let outcomes = race(|nth| {
             let (clients, client_id) = (clients.clone(), client_id.clone());
             async move {
-                let at = base + TimeDelta::milliseconds(i64::try_from(nth)?);
+                let at = base + SignedDuration::from_millis(i64::try_from(nth)?);
                 let outcome = clients.record_signature_migration(&client_id, at).await?;
                 Ok((at, outcome))
             }
@@ -1296,7 +1296,7 @@ mod tests {
     async fn racing_consumes_spend_a_single_use_key_once() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let clients = SqlClientStore::new(test_db.db().clone());
-        let minted = mint(single_use(), Utc::now())?;
+        let minted = mint(single_use(), Timestamp::now())?;
         let (key_id, secret) = minted
             .token
             .parse_parts()

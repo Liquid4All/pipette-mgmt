@@ -14,8 +14,8 @@ use pipette_web_testkit::{
     authed_user_delete, authed_user_get, authed_user_post, body_json, create_user, json_str,
     make_service_account, make_state, make_state_require_user_preauth,
     make_state_with_legacy_signatures, mint_user_preauth, register_user_key, registered_user,
-    request_user_account, request_with_headers, seed_org, set_user_org, setup_benchmarks,
-    unauthed_post, user_auth_headers, user_auth_headers_at,
+    request_user_account, request_with_headers, seed_org, seed_org_named, set_user_org,
+    setup_benchmarks, unauthed_post, user_auth_headers, user_auth_headers_at,
 };
 
 // axum's `JsonRejection` text, which `ApiJson` passes through; an axum upgrade
@@ -73,8 +73,9 @@ async fn test_users_me_names_the_members_organization() -> anyhow::Result<()> {
     crate::api_schema::assert_conforms("OwnUserView", &body)?;
     assert!(body.get("org_id").is_none(), "{body}");
     assert!(body.get("org_slug").is_none(), "{body}");
+    assert!(body.get("org_display_name").is_none(), "{body}");
 
-    let acme = seed_org(&state, "acme").await?;
+    let acme = seed_org_named(&state, "acme", "Acme Corp.").await?;
     set_user_org(&state, &user_id, Some(acme.org_id.clone())).await?;
     let body =
         body_json(authed_user_get(&state, &key, &user_id, &key_id, "/api/v1/users/me").await?)
@@ -82,6 +83,7 @@ async fn test_users_me_names_the_members_organization() -> anyhow::Result<()> {
     crate::api_schema::assert_conforms("OwnUserView", &body)?;
     assert_eq!(body["org_id"], json!(acme.org_id.as_str()));
     assert_eq!(body["org_slug"], json!("acme"));
+    assert_eq!(body["org_display_name"], json!("Acme Corp."));
     Ok(())
 }
 
@@ -113,7 +115,7 @@ async fn test_the_account_reads_its_resolved_permissions() -> anyhow::Result<()>
     crate::api_schema::assert_conforms("OwnUserView", &body)?;
     assert_eq!(body["permissions"], json!(["read_plans", "submit_plans"]));
     assert_eq!(body["contact_email"], json!(user.contact_email.as_str()));
-    let created_at = chrono::DateTime::parse_from_rfc3339(json_str(&body, "created_at")?)?;
+    let created_at = json_str(&body, "created_at")?.parse::<jiff::Timestamp>()?;
     assert_eq!(created_at, user.created_at);
     Ok(())
 }
@@ -232,7 +234,7 @@ async fn test_a_signature_is_spent_once() -> anyhow::Result<()> {
 async fn test_a_stale_signature_is_refused() -> anyhow::Result<()> {
     let (_dir, state, key, user_id, key_id) = user_state().await?;
 
-    let stale = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let stale = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)).to_string();
     let headers = user_auth_headers_at(&key, &user_id, &key_id, "GET", "/api/v1/users/me", stale)?;
     let resp = request_with_headers(&state, "GET", "/api/v1/users/me", &headers).await?;
 
@@ -331,7 +333,7 @@ async fn test_an_off_curve_user_key_is_the_callers_fault() -> anyhow::Result<()>
     let headers = vec![
         ("X-Client-Id", user.user_id.to_string()),
         ("X-User-Key-Id", key_id),
-        ("X-Timestamp", chrono::Utc::now().to_rfc3339()),
+        ("X-Timestamp", jiff::Timestamp::now().to_string()),
         ("X-Signature", hex::encode([0u8; 64])),
         ("X-Nonce", "any".to_string()),
     ];
@@ -375,7 +377,7 @@ async fn test_a_small_order_user_key_cannot_be_signed_for() -> anyhow::Result<()
     let headers = vec![
         ("X-Client-Id", user.user_id.to_string()),
         ("X-User-Key-Id", key_id),
-        ("X-Timestamp", chrono::Utc::now().to_rfc3339()),
+        ("X-Timestamp", jiff::Timestamp::now().to_string()),
         ("X-Signature", hex::encode(forged)),
         ("X-Nonce", "any".to_string()),
     ];
@@ -400,7 +402,7 @@ async fn test_a_user_has_no_timestamp_only_fallback() -> anyhow::Result<()> {
     let state = make_state_with_legacy_signatures(dir.path(), true).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadPlans]).await?;
 
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = jiff::Timestamp::now().to_string();
     let signature = key.sign(timestamp.as_bytes());
     let headers = vec![
         ("X-Client-Id", user_id.to_string()),
@@ -1529,14 +1531,14 @@ async fn test_a_key_added_with_an_expiry_lists_it() -> anyhow::Result<()> {
     let browser = pipette_web_testkit::signing_key()?;
     let public_key = hex::encode(browser.verifying_key().as_bytes());
     // At the cap, from a caller whose clock runs a few minutes ahead.
-    let expires_at = chrono::Utc::now()
+    let expires_at = jiff::Timestamp::now()
         + pipette_httpapi::api_v1::users::own::MAX_KEY_LIFETIME
-        + chrono::TimeDelta::minutes(4);
+        + jiff::SignedDuration::from_mins(4);
 
     let past = json!({
         "public_key": public_key,
         "key_details": "a browser",
-        "expires_at": chrono::Utc::now() - chrono::TimeDelta::seconds(1),
+        "expires_at": jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
     });
     let resp = authed_user_post(
         &state,
@@ -1556,9 +1558,9 @@ async fn test_a_key_added_with_an_expiry_lists_it() -> anyhow::Result<()> {
     let too_far = json!({
         "public_key": public_key,
         "key_details": "a browser",
-        "expires_at": chrono::Utc::now()
+        "expires_at": jiff::Timestamp::now()
             + pipette_httpapi::api_v1::users::own::MAX_KEY_LIFETIME
-            + chrono::TimeDelta::hours(1),
+            + jiff::SignedDuration::from_hours(1),
     });
     let resp = authed_user_post(
         &state,
@@ -1599,7 +1601,7 @@ async fn test_a_key_added_with_an_expiry_lists_it() -> anyhow::Result<()> {
         .as_array()
         .and_then(|keys| keys.iter().find(|k| k["key_details"] == "a browser"))
         .ok_or_else(|| anyhow::anyhow!("the browser key is listed: {me}"))?;
-    let listed_at = chrono::DateTime::parse_from_rfc3339(json_str(listed, "expires_at")?)?;
+    let listed_at = json_str(listed, "expires_at")?.parse::<jiff::Timestamp>()?;
     assert_eq!(listed_at, expires_at);
     let own = me["keys"]
         .as_array()
@@ -1619,11 +1621,11 @@ async fn test_an_expired_key_signs_nothing() -> anyhow::Result<()> {
     let public_key =
         pipette_plan_types::PublicKeyHex::try_new(hex::encode(browser.verifying_key().as_bytes()))?;
     let lapsed = pipette_core::user::UserKey {
-        expires_at: Some(chrono::Utc::now() - chrono::TimeDelta::seconds(1)),
+        expires_at: Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)),
         ..pipette_core::user::UserKey::new(
             public_key,
             pipette_plan_types::NonEmptyTrimmedString::try_new("a browser")?,
-            chrono::Utc::now() - chrono::TimeDelta::days(30),
+            jiff::Timestamp::now() - jiff::SignedDuration::from_hours(30 * 24),
         )
     };
     state.user_store.put_user_key(&user_id, &lapsed).await?;

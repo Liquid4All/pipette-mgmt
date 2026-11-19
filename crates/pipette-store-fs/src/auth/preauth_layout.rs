@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -71,7 +71,7 @@ pub(super) enum Spend {
 /// The marker, not the record's deletion, is the spend: `create_new` is
 /// `O_EXCL`, so one concurrent consume wins. If the caller's later delete of the
 /// record never lands, the marker still makes the next consume lose.
-pub(super) fn claim_spent(dir: &Path, key_id: &str, now: DateTime<Utc>) -> anyhow::Result<Spend> {
+pub(super) fn claim_spent(dir: &Path, key_id: &str, now: Timestamp) -> anyhow::Result<Spend> {
     std::fs::create_dir_all(dir)?;
     match std::fs::OpenOptions::new()
         .write(true)
@@ -79,7 +79,7 @@ pub(super) fn claim_spent(dir: &Path, key_id: &str, now: DateTime<Utc>) -> anyho
         .open(marker_path(dir, key_id))
     {
         Ok(mut file) => {
-            std::io::Write::write_all(&mut file, now.to_rfc3339().as_bytes())?;
+            std::io::Write::write_all(&mut file, now.to_string().as_bytes())?;
             Ok(Spend::Claimed)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Spend::AlreadySpent),

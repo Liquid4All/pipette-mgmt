@@ -4,12 +4,12 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
     CampaignGroupId, CampaignGroupPolicy, CampaignId, CampaignState, JobId, Labels,
-    NonEmptyTrimmedString, PlanId, PrincipalOwner,
+    NonEmptyTrimmedString, PlanId, PolicyKind, PrincipalOwner,
 };
 
 use crate::types::Mint;
@@ -44,10 +44,14 @@ pub struct Campaign {
     /// Absent while `active`, so a record nobody archived reads as it did before.
     #[serde(default, skip_serializing_if = "CampaignState::is_active")]
     pub state: CampaignState,
-    pub created_at: DateTime<Utc>,
+    /// Why the campaign is locked; set only while `locked`, by
+    /// [`set_state`](Self::set_state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_note: Option<NonEmptyTrimmedString>,
+    pub created_at: Timestamp,
     /// When any field here last changed: a rename, new labels, a state change,
     /// or a hand-off to another owner. Equal to `created_at` on a fresh record.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl From<Campaign> for pipette_plan_types::Campaign {
@@ -59,6 +63,7 @@ impl From<Campaign> for pipette_plan_types::Campaign {
             current_plan_id: campaign.current_plan_id,
             labels: campaign.labels,
             state: campaign.state,
+            state_note: campaign.state_note,
             created_at: campaign.created_at,
             updated_at: campaign.updated_at,
         }
@@ -99,7 +104,7 @@ impl NewCampaign {
     /// The campaign, running `plan_id`: the plan just filed under
     /// [`campaign_id`](Self::campaign_id). Unchecked here; a plan filed anywhere
     /// else would gain a second campaign.
-    pub fn around(self, plan_id: PlanId, created_at: DateTime<Utc>) -> Campaign {
+    pub fn around(self, plan_id: PlanId, created_at: Timestamp) -> Campaign {
         Campaign {
             campaign_id: self.campaign_id,
             name: self.name,
@@ -107,6 +112,7 @@ impl NewCampaign {
             current_plan_id: Some(plan_id),
             labels: Labels::default(),
             state: CampaignState::Active,
+            state_note: None,
             created_at,
             updated_at: created_at,
         }
@@ -117,7 +123,7 @@ impl Campaign {
     /// Move onto `plan_id`, the plan ingestion just filed into this campaign;
     /// nothing hands this an arbitrary plan. Re-advancing onto the current plan,
     /// as a retried ingest does, is a no-op.
-    pub fn advance(&mut self, plan_id: PlanId, at: DateTime<Utc>) -> bool {
+    pub fn advance(&mut self, plan_id: PlanId, at: Timestamp) -> bool {
         if self.current_plan_id.as_ref() == Some(&plan_id) {
             return false;
         }
@@ -128,7 +134,7 @@ impl Campaign {
 
     /// Rename the campaign, returning whether anything changed. Renaming to the
     /// current name writes nothing and keeps `updated_at`, so a retry is safe.
-    pub fn rename(&mut self, name: NonEmptyTrimmedString, at: DateTime<Utc>) -> bool {
+    pub fn rename(&mut self, name: NonEmptyTrimmedString, at: Timestamp) -> bool {
         if self.name == name {
             return false;
         }
@@ -138,7 +144,7 @@ impl Campaign {
     }
 
     /// Replace the campaign's labels with `labels`, on the same no-op rule.
-    pub fn set_labels(&mut self, labels: Labels, at: DateTime<Utc>) -> bool {
+    pub fn set_labels(&mut self, labels: Labels, at: Timestamp) -> bool {
         if self.labels == labels {
             return false;
         }
@@ -147,19 +153,27 @@ impl Campaign {
         true
     }
 
-    /// Archive the campaign or unarchive it, on the same no-op rule.
-    pub fn set_state(&mut self, state: CampaignState, at: DateTime<Utc>) -> bool {
-        if self.state == state {
+    /// Lock, archive or reactivate the campaign, on the same no-op rule.
+    /// `note` is kept only with `locked`; any other state clears it.
+    pub fn set_state(
+        &mut self,
+        state: CampaignState,
+        note: Option<NonEmptyTrimmedString>,
+        at: Timestamp,
+    ) -> bool {
+        let note = note.filter(|_| state == CampaignState::Locked);
+        if self.state == state && self.state_note == note {
             return false;
         }
         self.state = state;
+        self.state_note = note;
         self.updated_at = at;
         true
     }
 
     /// Hand the campaign to a new owner, on the same no-op rule. Keeps the
     /// pointer: a team taking over inherits the work mid-flight.
-    pub fn set_owner(&mut self, owner: CampaignOwner, at: DateTime<Utc>) -> bool {
+    pub fn set_owner(&mut self, owner: CampaignOwner, at: Timestamp) -> bool {
         if self.owner == owner {
             return false;
         }
@@ -180,14 +194,14 @@ pub struct CampaignGroup {
     /// hand-off takes a campaign out (`campaign_admin::leave_group`). The store
     /// checks neither.
     pub owner: CampaignOwner,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the name last changed; `created_at` on a fresh record.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl CampaignGroup {
     /// Minted here so no caller can choose an id that collides.
-    pub fn new(name: NonEmptyTrimmedString, owner: CampaignOwner, at: DateTime<Utc>) -> Self {
+    pub fn new(name: NonEmptyTrimmedString, owner: CampaignOwner, at: Timestamp) -> Self {
         Self {
             group_id: CampaignGroupId::mint(),
             name,
@@ -198,7 +212,7 @@ impl CampaignGroup {
     }
 
     /// Returns whether anything changed; the current name writes nothing and keeps `updated_at`.
-    pub fn rename(&mut self, name: NonEmptyTrimmedString, at: DateTime<Utc>) -> bool {
+    pub fn rename(&mut self, name: NonEmptyTrimmedString, at: Timestamp) -> bool {
         if self.name == name {
             return false;
         }
@@ -226,18 +240,53 @@ impl From<CampaignGroup> for pipette_plan_types::CampaignGroup {
 /// is a row the pass has not written.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GroupPolicyState {
-    /// The acting policies, as read, when `decided` and `refusal` were written.
+    /// The acting policies, as read, when the member's [`JobPolicyState`]s,
+    /// `triggered` and `refusal` were written.
     pub policies: Vec<CampaignGroupPolicy>,
-    /// Jobs of the head the pass is done with under `policies`: kept, or left
-    /// for good.
-    pub decided: BTreeSet<JobId>,
+    /// The kinds of `policies` that flag a job of the head, or whose re-runs
+    /// filed into the campaign wait for their rows; the others are cleared.
+    pub triggered: BTreeSet<PolicyKind>,
     /// The pass's last filing into the campaign.
     pub filed: Option<GroupFiling>,
     /// The head whose filing was refused, held while the build stays the same.
     pub refusal: Option<Refusal>,
     /// When pipette-duckdb last failed on the member's rows, which takes it
     /// behind the others in the next round; cleared once they read.
-    pub unreadable_at: Option<DateTime<Utc>>,
+    pub unreadable_at: Option<Timestamp>,
+    /// The version of the pass's rules for what a policy does with a job it
+    /// flags that the job states were kept under; 0 on a state kept before the
+    /// pass recorded one. Under another, the pass reads every answered job
+    /// again.
+    #[serde(default)]
+    pub rules: u32,
+}
+
+/// What the policy pass found of one job of a member's head under the member's
+/// `policies`: the JSON of a `campaign_group_job_states` row, which goes when
+/// the campaign leaves the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPolicyState {
+    pub job_id: JobId,
+    /// The checks of the acting policies that flag the job.
+    pub flagged: BTreeSet<PolicyKind>,
+    /// The pass is done with the job: kept, or left for good. A job it re-runs,
+    /// marks or skips until the next read is read again each round.
+    pub decided: bool,
+    /// The recorded models of the job's rows that resolve to no model params
+    /// entry, which each round checks against the table again.
+    pub missing_params: BTreeSet<RecordedModel>,
+    /// The job's family and sizes, when smaller_failed acts.
+    pub family: Option<(String, Vec<i64>)>,
+    /// A row of the job failed.
+    pub failed: bool,
+}
+
+/// A result row's `model_descriptor` and `model_vault_descriptor`, by which
+/// the model params table resolves it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RecordedModel {
+    pub descriptor: Option<String>,
+    pub vault_descriptor: Option<String>,
 }
 
 /// A revision the policy pass filed into a member campaign.
@@ -252,7 +301,7 @@ pub struct GroupFiling {
     pub commit_unknown: bool,
     /// With `unreadable_at`, when the pass last filed into or failed to read the
     /// member: a round takes the longest ago first.
-    pub filed_at: DateTime<Utc>,
+    pub filed_at: Timestamp,
 }
 
 /// A head the policy pass could not file again, and why.
@@ -267,7 +316,7 @@ pub struct Refusal {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rstest::rstest;
 
     use pipette_plan_types::{OrgId, UserId};
@@ -288,7 +337,7 @@ mod tests {
     }
 
     fn a_campaign() -> anyhow::Result<Campaign> {
-        Ok(a_new_campaign()?.around(a_plan(), Utc::now()))
+        Ok(a_new_campaign()?.around(a_plan(), Timestamp::now()))
     }
 
     /// A campaign is created around its first plan, under the id that plan was
@@ -305,7 +354,7 @@ mod tests {
         );
 
         let first = a_plan();
-        let campaign = new.around(first.clone(), Utc::now());
+        let campaign = new.around(first.clone(), Timestamp::now());
         assert_eq!(campaign.campaign_id, campaign_id);
         assert_eq!(campaign.current_plan_id, Some(first));
         assert_eq!(campaign.created_at, campaign.updated_at);
@@ -320,7 +369,7 @@ mod tests {
         let id = campaign.campaign_id.clone();
         let second = a_plan();
 
-        assert!(campaign.advance(second.clone(), Utc::now()));
+        assert!(campaign.advance(second.clone(), Timestamp::now()));
         assert_eq!(campaign.current_plan_id, Some(second));
         assert_eq!(campaign.campaign_id, id, "the identity never moves");
         Ok(())
@@ -332,13 +381,16 @@ mod tests {
         let mut campaign = a_campaign()?;
         let plan_id = campaign.current_plan_id.clone();
 
-        assert!(campaign.rename(NonEmptyTrimmedString::try_new("Nightly v2")?, Utc::now()));
+        assert!(campaign.rename(
+            NonEmptyTrimmedString::try_new("Nightly v2")?,
+            Timestamp::now()
+        ));
         let org_id = OrgId::mint();
         assert!(campaign.set_owner(
             CampaignOwner::Org {
                 org_id: org_id.clone()
             },
-            Utc::now()
+            Timestamp::now()
         ));
 
         assert_eq!(
@@ -361,11 +413,11 @@ mod tests {
             .context("created with a plan")?;
         let before = campaign.clone();
 
-        assert!(!campaign.advance(plan_id, Utc::now()));
-        assert!(!campaign.rename(campaign.name.clone(), Utc::now()));
-        assert!(!campaign.set_labels(campaign.labels.clone(), Utc::now()));
-        assert!(!campaign.set_owner(campaign.owner.clone(), Utc::now()));
-        assert!(!campaign.set_state(campaign.state, Utc::now()));
+        assert!(!campaign.advance(plan_id, Timestamp::now()));
+        assert!(!campaign.rename(campaign.name.clone(), Timestamp::now()));
+        assert!(!campaign.set_labels(campaign.labels.clone(), Timestamp::now()));
+        assert!(!campaign.set_owner(campaign.owner.clone(), Timestamp::now()));
+        assert!(!campaign.set_state(campaign.state, None, Timestamp::now()));
         assert_eq!(
             campaign, before,
             "a no-op moves nothing, updated_at included"
@@ -382,7 +434,7 @@ mod tests {
         let created = campaign.updated_at;
 
         let labels = |of: serde_json::Value| serde_json::from_value::<Labels>(of);
-        let later = created + chrono::Duration::seconds(5);
+        let later = created + jiff::SignedDuration::from_secs(5);
         assert!(campaign.set_labels(
             labels(serde_json::json!({"study": "acmelm", "kind": "canary"}))?,
             later
@@ -406,9 +458,9 @@ mod tests {
     fn an_archive_is_stored_and_an_unarchive_is_not() -> anyhow::Result<()> {
         let mut campaign = a_campaign()?;
         assert!(serde_json::to_value(&campaign)?.get("state").is_none());
-        let later = campaign.updated_at + chrono::Duration::seconds(5);
+        let later = campaign.updated_at + jiff::SignedDuration::from_secs(5);
 
-        assert!(campaign.set_state(CampaignState::Archived, later));
+        assert!(campaign.set_state(CampaignState::Archived, None, later));
         assert_eq!(
             serde_json::to_value(&campaign)?.get("state"),
             Some(&serde_json::json!("archived"))
@@ -419,8 +471,32 @@ mod tests {
             campaign
         );
 
-        assert!(campaign.set_state(CampaignState::Active, later));
+        assert!(campaign.set_state(CampaignState::Active, None, later));
         assert!(serde_json::to_value(&campaign)?.get("state").is_none());
+        Ok(())
+    }
+
+    /// A lock keeps its note, a new note on a locked campaign is a change, and
+    /// any other state drops the note.
+    #[test]
+    fn a_lock_keeps_its_note_until_the_state_changes() -> anyhow::Result<()> {
+        let mut campaign = a_campaign()?;
+        let later = campaign.updated_at + jiff::SignedDuration::from_secs(5);
+        let note = |text: &str| NonEmptyTrimmedString::try_new(text);
+
+        assert!(campaign.set_state(CampaignState::Locked, Some(note("release")?), later));
+        assert_eq!(
+            serde_json::to_value(&campaign)?.get("state_note"),
+            Some(&serde_json::json!("release"))
+        );
+        assert!(!campaign.set_state(CampaignState::Locked, Some(note("release")?), later));
+        assert!(campaign.set_state(CampaignState::Locked, Some(note("audit")?), later));
+
+        assert!(campaign.set_state(CampaignState::Archived, Some(note("ignored")?), later));
+        assert_eq!(campaign.state_note, None);
+        assert!(campaign.set_state(CampaignState::Locked, Some(note("again")?), later));
+        assert!(campaign.set_state(CampaignState::Active, None, later));
+        assert!(serde_json::to_value(&campaign)?.get("state_note").is_none());
         Ok(())
     }
 
@@ -473,7 +549,7 @@ mod tests {
         #[case] labels: serde_json::Value,
         #[case] state: CampaignState,
     ) -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let record = Campaign {
             campaign_id: CampaignId::mint(),
             name: NonEmptyTrimmedString::try_new("Nightly")?,
@@ -483,6 +559,7 @@ mod tests {
             current_plan_id: current_plan_id.map(PlanId::try_new).transpose()?,
             labels: serde_json::from_value(labels)?,
             state,
+            state_note: None,
             created_at: now,
             updated_at: now,
         };

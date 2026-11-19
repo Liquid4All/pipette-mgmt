@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::TimeZone;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -52,9 +51,7 @@ pub(super) fn test_client(
         client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
         contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
         status: pipette_core::client::ClientStatus::Pending,
-        registered_at: chrono::Utc
-            .timestamp_opt(registered_at_secs, 0)
-            .single()
+        registered_at: jiff::Timestamp::from_second(registered_at_secs)
             .context("valid timestamp")?,
         device_profile: Default::default(),
         capabilities: Default::default(),
@@ -178,7 +175,7 @@ async fn s3_preauth_keyspaces_do_not_cross() -> anyhow::Result<()> {
             default_permissions: None,
             note: None,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     let user_key = pipette_core::user_preauth::mint(
         pipette_core::user_preauth::UserPreauthParams {
@@ -187,7 +184,7 @@ async fn s3_preauth_keyspaces_do_not_cross() -> anyhow::Result<()> {
             expires_at: None,
             note: None,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     clients.put_client_preauth_key(&client_key.key).await?;
     users.put_user_preauth_key(&user_key.key).await?;
@@ -274,7 +271,7 @@ async fn s3_user_key_and_claim_objects_use_their_prefixes() -> anyhow::Result<()
     let key = pipette_core::user::UserKey::new(
         public_key.clone(),
         NonEmptyTrimmedString::try_new("laptop")?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     users.put_user_key(&user_id, &key).await?;
 

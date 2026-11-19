@@ -16,10 +16,11 @@ use pipette_plan_types::{
     CampaignGroup, CampaignId, CampaignListQuery, CampaignOverview, CampaignOverviewQuery,
     CampaignPlanRow, CampaignPlans, CampaignReadQuery, CampaignView, DeviceTimeTotal, Highlights,
     ListPage, Named, OrgId, OwnedListQuery, OwnerFilter, OwnerLookupQuery, PlanId, PlanReadQuery,
-    PlanSummary, UserId, UserPermission,
+    PlanSummary, PolicyCheck, UserId, UserPermission,
 };
 use pipette_store::{STORAGE_CONCURRENCY, drain_campaigns};
 
+use crate::api_v1::campaigns::tags::{campaign_tags, may_tag};
 use crate::api_v1::campaigns::{CampaignReviser, require};
 use crate::auth::{ActiveUser, Caller, user_org};
 use crate::campaign_access::{CampaignAuthority, CampaignReach};
@@ -95,6 +96,17 @@ pub async fn list_campaigns(
     } else {
         HashMap::new()
     };
+    let mut checks = if read.plan.unwrap_or(false) {
+        policy_checks(&state, &page.items).await?
+    } else {
+        HashMap::new()
+    };
+    let tags = if read.plan.unwrap_or(false) {
+        let ids: Vec<CampaignId> = page.items.iter().map(|c| c.campaign_id.clone()).collect();
+        campaign_tags(&state, &ids).await?
+    } else {
+        Vec::new()
+    };
     let names = if read.names.unwrap_or(false) {
         Some(owner_labels(&state, page.items.iter().map(|campaign| &campaign.owner)).await)
     } else {
@@ -108,6 +120,13 @@ pub async fn list_campaigns(
             CampaignView {
                 plan: head.and_then(|plan_id| plans.remove(plan_id)),
                 models: head.and_then(|plan_id| models.remove(plan_id)),
+                policy_checks: checks.remove(&campaign.campaign_id),
+                current_plan_tags: tags
+                    .iter()
+                    .filter(|tag| tag.campaign_id == campaign.campaign_id)
+                    .filter(|tag| Some(&tag.plan_id) == head)
+                    .cloned()
+                    .collect(),
                 campaign: campaign.into(),
             }
         })
@@ -174,9 +193,57 @@ async fn plan_models(state: &AppState, plan_ids: Vec<PlanId>) -> HashMap<PlanId,
         .await
 }
 
-/// Whether `campaign` is in the state `filter` asks for; any state without one.
+/// The policy checks of each of `campaigns` that is active and in a group, from
+/// what queue-maintenance last kept of it: the policies on at that read, each
+/// cleared or triggered.
+async fn policy_checks(
+    state: &AppState,
+    campaigns: &[Campaign],
+) -> Result<HashMap<CampaignId, Vec<PolicyCheck>>, AppError> {
+    let Some(groups) = state.campaign_group_store.as_deref() else {
+        return Ok(HashMap::new());
+    };
+    let active: Vec<CampaignId> = campaigns
+        .iter()
+        .filter(|campaign| campaign.state.is_active())
+        .map(|campaign| campaign.campaign_id.clone())
+        .collect();
+    let members = groups
+        .member_states(&active)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to read the campaigns' group states")))?;
+    members
+        .into_iter()
+        .filter_map(|member| {
+            let kept = match member.policy_state {
+                Ok(kept) => kept?,
+                Err(bad) => {
+                    return Some(Err(AppError::internal(
+                        anyhow::Error::from(bad)
+                            .context("a campaign's group state does not decode"),
+                    )));
+                }
+            };
+            let checks: Vec<PolicyCheck> = kept
+                .policies
+                .iter()
+                .map(|policy| PolicyCheck {
+                    kind: policy.kind,
+                    triggered: kept.triggered.contains(&policy.kind),
+                })
+                .collect();
+            (!checks.is_empty()).then_some(Ok((member.campaign_id, checks)))
+        })
+        .collect()
+}
+
+/// Whether `campaign` is in a state `filter` asks for; any state without one,
+/// or with an empty list.
 fn in_state(filter: &CampaignListQuery, campaign: &Campaign) -> bool {
-    filter.state.is_none_or(|state| campaign.state == state)
+    filter
+        .state
+        .as_ref()
+        .is_none_or(|states| states.is_empty() || states.contains(&campaign.state))
 }
 
 /// The campaign `plan_id`'s manifest names, so a superseded plan finds it
@@ -254,6 +321,8 @@ pub async fn get_campaign(
             campaign: campaign.into(),
             plan,
             models: None,
+            policy_checks: None,
+            current_plan_tags: Vec::new(),
         },
         names,
     }))
@@ -328,6 +397,7 @@ pub async fn list_campaign_plans(
         current_plan_id: chain.plans.first().cloned(),
         superseded_plan_ids: chain.superseded().to_vec(),
         history_truncated: chain.truncated,
+        tags: campaign_tags(&state, std::slice::from_ref(&campaign_id)).await?,
     }))
 }
 
@@ -375,6 +445,8 @@ pub async fn org_campaigns(
             .as_ref()
             .and_then(|plan_id| plans.remove(plan_id)),
         models: None,
+        policy_checks: None,
+        current_plan_tags: Vec::new(),
         campaign: campaign.clone().into(),
     }))
 }
@@ -496,6 +568,8 @@ pub(crate) async fn overview(
     } else {
         None
     };
+    let may_tag = may_tag(state, caller, &campaign).await?;
+    let tags = campaign_tags(state, std::slice::from_ref(&campaign.campaign_id)).await?;
 
     let submitters = links
         .iter()
@@ -526,10 +600,19 @@ pub(crate) async fn overview(
             may_edit_variants: revisable.is_some(),
             // [`may_rerun`]'s rule, from the reads above.
             may_rerun: revisable.is_some_and(|head| !head.content_keys.is_empty()),
+            may_tag,
             catalog_org_id,
             history: links
                 .into_iter()
-                .map(|(plan_id, plan)| CampaignPlanRow { plan_id, plan })
+                .map(|(plan_id, plan)| CampaignPlanRow {
+                    tags: tags
+                        .iter()
+                        .filter(|tag| tag.plan_id == plan_id)
+                        .cloned()
+                        .collect(),
+                    plan_id,
+                    plan,
+                })
                 .collect(),
             history_truncated: chain.truncated,
             device_time_current_plan,

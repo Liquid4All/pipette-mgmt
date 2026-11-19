@@ -10,16 +10,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator as _;
 use tokio::sync::OnceCell;
 
 use pipette_core::BUILD_VERSION;
 use pipette_core::audit::new_event;
 use pipette_core::benchmark::Benchmark;
-use pipette_core::campaign::{Campaign, CampaignGroup, GroupFiling, GroupPolicyState, Refusal};
+use pipette_core::campaign::{
+    Campaign, CampaignGroup, GroupFiling, GroupPolicyState, JobPolicyState, RecordedModel, Refusal,
+};
 use pipette_core::config::Config;
 use pipette_core::plan::{PlanManifest, PlanSummary};
 use pipette_plan_types::{
@@ -29,8 +32,8 @@ use pipette_plan_types::{
     PolicyRerun, PolicySettings, PolicySkipReason, RerunOutcome, RevisionChange, SmallerFailure,
 };
 use pipette_store::{
-    CampaignGroupStore, GroupMember, JobHolder, JobHolderListing, PlanStore, STORAGE_CONCURRENCY,
-    Stores, SubmissionStore, TodoStore,
+    CampaignGroupStore, GroupMember, JobHolder, JobHolderListing, JobStateChanges, PlanStore,
+    STORAGE_CONCURRENCY, Stores, SubmissionStore, TodoStore,
 };
 
 use crate::audit::{AuditReach, host_actor};
@@ -41,10 +44,18 @@ use crate::plan_document::DocumentError;
 use crate::plan_ingestion::{IngestContext, IngestError, IngestSettings, ModelCheck, size_family};
 use crate::plan_results::{ResultRow, ResultsDb, ResultsError, rows_by_job};
 use crate::queue_maintenance::millis;
+use crate::score::{VaultNames, policy_rows};
+use crate::submission::parse_stored_submission;
 
 /// The runs of a re-run chain, the job included, at which no policy re-runs
 /// the job: one flagged on every run spends `MAX_RERUNS` there anyway.
 const CHAIN_RUNS: u32 = MAX_RERUNS + 1;
+
+/// The version of what the policies do with a job they flag, which a member's
+/// [`GroupPolicyState::rules`] records. Bump it with a change to those rules,
+/// so the pass reads every answered job once under the new ones, as after a
+/// policy save. 1: spread marks a cell failed once its re-runs are spent.
+const RULES: u32 = 1;
 
 /// A member campaign read for its group's policies.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,12 +66,20 @@ pub struct Evaluation {
     /// One per kind, in kind order. The policy pass counts only the policies
     /// that are on.
     pub checks: Vec<PolicyCheckCounts>,
-    /// The plan's jobs with a recorded outcome, as its `settled_jobs` holds them.
+    /// The plan's jobs with a recorded outcome, as its `settled_jobs` holds
+    /// them, an eval's left out ([`performance_jobs`]).
     pub answered_job_count: usize,
-    /// Answered jobs with no rows in pipette-duckdb yet.
+    /// Answered jobs with no rows in pipette-duckdb yet, except the jobs of
+    /// `from_body`.
     pub waiting_job_count: usize,
     /// The jobs the policies that are on would re-run together.
     pub rerun_job_ids: BTreeSet<JobId>,
+    /// The jobs of `rerun_job_ids` that the policies flag on rows built from
+    /// their submission bodies, as pipette-duckdb has no rows for them yet.
+    pub from_body: BTreeSet<JobId>,
+    /// Submission-body lookups, including the second read of each re-run
+    /// candidate, when [`Pass::bodies`] is given.
+    pub body_reads: usize,
     /// The jobs to mark failed, each with its reason.
     pub marked: BTreeMap<JobId, String>,
     /// Answered jobs with rows that stay as they are: no policy that is on
@@ -85,15 +104,25 @@ pub struct Evaluation {
     /// The failed jobs read whose family holds a larger job with rows and no
     /// failure; found only when [`Pass::catalog`] is given.
     pub smaller_failed: Vec<SmallerFailure>,
-    /// The jobs this read decided: kept, or left for good. `record.decided`
-    /// adds those decided before.
+    /// The jobs this read decided: kept, or left for good.
     pub decided: BTreeSet<JobId>,
+    /// The checks of the policies that are on that flag each job this read
+    /// walked.
+    pub flagged: BTreeMap<JobId, BTreeSet<PolicyKind>>,
+    /// A job state for each job with rows that this read read, smaller_failed
+    /// aside, which needs every job's.
+    pub read: Vec<JobPolicyState>,
+    /// The member's job states once the policy pass read its rows: those it
+    /// read and those decided before, in job id order. `None` leaves the
+    /// stored ones as they are.
+    pub job_states: Option<Vec<JobPolicyState>>,
     /// What holds the member before its rows are read, for the states
     /// `waiting_for_devices`, `filing_not_advanced` and `refused`.
     pub hold: Option<Hold>,
     /// What the policy pass keeps of a member whose rows it read, or failed to
-    /// read, which [`file()`] completes with its filing; `None` from the
-    /// preview and for a member not read.
+    /// read, which [`file()`] completes with its filing, or of one its queued
+    /// re-runs or a refusal holds; `None` from the preview and for a member not
+    /// read.
     pub record: Option<GroupPolicyState>,
 }
 
@@ -144,11 +173,26 @@ pub struct Pass<'a> {
     pub catalog: Option<&'a HashMap<BenchmarkId, Benchmark>>,
     /// The member's recorded re-runs that wait for their rows.
     pub waiting: &'a [PolicyRerun],
+    /// The member's stored job states; the preview takes none.
+    pub job_states: &'a [JobPolicyState],
+    /// What the pass reads the submission bodies of answered jobs with no
+    /// rows with; `None` reads pipette-duckdb rows alone, as the preview does.
+    pub bodies: Option<BodyReads<'a>>,
+}
+
+/// What builds rows from a submission body: the benchmark catalog, and the
+/// stores that the scorer reads a body's vault names from.
+#[derive(Clone, Copy)]
+pub struct BodyReads<'a> {
+    pub catalog: &'a HashMap<BenchmarkId, Benchmark>,
+    pub stores: &'a Stores,
 }
 
 /// Read `campaign`, a member of `group`, under the group's `stored` policies
 /// (a kind not stored reads as its defaults): what the policies that are on
 /// would re-run and mark in its current plan, and what each would do alone.
+/// Only the answered jobs of performance benchmarks are read; no policy judges
+/// an eval's ([`performance_jobs`]).
 /// `results` is `None` once an earlier member's pipette-duckdb read failed:
 /// a member read that far then reads [`PolicyMemberState::Unreadable`], as
 /// does one whose own read fails or times out. A member whose last group
@@ -157,9 +201,12 @@ pub struct Pass<'a> {
 /// the rows of one that waits for devices or was refused, for the model params
 /// check. The policy pass leaves out the jobs decided under the same policies
 /// and counts only the policies that are on; the preview reads every answered
-/// job and counts each policy, on or off. It writes nothing: the policy pass
-/// cancels the filing a [`Hold::NotAdvanced`] names. A store read that fails
-/// is an error.
+/// job and counts each policy, on or off. With [`Pass::bodies`], the rows of
+/// an answered job with none in pipette-duckdb come from its submission body,
+/// and they act only by a re-run. It writes nothing: the policy pass
+/// cancels the filing a [`Hold::NotAdvanced`] names. Failed plan-store reads
+/// return errors. Failed submission-body or vault-name reads leave jobs
+/// waiting for result rows.
 pub async fn evaluate(
     plans: &dyn PlanStore,
     results: Option<&ResultsDb>,
@@ -188,6 +235,8 @@ pub async fn evaluate(
         answered_job_count: 0,
         waiting_job_count: 0,
         rerun_job_ids: BTreeSet::new(),
+        from_body: BTreeSet::new(),
+        body_reads: 0,
         marked: BTreeMap::new(),
         kept_job_count: 0,
         skipped: BTreeMap::new(),
@@ -198,6 +247,9 @@ pub async fn evaluate(
         missing_model_params: Vec::new(),
         smaller_failed: Vec::new(),
         decided: BTreeSet::new(),
+        flagged: BTreeMap::new(),
+        read: Vec::new(),
+        job_states: None,
         hold: None,
         record: None,
     };
@@ -217,8 +269,10 @@ pub async fn evaluate(
             });
         }
     };
+    let sources = Sources::new(plans, head.settled_jobs.keys().cloned().collect());
+    let settled = performance_jobs(&head, &sources).await?;
     let read = Evaluation {
-        answered_job_count: head.settled_jobs.len(),
+        answered_job_count: settled.len(),
         earliest_deadline: head.job_expiry.map(|expiry| expiry.earliest),
         ..evaluation
     };
@@ -235,12 +289,30 @@ pub async fn evaluate(
             hold: Some(hold),
             ..read
         };
-        let Some(table) = pass.table.filter(|_| pass.preview) else {
+        if !pass.preview {
+            // Its rows are not read, so its waiting re-runs and kept job states tell.
+            let jobs: HashSet<&JobId> = head.job_ids.iter().collect();
+            let kept: Vec<JobPolicyState> = pass
+                .job_states
+                .iter()
+                .filter(|job| jobs.contains(&job.job_id))
+                .cloned()
+                .collect();
+            let record = GroupPolicyState {
+                triggered: triggered(&acting, &kept, pass.waiting, &[]),
+                ..pass.state.clone()
+            };
+            return Ok(Evaluation {
+                record: Some(record),
+                ..held
+            });
+        }
+        let Some(table) = pass.table else {
             return Ok(held);
         };
-        let answered: Vec<JobId> = head.settled_jobs.keys().cloned().collect();
-        let families = families(plans, pass.catalog, &campaign.campaign_id, &answered).await?;
-        return Ok(match results.all_job_results(&answered).await {
+        let families = families(&sources, pass.catalog, &campaign.campaign_id, &settled).await?;
+        drop(sources);
+        return Ok(match results.all_job_results(&settled).await {
             Ok(rows) => {
                 let rows = rows_by_job(rows);
                 with_smaller_failed(families.as_ref(), &rows, with_params(table, &rows, held))
@@ -255,27 +327,30 @@ pub async fn evaluate(
             }
         });
     }
-    let decided: BTreeSet<JobId> = if !pass.preview && pass.state.policies == acting {
-        let jobs: HashSet<&JobId> = head.job_ids.iter().collect();
-        pass.state
-            .decided
-            .iter()
-            .filter(|job_id| jobs.contains(job_id))
-            .cloned()
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
-    let answered: Vec<JobId> = head
-        .settled_jobs
-        .keys()
-        .filter(|job_id| !decided.contains(*job_id))
-        .cloned()
+    // The job states decided under the same policies and rules on jobs the head
+    // still holds.
+    let decided: Vec<&JobPolicyState> =
+        if !pass.preview && pass.state.policies == acting && pass.state.rules == RULES {
+            let jobs: HashSet<&JobId> = head.job_ids.iter().collect();
+            pass.job_states
+                .iter()
+                .filter(|job_state| job_state.decided && jobs.contains(&job_state.job_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let done: HashSet<&JobId> = decided.iter().map(|job_state| &job_state.job_id).collect();
+    let answered: Vec<JobId> = settled
+        .into_iter()
+        .filter(|job_id| !done.contains(job_id))
         .collect();
     // The pass walks no chain and reads no rows for a policy that is off.
     let tallied = if pass.preview { &policies } else { &acting };
     let unrecorded = unrecorded(pass.submissions, &head, pass.waiting).await?;
-    let families = families(plans, pass.catalog, &campaign.campaign_id, &answered).await?;
+    let families = families(&sources, pass.catalog, &campaign.campaign_id, &answered).await?;
+    // The bodies are not needed past the families, so they are not held through
+    // the result rows that `judge` reads.
+    drop(sources);
     let judged = judge(
         plans,
         results,
@@ -288,30 +363,33 @@ pub async fn evaluate(
         &answered,
         pass.waiting,
         &unrecorded,
+        pass.bodies.map(|bodies| (pass.submissions, bodies)),
         read.clone(),
     )
     .await;
     match judged {
+        Ok(evaluation) if pass.preview => Ok(evaluation),
         Ok(evaluation) => {
-            let record = (!pass.preview).then(|| GroupPolicyState {
+            let job_states = job_states(&acting, pass.table, decided, &evaluation.read);
+            let triggered = triggered(&acting, &job_states, pass.waiting, &evaluation.judged);
+            let record = GroupPolicyState {
                 policies: acting,
-                decided: decided
-                    .into_iter()
-                    .chain(evaluation.decided.iter().cloned())
-                    .collect(),
+                triggered,
                 filed: pass.state.filed.clone(),
                 refusal: None,
                 unreadable_at: None,
-            });
+                rules: RULES,
+            };
             Ok(Evaluation {
-                record,
+                record: Some(record),
+                job_states: Some(job_states),
                 ..evaluation
             })
         }
         Err(error) => {
             unanswered(&campaign.campaign_id, error);
             let record = (!pass.preview).then(|| GroupPolicyState {
-                unreadable_at: Some(Utc::now()),
+                unreadable_at: Some(Timestamp::now()),
                 ..pass.state.clone()
             });
             Ok(Evaluation {
@@ -321,6 +399,127 @@ pub async fn evaluate(
             })
         }
     }
+}
+
+/// The member's job states after a read: `decided`, with the models of their
+/// rows checked against `table` again, and `read`, with model_params' and
+/// smaller_failed's flags taken afresh over all of them, in job id order.
+fn job_states(
+    acting: &[CampaignGroupPolicy],
+    table: Option<&ModelParamTable>,
+    decided: Vec<&JobPolicyState>,
+    read: &[JobPolicyState],
+) -> Vec<JobPolicyState> {
+    let on = |kind: PolicyKind| acting.iter().any(|policy| policy.kind == kind);
+    let mut job_states: Vec<JobPolicyState> = decided
+        .into_iter()
+        .cloned()
+        .map(|mut job_state| {
+            if let Some(table) = table {
+                job_state.missing_params.retain(|model| {
+                    table
+                        .resolve_recorded(
+                            model.descriptor.as_deref(),
+                            model.vault_descriptor.as_deref(),
+                        )
+                        .is_none()
+                });
+            }
+            job_state
+        })
+        .chain(read.iter().cloned())
+        .map(|mut job_state| {
+            job_state.flagged.remove(&PolicyKind::SmallerFailed);
+            if on(PolicyKind::ModelParams) && !job_state.missing_params.is_empty() {
+                job_state.flagged.insert(PolicyKind::ModelParams);
+            } else {
+                job_state.flagged.remove(&PolicyKind::ModelParams);
+            }
+            job_state
+        })
+        .collect();
+    job_states.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    if on(PolicyKind::SmallerFailed) {
+        let below: HashSet<JobId> = failed_below_clean(&job_states);
+        job_states
+            .iter_mut()
+            .filter(|job_state| below.contains(&job_state.job_id))
+            .for_each(|job_state| {
+                job_state.flagged.insert(PolicyKind::SmallerFailed);
+            });
+    }
+    job_states
+}
+
+/// The writes that take the stored job states `before` to `after`.
+fn job_state_changes(before: &[JobPolicyState], after: &[JobPolicyState]) -> JobStateChanges {
+    let stored: HashMap<&JobId, &JobPolicyState> = before.iter().map(|v| (&v.job_id, v)).collect();
+    let kept: HashSet<&JobId> = after.iter().map(|job_state| &job_state.job_id).collect();
+    JobStateChanges {
+        put: after
+            .iter()
+            .filter(|job_state| stored.get(&job_state.job_id) != Some(job_state))
+            .cloned()
+            .collect(),
+        removed: before
+            .iter()
+            .map(|job_state| &job_state.job_id)
+            .filter(|job_id| !kept.contains(job_id))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The failed jobs of `job_states` whose family holds a larger job with rows and
+/// no failure, as [`smaller_failures`] finds them in rows.
+fn failed_below_clean(job_states: &[JobPolicyState]) -> HashSet<JobId> {
+    let by_family: HashMap<&str, Vec<(&[i64], &JobPolicyState)>> = job_states
+        .iter()
+        .filter_map(|job_state| {
+            let (key, sizes) = job_state.family.as_ref()?;
+            Some((key.as_str(), (sizes.as_slice(), job_state)))
+        })
+        .fold(HashMap::new(), |mut by_family, (key, job)| {
+            by_family.entry(key).or_default().push(job);
+            by_family
+        });
+    by_family
+        .values()
+        .flat_map(|jobs| {
+            jobs.iter()
+                .filter(|(sizes, job_state)| {
+                    job_state.failed
+                        && jobs
+                            .iter()
+                            .any(|(larger, other)| !other.failed && below(sizes, larger))
+                })
+                .map(|(_, job_state)| job_state.job_id.clone())
+        })
+        .collect()
+}
+
+/// The kinds of `acting` that flag a job of `job_states`, or whose re-runs in
+/// `waiting` still wait for their rows: those the read did not judge.
+fn triggered(
+    acting: &[CampaignGroupPolicy],
+    job_states: &[JobPolicyState],
+    waiting: &[PolicyRerun],
+    judged: &[PolicyRerun],
+) -> BTreeSet<PolicyKind> {
+    let judged: BTreeSet<(&JobId, PolicyKind)> = judged
+        .iter()
+        .map(|rerun| (&rerun.rerun_job_id, rerun.kind))
+        .collect();
+    let waiting = waiting
+        .iter()
+        .filter(|rerun| !judged.contains(&(&rerun.rerun_job_id, rerun.kind)))
+        .map(|rerun| rerun.kind);
+    job_states
+        .iter()
+        .flat_map(|job_state| job_state.flagged.iter().copied())
+        .chain(waiting)
+        .filter(|kind| acting.iter().any(|policy| policy.kind == *kind))
+        .collect()
 }
 
 fn unanswered(campaign_id: &CampaignId, error: ResultsError) {
@@ -527,6 +726,7 @@ async fn judge(
     answered: &[JobId],
     waiting: &[PolicyRerun],
     unrecorded: &HashSet<JobId>,
+    bodies: Option<(&dyn SubmissionStore, BodyReads<'_>)>,
     mut evaluation: Evaluation,
 ) -> Result<Evaluation, ResultsError> {
     let rows = rows_by_job(results.all_job_results(answered).await?);
@@ -534,10 +734,24 @@ async fn judge(
         evaluation = with_params(table, &rows, evaluation);
     }
     evaluation = with_smaller_failed(families, &rows, evaluation);
+    let without_rows: Vec<JobId> = answered
+        .iter()
+        .filter(|job_id| !rows.contains_key(*job_id))
+        .cloned()
+        .collect();
+    let read_bodies = match bodies {
+        Some((submissions, bodies)) => {
+            evaluation.body_reads = without_rows.len();
+            body_rows(submissions, bodies.catalog, without_rows).await
+        }
+        None => HashMap::new(),
+    };
     let mut chains: BTreeMap<&JobId, Chain<'_>> = answered
         .iter()
         .filter_map(|job_id| {
-            let rows = rows.get(job_id)?;
+            let rows = rows
+                .get(job_id)
+                .or_else(|| read_bodies.get(job_id).map(|(_, rows)| rows))?;
             let flagging: Vec<&CampaignGroupPolicy> = policies
                 .iter()
                 .filter(|policy| flags(policy, rows))
@@ -548,18 +762,54 @@ async fn judge(
         })
         .collect();
     walk(plans, results, campaign_id, head, &mut chains).await?;
+    // A body's rows can change once the scorer scores it, so they act only by a
+    // re-run, whose wrong flag costs one more run; any other outcome waits for
+    // the rows in pipette-duckdb.
+    let rerunning: Vec<(JobId, [u8; 32])> = read_bodies
+        .into_iter()
+        .filter(|(job_id, _)| {
+            chains
+                .get(job_id)
+                .and_then(|chain| chain.outcome(|policy| policy.enabled))
+                .is_some_and(|outcome| matches!(outcome, Outcome::Rerun))
+        })
+        .map(|(job_id, (fingerprint, _))| (job_id, fingerprint))
+        .collect();
+    let named = match bodies {
+        Some((submissions, bodies)) => {
+            evaluation.body_reads += rerunning.len();
+            named_rows(submissions, bodies, rerunning).await
+        }
+        None => HashMap::new(),
+    };
+    evaluation.from_body = named.keys().cloned().collect();
+    let rows_of = |job_id: &JobId| rows.get(job_id).or_else(|| named.get(job_id));
     let (scored, unscored): (Vec<&JobId>, Vec<&JobId>) = answered
         .iter()
-        .partition(|job_id| rows.contains_key(*job_id));
+        .partition(|job_id| rows_of(job_id).is_some());
     evaluation.waiting_job_count = unscored.len();
     scored
-        .into_iter()
-        .for_each(|job_id| evaluation.count(job_id, chains.get(&job_id), group_id));
+        .iter()
+        .for_each(|job_id| evaluation.count(job_id, chains.get(job_id), group_id));
+    let missing = table
+        .map(|table| missing_by_job(table, &rows))
+        .unwrap_or_default();
+    evaluation.read = scored
+        .iter()
+        .map(|&job_id| JobPolicyState {
+            job_id: job_id.clone(),
+            flagged: evaluation.flagged.get(job_id).cloned().unwrap_or_default(),
+            decided: evaluation.decided.contains(job_id),
+            missing_params: missing.get(job_id).cloned().unwrap_or_default(),
+            family: families.and_then(|families| families.get(job_id).cloned()),
+            failed: rows_of(job_id).is_some_and(|rows| failed_row(rows).is_some()),
+        })
+        .collect();
     evaluation.reruns = evaluation
         .rerun_job_ids
         .iter()
         .filter_map(|job_id| {
-            let (chain, rows) = (chains.get(job_id)?, rows.get(job_id)?);
+            let (chain, rows) = (chains.get(job_id)?, rows_of(job_id)?);
             let reruns = chain
                 .rerunning()
                 .filter_map(|tally| Rerunning::new(tally.policy, tally.attempts, rows))
@@ -574,7 +824,7 @@ async fn judge(
         .filter(|job_id| !held.contains(job_id))
         .collect();
     let left_rows = rows_by_job(results.all_job_results(&left).await?);
-    let at = Utc::now();
+    let at = Timestamp::now();
     evaluation.judged = waiting
         .iter()
         .filter_map(|rerun| {
@@ -628,6 +878,107 @@ async fn unrecorded(
         .await
 }
 
+/// The rows that [`policy_rows`] builds from the submission body of each of
+/// `jobs`, with a fingerprint instead of the full body. Missing, unreadable
+/// or invalid bodies leave the job waiting for its rows in pipette-duckdb.
+/// A held submission has no body here: `find_job` does not read the unverified
+/// archive.
+async fn body_rows(
+    submissions: &dyn SubmissionStore,
+    catalog: &HashMap<BenchmarkId, Benchmark>,
+    jobs: Vec<JobId>,
+) -> HashMap<JobId, ([u8; 32], Vec<ResultRow>)> {
+    futures::stream::iter(jobs)
+        .map(|job_id| async move {
+            let read = async {
+                let Some(record) = submissions.find_job(&job_id).await? else {
+                    return Ok(None);
+                };
+                let submission = parse_stored_submission(&record.body)?;
+                let rows = policy_rows(catalog, &submission, &VaultNames::default())?;
+                rows.map(|rows| anyhow::Ok((body_fingerprint(&record.body)?, rows)))
+                    .transpose()
+            };
+            match read.await {
+                Ok(read) => read.map(|read| (job_id, read)),
+                Err(error) => {
+                    tracing::debug!(
+                        %job_id,
+                        error = %format!("{error:#}"),
+                        "queue-maintenance: a submission body gave no policy rows; the job waits \
+                         for its rows"
+                    );
+                    None
+                }
+            }
+        })
+        .buffer_unordered(STORAGE_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
+}
+
+/// Hash the JSON into a fixed-size fingerprint without allocating its text.
+fn body_fingerprint(body: &Value) -> anyhow::Result<[u8; 32]> {
+    struct HashWriter(Sha256);
+
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut hash = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut hash, body)?;
+    Ok(hash.0.finalize().into())
+}
+
+/// Read each re-run candidate again and build rows with the scorer's vault
+/// names. Changed or missing bodies wait for the next pass. Failed body or
+/// name reads also leave the job waiting.
+async fn named_rows(
+    submissions: &dyn SubmissionStore,
+    bodies: BodyReads<'_>,
+    rerunning: Vec<(JobId, [u8; 32])>,
+) -> HashMap<JobId, Vec<ResultRow>> {
+    futures::stream::iter(rerunning)
+        .map(|(job_id, fingerprint)| async move {
+            let read = async {
+                let Some(record) = submissions.find_job(&job_id).await? else {
+                    return Ok(None);
+                };
+                if body_fingerprint(&record.body)? != fingerprint {
+                    tracing::debug!(%job_id, "queue-maintenance: a re-run candidate's submission body changed; the job waits for the next pass");
+                    return Ok(None);
+                }
+                let submission = parse_stored_submission(&record.body)?;
+                let names = VaultNames::of(bodies.stores, &submission).await?;
+                policy_rows(bodies.catalog, &submission, &names)
+            };
+            match read.await {
+                Ok(rows) => rows.map(|rows| (job_id, rows)),
+                Err(error) => {
+                    tracing::warn!(
+                        %job_id,
+                        error = %format!("{error:#}"),
+                        "queue-maintenance: a flagged submission body or its vault names did not \
+                         read; the job waits for its rows"
+                    );
+                    None
+                }
+            }
+        })
+        .buffer_unordered(STORAGE_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
+}
+
 /// `evaluation` with the gaps of `rows` in `table`, whose jobs the model
 /// params check flags and, as it only flags, keeps.
 fn with_params(
@@ -651,11 +1002,44 @@ fn with_params(
 /// Each job's family key and sizes, as [`size_family`] gives them.
 type Families = HashMap<JobId, (String, Vec<i64>)>;
 
-/// The families of `jobs` of `campaign_id` whose benchmark type has sizes, read
-/// from their sources by `catalog`; `None` without one. A job with no source has
-/// no family.
+/// `Sources` reads and caches the job sources once so that [`performance_jobs`]
+/// and [`families`] share the result. A source that does not decode fails the read.
+struct Sources<'a> {
+    plans: &'a dyn PlanStore,
+    jobs: Vec<JobId>,
+    read: OnceCell<HashMap<JobId, Value>>,
+}
+
+impl<'a> Sources<'a> {
+    fn new(plans: &'a dyn PlanStore, jobs: Vec<JobId>) -> Self {
+        Self {
+            plans,
+            jobs,
+            read: OnceCell::new(),
+        }
+    }
+
+    /// The sources of `wanted`, a subset of `jobs`. The first use reads only
+    /// `wanted`; a later use takes from that read, so it names a subset of the
+    /// first use's jobs.
+    async fn bodies(&self, wanted: &[JobId]) -> anyhow::Result<&HashMap<JobId, Value>> {
+        self.read
+            .get_or_try_init(|| async {
+                let sources = self.plans.get_job_sources(wanted).await?;
+                if let Some(bad) = sources.unreadable.first() {
+                    anyhow::bail!("job source {} does not decode: {}", bad.key, bad.reason);
+                }
+                Ok(sources.items.into_iter().collect())
+            })
+            .await
+    }
+}
+
+/// Find the families of jobs whose benchmark types have sizes. Use `sources`
+/// and `catalog` for `campaign_id`. Return `None` without a catalog. A job with
+/// no source has no family.
 async fn families(
-    plans: &dyn PlanStore,
+    sources: &Sources<'_>,
     catalog: Option<&HashMap<BenchmarkId, Benchmark>>,
     campaign_id: &CampaignId,
     jobs: &[JobId],
@@ -663,21 +1047,53 @@ async fn families(
     let Some(catalog) = catalog else {
         return Ok(None);
     };
-    let sources = plans.get_job_sources(jobs).await?;
-    if let Some(bad) = sources.unreadable.first() {
-        anyhow::bail!("job source {} does not decode: {}", bad.key, bad.reason);
-    }
-    sources
-        .items
-        .into_iter()
-        .filter_map(|(job_id, body)| {
-            size_family(&body, catalog, campaign_id)
+    let bodies = sources.bodies(jobs).await?;
+    jobs.iter()
+        .filter_map(|job_id| {
+            let body = bodies.get(job_id)?;
+            size_family(body, catalog, campaign_id)
                 .with_context(|| format!("finding the family of job {job_id}"))
-                .map(|family| family.map(|family| (job_id, family)))
+                .map(|family| family.map(|family| (job_id.clone(), family)))
                 .transpose()
         })
         .collect::<anyhow::Result<_>>()
         .map(Some)
+}
+
+/// The jobs of `sources`, all `plan`'s, that the policies judge: those of a
+/// performance benchmark. An eval's cell (`eval`, `vlm_eval`, `asr_eval`), which
+/// the server scores, is never flagged, re-run or marked. A job is typed by the
+/// benchmark its source names, as `plan` types its cells; a plan that recorded
+/// its types, none an eval, reads no source.
+async fn performance_jobs(
+    plan: &PlanManifest,
+    sources: &Sources<'_>,
+) -> anyhow::Result<Vec<JobId>> {
+    let recorded = &plan.benchmark_types;
+    if !recorded.is_empty() && !recorded.values().any(|kind| kind.is_scored_via_server()) {
+        return Ok(sources.jobs.clone());
+    }
+    let benchmarks: HashMap<&JobId, BenchmarkId> = sources
+        .bodies(&sources.jobs)
+        .await?
+        .iter()
+        .filter_map(|(job_id, body)| {
+            let id = body.pointer("/spec/benchmark")?.as_str()?;
+            Some((job_id, BenchmarkId::try_new(id).ok()?))
+        })
+        .collect();
+    let types = crate::plan_cells::filed_types(recorded, benchmarks.values());
+    Ok(sources
+        .jobs
+        .iter()
+        .filter(|job_id| {
+            !benchmarks
+                .get(job_id)
+                .and_then(|id| types.get(id))
+                .is_some_and(|kind| kind.is_scored_via_server())
+        })
+        .cloned()
+        .collect())
 }
 
 /// `evaluation` with the failed jobs of `rows` that a larger job of their
@@ -766,6 +1182,15 @@ fn below(smaller: &[i64], larger: &[i64]) -> bool {
 impl Evaluation {
     /// Count an answered job with rows, walked as `chain` when a check flags it.
     fn count(&mut self, job_id: &JobId, chain: Option<&Chain<'_>>, group_id: &CampaignGroupId) {
+        let flagging: BTreeSet<PolicyKind> = chain
+            .into_iter()
+            .flat_map(|chain| &chain.tallies)
+            .filter(|tally| tally.policy.enabled)
+            .map(|tally| tally.policy.kind)
+            .collect();
+        if !flagging.is_empty() {
+            self.flagged.insert(job_id.clone(), flagging);
+        }
         self.checks.iter_mut().for_each(|check| {
             let kind = check.kind;
             let Some(outcome) = chain.and_then(|chain| chain.outcome(|policy| policy.kind == kind))
@@ -794,10 +1219,10 @@ impl Evaluation {
                         .map(|tally| tally.policy.kind),
                 );
             }
-            Some(Outcome::Mark { spent }) => {
+            Some(Outcome::Mark { kind, spent }) => {
                 self.marked
-                    .insert(job_id.clone(), mark_reason(group_id, spent));
-                self.kinds.insert(PolicyKind::Swap);
+                    .insert(job_id.clone(), mark_reason(group_id, kind, spent));
+                self.kinds.insert(kind);
             }
             Some(Outcome::Skip(reason)) => {
                 if for_good(reason) {
@@ -820,12 +1245,14 @@ fn for_good(reason: PolicySkipReason) -> bool {
 
 /// What the policies that flag a job make of it: re-run it while one of them
 /// has a re-run left and its chain has fewer than [`CHAIN_RUNS`] runs, else
-/// mark it failed if swap is among them, else keep it.
+/// mark it failed if one that marks is among them, else keep it.
 enum Outcome {
     Rerun,
-    /// The swap check's flagged runs in a row and its re-runs, when it spent
-    /// them; `None` when the chain is full instead.
+    /// The first of them that marks ([`PolicyKind::marks`]), with its flagged
+    /// runs in a row and its re-runs when it spent them; `None` when the chain
+    /// is full instead.
     Mark {
+        kind: PolicyKind,
         spent: Option<(u32, u32)>,
     },
     Keep,
@@ -834,8 +1261,9 @@ enum Outcome {
     Skip(PolicySkipReason),
 }
 
-/// The reason a mark's failure record carries.
-fn mark_reason(group_id: &CampaignGroupId, spent: Option<(u32, u32)>) -> String {
+/// The reason a mark's failure record carries, naming the `kind` policy that
+/// marked it.
+fn mark_reason(group_id: &CampaignGroupId, kind: PolicyKind, spent: Option<(u32, u32)>) -> String {
     let why = match spent {
         Some((attempts, max_reruns)) => format!(
             "flagged on {attempts} run{} in a row, {max_reruns} re-run{} spent",
@@ -844,7 +1272,7 @@ fn mark_reason(group_id: &CampaignGroupId, spent: Option<(u32, u32)>) -> String 
         ),
         None => format!("its re-run chain has {CHAIN_RUNS} runs"),
     };
-    format!("The swap policy of campaign group {group_id} marked this job failed: {why}.")
+    format!("The {kind} policy of campaign group {group_id} marked this job failed: {why}.")
 }
 
 /// One flagged job's walk back along its re-run chain.
@@ -979,9 +1407,7 @@ impl<'p> Chain<'p> {
         if tallies.is_empty() {
             return None;
         }
-        let swap = tallies
-            .iter()
-            .find(|tally| tally.policy.kind == PolicyKind::Swap);
+        let marking = tallies.iter().find(|tally| tally.policy.kind.marks());
         let skip = self
             .skip
             .or_else(|| tallies.iter().find_map(|tally| tally.skip));
@@ -989,9 +1415,10 @@ impl<'p> Chain<'p> {
             Outcome::Skip(reason)
         } else if self.runs < CHAIN_RUNS && tallies.iter().any(|tally| tally.has_budget()) {
             Outcome::Rerun
-        } else if let Some(swap) = swap {
+        } else if let Some(marking) = marking {
             Outcome::Mark {
-                spent: (!swap.has_budget()).then_some((swap.attempts, swap.limit)),
+                kind: marking.policy.kind,
+                spent: (!marking.has_budget()).then_some((marking.attempts, marking.limit)),
             }
         } else {
             Outcome::Keep
@@ -1353,7 +1780,7 @@ fn judged(
     group_id: &CampaignGroupId,
     waiting: &PolicyRerun,
     rows: &[ResultRow],
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> PolicyRerun {
     let filed = CampaignGroupPolicy {
         // `flags` reads the settings of spread and failed alone, and failed's
@@ -1387,7 +1814,7 @@ fn judged(
 
 /// `waiting` once found at `at` with neither rows nor a record, its re-run no
 /// longer in its campaign's plan.
-fn dropped(waiting: &PolicyRerun, at: DateTime<Utc>) -> PolicyRerun {
+fn dropped(waiting: &PolicyRerun, at: Timestamp) -> PolicyRerun {
     PolicyRerun {
         outcome: Some(RerunOutcome::Dropped),
         judged_at: Some(at),
@@ -1402,17 +1829,10 @@ fn missing_params(
     table: &ModelParamTable,
     rows: &HashMap<JobId, Vec<ResultRow>>,
 ) -> (Vec<ModelParamsGap>, usize) {
-    // shortcut: a row that records no model, or whose descriptors give no key,
-    // is left out, as its job's requested model would need the plan's cells;
-    // read those cells once such rows need an entry too.
     let gaps: BTreeMap<String, (usize, BTreeSet<&JobId>)> = rows
         .values()
         .flatten()
-        .filter(|row| {
-            let (total, active) = row.filled_model_params(table, None);
-            total.is_none() || active.is_none()
-        })
-        .filter_map(|row| Some((model_key(row)?, &row.job_id)))
+        .filter_map(|row| Some((gap_key(table, row)?, &row.job_id)))
         .fold(BTreeMap::new(), |mut gaps, (key, job_id)| {
             let (row_count, jobs) = gaps.entry(key).or_default();
             *row_count += 1;
@@ -1429,6 +1849,39 @@ fn missing_params(
         })
         .collect();
     (missing, jobs.len())
+}
+
+/// The key an entry would take for `row`'s model, when `row` lacks model params
+/// once filled as the plan pages fill it, with no requested model.
+fn gap_key(table: &ModelParamTable, row: &ResultRow) -> Option<String> {
+    // shortcut: a row that records no model, or whose descriptors give no key,
+    // is left out, as its job's requested model would need the plan's cells;
+    // read those cells once such rows need an entry too.
+    let (total, active) = row.filled_model_params(table, None);
+    (total.is_none() || active.is_none())
+        .then(|| model_key(row))
+        .flatten()
+}
+
+/// The recorded models of each job's rows that lack model params, as
+/// [`missing_params`] counts them.
+fn missing_by_job(
+    table: &ModelParamTable,
+    rows: &HashMap<JobId, Vec<ResultRow>>,
+) -> HashMap<JobId, BTreeSet<RecordedModel>> {
+    rows.iter()
+        .filter_map(|(job_id, rows)| {
+            let models: BTreeSet<RecordedModel> = rows
+                .iter()
+                .filter(|row| gap_key(table, row).is_some())
+                .map(|row| RecordedModel {
+                    descriptor: row.model_descriptor.clone(),
+                    vault_descriptor: row.model_vault_descriptor.clone(),
+                })
+                .collect();
+            (!models.is_empty()).then(|| (job_id.clone(), models))
+        })
+        .collect()
 }
 
 /// `value` as the console holds it: the API sends an `f32` as its shortest
@@ -1710,7 +2163,7 @@ async fn filing(
             .cloned()
             .collect(),
         commit_unknown: false,
-        filed_at: Utc::now(),
+        filed_at: Timestamp::now(),
     };
     let campaign_id = &campaign.campaign_id;
     let stop = stopped_now(&*stores.plans, base)
@@ -1890,6 +2343,8 @@ where
         reruns_recorded = counts.reruns_recorded,
         reruns_judged = counts.reruns_judged,
         jobs_waiting_for_rows = counts.jobs_waiting_for_rows,
+        body_reads = counts.body_reads,
+        body_reruns = counts.body_reruns,
         members_waiting_for_devices = counts.members_waiting_for_devices,
         filings_not_advanced = counts.filings_not_advanced,
         cancel_markers_written = counts.cancel_markers_written,
@@ -1915,10 +2370,11 @@ where
 /// What a round of the policy pass did: the fields of its log line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PassCounts {
-    /// Groups with a policy on, past those with a policy that does not decode.
+    /// Groups with a policy on, past those skipped for a policy.
     groups: usize,
-    /// Groups with a policy that does not decode, and groups whose record or
-    /// members did not read.
+    /// Groups with a policy that does not decode or is on with settings its
+    /// kind refuses (failed without codes), and groups whose record or members
+    /// did not read.
     groups_skipped: usize,
     members: usize,
     members_read: usize,
@@ -1939,6 +2395,10 @@ struct PassCounts {
     reruns_recorded: usize,
     reruns_judged: usize,
     jobs_waiting_for_rows: usize,
+    /// The submission bodies read for answered jobs with no rows, and the jobs
+    /// of advanced filings that their bodies' rows re-ran.
+    body_reads: usize,
+    body_reruns: usize,
     members_waiting_for_devices: usize,
     /// This round's filings the campaign did not move onto, and earlier ones
     /// that still run and hold their campaign.
@@ -2059,6 +2519,7 @@ where
         stores,
         groups,
         table: OnceCell::new(),
+        catalog: OnceCell::new(),
         probed: OnceCell::new(),
         validate_index,
     };
@@ -2099,7 +2560,7 @@ async fn members(
 /// read its rows, longest ago first and those with neither before any, so one
 /// member's ingests cannot use up every round's budget, nor one member's failing
 /// read end every round's reads.
-fn order(member: &GroupMember) -> (Option<DateTime<Utc>>, &CampaignId) {
+fn order(member: &GroupMember) -> (Option<Timestamp>, &CampaignId) {
     let last = member
         .policy_state
         .as_ref()
@@ -2120,6 +2581,9 @@ struct Round<'a, Validate> {
     /// The model params table of the round's filings and model_params checks,
     /// loaded for the first.
     table: OnceCell<ModelParamTable>,
+    /// The benchmark catalog of the round's smaller_failed checks, loaded for
+    /// the first.
+    catalog: OnceCell<HashMap<BenchmarkId, Benchmark>>,
     /// Set once the plan index backend passed its probe, before the round's
     /// first filing.
     probed: OnceCell<()>,
@@ -2211,6 +2675,61 @@ where
                 return None;
             }
         };
+        let checks_families = stored
+            .iter()
+            .any(|policy| policy.kind == PolicyKind::SmallerFailed);
+        let catalog = if checks_families {
+            match self.catalog().await {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    tracing::warn!(
+                        %campaign_id,
+                        error = %format!("{error:#}"),
+                        "queue-maintenance: failed to read the benchmark catalog for a campaign \
+                         group member, skipped this round"
+                    );
+                    counts.members_skipped += 1;
+                    counts.failed_items += 1;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let stored_job_states = match self.groups.job_states(&group.group_id, campaign_id).await {
+            Ok(job_states) => job_states,
+            Err(error) => {
+                tracing::warn!(
+                    %campaign_id,
+                    error = %format!("{error:#}"),
+                    "queue-maintenance: failed to read a campaign group member's job states, \
+                     skipped this round"
+                );
+                counts.members_skipped += 1;
+                counts.failed_items += 1;
+                return None;
+            }
+        };
+        let reruns = stored.iter().any(|policy| policy.kind.reruns_or_marks());
+        let bodies = if reruns {
+            match self.catalog().await {
+                Ok(catalog) => Some(BodyReads {
+                    catalog,
+                    stores: self.stores,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %campaign_id,
+                        error = %format!("{error:#}"),
+                        "queue-maintenance: failed to read the benchmark catalog, so a campaign \
+                         group member's jobs wait for their rows"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let state = kept.cloned().unwrap_or_default();
         let pass = Pass {
             state: &state,
@@ -2218,8 +2737,10 @@ where
             submissions: &*self.stores.submissions,
             preview: false,
             table,
-            catalog: None,
+            catalog,
             waiting: &waiting,
+            job_states: &stored_job_states,
+            bodies,
         };
         let plans = &*self.stores.plans;
         let evaluation = match evaluate(plans, results, group, &campaign, stored, pass).await {
@@ -2275,10 +2796,16 @@ where
             Some(filing) => filing.record.as_ref(),
             None => evaluation.record.as_ref(),
         };
-        if let Some(record) = record.filter(|&record| kept != Some(record)) {
+        let changes = evaluation
+            .job_states
+            .as_deref()
+            .map(|job_states| job_state_changes(&stored_job_states, job_states))
+            .unwrap_or_default();
+        let changed = changes != JobStateChanges::default();
+        if let Some(record) = record.filter(|&record| changed || kept != Some(record)) {
             match self
                 .groups
-                .set_policy_state(&group.group_id, campaign_id, record)
+                .set_policy_state(&group.group_id, campaign_id, record, &changes)
                 .await
             {
                 Ok(true) => {}
@@ -2300,6 +2827,17 @@ where
         if let Some(FilingOutcome::Advanced { plan_id, .. }) =
             filing.as_ref().map(|filing| &filing.outcome)
         {
+            counts.body_reruns += evaluation.from_body.len();
+            evaluation.from_body.iter().for_each(|job_id| {
+                tracing::info!(
+                    group_id = %group.group_id,
+                    %campaign_id,
+                    %job_id,
+                    filed = %plan_id,
+                    "queue-maintenance: a campaign group filing re-runs a job on the rows of its \
+                     submission body"
+                );
+            });
             self.write_reruns(group, campaign_id, &evaluation, plan_id, counts)
                 .await;
         }
@@ -2433,6 +2971,14 @@ where
             .await
     }
 
+    /// The round's benchmark catalog, read again on the next call if the read
+    /// failed.
+    async fn catalog(&self) -> anyhow::Result<&HashMap<BenchmarkId, Benchmark>> {
+        self.catalog
+            .get_or_try_init(|| crate::org_catalog::load_server_catalog(&*self.stores.catalog))
+            .await
+    }
+
     /// The ingest settings of the round's filings, as the CLI's re-run builds
     /// them. The plan index backend is probed before the first, and again
     /// before the next if the probe failed.
@@ -2562,6 +3108,7 @@ impl PassCounts {
         match evaluation.state {
             PolicyMemberState::Evaluated => {
                 self.jobs_waiting_for_rows += evaluation.waiting_job_count;
+                self.body_reads += evaluation.body_reads;
                 self.jobs_left_for_good += evaluation
                     .skipped
                     .values()
@@ -2775,8 +3322,9 @@ pub struct Backfilled {
 
 /// Record the re-runs each of `group_ids`' policies filed before the policy
 /// pass recorded them. In each member campaign's history, each plan the group
-/// filed gives a row per job it re-ran and per policy its change names that
-/// flags the run it replaces with a re-run left, the policy as stored now. A
+/// filed gives a row per job of a performance benchmark it re-ran
+/// ([`performance_jobs`]) and per policy its change names that flags the run
+/// it replaces with a re-run left, the policy as stored now. A
 /// row's `attempt` counts the runs in a row that the policy flags, back from
 /// the replaced run along the group's re-runs, and the policy has a re-run
 /// left while that is at most its `max_reruns`. A re-run whose rows landed is
@@ -2864,6 +3412,22 @@ async fn filed_reruns(
             (by == group_id).then_some((filed, policies.as_slice(), minted))
         })
         .collect();
+    let filings: Vec<Filed<'_>> = futures::stream::iter(filings)
+        .then(|(filed, policies, minted)| async move {
+            let jobs = minted.iter().map(|(job, _)| (*job).clone()).collect();
+            let judged: HashSet<JobId> =
+                performance_jobs(filed, &Sources::new(&*stores.plans, jobs))
+                    .await?
+                    .into_iter()
+                    .collect();
+            let minted = minted
+                .into_iter()
+                .filter(|(job, _)| judged.contains(*job))
+                .collect();
+            anyhow::Ok((filed, policies, minted))
+        })
+        .try_collect()
+        .await?;
     let minted: Vec<(&JobId, &JobId)> = filings
         .iter()
         .flat_map(|(_, _, jobs)| jobs.iter().copied())
@@ -2928,7 +3492,7 @@ async fn filed_reruns(
         .into_iter()
         .flat_map(|head| &head.job_ids)
         .collect();
-    let at = Utc::now();
+    let at = Timestamp::now();
     let rows = named
         .map(|(filed, kind, job, of)| {
             let policy = kind.policy(group_id, stored);
@@ -2962,18 +3526,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use chrono::{SubsecRound, Utc};
     use httpmock::Method::POST;
     use httpmock::{Mock, MockServer};
+    use jiff::Timestamp;
     use serde::Deserialize;
     use serde_json::json;
 
     use pipette_core::campaign::{CampaignOwner, NewCampaign};
     use pipette_core::config::{Config, DuckDbConfig, DuckDbPassword, StorageConfig};
-    use pipette_core::plan::{SettledOutcome, sample_manifest};
+    use pipette_core::plan::{PlanNotes, SettledOutcome, sample_manifest};
     use pipette_core::types::Mint;
     use pipette_plan_types::{
-        AuditActor, CampaignState, NonEmptyTrimmedString, OrgId, PolicySettings, UserId,
+        AuditActor, BenchmarkType, CampaignState, NonEmptyTrimmedString, OrgId, PolicySettings,
+        UserId,
     };
     use pipette_store::{AuditFilter, Stores};
     use pipette_store_sql::scratch::TestDb;
@@ -2995,6 +3560,42 @@ mod tests {
     fn fixture() -> anyhow::Result<Vec<Case>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/test/policy-checks.json");
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    }
+
+    /// An evaluation reads its job sources once. Later calls use the cached
+    /// sources even after the test deletes the stored source. The first use
+    /// reads only the jobs it names.
+    #[tokio::test]
+    async fn the_job_sources_are_read_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = pipette_store_fs::build_local_fs_stores(
+            &Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )?;
+        let job_id = JobId::try_new("job-01a1bced-6a57-72a5-9b39-8f2a41c52513")?;
+        let unnamed = JobId::try_new("job-01a1bced-6a57-72a5-9b39-8f2b197c7306")?;
+        let body = json!({"spec": {"benchmark": "prefill_throughput_512"}});
+        stores.plans.put_job_source(&job_id, &body).await?;
+        stores.plans.put_job_source(&unnamed, &body).await?;
+        let sources = Sources::new(&*stores.plans, vec![job_id.clone(), unnamed.clone()]);
+        let wanted = std::slice::from_ref(&job_id);
+
+        let first = sources.bodies(wanted).await?;
+        let read: Vec<&JobId> = first.keys().collect();
+        std::fs::remove_file(
+            dir.path()
+                .join("job-sources")
+                .join(format!("{job_id}.json")),
+        )?;
+        let second = sources.bodies(wanted).await?.get(&job_id).cloned();
+
+        assert_eq!(read, vec![&job_id]);
+        assert_eq!(second, Some(body));
+        Ok(())
     }
 
     /// `ui/test/policy-checks.test.ts` runs the console's checks over the same
@@ -3072,11 +3673,11 @@ mod tests {
     #[rstest::rstest]
     #[case::runtime_error("client", Some("runtime_error"), true)]
     #[case::device_error("client", Some("device_error"), true)]
-    #[case::device_not_ready("client", Some("device_not_ready"), false)]
+    #[case::device_not_ready("client", Some("device_not_ready"), true)]
     #[case::unspecified("client", Some("unspecified"), true)]
-    #[case::out_of_memory("client", Some("out_of_memory"), false)]
+    #[case::out_of_memory("client", Some("out_of_memory"), true)]
     #[case::attempt_timeout("client", Some("attempt_timeout"), false)]
-    #[case::harness_error("client", Some("harness_error"), false)]
+    #[case::harness_error("client", Some("harness_error"), true)]
     #[case::no_code("client", None, false)]
     #[case::marked("marked", Some("unspecified"), false)]
     #[case::smaller_run_failed("smaller_run_failed", Some("attempt_timeout"), false)]
@@ -3262,7 +3863,7 @@ mod tests {
             rerun_job_id: job("job-2"),
             rerun_of: job("job-1"),
             plan_id: PlanId::try_new(HEAD)?,
-            filed_at: Utc::now(),
+            filed_at: Timestamp::now(),
             attempt: 1,
             benchmark_id: "decode_throughput_512_100".to_owned(),
             model_key: None,
@@ -3307,7 +3908,7 @@ mod tests {
             json!({"decode_tokens": 100}),
             json!({}),
         )?];
-        let judged = judged(&CampaignGroupId::mint(), &waiting, &rows, Utc::now());
+        let judged = judged(&CampaignGroupId::mint(), &waiting, &rows, Timestamp::now());
         assert_eq!(judged.outcome, Some(outcome));
         Ok(())
     }
@@ -3329,7 +3930,7 @@ mod tests {
             ..a_rerun(PolicyKind::Failed)?
         };
         let rows = [failure("client", Some("harness_error"))?];
-        let judged = judged(&CampaignGroupId::mint(), &waiting, &rows, Utc::now());
+        let judged = judged(&CampaignGroupId::mint(), &waiting, &rows, Timestamp::now());
         assert_eq!(
             (judged.after, judged.after_code.as_deref(), judged.outcome),
             (Some(after), Some("harness_error"), Some(outcome))
@@ -3342,7 +3943,7 @@ mod tests {
     #[test]
     fn a_failed_run_gives_its_failure_code() -> anyhow::Result<()> {
         let rows = [
-            failure("client", Some("out_of_memory"))?,
+            failure("client", Some("attempt_timeout"))?,
             failure("client", Some("device_error"))?,
         ];
         let code = |kind: PolicyKind, rows: &[ResultRow]| {
@@ -3354,7 +3955,7 @@ mod tests {
         );
         assert_eq!(
             code(PolicyKind::Failed, &rows[..1]).as_deref(),
-            Some("out_of_memory")
+            Some("attempt_timeout")
         );
         assert_eq!(code(PolicyKind::Swap, &rows), None);
         Ok(())
@@ -3489,6 +4090,18 @@ mod tests {
         JobId::new_unchecked(name)
     }
 
+    /// A job state the pass is done with on `name`, which `flagged` flag.
+    fn decided_state(name: &str, flagged: &[PolicyKind]) -> anyhow::Result<JobPolicyState> {
+        Ok(JobPolicyState {
+            job_id: JobId::try_new(name)?,
+            flagged: flagged.iter().copied().collect(),
+            decided: true,
+            missing_params: BTreeSet::new(),
+            family: None,
+            failed: false,
+        })
+    }
+
     /// The rows of a run that the checks of `kinds` flag, of swap and spread.
     fn run(job_id: &str, kinds: &[PolicyKind]) -> Vec<Value> {
         let swap = if kinds.contains(&PolicyKind::Swap) {
@@ -3514,6 +4127,47 @@ mod tests {
             swap,
             null
         ])]
+    }
+
+    /// The rows of a run whose result's standard deviation is `percent` of its
+    /// value.
+    fn spread_of(job_id: &str, percent: f64) -> Vec<Value> {
+        vec![json!([
+            job_id,
+            "decode_throughput_512_100",
+            "decode_throughput",
+            "decode",
+            100.0,
+            percent,
+            "tokens/sec",
+            false,
+            null,
+            0,
+            null
+        ])]
+    }
+
+    /// The rows of a run whose time to first token is over its end-to-end
+    /// latency.
+    fn ttft_over(job_id: &str) -> Vec<Value> {
+        [("ttft", 200.0), ("end_to_end_latency", 100.0)]
+            .into_iter()
+            .map(|(metric, ms)| {
+                json!([
+                    job_id,
+                    "end_to_end_latency_512_100",
+                    "end_to_end_latency",
+                    metric,
+                    ms,
+                    1.0,
+                    "ms",
+                    false,
+                    null,
+                    0,
+                    null
+                ])
+            })
+            .collect()
     }
 
     /// The rows of a run failed with `code`, as `source` reports it: `client`
@@ -3740,10 +4394,10 @@ runtimes = [
             let group = CampaignGroup::new(
                 NonEmptyTrimmedString::try_new("aa-perf")?,
                 owner.clone(),
-                Utc::now(),
+                Timestamp::now(),
             );
             let campaign = NewCampaign::new(NonEmptyTrimmedString::try_new("S26 CPU")?, owner)
-                .around(PlanId::try_new(HEAD)?, Utc::now());
+                .around(PlanId::try_new(HEAD)?, Timestamp::now());
             Ok(Some(Self {
                 db,
                 stores,
@@ -3859,6 +4513,59 @@ runtimes = [
             self.kept_of(&self.campaign.campaign_id).await
         }
 
+        /// The campaign's job states, in job id order.
+        async fn job_states(&self) -> anyhow::Result<Vec<JobPolicyState>> {
+            self.groups()?
+                .job_states(&self.group.group_id, &self.campaign.campaign_id)
+                .await
+        }
+
+        /// The group and the campaign stored, the campaign its member, so what
+        /// a round reads can be kept.
+        async fn enroll(&self) -> anyhow::Result<()> {
+            let groups = self.groups()?;
+            groups.create_group(&self.group).await?;
+            self.stores.campaigns.put_campaign(&self.campaign).await?;
+            groups
+                .add_members(
+                    &self.group.group_id,
+                    std::slice::from_ref(&self.campaign.campaign_id),
+                )
+                .await
+        }
+
+        /// The jobs of the campaign's job states the pass is done with.
+        async fn decided(&self) -> anyhow::Result<BTreeSet<JobId>> {
+            Ok(self
+                .job_states()
+                .await?
+                .into_iter()
+                .filter(|job_state| job_state.decided)
+                .map(|job_state| job_state.job_id)
+                .collect())
+        }
+
+        /// Keep `state` and `job_states` for the campaign, as a round keeps what
+        /// it read.
+        async fn keep(
+            &self,
+            state: &GroupPolicyState,
+            job_states: &[JobPolicyState],
+        ) -> anyhow::Result<()> {
+            let changes = job_state_changes(&self.job_states().await?, job_states);
+            let kept = self
+                .groups()?
+                .set_policy_state(
+                    &self.group.group_id,
+                    &self.campaign.campaign_id,
+                    state,
+                    &changes,
+                )
+                .await?;
+            anyhow::ensure!(kept, "the campaign is a member");
+            Ok(())
+        }
+
         /// The campaign's recorded re-runs, newest filing first.
         async fn reruns(&self) -> anyhow::Result<Vec<PolicyRerun>> {
             let campaign = std::slice::from_ref(&self.campaign.campaign_id);
@@ -3901,6 +4608,59 @@ runtimes = [
                 .await
         }
 
+        /// Record `job_id` answered with the stored submission `body`, out of
+        /// the queue.
+        async fn submit(&self, job_id: &JobId, body: &Value) -> anyhow::Result<()> {
+            self.stores
+                .submissions
+                .write_processed(job_id, body)
+                .await?;
+            self.stores.todo.delete_avail_by_job(job_id).await
+        }
+
+        /// Evaluate the campaign with no saved policy state. Read the bodies
+        /// of answered jobs without rows. Use the benchmark from [`DOCUMENT`]
+        /// and the supplied `waiting` re-runs.
+        async fn round_with_bodies(
+            &self,
+            stored: &[CampaignGroupPolicy],
+            waiting: &[PolicyRerun],
+        ) -> anyhow::Result<Evaluation> {
+            let duckdb = self.config().duckdb.context("the mock pipette-duckdb")?;
+            let results = ResultsDb::new(reqwest::Client::new(), duckdb)?;
+            let id = BenchmarkId::try_new("decode_throughput_512_100")?;
+            let benchmark = Benchmark::from_toml(
+                id.as_str(),
+                "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 512\n\
+                 parameter_decode_tokens = 100",
+            )?;
+            let catalog = HashMap::from([(id, benchmark)]);
+            let state = GroupPolicyState::default();
+            let pass = Pass {
+                state: &state,
+                todo: &*self.stores.todo,
+                submissions: &*self.stores.submissions,
+                preview: false,
+                table: None,
+                catalog: None,
+                waiting,
+                job_states: &[],
+                bodies: Some(BodyReads {
+                    catalog: &catalog,
+                    stores: &self.stores,
+                }),
+            };
+            evaluate(
+                &*self.stores.plans,
+                Some(&results),
+                &self.group,
+                &self.campaign,
+                stored,
+                pass,
+            )
+            .await
+        }
+
         /// Lease the queued `job_id` to a registered device: maintenance
         /// recycles a lease whose device the roster does not know.
         async fn lease(&self, job_id: &JobId) -> anyhow::Result<()> {
@@ -3922,7 +4682,7 @@ runtimes = [
                 client_details: NonEmptyTrimmedString::try_new("mac mini")?,
                 contact_email: pipette_plan_types::ContactEmail::try_new("lab@example.test")?,
                 status: pipette_core::client::ClientStatus::Approved,
-                registered_at: Utc::now(),
+                registered_at: Timestamp::now(),
                 device_profile: Default::default(),
                 capabilities: Default::default(),
             };
@@ -3934,7 +4694,7 @@ runtimes = [
                     job_id,
                     expires_at,
                     &holder.client_id,
-                    Utc::now() + chrono::Duration::hours(1),
+                    Timestamp::now() + jiff::SignedDuration::from_hours(1),
                 )
                 .await?;
             anyhow::ensure!(
@@ -4065,6 +4825,7 @@ runtimes = [
                 stores: &self.stores,
                 groups,
                 table: OnceCell::new(),
+                catalog: OnceCell::new(),
                 probed: OnceCell::new(),
                 validate_index: &probed,
             };
@@ -4197,6 +4958,17 @@ runtimes = [
             Ok(())
         }
 
+        /// Store each job's source, naming its benchmark.
+        async fn source(&self, jobs: &[(&str, &str)]) -> anyhow::Result<()> {
+            let plans = &*self.stores.plans;
+            futures::future::try_join_all(jobs.iter().map(|(job_id, benchmark)| async move {
+                let body = json!({ "spec": { "benchmark": benchmark } });
+                plans.put_job_source(&job(job_id), &body).await
+            }))
+            .await?;
+            Ok(())
+        }
+
         /// Answer the query that names every job of `runs` with their rows.
         async fn answer(&self, runs: &[(&str, Vec<Value>)]) -> Mock<'_> {
             self.answer_in(&COLUMNS, runs).await
@@ -4263,6 +5035,14 @@ runtimes = [
             let duckdb = self.config().duckdb.context("the mock pipette-duckdb")?;
             let results = ResultsDb::new(reqwest::Client::new(), duckdb)?;
             let none = GroupPolicyState::default();
+            let job_states = match state {
+                Some(_) => {
+                    self.groups()?
+                        .job_states(&self.group.group_id, &campaign.campaign_id)
+                        .await?
+                }
+                None => Vec::new(),
+            };
             let pass = Pass {
                 state: state.unwrap_or(&none),
                 todo: &*self.stores.todo,
@@ -4271,6 +5051,8 @@ runtimes = [
                 table,
                 catalog: None,
                 waiting: &[],
+                job_states: &job_states,
+                bodies: None,
             };
             evaluate(
                 &*self.stores.plans,
@@ -4284,18 +5066,26 @@ runtimes = [
         }
 
         /// What the policies that are on would do with each job: `re-run`, the
-        /// end of a mark's reason, or why the job is skipped.
+        /// end of a mark's reason, after `spread: ` for a spread mark, or why
+        /// the job is skipped.
         fn outcomes(&self, evaluation: &Evaluation) -> Vec<String> {
-            let lead = format!(
-                "The swap policy of campaign group {} marked this job failed: ",
-                self.group.group_id
-            );
+            let lead = |kind: PolicyKind| {
+                format!(
+                    "The {kind} policy of campaign group {} marked this job failed: ",
+                    self.group.group_id
+                )
+            };
+            let (swap, spread) = (lead(PolicyKind::Swap), lead(PolicyKind::Spread));
             let mut outcomes: Vec<String> = evaluation
                 .rerun_job_ids
                 .iter()
                 .map(|job_id| format!("{job_id}: re-run"))
                 .chain(evaluation.marked.iter().map(|(job_id, reason)| {
-                    format!("{job_id}: {}", reason.strip_prefix(&lead).unwrap_or(reason))
+                    match (reason.strip_prefix(&swap), reason.strip_prefix(&spread)) {
+                        (Some(why), _) => format!("{job_id}: {why}"),
+                        (None, Some(why)) => format!("{job_id}: spread: {why}"),
+                        (None, None) => format!("{job_id}: {reason}"),
+                    }
                 }))
                 .chain(
                     evaluation
@@ -4396,6 +5186,261 @@ runtimes = [
         Ok(())
     }
 
+    /// The columns of [`flagged_by`].
+    const CELL_COLUMNS: [&str; 14] = [
+        "job_id",
+        "benchmark_id",
+        "benchmark_type",
+        "metric",
+        "value",
+        "value_stddev",
+        "unit",
+        "failed",
+        "failure_source",
+        "failure_code",
+        "observation_max_swap_bytes",
+        "model_descriptor",
+        "model_params_total_millions",
+        "model_params_active_millions",
+    ];
+
+    /// The rows of a `decode_throughput_512_100` run of job-perf that `kind`'s
+    /// check flags. A measured row records [`MODEL`] with no parameter counts.
+    fn flagged_by(kind: PolicyKind) -> Vec<Value> {
+        let measured = |metric: &str, unit: &str, value: f64, stddev: f64, swap: u32| {
+            json!([
+                "job-perf",
+                "decode_throughput_512_100",
+                "decode_throughput",
+                metric,
+                value,
+                stddev,
+                unit,
+                false,
+                null,
+                null,
+                swap,
+                MODEL,
+                null,
+                null
+            ])
+        };
+        match kind {
+            PolicyKind::Swap => vec![measured("decode", "tokens/sec", 100.0, 1.0, 4096)],
+            PolicyKind::Spread => vec![measured("decode", "tokens/sec", 100.0, 10.0, 0)],
+            PolicyKind::TtftOverE2e => vec![
+                measured("ttft", "ms", 200.0, 1.0, 0),
+                measured("end_to_end_latency", "ms", 100.0, 1.0, 0),
+            ],
+            PolicyKind::ModelParams => vec![measured("decode", "tokens/sec", 100.0, 1.0, 0)],
+            PolicyKind::Failed | PolicyKind::SmallerFailed => vec![json!([
+                "job-perf",
+                "decode_throughput_512_100",
+                "decode_throughput",
+                "decode",
+                null,
+                null,
+                "tokens/sec",
+                true,
+                "client",
+                "runtime_error",
+                null,
+                null,
+                null,
+                null
+            ])],
+        }
+    }
+
+    /// No policy judges an eval: a text eval's, a VL eval's and an ASR eval's
+    /// cells, typed so by their plan (the ASR eval's id has no eval prefix), are
+    /// never read, so none is answered, waits, is flagged, re-run or marked, or
+    /// keeps a job state, while each check flags the decode cell beside them, in
+    /// the preview and in the pass. A larger clean decode cell is its family's.
+    #[rstest::rstest]
+    #[case::swap(PolicyKind::Swap, true)]
+    #[case::spread(PolicyKind::Spread, true)]
+    #[case::failed(PolicyKind::Failed, true)]
+    #[case::ttft_over_e2e(PolicyKind::TtftOverE2e, true)]
+    #[case::model_params(PolicyKind::ModelParams, false)]
+    #[case::smaller_failed(PolicyKind::SmallerFailed, false)]
+    #[tokio::test]
+    async fn no_policy_judges_an_eval(
+        #[case] kind: PolicyKind,
+        #[case] reruns: bool,
+    ) -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        let cells = [
+            (
+                "job-perf",
+                "decode_throughput_512_100",
+                BenchmarkType::DecodeThroughput,
+            ),
+            (
+                "job-larger",
+                "decode_throughput_1024_100",
+                BenchmarkType::DecodeThroughput,
+            ),
+            ("job-eval", "eval_math_500", BenchmarkType::Eval),
+            ("job-vlm", "vlm_eval_mmstar", BenchmarkType::VlmEval),
+            ("job-asr", "librispeech_wer", BenchmarkType::AsrEval),
+        ];
+        let head = PlanManifest {
+            benchmark_types: cells
+                .iter()
+                .map(|(_, id, benchmark_type)| Ok((BenchmarkId::try_new(*id)?, *benchmark_type)))
+                .collect::<anyhow::Result<_>>()?,
+            ..world.plan(HEAD, &cells.map(|(job_id, ..)| (job_id, None)))?
+        };
+        world.put(std::slice::from_ref(&head)).await?;
+        world
+            .source(&cells.map(|(job_id, benchmark, _)| (job_id, benchmark)))
+            .await?;
+        let evals: Vec<Mock<'_>> = futures::stream::iter(["job-eval", "job-vlm", "job-asr"])
+            .then(|job_id| {
+                world.duckdb.mock_async(move |when, then| {
+                    when.method(POST).body_includes(format!("'{job_id}'"));
+                    then.status(500);
+                })
+            })
+            .collect()
+            .await;
+        let larger = json!([
+            "job-larger",
+            "decode_throughput_1024_100",
+            "decode_throughput",
+            "decode",
+            100.0,
+            1.0,
+            "tokens/sec",
+            false,
+            null,
+            null,
+            0,
+            MODEL,
+            350,
+            350
+        ]);
+        let rows: Vec<Value> = flagged_by(kind).into_iter().chain([larger]).collect();
+        let answered = world
+            .duckdb
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/query")
+                    .body_includes("'job-perf'");
+                then.status(200)
+                    .json_body(json!({ "columns": CELL_COLUMNS, "rows": rows }));
+            })
+            .await;
+        let table = ModelParamTable::from_toml("\"LFM2-700M\" = 742")?;
+        let catalog: HashMap<BenchmarkId, Benchmark> = [
+            ("decode_throughput_512_100", 512),
+            ("decode_throughput_1024_100", 1024),
+        ]
+        .into_iter()
+        .map(|(id, prefill_tokens)| {
+            let definition = format!(
+                "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = \
+                 {prefill_tokens}\nparameter_decode_tokens = 100"
+            );
+            Ok((
+                BenchmarkId::try_new(id)?,
+                Benchmark::from_toml(id, &definition)?,
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+        let stored = [world.on(kind, kind.max_reruns().min(1))];
+        let duckdb = world.config().duckdb.context("the mock pipette-duckdb")?;
+        let results = ResultsDb::new(reqwest::Client::new(), duckdb)?;
+        let none = GroupPolicyState::default();
+        let reading = |preview| Pass {
+            state: &none,
+            todo: &*world.stores.todo,
+            submissions: &*world.stores.submissions,
+            preview,
+            table: Some(&table),
+            catalog: Some(&catalog),
+            waiting: &[],
+            job_states: &[],
+            bodies: None,
+        };
+        let (plans, group, campaign) = (&*world.stores.plans, &world.group, &world.campaign);
+        let preview = evaluate(
+            plans,
+            Some(&results),
+            group,
+            campaign,
+            &stored,
+            reading(true),
+        )
+        .await?;
+        let pass = evaluate(
+            plans,
+            Some(&results),
+            group,
+            campaign,
+            &stored,
+            reading(false),
+        )
+        .await?;
+        answered.assert_calls_async(2).await;
+        futures::future::join_all(evals.iter().map(|eval| eval.assert_calls_async(0))).await;
+        let perf = BTreeSet::from([job("job-larger"), job("job-perf")]);
+        [&preview, &pass].iter().for_each(|evaluation| {
+            let named: BTreeSet<JobId> = evaluation
+                .flagged
+                .keys()
+                .chain(&evaluation.rerun_job_ids)
+                .chain(evaluation.marked.keys())
+                .chain(evaluation.skipped.keys())
+                .chain(evaluation.reruns.keys())
+                .chain(&evaluation.decided)
+                .chain(evaluation.read.iter().map(|job_state| &job_state.job_id))
+                .chain(
+                    evaluation
+                        .smaller_failed
+                        .iter()
+                        .flat_map(|found| [&found.job_id, &found.clean_job_id]),
+                )
+                .cloned()
+                .collect();
+            assert!(named.is_subset(&perf), "{kind}: {named:?}");
+            assert_eq!(
+                (
+                    evaluation.state,
+                    evaluation.answered_job_count,
+                    evaluation.waiting_job_count,
+                    counts(evaluation, kind).map(|(flagged, ..)| flagged),
+                    evaluation.rerun_job_ids.clone(),
+                ),
+                (
+                    PolicyMemberState::Evaluated,
+                    2,
+                    0,
+                    Some(1),
+                    reruns
+                        .then(|| job("job-perf"))
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                ),
+                "{kind}"
+            );
+        });
+        let kept: Option<BTreeSet<JobId>> = pass.job_states.map(|job_states| {
+            job_states
+                .into_iter()
+                .map(|job_state| job_state.job_id)
+                .collect()
+        });
+        assert_eq!(
+            (kept, pass.record.map(|record| record.triggered)),
+            (Some(perf), Some(BTreeSet::from([kind])))
+        );
+        Ok(())
+    }
+
     /// The mock answers no query, so a member that reads rows reads unreadable.
     #[tokio::test]
     async fn a_member_is_read_no_further_than_its_campaign_and_plan_allow() -> anyhow::Result<()> {
@@ -4456,6 +5501,13 @@ runtimes = [
                 },
                 PolicyMemberState::NoPlan,
             ),
+            (
+                Campaign {
+                    state: CampaignState::Locked,
+                    ..world.campaign.clone()
+                },
+                PolicyMemberState::NoPlan,
+            ),
             (running("plan-missing")?, PolicyMemberState::NoPlan),
             (running("plan-bodies")?, PolicyMemberState::NoPlan),
             (running("plan-creating")?, PolicyMemberState::NotReady),
@@ -4487,6 +5539,8 @@ runtimes = [
             table: None,
             catalog: None,
             waiting: &[],
+            job_states: &[],
+            bodies: None,
         };
         let unread = evaluate(
             &*world.stores.plans,
@@ -4658,15 +5712,28 @@ runtimes = [
         Ok(())
     }
 
+    /// Once their re-runs are spent, swap and spread mark a job failed, the
+    /// first of them that flags it naming the mark, and ttft_over_e2e keeps
+    /// its result.
     #[tokio::test]
-    async fn a_spent_budget_marks_a_swap_and_keeps_the_others() -> anyhow::Result<()> {
+    async fn a_spent_budget_marks_a_swap_or_a_spread_and_keeps_the_others() -> anyhow::Result<()> {
         let Some(world) = World::new().await? else {
             return Ok(());
         };
         world
             .put(&[
-                world.plan("plan-1", &[("job-a", None), ("job-b", None)])?,
-                world.plan(HEAD, &[("job-c", Some("job-a")), ("job-d", Some("job-b"))])?,
+                world.plan(
+                    "plan-1",
+                    &[("job-a", None), ("job-b", None), ("job-x", None)],
+                )?,
+                world.plan(
+                    HEAD,
+                    &[
+                        ("job-c", Some("job-a")),
+                        ("job-d", Some("job-b")),
+                        ("job-e", Some("job-x")),
+                    ],
+                )?,
             ])
             .await?;
         let (both, spread) = ([PolicyKind::Swap, PolicyKind::Spread], [PolicyKind::Spread]);
@@ -4674,26 +5741,120 @@ runtimes = [
             .answer(&[
                 ("job-c", run("job-c", &both)),
                 ("job-d", run("job-d", &spread)),
+                ("job-e", ttft_over("job-e")),
             ])
             .await;
         world
             .answer(&[
                 ("job-a", run("job-a", &both)),
                 ("job-b", run("job-b", &spread)),
+                ("job-x", ttft_over("job-x")),
             ])
             .await;
         let stored = [
             world.on(PolicyKind::Swap, 1),
             world.on(PolicyKind::Spread, 1),
+            world.on(PolicyKind::TtftOverE2e, 1),
         ];
         let evaluation = world.read(&world.campaign, &stored).await?;
         assert_eq!(
             world.outcomes(&evaluation),
-            ["job-c: flagged on 2 runs in a row, 1 re-run spent."]
+            [
+                "job-c: flagged on 2 runs in a row, 1 re-run spent.",
+                "job-d: spread: flagged on 2 runs in a row, 1 re-run spent."
+            ]
         );
         assert_eq!(evaluation.kept_job_count, 1);
+        assert_eq!(
+            evaluation.kinds,
+            BTreeSet::from([PolicyKind::Swap, PolicyKind::Spread])
+        );
         assert_eq!(counts(&evaluation, PolicyKind::Swap), Some((1, 0, 1, 0)));
-        assert_eq!(counts(&evaluation, PolicyKind::Spread), Some((2, 0, 0, 2)));
+        assert_eq!(counts(&evaluation, PolicyKind::Spread), Some((2, 0, 2, 0)));
+        assert_eq!(
+            counts(&evaluation, PolicyKind::TtftOverE2e),
+            Some((1, 0, 0, 1))
+        );
+        Ok(())
+    }
+
+    /// Spread marks a cell failed once it flags the cell on 1 + `max_reruns`
+    /// runs in a row, at the group's own `percent` and `max_reruns`. At 8% with
+    /// 1 re-run, job-c, at 10% on its last two runs, is marked, job-d, whose
+    /// run before was at 6%, is re-run, and job-e, at 7%, is not flagged. With
+    /// 2 re-runs job-c is marked on its third run in a row; at 5%, job-d is
+    /// marked and job-e re-run.
+    #[rstest::rstest]
+    #[case::one_rerun(
+        8.0,
+        1,
+        &["job-c: spread: flagged on 2 runs in a row, 1 re-run spent.", "job-d: re-run"],
+        (2, 1, 1, 0)
+    )]
+    #[case::two_reruns(
+        8.0,
+        2,
+        &["job-c: spread: flagged on 3 runs in a row, 2 re-runs spent.", "job-d: re-run"],
+        (2, 1, 1, 0)
+    )]
+    #[case::five_percent(
+        5.0,
+        1,
+        &[
+            "job-c: spread: flagged on 2 runs in a row, 1 re-run spent.",
+            "job-d: spread: flagged on 2 runs in a row, 1 re-run spent.",
+            "job-e: re-run",
+        ],
+        (3, 1, 2, 0)
+    )]
+    #[tokio::test]
+    async fn spread_marks_a_cell_past_its_reruns_at_the_groups_settings(
+        #[case] percent: f64,
+        #[case] max_reruns: u32,
+        #[case] outcomes: &[&str],
+        #[case] spread: (usize, usize, usize, usize),
+    ) -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world
+            .put(&[
+                world.plan("plan-0", &[("job-z", None)])?,
+                world.plan("plan-1", &[("job-a", Some("job-z")), ("job-b", None)])?,
+                world.plan(
+                    HEAD,
+                    &[
+                        ("job-c", Some("job-a")),
+                        ("job-d", Some("job-b")),
+                        ("job-e", None),
+                    ],
+                )?,
+            ])
+            .await?;
+        world
+            .answer(&[
+                ("job-c", spread_of("job-c", 10.0)),
+                ("job-d", spread_of("job-d", 10.0)),
+                ("job-e", spread_of("job-e", 7.0)),
+            ])
+            .await;
+        world
+            .answer(&[
+                ("job-a", spread_of("job-a", 10.0)),
+                ("job-b", spread_of("job-b", 6.0)),
+            ])
+            .await;
+        world.answer(&[("job-z", spread_of("job-z", 10.0))]).await;
+        let stored = [CampaignGroupPolicy {
+            settings: PolicySettings {
+                percent: Some(percent),
+                ..PolicySettings::default()
+            },
+            ..world.on(PolicyKind::Spread, max_reruns)
+        }];
+        let evaluation = world.read(&world.campaign, &stored).await?;
+        assert_eq!(world.outcomes(&evaluation), outcomes);
+        assert_eq!(counts(&evaluation, PolicyKind::Spread), Some(spread));
         Ok(())
     }
 
@@ -4701,7 +5862,7 @@ runtimes = [
     /// check counts: only the first one's rows are read.
     #[rstest::rstest]
     #[case::fifteen(15, &["job-c: re-run"], (1, 1, 0, 0), (1, 1, 0, 0))]
-    #[case::sixteen(16, &["job-c: its re-run chain has 16 runs."], (1, 0, 1, 0), (1, 0, 0, 1))]
+    #[case::sixteen(16, &["job-c: its re-run chain has 16 runs."], (1, 0, 1, 0), (1, 0, 1, 0))]
     #[tokio::test]
     async fn a_job_whose_chain_has_16_runs_is_not_rerun(
         #[case] runs: usize,
@@ -4857,7 +6018,8 @@ runtimes = [
     }
 
     /// The failed check re-runs a device failure that a retry may fix, and
-    /// keeps a timeout, which the pass records as decided.
+    /// keeps a timeout, which the pass records as decided; the re-run job
+    /// triggers the policy.
     #[tokio::test]
     async fn a_timeout_is_kept_and_decided_and_a_runtime_error_rerun() -> anyhow::Result<()> {
         let Some(world) = World::new().await? else {
@@ -4878,9 +6040,22 @@ runtimes = [
             .await?;
         assert_eq!(world.outcomes(&evaluation), ["job-1: re-run"]);
         assert_eq!(evaluation.kinds, BTreeSet::from([PolicyKind::Failed]));
+        let job_states: Vec<(JobId, Vec<PolicyKind>, bool)> = evaluation
+            .job_states
+            .context("the round's job states")?
+            .into_iter()
+            .map(|v| (v.job_id, v.flagged.into_iter().collect(), v.decided))
+            .collect();
         assert_eq!(
-            evaluation.record.map(|record| record.decided),
-            Some(BTreeSet::from([job("job-2")]))
+            job_states,
+            [
+                (job("job-1"), vec![PolicyKind::Failed], false),
+                (job("job-2"), vec![], true)
+            ]
+        );
+        assert_eq!(
+            evaluation.record.map(|record| record.triggered),
+            Some(BTreeSet::from([PolicyKind::Failed]))
         );
         Ok(())
     }
@@ -4963,6 +6138,7 @@ runtimes = [
         let Some(world) = World::new().await? else {
             return Ok(());
         };
+        world.enroll().await?;
         world
             .put(&[world.plan(HEAD, &[("job-1", None), ("job-2", None)])?])
             .await?;
@@ -4975,12 +6151,342 @@ runtimes = [
             .round(&world.campaign, &stored, Some(&GroupPolicyState::default()))
             .await?;
         let record = first.record.clone().context("the first round's record")?;
+        let job_states = first
+            .job_states
+            .clone()
+            .context("the first round's job states")?;
+        world.keep(&record, &job_states).await?;
         let second = world.round(&world.campaign, &stored, Some(&record)).await?;
         both.assert_calls_async(1).await;
         alone.assert_calls_async(1).await;
         assert_eq!((first.waiting_job_count, second.waiting_job_count), (1, 1));
-        assert_eq!(record.decided, BTreeSet::from([job("job-1")]));
-        assert_eq!(second.record, Some(record));
+        let decided: Vec<(&JobId, bool)> =
+            job_states.iter().map(|v| (&v.job_id, v.decided)).collect();
+        assert_eq!(decided, [(&job("job-1"), true)]);
+        assert_eq!(
+            (second.record, second.job_states),
+            (Some(record), Some(job_states))
+        );
+        Ok(())
+    }
+
+    /// The stored body of a decode_throughput success of `job_id`, at 100
+    /// tokens/sec with a 1% spread, and a peak swap of `swap` bytes.
+    fn decode_body(job_id: &str, swap: i64) -> Value {
+        json!({
+            "message_type": "success",
+            "benchmark_id": "decode_throughput_512_100",
+            "benchmark_type": "decode_throughput",
+            "client_id": "ev1_a",
+            "job_id": job_id,
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "device_name": "mac mini",
+            "device_form_factor": "desktop",
+            "device_os_name": "macos",
+            "device_os_version": "15.0",
+            "device_chip_model": "m4",
+            "device_ram_bytes": 16_000_000_000_i64,
+            "decode_time_ms": 1000.0,
+            "decode_time_ms_stddev": 10.0,
+            "observation_max_swap_bytes": swap,
+        })
+    }
+
+    /// The stored body of a decode_throughput failure of `job_id` that its
+    /// device reports with `code`.
+    fn failure_body(job_id: &str, code: &str) -> Value {
+        json!({
+            "message_type": "failure",
+            "benchmark_id": "decode_throughput_512_100",
+            "benchmark_type": "decode_throughput",
+            "client_id": "ev1_a",
+            "job_id": job_id,
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "retriable": false,
+            "failure_reason": "OOM",
+            "failure_code": code,
+        })
+    }
+
+    /// Only an unchanged body can supply a candidate's named rows on its
+    /// second read, including when a replacement changes metadata alone.
+    #[rstest::rstest]
+    #[case::unchanged("unchanged")]
+    #[case::changed_values("changed_values")]
+    #[case::changed_metadata("changed_metadata")]
+    #[case::missing("missing")]
+    #[case::malformed("malformed")]
+    #[tokio::test]
+    async fn a_rerun_candidate_requires_the_same_body(#[case] change: &str) -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        let job_id = job("job-1");
+        let original = decode_body(job_id.as_str(), 4096);
+        let submissions = &*world.stores.submissions;
+        submissions.write_incoming(&job_id, &original).await?;
+        let id = BenchmarkId::try_new("decode_throughput_512_100")?;
+        let benchmark = Benchmark::from_toml(
+            id.as_str(),
+            "benchmark_type = \"decode_throughput\"\nparameter_prefill_tokens = 512\n\
+             parameter_decode_tokens = 100",
+        )?;
+        let catalog = HashMap::from([(id, benchmark)]);
+        let first = body_rows(submissions, &catalog, vec![job_id.clone()]).await;
+        let (fingerprint, rows) = first.get(&job_id).context("the first read gives rows")?;
+        assert!(flags(&world.on(PolicyKind::Swap, 3), rows));
+        match change {
+            "unchanged" => {}
+            "changed_values" => {
+                submissions
+                    .write_incoming(&job_id, &decode_body(job_id.as_str(), 0))
+                    .await?;
+            }
+            "changed_metadata" => {
+                let mut replacement = original.clone();
+                replacement["submitted_at"] = json!("2026-01-01T00:00:01Z");
+                submissions.write_incoming(&job_id, &replacement).await?;
+            }
+            "missing" => submissions.delete_incoming(&job_id).await?,
+            "malformed" => submissions.write_incoming(&job_id, &json!({})).await?,
+            other => anyhow::bail!("unknown body change: {other}"),
+        }
+        let second = named_rows(
+            submissions,
+            BodyReads {
+                catalog: &catalog,
+                stores: &world.stores,
+            },
+            vec![(job_id.clone(), *fingerprint)],
+        )
+        .await;
+        assert_eq!(second.contains_key(&job_id), change == "unchanged");
+        if let Some(rows) = second.get(&job_id) {
+            assert!(flags(&world.on(PolicyKind::Swap, 3), rows));
+        }
+        Ok(())
+    }
+
+    /// A swap in a result's body files its re-run in the first round after
+    /// the answer, before pipette-duckdb has its rows, and the re-run records
+    /// the swap that the body reports.
+    #[tokio::test]
+    async fn a_swap_in_a_body_files_its_rerun_before_its_rows() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        world.turn_on(&stored).await?;
+        let swapped = world.jobs.first().context("a job")?;
+        world
+            .submit(swapped, &decode_body(swapped.as_str(), 4096))
+            .await?;
+        world.maintain().await?;
+        world.answer(&[(swapped.as_str(), Vec::new())]).await;
+        let (evaluation, filing, counts) = world.pass(&stored).await?;
+        assert_eq!(evaluation.from_body, BTreeSet::from([swapped.clone()]));
+        assert!(matches!(
+            filing.map(|filing| filing.outcome),
+            Some(FilingOutcome::Advanced { .. })
+        ));
+        assert_eq!(
+            (
+                counts.body_reads,
+                counts.body_reruns,
+                counts.jobs_waiting_for_rows
+            ),
+            (2, 1, 0)
+        );
+        let reruns = world.reruns().await?;
+        let recorded: Vec<(&JobId, f64, Option<&str>)> = reruns
+            .iter()
+            .map(|rerun| (&rerun.rerun_of, rerun.before, rerun.model_key.as_deref()))
+            .collect();
+        assert_eq!(recorded, [(swapped, 4096.0, None)]);
+        Ok(())
+    }
+
+    /// A body that no check flags leaves its job waiting, undecided and with
+    /// no job state; once its rows land and a check flags them, the rows
+    /// re-run it.
+    #[tokio::test]
+    async fn a_clean_body_waits_for_the_rows_that_act() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        world.put(&[world.plan(HEAD, &[("job-1", None)])?]).await?;
+        world
+            .submit(&job("job-1"), &decode_body("job-1", 0))
+            .await?;
+        world.answer(&[("job-1", Vec::new())]).await;
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        let first = world.round_with_bodies(&stored, &[]).await?;
+        assert_eq!((first.body_reads, first.waiting_job_count), (1, 1));
+        assert!(first.rerun_job_ids.is_empty() && first.from_body.is_empty());
+        assert!(first.decided.is_empty());
+        assert_eq!(first.job_states, Some(Vec::new()));
+        world.duckdb.reset_async().await;
+        world
+            .answer(&[("job-1", run("job-1", &[PolicyKind::Swap]))])
+            .await;
+        let second = world.round_with_bodies(&stored, &[]).await?;
+        assert_eq!((second.body_reads, second.waiting_job_count), (0, 0));
+        assert_eq!(second.rerun_job_ids, BTreeSet::from([job("job-1")]));
+        assert!(second.from_body.is_empty());
+        Ok(())
+    }
+
+    /// A body whose outcome is a mark, a keep or a skip acts on nothing: the
+    /// job waits, undecided, for the rows that the same outcome acts on.
+    #[rstest::rstest]
+    #[case::mark(PolicyKind::Swap, 0, true)]
+    #[case::keep(PolicyKind::Failed, 0, true)]
+    #[case::skip(PolicyKind::Swap, 3, false)]
+    #[tokio::test]
+    async fn a_body_acts_only_by_a_rerun(
+        #[case] kind: PolicyKind,
+        #[case] max_reruns: u32,
+        #[case] keyed: bool,
+    ) -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        let head = world.plan(HEAD, &[("job-1", None)])?;
+        let head = PlanManifest {
+            content_keys: head.content_keys.into_iter().filter(|_| keyed).collect(),
+            ..head
+        };
+        world.put(&[head]).await?;
+        let on = world.on(kind, max_reruns);
+        let policy = CampaignGroupPolicy {
+            settings: PolicySettings {
+                codes: on
+                    .settings
+                    .codes
+                    .as_ref()
+                    .map(|_| BTreeMap::from([(FailureCode::RuntimeError, max_reruns)])),
+                ..on.settings.clone()
+            },
+            ..on
+        };
+        let (body, rows) = if kind == PolicyKind::Failed {
+            (
+                failure_body("job-1", "runtime_error"),
+                failed_run("job-1", "client", "runtime_error"),
+            )
+        } else {
+            (decode_body("job-1", 4096), run("job-1", &[kind]))
+        };
+        world.submit(&job("job-1"), &body).await?;
+        world.answer(&[("job-1", Vec::new())]).await;
+        let stored = [policy];
+        let from_body = world.round_with_bodies(&stored, &[]).await?;
+        assert_eq!((from_body.body_reads, from_body.waiting_job_count), (1, 1));
+        assert!(from_body.rerun_job_ids.is_empty() && from_body.from_body.is_empty());
+        assert!(from_body.marked.is_empty() && from_body.skipped.is_empty());
+        assert!(from_body.decided.is_empty());
+        world.duckdb.reset_async().await;
+        world.answer(&[("job-1", rows)]).await;
+        let from_rows = world.round_with_bodies(&stored, &[]).await?;
+        assert!(from_rows.rerun_job_ids.is_empty());
+        assert!(!from_rows.marked.is_empty() || from_rows.decided.contains(&job("job-1")));
+        Ok(())
+    }
+
+    /// A re-run whose job has only a body is not judged, even as that body
+    /// re-runs it again on its earlier run's rows.
+    #[tokio::test]
+    async fn a_rerun_is_not_judged_from_its_body() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        world
+            .put(&[world.plan(HEAD, &[("job-2", Some("job-1"))])?])
+            .await?;
+        world
+            .submit(&job("job-2"), &decode_body("job-2", 4096))
+            .await?;
+        world.answer(&[("job-2", Vec::new())]).await;
+        world
+            .answer(&[("job-1", run("job-1", &[PolicyKind::Swap]))])
+            .await;
+        let waiting = PolicyRerun {
+            campaign_id: world.campaign.campaign_id.clone(),
+            ..a_rerun(PolicyKind::Swap)?
+        };
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        let evaluation = world
+            .round_with_bodies(&stored, std::slice::from_ref(&waiting))
+            .await?;
+        assert!(evaluation.judged.is_empty());
+        assert_eq!(evaluation.from_body, BTreeSet::from([job("job-2")]));
+        Ok(())
+    }
+
+    /// A held submission is not in the store the pass reads bodies from, so
+    /// its job waits for its rows.
+    #[tokio::test]
+    async fn a_held_submission_reruns_nothing() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        world.put(&[world.plan(HEAD, &[("job-1", None)])?]).await?;
+        world
+            .stores
+            .submissions
+            .write_unverified(
+                &pipette_plan_types::ClientId::try_new("ev1_a")?,
+                &job("job-1"),
+                &decode_body("job-1", 4096),
+            )
+            .await?;
+        world.answer(&[("job-1", Vec::new())]).await;
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        let evaluation = world.round_with_bodies(&stored, &[]).await?;
+        assert_eq!(
+            (evaluation.body_reads, evaluation.waiting_job_count),
+            (1, 1)
+        );
+        assert!(evaluation.rerun_job_ids.is_empty());
+        Ok(())
+    }
+
+    /// An eval's job is not among the jobs the policies read, so its body is
+    /// not read.
+    #[tokio::test]
+    async fn an_evals_body_is_not_read() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        let head = PlanManifest {
+            benchmark_types: BTreeMap::from([(
+                BenchmarkId::try_new("eval_math_500")?,
+                BenchmarkType::Eval,
+            )]),
+            ..world.plan(HEAD, &[("job-1", None)])?
+        };
+        world.put(&[head]).await?;
+        world.source(&[("job-1", "eval_math_500")]).await?;
+        world
+            .submit(&job("job-1"), &decode_body("job-1", 4096))
+            .await?;
+        world.answer(&[]).await;
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        let evaluation = world.round_with_bodies(&stored, &[]).await?;
+        assert_eq!(
+            (
+                evaluation.answered_job_count,
+                evaluation.body_reads,
+                evaluation.waiting_job_count
+            ),
+            (0, 0, 0)
+        );
+        assert!(evaluation.rerun_job_ids.is_empty());
         Ok(())
     }
 
@@ -4992,22 +6498,32 @@ runtimes = [
         let Some(world) = World::new().await? else {
             return Ok(());
         };
+        world.enroll().await?;
         world
             .put(&[world.plan(HEAD, &[("job-1", None), ("job-2", None)])?])
             .await?;
         let kept = GroupPolicyState {
             policies: vec![world.on(PolicyKind::Swap, 3)],
-            decided: BTreeSet::from([job("job-1"), job("job-2")]),
+            rules: RULES,
             ..GroupPolicyState::default()
         };
+        let decided = ["job-1", "job-2"]
+            .map(|id| decided_state(id, &[]))
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        world.keep(&kept, &decided).await?;
         // No query is answered yet, so a round that read rows would read
         // unreadable.
         let quiet = world
             .round(&world.campaign, &kept.policies, Some(&kept))
             .await?;
         assert_eq!(
-            (quiet.state, quiet.record.as_ref()),
-            (PolicyMemberState::Evaluated, Some(&kept))
+            (
+                quiet.state,
+                quiet.record.as_ref(),
+                quiet.job_states.as_ref()
+            ),
+            (PolicyMemberState::Evaluated, Some(&kept), Some(&decided))
         );
         let both = world
             .answer(&[("job-1", run("job-1", &[])), ("job-2", run("job-2", &[]))])
@@ -5025,14 +6541,56 @@ runtimes = [
         Ok(())
     }
 
-    /// One filing into a head that still runs: it re-runs a swapped job, marks
-    /// failed one whose swap re-runs are spent, keeps a spread job whose
-    /// re-runs are spent, and carries the queued job and the leased one with
-    /// their ids and the lease. Its change, its note and the mark's reason name
-    /// the group and the policy, and the record keeps the filing and the kept
-    /// job.
+    /// A member kept under older rules for what the policies do with a job
+    /// they flag is read in full once under this build's: a spread cell the
+    /// older rules kept with its re-runs spent is marked now, and the record
+    /// keeps the current rules, under which later rounds trust its job states.
     #[tokio::test]
-    async fn a_filing_reruns_marks_keeps_and_carries_the_live_jobs() -> anyhow::Result<()> {
+    async fn a_member_kept_under_older_rules_is_read_again() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        world
+            .put(&[
+                world.plan("plan-1", &[("job-a", None)])?,
+                world.plan(HEAD, &[("job-c", Some("job-a")), ("job-d", None)])?,
+            ])
+            .await?;
+        let stored = [world.on(PolicyKind::Spread, 1)];
+        let older = GroupPolicyState {
+            policies: stored.to_vec(),
+            ..GroupPolicyState::default()
+        };
+        let decided = [
+            decided_state("job-c", &[PolicyKind::Spread])?,
+            decided_state("job-d", &[])?,
+        ];
+        world.keep(&older, &decided).await?;
+        let spreads = [PolicyKind::Spread];
+        world
+            .answer(&[
+                ("job-c", run("job-c", &spreads)),
+                ("job-d", run("job-d", &[])),
+            ])
+            .await;
+        world.answer(&[("job-a", run("job-a", &spreads))]).await;
+        let read = world.round(&world.campaign, &stored, Some(&older)).await?;
+        assert_eq!(
+            world.outcomes(&read),
+            ["job-c: spread: flagged on 2 runs in a row, 1 re-run spent."]
+        );
+        assert_eq!(read.record.map(|record| record.rules), Some(RULES));
+        Ok(())
+    }
+
+    /// One filing into a head that still runs: it re-runs a swapped job, marks
+    /// failed one whose swap re-runs are spent and one whose spread re-runs are
+    /// spent, and carries the queued job and the leased one with their ids and
+    /// the lease. Its change, its note and each mark's reason name the group
+    /// and the policies, and the record keeps the filing.
+    #[tokio::test]
+    async fn a_filing_reruns_marks_and_carries_the_live_jobs() -> anyhow::Result<()> {
         let Some(world) = World::filed().await? else {
             return Ok(());
         };
@@ -5087,13 +6645,13 @@ runtimes = [
 
         let (evaluation, filing, counted) = world.pass(&stored).await?;
         assert_eq!(counts(&evaluation, PolicyKind::Swap), Some((2, 1, 1, 0)));
-        assert_eq!(counts(&evaluation, PolicyKind::Spread), Some((1, 0, 0, 1)));
+        assert_eq!(counts(&evaluation, PolicyKind::Spread), Some((1, 0, 1, 0)));
         assert_eq!(
             counted,
             PassCounts {
                 revisions: 1,
                 rerun_jobs: 1,
-                marked_jobs: 1,
+                marked_jobs: 2,
                 reruns_recorded: 1,
                 ..PassCounts::default()
             }
@@ -5113,7 +6671,7 @@ runtimes = [
                 revised.carried_job_count,
                 revised.dropped_job_count
             ),
-            (1, 1, 3, 0)
+            (1, 2, 2, 0)
         );
         assert_eq!(
             world.current().await?.current_plan_id.as_ref(),
@@ -5128,13 +6686,21 @@ runtimes = [
                 .map(|(job_id, _)| job_id.clone())
                 .context("a job minted for it")
         };
-        let (rerun, marked) = (minted(&swapped)?, minted(&spent_again)?);
+        let (rerun, marked, spread_marked) = (
+            minted(&swapped)?,
+            minted(&spent_again)?,
+            minted(&spread_again)?,
+        );
         assert!(
-            [&spread_again, &queued, &leased, &rerun, &marked]
+            [&queued, &leased, &rerun, &marked, &spread_marked]
                 .iter()
                 .all(|job_id| filed.job_ids.contains(job_id))
         );
-        assert!(!filed.job_ids.contains(&swapped) && !filed.job_ids.contains(&spent_again));
+        assert!(
+            [&swapped, &spent_again, &spread_again]
+                .iter()
+                .all(|job_id| !filed.job_ids.contains(job_id))
+        );
         // The queued job waits under its id, and the leased one keeps its
         // device, each a job of the filed plan.
         let todo = &world.stores.todo;
@@ -5169,43 +6735,59 @@ runtimes = [
             Some(RevisionChange::Rerun {
                 answered: None,
                 job_count: 1,
-                marked_job_count: 1,
+                marked_job_count: 2,
                 group_id: Some(group_id.clone()),
-                policies: vec![PolicyKind::Swap],
+                policies: vec![PolicyKind::Swap, PolicyKind::Spread],
             })
         );
         assert_eq!(
             notes.note,
             Some(format!(
-                "Campaign group {group_id} policies swap: re-run 1, marked 1 failed."
+                "Campaign group {group_id} policies swap, spread: re-run 1, marked 2 failed."
             ))
         );
-        let record = world
-            .stores
-            .submissions
-            .find_job(&marked)
-            .await?
-            .context("the mark's record")?;
-        let Submission::Failure(failure) = parse_stored_submission(&record.body)? else {
-            anyhow::bail!("the mark's record is no failure: {}", record.body);
-        };
+        let submissions = &*world.stores.submissions;
+        let reasons =
+            futures::future::try_join_all([&marked, &spread_marked].map(|job_id| async move {
+                let record = submissions
+                    .find_job(job_id)
+                    .await?
+                    .context("the mark's record")?;
+                let Submission::Failure(failure) = parse_stored_submission(&record.body)? else {
+                    anyhow::bail!("the mark's record is no failure: {}", record.body);
+                };
+                anyhow::Ok(failure.wire.failure_reason.as_str().to_owned())
+            }))
+            .await?;
         assert_eq!(
-            failure.wire.failure_reason.as_str(),
-            format!(
-                "The swap policy of campaign group {group_id} marked this job failed: flagged \
+            reasons,
+            ["swap", "spread"].map(|kind| format!(
+                "The {kind} policy of campaign group {group_id} marked this job failed: flagged \
                  on 2 runs in a row, 1 re-run spent."
-            )
+            ))
         );
 
         let kept = world.kept().await?.context("the member's record")?;
         assert_eq!(
-            (kept.policies.as_slice(), &kept.decided),
-            (stored.as_slice(), &BTreeSet::from([spread_again]))
+            (
+                kept.policies.as_slice(),
+                &world.decided().await?,
+                &kept.triggered
+            ),
+            (
+                stored.as_slice(),
+                &BTreeSet::new(),
+                &BTreeSet::from([PolicyKind::Swap, PolicyKind::Spread])
+            )
         );
         let recorded = kept.filed.context("the filing's record")?;
         assert_eq!(
             (&recorded.plan_id, &recorded.queued, recorded.commit_unknown),
-            (plan_id, &BTreeSet::from([rerun.clone(), marked]), false)
+            (
+                plan_id,
+                &BTreeSet::from([rerun.clone(), marked, spread_marked]),
+                false
+            )
         );
 
         // The re-run waits for its rows; the mark is no re-run.
@@ -5216,7 +6798,11 @@ runtimes = [
                 rerun_job_id: rerun,
                 rerun_of: swapped,
                 plan_id: plan_id.clone(),
-                filed_at: filed.created_at.trunc_subsecs(6),
+                filed_at: filed.created_at.round(
+                    jiff::TimestampRound::new()
+                        .smallest(jiff::Unit::Microsecond)
+                        .mode(jiff::RoundMode::Trunc)
+                )?,
                 before: 4096.0,
                 threshold: Some(0.0),
                 ..a_rerun(PolicyKind::Swap)?
@@ -5226,7 +6812,8 @@ runtimes = [
     }
 
     /// After a filing, the campaign waits while a device has not taken its
-    /// re-run, and nothing of its rows is read. Once one has, the next round
+    /// re-run, and nothing of its rows is read, though the re-run keeps its
+    /// policy triggered. Once one has, the next round
     /// reads only the job answered since, and a round with nothing new reads
     /// nothing.
     #[tokio::test]
@@ -5252,9 +6839,21 @@ runtimes = [
             .and_then(|filing| filing.record?.filed)
             .context("the filing's record")?;
         let rerun = filed.queued.first().context("the filing's re-run")?;
+        // A state with no policy triggered, as an older binary kept one.
+        let filed_state = world.kept().await?.context("the filing's record")?;
+        let unmarked = GroupPolicyState {
+            triggered: BTreeSet::new(),
+            ..filed_state
+        };
+        world.keep(&unmarked, &world.job_states().await?).await?;
 
         world.duckdb.reset_async().await;
         let (waiting, _, counted) = world.pass(&stored).await?;
+        // It reads no rows while held, so its waiting re-run triggers swap.
+        assert_eq!(
+            world.kept().await?.map(|state| state.triggered),
+            Some(BTreeSet::from([PolicyKind::Swap]))
+        );
         assert_eq!(
             (
                 waiting.state,
@@ -5290,8 +6889,8 @@ runtimes = [
         again.assert_calls_async(0).await;
         new.assert_calls_async(1).await;
         assert_eq!(
-            world.kept().await?.map(|record| record.decided),
-            Some(BTreeSet::from([kept.clone(), later.clone()]))
+            world.decided().await?,
+            BTreeSet::from([kept.clone(), later.clone()])
         );
 
         // No query is answered now, so a round that read rows would read
@@ -5494,6 +7093,98 @@ runtimes = [
         Ok(())
     }
 
+    /// The backfill gives no row for a group filing's re-run of an eval's
+    /// cell, whatever the replaced run's rows, and one for its decode cell.
+    #[tokio::test]
+    async fn the_backfill_records_no_rerun_of_an_eval() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        world.turn_on(&stored).await?;
+        let earlier = PlanManifest {
+            previous_plan_id: None,
+            ..world.plan("plan-1", &[("job-a", None), ("job-b", None)])?
+        };
+        let filed = PlanManifest {
+            previous_plan_id: Some(earlier.plan_id.clone()),
+            benchmark_types: BTreeMap::from([
+                (BenchmarkId::try_new("eval_math_500")?, BenchmarkType::Eval),
+                (
+                    BenchmarkId::try_new("decode_throughput_512_100")?,
+                    BenchmarkType::DecodeThroughput,
+                ),
+            ]),
+            ..world.plan(HEAD, &[("job-c", Some("job-a")), ("job-d", Some("job-b"))])?
+        };
+        world.put(&[earlier, filed]).await?;
+        let plans = &*world.stores.plans;
+        let change = RevisionChange::Rerun {
+            answered: None,
+            job_count: 2,
+            marked_job_count: 0,
+            group_id: Some(world.group.group_id.clone()),
+            policies: vec![PolicyKind::Swap],
+        };
+        let notes = PlanNotes {
+            note: None,
+            change: Some(change),
+        };
+        anyhow::ensure!(
+            plans
+                .put_plan_notes(&PlanId::try_new(HEAD)?, &notes)
+                .await?,
+            "the filing's notes are kept"
+        );
+        world
+            .source(&[
+                ("job-c", "eval_math_500"),
+                ("job-d", "decode_throughput_512_100"),
+            ])
+            .await?;
+        let swap = [PolicyKind::Swap];
+        let rows: Vec<Value> = [run("job-a", &swap), run("job-b", &swap)].concat();
+        world
+            .duckdb
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/query")
+                    .body_includes("'job-b'");
+                then.status(200)
+                    .json_body(json!({ "columns": COLUMNS, "rows": rows }));
+            })
+            .await;
+        let results = ResultsDb::new(
+            reqwest::Client::new(),
+            world.config().duckdb.context("the mock pipette-duckdb")?,
+        )?;
+        backfill(
+            &world.stores,
+            &results,
+            std::slice::from_ref(&world.group.group_id),
+        )
+        .await?;
+        let recorded: Vec<(PolicyKind, JobId, JobId, u32)> = world
+            .reruns()
+            .await?
+            .into_iter()
+            .map(|rerun| {
+                (
+                    rerun.kind,
+                    rerun.rerun_job_id,
+                    rerun.rerun_of,
+                    rerun.attempt,
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [(PolicyKind::Swap, job("job-d"), job("job-b"), 1)]
+        );
+        Ok(())
+    }
+
     /// A waiting re-run that its check no longer flags is failed when a row of
     /// it failed: a swap or spread re-run that failed outright, and a failed
     /// one whose code that policy does not re-run. A failed one that fails
@@ -5517,7 +7208,7 @@ runtimes = [
             .answer(&[
                 ("job-1", run("job-1", &[])),
                 ("job-2", failed_run("job-2", "client", "runtime_error")),
-                ("job-3", failed_run("job-3", "client", "out_of_memory")),
+                ("job-3", failed_run("job-3", "client", "attempt_timeout")),
                 ("job-4", Vec::new()),
             ])
             .await;
@@ -5555,6 +7246,8 @@ runtimes = [
             table: None,
             catalog: None,
             waiting: &waiting,
+            job_states: &[],
+            bodies: None,
         };
         let duckdb = world.config().duckdb.context("the mock pipette-duckdb")?;
         let results = ResultsDb::new(reqwest::Client::new(), duckdb)?;
@@ -5605,7 +7298,7 @@ runtimes = [
                     "job-3",
                     failed,
                     Some(0.0),
-                    Some("out_of_memory"),
+                    Some("attempt_timeout"),
                     Some(RerunOutcome::Failed)
                 ),
                 (
@@ -5832,6 +7525,55 @@ runtimes = [
                 .collect()
         };
         assert_eq!(unjudged(backfilled), unjudged(passed));
+        Ok(())
+    }
+
+    /// The backfill gives a failed row the re-runs of the replaced run's code,
+    /// as the policy is stored now: once device_not_ready drops to 1 re-run
+    /// while runtime_error keeps 2, a runtime_error run's re-run at attempt 1
+    /// is recorded and a device_not_ready run's at attempt 2 is not.
+    #[tokio::test]
+    async fn the_backfill_gives_each_run_the_reruns_of_its_code() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let failed = |device_not_ready| CampaignGroupPolicy {
+            settings: PolicySettings {
+                codes: Some(
+                    [
+                        (FailureCode::DeviceNotReady, device_not_ready),
+                        (FailureCode::RuntimeError, 2),
+                    ]
+                    .into(),
+                ),
+                ..PolicySettings::default()
+            },
+            ..world.on(PolicyKind::Failed, 0)
+        };
+        let filed = failed(2);
+        world.turn_on(std::slice::from_ref(&filed)).await?;
+        let fails = |job: &JobId, code| failed_run(job.as_str(), "client", code);
+        let first = world.jobs.first().context("a job")?;
+        let stored = std::slice::from_ref(&filed);
+        let second = world
+            .reran(stored, first, fails(first, "runtime_error"))
+            .await?;
+        let third = world
+            .reran(stored, &second, fails(&second, "device_not_ready"))
+            .await?;
+        assert!(world.groups()?.replace_policy(&filed, &failed(1)).await?);
+        let backfilled = world
+            .backfilled(&[
+                (first.as_str(), fails(first, "runtime_error")),
+                (second.as_str(), fails(&second, "device_not_ready")),
+                (third.as_str(), Vec::new()),
+            ])
+            .await?;
+        let rows: Vec<(u32, &JobId)> = backfilled
+            .iter()
+            .map(|rerun| (rerun.attempt, &rerun.rerun_of))
+            .collect();
+        assert_eq!(rows, [(1, first)]);
         Ok(())
     }
 
@@ -6531,7 +8273,12 @@ runtimes = [
         };
         let written = world
             .groups()?
-            .set_policy_state(&world.group.group_id, &world.campaign.campaign_id, &earlier)
+            .set_policy_state(
+                &world.group.group_id,
+                &world.campaign.campaign_id,
+                &earlier,
+                &JobStateChanges::default(),
+            )
             .await?;
         anyhow::ensure!(written, "the member's state was not written");
 
@@ -6953,7 +8700,9 @@ runtimes = [
     }
 
     /// With model_params alone on, a round reads the rows and counts the key
-    /// its rows lack, files nothing, marks nothing, and keeps the job decided.
+    /// its rows lack, files nothing, marks nothing, and keeps the job decided,
+    /// with the policy triggered. Once an entry for the model is added, the
+    /// next round clears it without reading the rows again.
     #[tokio::test]
     async fn model_params_alone_files_and_marks_nothing() -> anyhow::Result<()> {
         let Some(world) = World::filed().await? else {
@@ -6992,10 +8741,39 @@ runtimes = [
         );
         let kept = world.kept().await?.context("the round's record")?;
         assert_eq!(
-            (kept.policies, kept.decided),
-            (stored.to_vec(), BTreeSet::from([answered.clone()]))
+            (kept.policies, world.decided().await?, kept.triggered),
+            (
+                stored.to_vec(),
+                BTreeSet::from([answered.clone()]),
+                BTreeSet::from([PolicyKind::ModelParams])
+            )
         );
         assert_eq!(world.plan_count().await?, 1);
+
+        world
+            .stores
+            .model_params
+            .put_model_params(&pipette_store_testkit::a_model_params(
+                "granite-4.2-8b",
+                8000,
+            )?)
+            .await?;
+        // No query is answered now, so a round that read rows would read
+        // unreadable.
+        world.duckdb.reset_async().await;
+        let (cleared, _, _) = world.pass(&stored).await?;
+        assert_eq!(cleared.state, PolicyMemberState::Evaluated);
+        let kept = world.kept().await?.context("the round's record")?;
+        let flagged: Vec<BTreeSet<PolicyKind>> = world
+            .job_states()
+            .await?
+            .into_iter()
+            .map(|v| v.flagged)
+            .collect();
+        assert_eq!(
+            (kept.triggered, flagged),
+            (BTreeSet::new(), vec![BTreeSet::new()])
+        );
         Ok(())
     }
 

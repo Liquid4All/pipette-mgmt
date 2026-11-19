@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::TimeZone;
 use httpmock::{Method::GET, MockServer};
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -197,6 +196,24 @@ impl DescriptorCatalogStore for Memory {
         anyhow::bail!("the importer never relabels a member")
     }
 
+    async fn remove_member(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _key: &pipette_plan_types::DescriptorMemberKey,
+    ) -> anyhow::Result<pipette_store::RemoveMemberOutcome> {
+        anyhow::bail!("the importer never removes a member")
+    }
+
+    async fn move_entry_to_global(
+        &self,
+        _org: &pipette_plan_types::OrgId,
+        _name: &CatalogName,
+        _actor: &pipette_plan_types::AuditActor,
+    ) -> anyhow::Result<pipette_store::MoveToGlobalOutcome> {
+        anyhow::bail!("the importer never moves an entry to global scope")
+    }
+
     async fn get_entry(
         &self,
         _scope: &pipette_plan_types::CatalogScope,
@@ -313,7 +330,7 @@ impl CatalogImportRunStore for Runs {
         _id: &str,
         _command: &str,
         _target: Option<&CatalogName>,
-        _at: DateTime<Utc>,
+        _at: Timestamp,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -321,7 +338,7 @@ impl CatalogImportRunStore for Runs {
     async fn finish_run(
         &self,
         _id: &str,
-        _at: DateTime<Utc>,
+        _at: Timestamp,
         finish: &CatalogImportRunFinish,
     ) -> anyhow::Result<()> {
         self.0
@@ -453,9 +470,9 @@ async fn upstream(faults: Faults) -> anyhow::Result<MockServer> {
     Ok(server)
 }
 
-fn now() -> anyhow::Result<DateTime<Utc>> {
-    Utc.with_ymd_and_hms(2026, 10, 16, 0, 30, 0)
-        .single()
+fn now() -> anyhow::Result<Timestamp> {
+    "2026-10-16T00:30:00Z"
+        .parse::<jiff::Timestamp>()
         .context("test time is invalid")
 }
 
@@ -490,7 +507,7 @@ async fn a_stable_and_the_last_complete_daily_share_one_build() -> anyhow::Resul
             .get("published_at")
             .and_then(Value::as_str)
             .context("stable publication time is missing")?
-            .parse::<DateTime<Utc>>()?
+            .parse::<Timestamp>()?
     );
     assert_eq!(daily.members.head().flavor(), Some("macos-x64"));
     assert_eq!(
@@ -508,7 +525,7 @@ async fn since_backfills_a_finished_utc_day() -> anyhow::Result<()> {
     let store = Memory::default();
     let runs = Runs::default();
     let config = DescriptorCatalogConfig::default();
-    let after = NaiveDate::from_ymd_opt(2026, 10, 16).context("invalid date")?;
+    let after = Date::new(2026, 10, 16).context("invalid date")?;
     let first = import(&api(&server)?, &store, &runs, &config, Some(after), now()?).await?;
     assert_eq!(first.entries_created, 1);
     assert!(
@@ -520,7 +537,7 @@ async fn since_backfills_a_finished_utc_day() -> anyhow::Result<()> {
             .await?
             .is_none()
     );
-    let day = NaiveDate::from_ymd_opt(2026, 10, 15).context("invalid date")?;
+    let day = Date::new(2026, 10, 15).context("invalid date")?;
     let second = import(&api(&server)?, &store, &runs, &config, Some(day), now()?).await?;
     assert_eq!(second.entries_created, 1);
     assert_eq!(
@@ -535,7 +552,10 @@ async fn default_since_uses_the_newest_llamacpp_daily_entry() -> anyhow::Result<
     let store = Memory::default();
     let at = now()?;
     for (name, time) in [
-        ("llamacpp-daily-2026-10-15", at - chrono::Duration::days(10)),
+        (
+            "llamacpp-daily-2026-10-15",
+            at - jiff::SignedDuration::from_hours(10 * 24),
+        ),
         ("other-daily-2026-10-20", at),
     ] {
         let entry = DescriptorEntry::new(
@@ -555,8 +575,8 @@ async fn default_since_uses_the_newest_llamacpp_daily_entry() -> anyhow::Result<
         store.create_entry(&entry).await?;
     }
     assert_eq!(
-        default_since(&store, at.date_naive()).await?,
-        NaiveDate::from_ymd_opt(2026, 10, 13).context("invalid date")?
+        default_since(&store, at.to_zoned_datetime(jiff::tz::TimeZone::UTC).date()).await?,
+        Date::new(2026, 10, 13).context("invalid date")?
     );
     Ok(())
 }
@@ -686,7 +706,7 @@ async fn releases_only(status: u16, headers: &[(&str, &str)]) -> MockServer {
 #[case::rate_limited(
     403,
     &[("X-RateLimit-Remaining", "0"), ("X-RateLimit-Reset", "1792108800")],
-    "rate limit reached until 2026-10-16T00:00:00+00:00",
+    "rate limit reached until 2026-10-16T00:00:00Z",
 )]
 #[tokio::test]
 async fn a_release_list_error_finishes_the_run_as_error(
@@ -828,9 +848,9 @@ async fn seed(
     kind: DescriptorEntryKind,
     state: DescriptorEntryState,
     age_days: i64,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> anyhow::Result<()> {
-    let released = at - chrono::Duration::days(age_days);
+    let released = at - jiff::SignedDuration::from_hours(24 * age_days);
     let creator = match kind {
         DescriptorEntryKind::HandMade => DescriptorEntryCreator::Operator,
         DescriptorEntryKind::Stable | DescriptorEntryKind::Daily => {
@@ -950,13 +970,12 @@ async fn a_backfilled_old_entry_starts_hidden() -> anyhow::Result<()> {
     use DescriptorEntryState::{Active, Hidden};
     let server = upstream(Faults::default()).await?;
     let store = Memory::default();
-    let at = Utc
-        .with_ymd_and_hms(2027, 1, 1, 3, 0, 0)
-        .single()
+    let at = "2027-01-01T03:00:00Z"
+        .parse::<jiff::Timestamp>()
         .context("test time is invalid")?;
     seed(&store, "llamacpp-v0.8.0", Stable, Active, 20, at).await?;
     seed(&store, "llamacpp-v0.9.0", Stable, Active, 10, at).await?;
-    let since = NaiveDate::from_ymd_opt(2026, 10, 15).context("invalid date")?;
+    let since = Date::new(2026, 10, 15).context("invalid date")?;
     let result = import(
         &api(&server)?,
         &store,
@@ -1022,10 +1041,10 @@ async fn expiry_runs_after_a_failed_release_list() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn default_since_without_a_daily_entry_is_fourteen_days_back() -> anyhow::Result<()> {
-    let today = NaiveDate::from_ymd_opt(2026, 10, 16).context("invalid date")?;
+    let today = Date::new(2026, 10, 16).context("invalid date")?;
     assert_eq!(
         default_since(&Memory::default(), today).await?,
-        NaiveDate::from_ymd_opt(2026, 10, 2).context("invalid date")?
+        Date::new(2026, 10, 2).context("invalid date")?
     );
     Ok(())
 }
@@ -1171,9 +1190,8 @@ async fn release_paging_stops_at_an_older_release() -> anyhow::Result<()> {
             then.status(200).json_body(json!([]));
         })
         .await;
-    let until = Utc
-        .with_ymd_and_hms(2026, 10, 15, 18, 0, 0)
-        .single()
+    let until = "2026-10-15T18:00:00Z"
+        .parse::<jiff::Timestamp>()
         .context("test time is invalid")?;
     assert_eq!(api(&server)?.releases(Some(until)).await?.len(), 100);
     assert_eq!(second_page.calls_async().await, 0);

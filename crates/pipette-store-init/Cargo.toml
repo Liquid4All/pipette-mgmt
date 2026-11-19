@@ -16,9 +16,7 @@ pipette-store-fs.workspace = true
 pipette-store-s3.workspace = true
 pipette-store-sql.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
-chrono.workspace = true
-futures.workspace = true
+jiff.workspace = true
 libc.workspace = true
 object_store.workspace = true
 serde.workspace = true
@@ -28,6 +26,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
 pipette-store-sql = { workspace = true, features = ["testkit"] }
 pipette-plan-types.workspace = true
 pipette-store-testkit.workspace = true

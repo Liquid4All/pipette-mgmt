@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use jiff::{Timestamp, civil::Date};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -103,8 +103,8 @@ impl GitHubClient {
                 "GitHub {path} returned {status}: rate limit reached until {}",
                 header("X-RateLimit-Reset")
                     .and_then(|reset| reset.parse::<i64>().ok())
-                    .and_then(|reset| DateTime::<Utc>::from_timestamp(reset, 0))
-                    .map_or_else(|| "an unknown time".to_owned(), |reset| reset.to_rfc3339())
+                    .and_then(|reset| jiff::Timestamp::from_second(reset).ok())
+                    .map_or_else(|| "an unknown time".to_owned(), |reset| reset.to_string())
             );
         }
         anyhow::bail!("GitHub {path} returned {status}")
@@ -139,7 +139,7 @@ impl GitHubClient {
 
     /// List releases, newest first. With `until`, stop after the first page
     /// that holds a release published before that time.
-    async fn releases(&self, until: Option<DateTime<Utc>>) -> anyhow::Result<Vec<Release>> {
+    async fn releases(&self, until: Option<Timestamp>) -> anyhow::Result<Vec<Release>> {
         self.paged(&format!("repos/{REPO}/releases"), |batch: &[Release]| {
             until.is_none_or(|until| {
                 batch
@@ -199,7 +199,7 @@ impl GitHubClient {
 struct Release {
     id: i64,
     tag_name: String,
-    published_at: Option<DateTime<Utc>>,
+    published_at: Option<Timestamp>,
     prerelease: bool,
     draft: bool,
 }
@@ -308,7 +308,7 @@ fn classify(tag: &str, assets: &[Asset], config: &DescriptorCatalogConfig) -> Cl
 fn descriptor(
     tag: &str,
     flavor: &LlamaCppFlavor,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> anyhow::Result<DescriptorMember> {
     let runtime = Runtime::LlamacppCliStockTools(LlamacppCliStockTools {
         source: LlamacppCliStockToolsSource::GithubRelease(LlamacppCliStockToolsRelease {
@@ -347,7 +347,7 @@ fn record_unknown(tag: &str, classified: &Classified, finish: &mut CatalogImport
 struct EntryCandidate<'a> {
     name: CatalogName,
     kind: DescriptorEntryKind,
-    published_at: DateTime<Utc>,
+    published_at: Timestamp,
     tag: &'a str,
     classified: &'a Classified,
 }
@@ -363,7 +363,7 @@ async fn create_entry(
         tag,
         classified,
     }: EntryCandidate<'_>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     finish: &mut CatalogImportRunFinish,
 ) -> anyhow::Result<()> {
     if let Some(existing) = store
@@ -436,7 +436,7 @@ async fn append_from_release(
     store: &dyn DescriptorCatalogStore,
     entry: &DescriptorEntry,
     config: &DescriptorCatalogConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
     finish: &mut CatalogImportRunFinish,
 ) -> anyhow::Result<()> {
     let tag = entry_tag(entry)?;
@@ -542,7 +542,7 @@ fn starts_hidden(
     stable_entries: &mut Vec<DescriptorEntry>,
     candidate: &DescriptorEntry,
     config: &DescriptorCatalogConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
     if candidate.kind != DescriptorEntryKind::Stable {
         return !expired(std::slice::from_ref(candidate), &config.expiry, now).is_empty();
@@ -560,7 +560,7 @@ fn starts_hidden(
 async fn expire(
     store: &dyn DescriptorCatalogStore,
     config: &DescriptorCatalogConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
     finish: &mut CatalogImportRunFinish,
 ) -> anyhow::Result<()> {
     let importer_lock = store.lock_importer_entries().await?;
@@ -611,7 +611,7 @@ async fn expire(
 /// stable releases already have entries.
 async fn newest_stable_release(
     store: &dyn DescriptorCatalogStore,
-) -> anyhow::Result<Option<DateTime<Utc>>> {
+) -> anyhow::Result<Option<Timestamp>> {
     let filter = DescriptorEntryFilter {
         scopes: [pipette_plan_types::CatalogScope::Global].into(),
         kinds: [DescriptorEntryKind::Stable].into(),
@@ -633,10 +633,7 @@ async fn newest_stable_release(
     Ok(page.items.first().map(|entry| entry.release_time))
 }
 
-async fn default_since(
-    store: &dyn DescriptorCatalogStore,
-    today: NaiveDate,
-) -> anyhow::Result<NaiveDate> {
+async fn default_since(store: &dyn DescriptorCatalogStore, today: Date) -> anyhow::Result<Date> {
     let filter = DescriptorEntryFilter {
         scopes: [pipette_plan_types::CatalogScope::Global].into(),
         kinds: [DescriptorEntryKind::Daily].into(),
@@ -658,10 +655,10 @@ async fn default_since(
         .items
         .first()
         .and_then(|entry| entry.name.as_str().strip_prefix(LLAMACPP_DAILY_PREFIX))
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        .and_then(|date| Date::strptime("%Y-%m-%d", date).ok());
     let since = match recent {
-        Some(day) => day.checked_sub_days(Days::new(2)),
-        None => today.checked_sub_days(Days::new(14)),
+        Some(day) => day.checked_sub(jiff::Span::new().days(2)).ok(),
+        None => today.checked_sub(jiff::Span::new().days(14)).ok(),
     };
     Ok(since.unwrap_or(today))
 }
@@ -674,7 +671,7 @@ async fn import_stable(
     config: &DescriptorCatalogConfig,
     stable_entries: &mut Vec<DescriptorEntry>,
     release: &Release,
-    now: DateTime<Utc>,
+    now: Timestamp,
     finish: &mut CatalogImportRunFinish,
 ) -> anyhow::Result<()> {
     let published_at = release
@@ -746,15 +743,17 @@ async fn import_inner(
     api: &GitHubClient,
     store: &dyn DescriptorCatalogStore,
     config: &DescriptorCatalogConfig,
-    since: Option<NaiveDate>,
-    now: DateTime<Utc>,
+    since: Option<Date>,
+    now: Timestamp,
     finish: &mut CatalogImportRunFinish,
 ) -> anyhow::Result<()> {
     let since = match since {
         Some(date) => date,
-        None => default_since(store, now.date_naive()).await?,
+        None => default_since(store, now.to_zoned_datetime(jiff::tz::TimeZone::UTC).date()).await?,
     };
-    let since_start = since.and_time(chrono::NaiveTime::MIN).and_utc();
+    let since_start = since
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)?
+        .timestamp();
     let until = newest_stable_release(store)
         .await?
         .map(|newest| newest.min(since_start));
@@ -793,13 +792,14 @@ async fn import_inner(
         .iter()
         .filter(|release| !release.draft && build_number(&release.tag_name).is_some())
         .try_fold(
-            HashMap::<NaiveDate, Vec<&Release>>::new(),
+            HashMap::<Date, Vec<&Release>>::new(),
             |mut days, release| {
                 let day = release
                     .published_at
                     .with_context(|| format!("{} has no publication time", release.tag_name))?
-                    .date_naive();
-                if day >= since && day < now.date_naive() {
+                    .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                    .date();
+                if day >= since && day < now.to_zoned_datetime(jiff::tz::TimeZone::UTC).date() {
                     days.entry(day).or_default().push(release);
                 }
                 anyhow::Ok(days)
@@ -809,7 +809,7 @@ async fn import_inner(
     dates.sort();
     let min_age = i64::try_from(config.llamacpp_min_build_age_secs)
         .ok()
-        .and_then(chrono::Duration::try_seconds)
+        .map(jiff::SignedDuration::from_secs)
         .context("llamacpp_min_build_age_secs is out of range")?;
     for date in dates {
         let name = CatalogName::try_new(format!("{LLAMACPP_DAILY_PREFIX}{date}"))?;
@@ -833,7 +833,7 @@ async fn import_inner(
             let at = release
                 .published_at
                 .context("daily build has no publication time")?;
-            if now.signed_duration_since(at) < min_age {
+            if now.duration_since(at) < min_age {
                 continue;
             }
             let classified = classify(&release.tag_name, &api.assets(release).await?, config);
@@ -895,7 +895,8 @@ where
     F: std::future::Future<Output = CatalogImportRunFinish>,
 {
     let id = uuid::Uuid::now_v7().to_string();
-    runs.start_run(&id, command, target, Utc::now()).await?;
+    runs.start_run(&id, command, target, Timestamp::now())
+        .await?;
     let finish = work.await;
     if let Some(error) = &finish.error_summary {
         tracing::error!(
@@ -909,7 +910,7 @@ where
             "catalog import run failed"
         );
     }
-    runs.finish_run(&id, Utc::now(), &finish)
+    runs.finish_run(&id, Timestamp::now(), &finish)
         .await
         .with_context(|| format!("recording the end of catalog import run {id}"))?;
     if let Some(error) = &finish.error_summary {
@@ -933,8 +934,8 @@ pub async fn import(
     store: &dyn DescriptorCatalogStore,
     runs: &dyn CatalogImportRunStore,
     config: &DescriptorCatalogConfig,
-    since: Option<NaiveDate>,
-    now: DateTime<Utc>,
+    since: Option<Date>,
+    now: Timestamp,
 ) -> anyhow::Result<CatalogImportRunFinish> {
     let work = async {
         let mut finish = CatalogImportRunFinish::default();
@@ -964,7 +965,7 @@ pub async fn refresh(
     runs: &dyn CatalogImportRunStore,
     config: &DescriptorCatalogConfig,
     name: &CatalogName,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<CatalogImportRunFinish> {
     let work = async {
         let mut finish = CatalogImportRunFinish::default();

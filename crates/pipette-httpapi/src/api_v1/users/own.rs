@@ -7,7 +7,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 use pipette_core::key_index::{KeyClaim, KeyHolderPrincipalId, digest_of};
 use pipette_core::types::DeriveFromKey;
@@ -33,11 +33,11 @@ use crate::state::AppState;
 const KEY_DETAILS_MAX_CHARS: usize = 4096;
 
 /// The furthest out a key may expire: an expiring key is a browser's sign-in.
-pub const MAX_KEY_LIFETIME: TimeDelta = TimeDelta::days(30);
+pub const MAX_KEY_LIFETIME: SignedDuration = SignedDuration::from_hours(30 * 24);
 
 /// Slack on [`MAX_KEY_LIFETIME`] for a caller whose clock runs ahead, as wide as
 /// the signature's own timestamp tolerance.
-const KEY_LIFETIME_SKEW: TimeDelta = TimeDelta::minutes(5);
+const KEY_LIFETIME_SKEW: SignedDuration = SignedDuration::from_mins(5);
 
 // POST /api/v1/users/register
 //
@@ -177,7 +177,7 @@ async fn request_account(
 
     // Mints the id and folds the address, which is what makes the record's
     // `contact_email` the index key claimed just below.
-    let user = User::requested(contact_email, Utc::now())
+    let user = User::requested(contact_email, Timestamp::now())
         .map_err(|e| AppError::BadRequest(format!("invalid contact_email: {e}")))?;
 
     // An unverified claim here would hold the address against the Clerk sign-in
@@ -403,8 +403,8 @@ pub async fn get_own_user(
         .map_err(|e| AppError::Internal(format!("failed to read the first sign-in: {e:#}")))?;
 
     let org_id = user_org(&state, &user.user_id).await?;
-    // A membership naming a deleted organization has no handle to show.
-    let org_slug = match &org_id {
+    // A membership naming a deleted organization has no handle or name to show.
+    let (org_slug, org_display_name) = match &org_id {
         Some(org_id) => state
             .org_store
             .get_org(org_id)
@@ -412,8 +412,9 @@ pub async fn get_own_user(
             .map_err(|e| {
                 AppError::Internal(format!("failed to read the account's organization: {e:#}"))
             })?
-            .map(|org| org.slug),
-        None => None,
+            .map(|org| (org.slug, org.display_name))
+            .unzip(),
+        None => (None, None),
     };
 
     let permissions = pipette_core::user_permission::effective(
@@ -425,6 +426,7 @@ pub async fn get_own_user(
         user: user.into(),
         org_id,
         org_slug,
+        org_display_name,
         permissions: UserPermissionSet::from(&permissions),
         keys: keys.into_iter().map(Into::into).collect(),
         first_clerk_sign_in,
@@ -520,7 +522,7 @@ pub(crate) async fn register_key(
     user: &User,
     public_key: PublicKeyHex,
     key_details: NonEmptyTrimmedString,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
 ) -> Result<UserKey, AppError> {
     // Bounded here so both registration paths inherit it.
     if key_details.chars().count() > KEY_DETAILS_MAX_CHARS {
@@ -528,14 +530,14 @@ pub(crate) async fn register_key(
             "key_details is longer than {KEY_DETAILS_MAX_CHARS} characters"
         )));
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     if expires_at.is_some_and(|at| at <= now) {
         return Err(AppError::BadRequest("expires_at has already passed".into()));
     }
     if expires_at.is_some_and(|at| at > now + MAX_KEY_LIFETIME + KEY_LIFETIME_SKEW) {
         return Err(AppError::BadRequest(format!(
             "expires_at is more than {} days away",
-            MAX_KEY_LIFETIME.num_days()
+            MAX_KEY_LIFETIME.as_hours() / 24
         )));
     }
 

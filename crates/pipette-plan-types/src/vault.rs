@@ -1,7 +1,7 @@
 //! `/api/v1/vault`: the records of stored files, the upload that registers
 //! them, and the variants an upload takes.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::owners::PrincipalOwner;
@@ -144,7 +144,8 @@ pub struct VaultResource {
     /// The public source the file is a copy of; absent for an upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<VaultOrigin>,
-    pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub created_at: Timestamp,
 }
 
 /// The plan entry an upload makes, as JSON and as the inline table a plan's

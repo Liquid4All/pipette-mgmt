@@ -17,11 +17,12 @@ For `spread`, raising the threshold of the defaults the caller read:
 
 Writes the group's policy for the check `kind`: `swap`, `spread`, `failed`,
 `ttft_over_e2e`, `model_params` or `smaller_failed`
-([policies](../campaign-groups.md#policies)). The body replaces the policy
+([policies](../campaign-groups.md#policies), which judge no eval's cell). The body replaces the policy
 whole, so every field is required. `max_reruns` is a whole number from 0 to 15
 for `swap`; 0 for `model_params` and `smaller_failed`, which only flag, and for
-`failed`, whose `codes` holds its re-runs; and from 1 to 15 for `spread` and
-`ttft_over_e2e`, which keep a cell's result once its re-runs are spent. In
+`failed`, whose `codes` holds its re-runs; and from 1 to 15 for `spread`, which
+marks a cell failed once its re-runs are spent, and `ttft_over_e2e`, which
+keeps the cell's result. In
 `settings`, `spread` takes `percent`, a number above 0, and optionally
 `short_repetition_ms` with `short_repetition_percent`, both numbers above 0,
 for rows whose repetitions are shorter

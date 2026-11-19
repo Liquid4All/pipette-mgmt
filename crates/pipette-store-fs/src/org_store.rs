@@ -130,7 +130,7 @@ impl OrgStore for LocalFsOrgStore {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     use pipette_core::organization::{Membership, Organization, Ownership};
     use pipette_core::types::Mint;
@@ -161,7 +161,7 @@ mod tests {
         let org = Organization::new(
             OrgSlug::try_new(" ACME ")?,
             NonEmptyTrimmedString::try_new("Acme Corp., Inc.")?,
-            Utc::now(),
+            Timestamp::now(),
         );
         let org_id = org.org_id.clone();
         store.claim_org_slug(org.slug.as_str(), &org_id).await?;

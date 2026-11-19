@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use pipette_core::denial::DenialRecord;
 use pipette_plan_types::{CachedArtifacts, ClientId, ExpiresAt, JobId};
@@ -111,7 +111,7 @@ impl TodoStore for ObservedTodoStore {
     ) -> anyhow::Result<RedateResult> {
         self.inner.redate_avail(job_id, from, to).await
     }
-    async fn restamp_avail_deadlines(&self, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    async fn restamp_avail_deadlines(&self, now: Timestamp) -> anyhow::Result<u64> {
         self.inner.restamp_avail_deadlines(now).await
     }
     async fn list_leases(&self) -> anyhow::Result<Vec<pipette_core::todo_filename::Lease>> {
@@ -125,7 +125,7 @@ impl TodoStore for ObservedTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         self.inner
             .get_leased(job_id, expires_at, client_id, lease_expiry)
@@ -135,7 +135,7 @@ impl TodoStore for ObservedTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        new_expiry: DateTime<Utc>,
+        new_expiry: Timestamp,
     ) -> anyhow::Result<RenewLeaseResult> {
         self.inner.renew_lease(job_id, client_id, new_expiry).await
     }
@@ -144,7 +144,7 @@ impl TodoStore for ObservedTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        expiry: DateTime<Utc>,
+        expiry: Timestamp,
     ) -> anyhow::Result<()> {
         self.inner
             .delete_lease(job_id, expires_at, client_id, expiry)
@@ -155,7 +155,7 @@ impl TodoStore for ObservedTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<ClaimResult> {
         self.inner
             .claim_job(job_id, expires_at, client_id, lease_expiry)
@@ -164,12 +164,12 @@ impl TodoStore for ObservedTodoStore {
     async fn claim_for_client(
         &self,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
         passed_over: &[JobId],
         checked_lease: Option<&pipette_core::todo_filename::Lease>,
         cached: Option<&CachedArtifacts>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ClaimOutcome> {
         self.inner
             .claim_for_client(
@@ -190,9 +190,9 @@ impl TodoStore for ObservedTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
         lost_lease_limit: usize,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> anyhow::Result<ReclaimOutcome> {
         self.inner
             .reclaim_for_client(job_id, client_id, lease_expiry, lost_lease_limit, now)
@@ -203,7 +203,7 @@ impl TodoStore for ObservedTodoStore {
         job_id: &JobId,
         expires_at: ExpiresAt,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<RecycleResult> {
         self.inner
             .recycle_lease(job_id, expires_at, client_id, lease_expiry)
@@ -290,16 +290,13 @@ impl TodoStore for ObservedTodoStore {
         &self,
         job_id: &JobId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<()> {
         self.inner
             .write_lost_lease(job_id, client_id, lease_expiry)
             .await
     }
-    async fn list_lost_leases(
-        &self,
-        job_id: &JobId,
-    ) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+    async fn list_lost_leases(&self, job_id: &JobId) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
         self.inner.list_lost_leases(job_id).await
     }
     async fn delete_lost_leases_for_job(&self, job_id: &JobId) -> anyhow::Result<()> {
@@ -334,7 +331,7 @@ impl TodoStore for ObservedTodoStore {
     async fn campaign_backlog(
         &self,
         client_id: &ClientId,
-        creating_before: DateTime<Utc>,
+        creating_before: Timestamp,
     ) -> anyhow::Result<CampaignBacklog> {
         self.inner
             .campaign_backlog(client_id, creating_before)
@@ -393,10 +390,10 @@ impl TodoStore for ObservedTodoStore {
     async fn stamp_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {
         self.inner.stamp_liveness(client_id).await
     }
-    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<DateTime<Utc>>> {
+    async fn read_liveness(&self, client_id: &ClientId) -> anyhow::Result<Option<Timestamp>> {
         self.inner.read_liveness(client_id).await
     }
-    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, DateTime<Utc>)>> {
+    async fn list_liveness(&self) -> anyhow::Result<Vec<(ClientId, Timestamp)>> {
         self.inner.list_liveness().await
     }
     async fn delete_liveness(&self, client_id: &ClientId) -> anyhow::Result<()> {

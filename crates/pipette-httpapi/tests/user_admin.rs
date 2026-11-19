@@ -197,7 +197,7 @@ async fn a_read_orgs_member_reads_its_organizations_accounts() -> anyhow::Result
     assert_eq!(got["user_id"], json!(target.as_str()));
     assert_eq!(got["contact_email"], json!(stored.contact_email.as_str()));
     assert_eq!(got["status"], json!("active"));
-    json_str(&got, "created_at")?.parse::<chrono::DateTime<chrono::Utc>>()?;
+    json_str(&got, "created_at")?.parse::<jiff::Timestamp>()?;
     assert_eq!(got["org_id"], json!(acme));
     assert_eq!(
         got["permissions"],
@@ -2052,7 +2052,7 @@ fn host_minted(user_id: &UserId) -> anyhow::Result<pipette_core::user_preauth::U
             expires_at: None,
             note: None,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?)
 }
 
@@ -2103,8 +2103,8 @@ async fn an_org_admin_onboards_a_member_with_a_preauth_key() -> anyhow::Result<(
     assert_eq!(minted["minted_by"], json!(lead.1.as_str()));
     assert_eq!(minted["note"], json!("for the new hire"));
     assert!(minted.get("secret_hash").is_none(), "{minted}");
-    let expires_at: chrono::DateTime<chrono::Utc> = json_str(&minted, "expires_at")?.parse()?;
-    let hours = (expires_at - chrono::Utc::now()).num_hours();
+    let expires_at: jiff::Timestamp = json_str(&minted, "expires_at")?.parse()?;
+    let hours = expires_at.duration_since(jiff::Timestamp::now()).as_hours();
     assert!((6 * 24..=7 * 24).contains(&hours), "expires in {hours}h");
 
     // Listed by its id and its minter, never by its secret.
@@ -2649,17 +2649,17 @@ async fn the_preauth_listing_shows_each_keys_provenance_newest_first() -> anyhow
     let minted = body_json(resp).await?;
 
     // Minted on the host two days ago, expired since yesterday.
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut host = pipette_core::user_preauth::mint(
         pipette_core::user_preauth::UserPreauthParams {
             user_id: member.clone(),
             usage: pipette_plan_types::UserPreauthUsage::SingleUse,
-            expires_at: Some(now - chrono::Duration::days(1)),
+            expires_at: Some(now - jiff::SignedDuration::from_hours(24)),
             note: Some(pipette_plan_types::NonEmptyTrimmedString::try_new(
                 "from the host",
             )?),
         },
-        now - chrono::Duration::days(2),
+        now - jiff::SignedDuration::from_hours(2 * 24),
     )?
     .key;
     // Sorts first by name, so only the date puts it last.
@@ -2775,8 +2775,11 @@ async fn a_key_minted_here_admits_only_the_first_machine() -> anyhow::Result<()>
     let member = keyless(&state, &acme, &[]).await?;
 
     let minted = body_json(mint(&state, &lead, &member).await?).await?;
-    let expires_at: chrono::DateTime<chrono::Utc> = json_str(&minted, "expires_at")?.parse()?;
-    assert_eq!((expires_at - chrono::Utc::now()).num_days(), 89);
+    let expires_at: jiff::Timestamp = json_str(&minted, "expires_at")?.parse()?;
+    assert_eq!(
+        expires_at.duration_since(jiff::Timestamp::now()).as_hours() / 24,
+        89
+    );
 
     // A second key of the same minter, stored beside it as a race or a
     // failed replacement would leave it.
@@ -3093,16 +3096,16 @@ async fn an_accounts_keys_are_listed_oldest_first() -> anyhow::Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("a single candidate public key"))?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let oldest = UserKey::new(
         highest,
         NonEmptyTrimmedString::try_new("old desktop")?,
-        now - chrono::Duration::days(2),
+        now - jiff::SignedDuration::from_hours(2 * 24),
     );
     let older = UserKey::new(
         lowest,
         NonEmptyTrimmedString::try_new("spare tablet")?,
-        now - chrono::Duration::days(1),
+        now - jiff::SignedDuration::from_hours(24),
     );
     state.user_store.put_user_key(&member.1, &older).await?;
     state.user_store.put_user_key(&member.1, &oldest).await?;

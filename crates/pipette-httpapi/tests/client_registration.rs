@@ -38,7 +38,7 @@ use pipette_web_testkit::{
 };
 
 async fn mint_stored_key(state: &AppState, params: ClientPreauthParams) -> anyhow::Result<String> {
-    let minted = pipette_core::client_preauth::mint(params, chrono::Utc::now())?;
+    let minted = pipette_core::client_preauth::mint(params, jiff::Timestamp::now())?;
     state
         .client_store
         .put_client_preauth_key(&minted.key)
@@ -1357,7 +1357,7 @@ async fn test_registration_seeds_around_a_template_name_it_cannot_grant() -> any
     // Widened as a newer binary, or one before the partition, would write it.
     let mut params = key_params(ClientPreauthUsage::SingleUse);
     params.default_permissions = Some(BTreeSet::from([ClientPermission::PerformWork]));
-    let mut minted = pipette_core::client_preauth::mint(params, chrono::Utc::now())?;
+    let mut minted = pipette_core::client_preauth::mint(params, jiff::Timestamp::now())?;
     minted
         .key
         .default_permissions
@@ -1890,7 +1890,7 @@ async fn test_a_key_stays_spent_when_its_record_survives_the_spend() -> anyhow::
     let state = make_state(dir.path()).await?;
     let minted = pipette_core::client_preauth::mint(
         key_params(ClientPreauthUsage::SingleUse),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     state
         .client_store
@@ -2021,11 +2021,11 @@ async fn test_a_refused_client_preauth_key_leaves_the_keypair_unclaimed(
     };
     let token = mint_stored_key(&state, key_params(ClientPreauthUsage::SingleUse)).await?;
     let mut expired = key_params(ClientPreauthUsage::SingleUse);
-    expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    expired.expires_at = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
     let expired = mint_stored_key(&state, expired).await?;
     let mut delegated = pipette_core::client_preauth::mint(
         key_params(ClientPreauthUsage::SingleUse),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     delegated.key.minted_by = Some(UserId::mint());
     state

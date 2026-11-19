@@ -585,8 +585,8 @@ async fn test_unread_runs_leave_an_answer_unknown() -> anyhow::Result<()> {
         manifest.expired_jobs.insert(
             lapsed.clone(),
             ExpiredJob {
-                horizon: chrono::Utc::now() - chrono::Duration::hours(2),
-                recorded_at: chrono::Utc::now(),
+                horizon: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2),
+                recorded_at: jiff::Timestamp::now(),
             },
         );
     })
@@ -918,8 +918,8 @@ async fn test_jobs_answer_without_results_when_duckdb_hangs() -> anyhow::Result<
 
 /// A row the warehouse holds no parameter count for reads it from mgmt's
 /// model-params rows, matched on either descriptor, on the page and in the
-/// results file; a stored count is kept, and a failed read of the rows leaves
-/// the page as the warehouse has it.
+/// results file; the table's count replaces a stored one, and a failed read of
+/// the rows leaves the page as the warehouse has it.
 #[rstest]
 #[case::its_descriptor(
     "model_descriptor",
@@ -991,16 +991,29 @@ async fn assert_an_empty_count_is_filled(
     let stored = mock_rows(&server, &job_id, run(json!(350))).await;
     assert_eq!(
         total(&filed.get_json(&filed.results("")).await?),
-        Some(json!(350)),
-        "a stored count is kept"
+        Some(json!(354)),
+        "the table replaces a stored count"
     );
     assert_eq!(
         csv_counts(&filed, &server, run(json!(350))).await?,
-        ("350".to_owned(), "350".to_owned()),
-        "a stored count is kept in the file"
+        ("354".to_owned(), "354".to_owned()),
+        "the table replaces a stored count in the file"
     );
 
     stored.delete_async().await;
+    filed
+        .state
+        .model_params_store
+        .delete_model_params(&pipette_store_testkit::a_model_params(key, 354)?.key)
+        .await?;
+    let uncatalogued = mock_rows(&server, &job_id, run(json!(350))).await;
+    assert_eq!(
+        total(&filed.get_json(&filed.results("")).await?),
+        Some(json!(350)),
+        "a model the table lacks keeps its stored count"
+    );
+
+    uncatalogued.delete_async().await;
     filed.state.model_params_store =
         std::sync::Arc::new(pipette_store_testkit::ModelParamsStoreUnimplemented);
     mock_rows(&server, &job_id, run(Value::Null)).await;
@@ -1163,7 +1176,7 @@ async fn test_runtime_digests_carry_their_catalog_names() -> anyhow::Result<()> 
             "type": "mlx_macos_pipette", "version": "0.31.3", "flavor": "macos-arm64",
             "source": {"type": "pip_requirements_text", "contents": "mlx-lm==0.31.3\n"},
         }))?,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )?;
     let planned_digest = planned.digest().to_owned();
     catalog
@@ -1520,8 +1533,8 @@ async fn test_cold_complete_read_starts_queue_beside_results() -> anyhow::Result
         manifest.expired_jobs.insert(
             job_id.clone(),
             ExpiredJob {
-                horizon: chrono::Utc::now() - chrono::Duration::hours(2),
-                recorded_at: chrono::Utc::now(),
+                horizon: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2),
+                recorded_at: jiff::Timestamp::now(),
             },
         );
     })

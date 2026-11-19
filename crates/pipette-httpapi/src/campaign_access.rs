@@ -418,7 +418,7 @@ async fn offboarded_members(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rstest::rstest;
 
     use pipette_core::campaign::NewCampaign;
@@ -528,7 +528,7 @@ mod tests {
         Ok(
             NewCampaign::new(NonEmptyTrimmedString::try_new("eval")?, owner).around(
                 PlanId::try_new("plan-0192b3c4-0000-7000-8000-000000000001")?,
-                Utc::now(),
+                Timestamp::now(),
             ),
         )
     }
@@ -583,7 +583,7 @@ mod tests {
         let personal = campaign(user(&UserId::mint()))?;
         let mut reader = User::try_new(
             pipette_plan_types::ContactEmail::try_new("publish+site@example.com")?,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         reader.campaign_scope = Some(BTreeSet::from([
             listed.campaign_id.clone(),

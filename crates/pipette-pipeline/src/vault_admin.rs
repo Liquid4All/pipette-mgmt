@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 
 use pipette_core::vault::{
     FoundBlob, ImportedBlob, SNIFF_BYTES, VaultObjectKey, VaultOwner, VaultResource, blob_key,
@@ -185,7 +185,7 @@ pub async fn upload(
     name: NonEmptyTrimmedString,
     owner: VaultOwner,
     artifact: VaultArtifact<VaultUploadFile>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<Vec<VaultResource>, VaultAdminError> {
     let owner_ref = &owner;
     let sizes: HashMap<Sha256, u64> = futures::stream::iter(artifact.files())
@@ -223,7 +223,7 @@ pub async fn record_import(
     vault: &dyn VaultStore,
     owner: VaultOwner,
     artifact: VaultArtifact<ImportedBlob>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<Vec<VaultResource>, VaultAdminError> {
     let owner_ref = &owner;
     futures::stream::iter(artifact.files())
@@ -342,7 +342,7 @@ pub struct Pruned {
 pub async fn prune(
     vault: &dyn VaultStore,
     older_than: std::time::Duration,
-    now: DateTime<Utc>,
+    now: Timestamp,
     dry_run: bool,
 ) -> anyhow::Result<Pruned> {
     // Files first, so a record written while this runs is read after them.
@@ -358,7 +358,7 @@ pub async fn prune(
         .iter()
         .map(|record| &record.object_key)
         .collect();
-    let cutoff = now - chrono::Duration::from_std(older_than)?;
+    let cutoff = now - jiff::SignedDuration::try_from(older_than)?;
     let (mut orphans, recent): (Vec<VaultBlob>, Vec<VaultBlob>) = stored
         .into_iter()
         .filter(|blob| is_blob_key(&blob.key) && !named.contains(&blob.key))
@@ -527,7 +527,7 @@ mod tests {
             "mmproj": {"filename": "mmproj.gguf", "sha256": mmproj},
         }))?;
         let name = NonEmptyTrimmedString::try_new("vision")?;
-        Ok(upload(vault, name, owner, artifact, Utc::now()).await)
+        Ok(upload(vault, name, owner, artifact, Timestamp::now()).await)
     }
 
     /// A record already written would name a file nothing else records.
@@ -605,7 +605,7 @@ mod tests {
             user_id: UserId::mint(),
         };
         let orphan = blob_key(&owner, &stored(vault, &owner, b"GGUF left behind").await?)?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let hour = std::time::Duration::from_secs(3600);
 
         // Just written: an upload stores its file before it describes it.
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!((young.orphans.len(), young.recent), (0, 1));
         assert!(vault.stat_blob(&orphan).await?.is_some());
 
-        let later = now + chrono::Duration::hours(2);
+        let later = now + jiff::SignedDuration::from_hours(2);
         let dry = prune(vault, hour, later, true).await?;
         let keys: Vec<&VaultObjectKey> = dry.orphans.iter().map(|blob| &blob.key).collect();
         assert_eq!(keys, [&orphan]);
@@ -648,7 +648,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("vault"))?;
         std::fs::write(record, "{")?;
 
-        let later = Utc::now() + chrono::Duration::hours(2);
+        let later = Timestamp::now() + jiff::SignedDuration::from_hours(2);
         let refused = prune(vault, std::time::Duration::ZERO, later, false).await;
         assert!(
             refused

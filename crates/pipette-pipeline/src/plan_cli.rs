@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use pipette_core::client::{Client, ClientStatus};
@@ -125,7 +125,7 @@ async fn dry_run_expanded(
         expanded.source,
         expanded.jobs,
         expanded.plan_warnings,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await?)
 }
@@ -265,7 +265,7 @@ async fn read_manifest(
 pub async fn plan_leases(
     stores: &Stores,
     plan_id: &PlanId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(PlanRecord, PlanLeases), PlanLookupError> {
     let record = plan_status(stores.plans.as_ref(), plan_id).await?;
     let leases = stores
@@ -283,7 +283,7 @@ pub async fn plan_leases(
 pub async fn explain_plan(
     stores: &Stores,
     plan_id: &PlanId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(PlanRecord, PlanExplanation), PlanLookupError> {
     explain_plan_with(
         stores.plans.as_ref(),
@@ -304,7 +304,7 @@ pub async fn explain_plan_with(
     clients: &dyn ClientStore,
     tags: &dyn TagStore,
     plan_id: &PlanId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(PlanRecord, PlanExplanation), PlanLookupError> {
     let record = plan_status(plans, plan_id).await?;
     let manifest = &record.manifest;
@@ -573,7 +573,7 @@ enum Takeability {
 async fn leased_job_ids(
     todo: &dyn TodoStore,
     jobs: &[JobId],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<HashSet<JobId>> {
     Ok(todo
         .leases_for_jobs(jobs)
@@ -612,7 +612,7 @@ async fn scan_takeability(
     starved_ids: &HashSet<&JobId>,
     fleet: ScanFleet<'_>,
     bodies: &mut HashMap<AvailEntry, Value>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<Takeability> {
     let ScanFleet {
         working,
@@ -827,7 +827,7 @@ mod tests {
 
     use std::collections::{BTreeMap, BTreeSet};
 
-    use chrono::{DateTime, Duration, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use rstest::rstest;
     use serde_json::json;
 
@@ -865,7 +865,7 @@ mod tests {
     }
 
     fn manifest(id: u128, status: PlanStatus) -> anyhow::Result<PlanManifest> {
-        let created_at: DateTime<Utc> = "2026-07-20T17:55:00Z".parse()?;
+        let created_at: Timestamp = "2026-07-20T17:55:00Z".parse()?;
         Ok(PlanManifest {
             campaign_id: None,
             previous_plan_id: None,
@@ -875,7 +875,7 @@ mod tests {
             plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(id)),
             status,
             // Stagger by id so "newest first" has a deterministic expectation.
-            created_at: created_at + Duration::seconds(i64::try_from(id)?),
+            created_at: created_at + SignedDuration::from_secs(i64::try_from(id)?),
             submitted_by: None,
             benchmark_types: Default::default(),
             job_ids: vec![JobId::new_unchecked("job-1")],
@@ -1556,7 +1556,7 @@ runtime_flags = [
             .await?;
         let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
         stores.todo = observed.clone();
-        let (_, before) = explain_plan(&stores, &plan, Utc::now()).await?;
+        let (_, before) = explain_plan(&stores, &plan, Timestamp::now()).await?;
         assert_eq!(before.census.denied, 0);
         stores
             .todo
@@ -1566,7 +1566,7 @@ runtime_flags = [
                 &pipette_core::denial::DenialRecord::default(),
             )
             .await?;
-        let (_, after) = explain_plan(&stores, &plan, Utc::now()).await?;
+        let (_, after) = explain_plan(&stores, &plan, Timestamp::now()).await?;
         assert_eq!(after.census.denied, 1);
         assert_ne!(
             before.verdict, after.verdict,
@@ -1731,11 +1731,11 @@ runtime_flags = [
                 }
             }
             Seed::IndexedThenLeased | Seed::IndexedThenLeaseLapsed => {
-                let hour = chrono::Duration::hours(1);
+                let hour = jiff::SignedDuration::from_hours(1);
                 let lease_expiry = if matches!(seed, Seed::IndexedThenLeaseLapsed) {
-                    Utc::now() - hour
+                    Timestamp::now() - hour
                 } else {
-                    Utc::now() + hour
+                    Timestamp::now() + hour
                 };
                 lease_plan_jobs(
                     stores,
@@ -1791,7 +1791,7 @@ runtime_flags = [
         let plan_id = ingest(&stores, jobs).await?;
         apply(&stores, &plan_id, seed).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(
             report.verdict,
             expected,
@@ -1812,7 +1812,7 @@ runtime_flags = [
         run_maintenance(&stores).await?;
 
         let alone = plan_status(stores.plans.as_ref(), &plan_id).await?;
-        let (with_explain, _) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (with_explain, _) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(alone, with_explain);
         Ok(())
     }
@@ -1832,7 +1832,7 @@ runtime_flags = [
 
         let second = ingest(&stores, vec![job("a.json", "os:android")]).await?;
 
-        let (_, report) = explain_plan(&stores, &second, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &second, Timestamp::now()).await?;
         assert_eq!(
             report.snapshot_computed_at, None,
             "no pass ran for this plan"
@@ -1878,7 +1878,7 @@ runtime_flags = [
         .await?;
         run_maintenance(&stores).await?;
 
-        let hour = chrono::Duration::hours(1);
+        let hour = jiff::SignedDuration::from_hours(1);
         let holder = ClientId::try_new("ev1_alpha")?;
         let mut keys = stores.todo.list_avail_entries().await?;
         let stranded = keys.pop().context("two jobs minted")?;
@@ -1889,15 +1889,20 @@ runtime_flags = [
                 &stranded.job_id,
                 stranded.expires_at,
                 &holder,
-                Utc::now() - hour,
+                Timestamp::now() - hour,
             )
             .await?;
         stores
             .todo
-            .claim_job(&held.job_id, held.expires_at, &holder, Utc::now() + hour)
+            .claim_job(
+                &held.job_id,
+                held.expires_at,
+                &holder,
+                Timestamp::now() + hour,
+            )
             .await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(report.verdict, SchedulingState::NothingOutstanding);
         assert_eq!(report.census.leased, 2);
         assert_eq!(report.census.lapsed_leases, 1);
@@ -1969,7 +1974,7 @@ runtime_flags = [
             Blocker::None => {}
         }
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(
             report.verdict,
             expected,
@@ -1999,7 +2004,7 @@ runtime_flags = [
         // A corrupt body, so any read of it fails. No `TodoStore` call writes one.
         db.execute("UPDATE queue_jobs SET body = '{'").await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(
             report.verdict,
             expected,
@@ -2039,9 +2044,9 @@ runtime_flags = [
         match vanish {
             Vanish::Claimed | Vanish::ClaimedThenLapsed => {
                 let lease_expiry = if matches!(vanish, Vanish::ClaimedThenLapsed) {
-                    Utc::now() - chrono::Duration::minutes(5)
+                    Timestamp::now() - jiff::SignedDuration::from_mins(5)
                 } else {
-                    Utc::now() + chrono::Duration::minutes(5)
+                    Timestamp::now() + jiff::SignedDuration::from_mins(5)
                 };
                 stores
                     .todo
@@ -2069,7 +2074,7 @@ runtime_flags = [
                 tags: &matching::FleetTags::default(),
             },
             &mut HashMap::new(),
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         assert_eq!(takeability, expected);
@@ -2120,7 +2125,7 @@ runtime_flags = [
         alpha.status = ClientStatus::Pending;
         enlist(&stores, &alpha).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(
             report.verdict,
             SchedulingState::Starved,
@@ -2169,7 +2174,7 @@ runtime_flags = [
         alpha.status = ClientStatus::Pending;
         enlist(&stores, &alpha).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(
             report.verdict,
             SchedulingState::Starved,
@@ -2212,7 +2217,7 @@ runtime_flags = [
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         ingest(&stores, vec![job("other.json", "os:ios")]).await?;
         run_maintenance(&stores).await?;
-        let (_, before) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, before) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(before.census.indexed, 1);
 
         let ids = stores
@@ -2231,7 +2236,7 @@ runtime_flags = [
         match how {
             Return::Recycled => {
                 let holder = ClientId::try_new("ev1_alpha")?;
-                let lease_expiry = Utc::now() + Duration::hours(1);
+                let lease_expiry = Timestamp::now() + SignedDuration::from_hours(1);
                 stores
                     .todo
                     .claim_job(&entry.job_id, entry.expires_at, &holder, lease_expiry)
@@ -2244,11 +2249,11 @@ runtime_flags = [
             Return::Redated => {
                 let later = match entry.expires_at {
                     pipette_plan_types::ExpiresAt::At(at) => {
-                        pipette_plan_types::ExpiresAt::At(at + Duration::hours(1))
+                        pipette_plan_types::ExpiresAt::At(at + SignedDuration::from_hours(1))
                     }
-                    pipette_plan_types::ExpiresAt::Never => {
-                        pipette_plan_types::ExpiresAt::At(Utc::now() + Duration::days(1))
-                    }
+                    pipette_plan_types::ExpiresAt::Never => pipette_plan_types::ExpiresAt::At(
+                        Timestamp::now() + SignedDuration::from_hours(24),
+                    ),
                 };
                 stores
                     .todo
@@ -2259,7 +2264,7 @@ runtime_flags = [
 
         let observed = pipette_store_testkit::ObservedTodoStore::wrap(&stores.todo);
         stores.todo = observed.clone();
-        let (_, after) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, after) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(after.verdict, SchedulingState::NotIndexed);
         assert_eq!(after.census.indexed, 0);
         let flag_reads: Vec<Vec<JobId>> = observed
@@ -2295,7 +2300,7 @@ runtime_flags = [
         assert_eq!(manifest.status, PlanStatus::Active, "the misleading status");
         assert!(manifest.progress_snapshot.is_none());
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(report.verdict, SchedulingState::NotIndexed);
         assert_eq!(report.snapshot_computed_at, None, "gate 0 leads the report");
         assert_eq!(report.census.claimable, 2);
@@ -2322,7 +2327,7 @@ runtime_flags = [
         let plan_id = ingest(&stores, vec![job("a.json", "os:android")]).await?;
         run_maintenance(&stores).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(report.verdict, SchedulingState::Starved);
         let group = report.groups.first().context("one starved group")?;
         assert_eq!(group.job_count, 1);
@@ -2355,7 +2360,7 @@ runtime_flags = [
         run_maintenance(&stores).await?;
         enlist(&stores, &client("ev1_droid", "Android")?).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         let group = report.groups.first().context("the group is still cached")?;
         assert_eq!(group.live_approved_client_count, 1);
         assert_eq!(
@@ -2402,7 +2407,7 @@ runtime_flags = [
                 .map(|rung| (rung.clause.clone(), rung.surviving_client_count))
                 .collect())
         };
-        let (_, untagged) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, untagged) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(untagged.verdict, SchedulingState::Starved);
         assert_eq!(
             ladder(&untagged)?,
@@ -2414,7 +2419,7 @@ runtime_flags = [
             .add_client_tag(&rig.client_id, &pipette_plan_types::Tag::try_new("lab")?)
             .await?;
 
-        let (_, tagged) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, tagged) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(ladder(&tagged)?, vec![("requires tag:lab".to_string(), 1)]);
         let group = tagged.groups.first().context("the group is still cached")?;
         assert_eq!(group.live_approved_client_count, 1);
@@ -2437,7 +2442,7 @@ runtime_flags = [
             .put_client(&client("ev1_droid", "Android")?)
             .await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(report.fleet.approved, 2);
         assert_eq!(
             report.fleet.working, 1,
@@ -2495,7 +2500,7 @@ runtime_flags = [
 
         overwrite_avail_body(&stores, &plan_id, &bad_body).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         let group = report.groups.first().context("one starved group")?;
         let rule = group.never_matches.as_deref().context("a proven rule")?;
         assert!(rule.contains(expected), "{rule}");
@@ -2531,7 +2536,7 @@ runtime_flags = [
         )
         .await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         let group = report.groups.first().context("one starved group")?;
         assert!(
             group.never_matches.is_some(),
@@ -2566,7 +2571,7 @@ runtime_flags = [
         .await?;
         run_maintenance(&stores).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(report.verdict, SchedulingState::Starved);
         let group = report.groups.first().context("one starved group")?;
         assert!(group.ladder.is_empty(), "no `requires`, so no ladder");
@@ -2606,7 +2611,7 @@ runtime_flags = [
         .await?;
         run_maintenance(&stores).await?;
 
-        let (_, report) = explain_plan(&stores, &plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &plan_id, Timestamp::now()).await?;
         let group = report.groups.first().context("one starved group")?;
         let roster = group.roster.context("the group names a client id")?;
         assert_eq!((roster.working, roster.eligible), (1, 0));
@@ -2635,7 +2640,8 @@ runtime_flags = [
             }
         };
 
-        let (_, report) = explain_plan(&stores, &plan_id, latest + Duration::seconds(1)).await?;
+        let (_, report) =
+            explain_plan(&stores, &plan_id, latest + SignedDuration::from_secs(1)).await?;
         assert_eq!(report.verdict, SchedulingState::Expired);
         assert_eq!(report.census.available, 1);
         assert_eq!(report.census.expired, 1);
@@ -2652,7 +2658,7 @@ runtime_flags = [
         let m = manifest(7, PlanStatus::Creating)?;
         stores.plans.put_plan(&m).await?;
 
-        let (_, report) = explain_plan(&stores, &m.plan_id, Utc::now()).await?;
+        let (_, report) = explain_plan(&stores, &m.plan_id, Timestamp::now()).await?;
         assert_eq!(report.verdict, SchedulingState::StillCreating);
         assert_eq!(report.census.total, 1);
         assert_eq!(report.census.available, 0);
@@ -2665,7 +2671,7 @@ runtime_flags = [
         stores: &Stores,
         plan_id: &PlanId,
         client_id: &ClientId,
-        lease_expiry: DateTime<Utc>,
+        lease_expiry: Timestamp,
     ) -> anyhow::Result<()> {
         let manifest = stores
             .plans
@@ -2709,7 +2715,7 @@ runtime_flags = [
         let plan_id = ingest(&stores, vec![job("a.json", "os:ios")]).await?;
         apply(&stores, &plan_id, seed).await?;
 
-        let (_, held) = plan_leases(&stores, &plan_id, Utc::now()).await?;
+        let (_, held) = plan_leases(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(held.live.len(), live, "live holders");
         assert_eq!(held.lapsed.len(), lapsed, "stranded jobs");
         assert_eq!(held.is_empty(), live == 0 && lapsed == 0);
@@ -2740,13 +2746,13 @@ runtime_flags = [
             &stores,
             &holder,
             &ClientId::try_new("ev1_alpha")?,
-            Utc::now() + Duration::hours(1),
+            Timestamp::now() + SignedDuration::from_hours(1),
         )
         .await?;
 
-        let (_, mine) = plan_leases(&stores, &holder, Utc::now()).await?;
+        let (_, mine) = plan_leases(&stores, &holder, Timestamp::now()).await?;
         assert_eq!(mine.live.len(), 1, "the plan whose job is held reports it");
-        let (_, theirs) = plan_leases(&stores, &other, Utc::now()).await?;
+        let (_, theirs) = plan_leases(&stores, &other, Timestamp::now()).await?;
         assert!(
             theirs.is_empty(),
             "another plan's hold is not this plan's work"
@@ -2768,7 +2774,7 @@ runtime_flags = [
         run_maintenance(&stores).await?;
 
         let alone = plan_status(stores.plans.as_ref(), &plan_id).await?;
-        let (with_leases, _) = plan_leases(&stores, &plan_id, Utc::now()).await?;
+        let (with_leases, _) = plan_leases(&stores, &plan_id, Timestamp::now()).await?;
         assert_eq!(alone, with_leases);
         Ok(())
     }

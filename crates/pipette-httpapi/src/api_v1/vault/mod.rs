@@ -11,8 +11,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, stream};
+use jiff::Timestamp;
 
 use pipette_core::vault::{VaultOwner, VaultResource};
 use pipette_pipeline::vault_admin::{StoredBlob, VaultAdminError};
@@ -315,7 +315,7 @@ pub async fn upload_resources(
         upload.name,
         owner.clone(),
         upload.artifact,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .inspect_err(
