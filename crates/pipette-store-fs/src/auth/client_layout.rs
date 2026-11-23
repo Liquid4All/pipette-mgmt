@@ -289,6 +289,7 @@ mod tests {
             public_key: PublicKeyHex::try_new(public_key)?,
             organization: NonEmptyTrimmedString::try_new(organization)?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Pending,
             registered_at: Timestamp::now(),

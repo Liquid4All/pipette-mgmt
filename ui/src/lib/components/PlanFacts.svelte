@@ -30,6 +30,14 @@
       source.run(() => planDocument(session.signer, plan.plan_id));
     }
   };
+
+  function download(text: string) {
+    const file = window.document.createElement("a");
+    file.href = URL.createObjectURL(new Blob([text], { type: "application/toml" }));
+    file.download = `${plan.plan_id}.toml`;
+    file.click();
+    setTimeout(() => URL.revokeObjectURL(file.href));
+  }
 </script>
 
 <dl>
@@ -70,7 +78,11 @@
     <summary>plan document</summary>
     {#if source.error}<p class="err" role="alert">{source.error}</p>
     {:else if source.data === null}<p class="muted">Loading…</p>
-    {:else}<pre>{source.data}</pre>{/if}
+    {:else}
+      {@const text = source.data}
+      <div class="bar"><button type="button" class="primary" onclick={() => download(text)}>Download TOML</button></div>
+      <pre>{text}</pre>
+    {/if}
   </details>
 {:else if note}
   <p class:err={note.fault} class:muted={!note.fault}>{note.text}</p>

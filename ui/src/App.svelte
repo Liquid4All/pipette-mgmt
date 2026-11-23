@@ -25,9 +25,7 @@
   import CliLogin from "./routes/CliLogin.svelte";
   import Client from "./routes/Client.svelte";
   import Fleet from "./routes/Fleet.svelte";
-  import MyCampaigns from "./routes/MyCampaigns.svelte";
-  import MyDevices from "./routes/MyDevices.svelte";
-  import MyVault from "./routes/MyVault.svelte";
+  import Home from "./routes/Home.svelte";
   import NotFound from "./routes/NotFound.svelte";
   import Org from "./routes/Org.svelte";
   import OrgBenchmarks from "./routes/OrgBenchmarks.svelte";
@@ -58,6 +56,7 @@
 
   /** Each page's component and title. */
   const PAGES: { [P in Page]: Entry<RouteOf<P>> } & { missing: Entry<Extract<Route, { page: "missing" }>> } = {
+    home: { component: Home, title: "Campaigns" },
     account: { component: Account, title: "Account" },
     "account-keys": { component: Account, title: "Account keys" },
     "login-cli": { component: CliLogin, title: "Approve pipette-ctl" },
@@ -72,13 +71,10 @@
     vault: { component: Vault, title: "Vault" },
     "vault-runtimes": { component: Vault, title: "Vault runtimes" },
     "vault-resource": { component: VaultResource, title: "Vault resource" },
-    "me-vault": { component: MyVault, title: "Vault" },
-    "me-vault-runtimes": { component: MyVault, title: "Vault runtimes" },
     "org-vault": { component: OrgVault, title: "Vault" },
     "org-vault-runtimes": { component: OrgVault, title: "Vault runtimes" },
     clients: { component: Fleet, title: "Fleet" },
     client: { component: Client, title: "Client" },
-    "me-devices": { component: MyDevices, title: "Devices" },
     "org-devices": { component: OrgDevices, title: "Devices" },
     users: { component: Users, title: "Users" },
     "user-new": { component: UserNew, title: "New account" },
@@ -118,8 +114,6 @@
     "campaign-plan-revisions": { component: Campaign, title: "Campaign history" },
     "campaign-plan-settings": { component: Campaign, title: "Campaign settings" },
     "campaign-document": { component: CampaignDocument, title: "Campaign document" },
-    "me-campaigns": { component: MyCampaigns, title: "Campaigns" },
-    "me-campaign-groups": { component: MyCampaigns, title: "Campaign groups" },
     "org-campaigns": { component: OrgCampaigns, title: "Campaigns" },
     "org-campaign-groups": { component: OrgCampaigns, title: "Campaign groups" },
     "campaign-group": { component: CampaignGroup, title: "Campaign group" },
@@ -138,11 +132,8 @@
 
   session.start();
 
-  // A pending account reads nothing (`GET /api/v1/users/me` alone admits it), so the
-  // frame says why once instead of each page refusing.
-  const pending = $derived(session.account?.status === "pending");
   const retrying = new Busy();
-  const treed = $derived(!!session.account && !pending);
+  const treed = $derived(!!session.account);
 
   // Remembered per browser; a narrow window, where the tree stacks above the page, starts folded.
   const FOLDED_ENTRY = "pipette-mgmt.app.tree-folded";
@@ -163,7 +154,7 @@
   }
 
   $effect(() => {
-    document.title = `${!session.identity ? "Sign in" : pending ? "Waiting for approval" : shown.title} · pipette-mgmt`;
+    document.title = `${!session.identity ? "Sign in" : shown.title} · pipette-mgmt`;
   });
 
   // A page drawn without a read has its anchor at once.
@@ -208,17 +199,6 @@
           {/if}
           <button type="button" aria-disabled={retrying.busy}
                   onclick={() => retrying.attempt(() => session.refresh())}>Try again</button>
-          <button type="button" aria-disabled={retrying.busy} onclick={() => session.leave()}>Sign out</button>
-        </div>
-      {:else if pending}
-        <h1>Waiting for approval</h1>
-        <p class="notice">
-          This account is pending an operator's approval, so it reads nothing here yet. Once an
-          operator approves it, check again.
-        </p>
-        <div class="bar">
-          <button type="button" aria-disabled={retrying.busy}
-                  onclick={() => retrying.attempt(() => session.refresh())}>Check again</button>
           <button type="button" aria-disabled={retrying.busy} onclick={() => session.leave()}>Sign out</button>
         </div>
       {:else if session.account}

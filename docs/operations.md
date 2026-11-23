@@ -307,8 +307,17 @@ holds back the next run's lease recycling by at most one member's read and
 revision. A revision of a plan with thousands of jobs can still take minutes.
 A run takes the members by when the pass last revised each or failed to read
 its rows, longest ago first, so a member it just revised, or whose rows
-pipette-duckdb did not answer, goes behind the others. When the pass reports a
-member:
+pipette-duckdb did not answer, goes behind the others. After a revision, the
+pass defers the member's next re-runs and marks for one to 30 minutes, unless
+the plan's earliest deadline comes first. The deadline check allows one 60 s
+tick after the interval, so it assumes that queue maintenance runs every minute.
+With a longer cadence, or a tick that `flock` drops, a deferred filing can
+reach the ingest after the deadline, and the ingest refuses it. A
+large campaign with many jobs that wait for each busy device gets the longest
+interval ([when a policy acts](api/campaign-groups.md#when-a-policy-acts)).
+For each deferred revision, the pass logs `queue-maintenance: a campaign group
+filing waits for its interval`. The log includes `interval_secs`, `remaining`,
+`running`, and `next_filing_at`. When the pass reports a member:
 
 - **A revision that did not advance** (`filings_not_advanced`): the campaign
   does not run the plan the pass filed. The pass cancels that plan, in the same
@@ -350,7 +359,8 @@ member:
   of the group and add it back, on the group's page or with `DELETE
   …/members/{campaign_id}` and `POST …/members`: the new row keeps no state,
   and the next run reads the campaign's plan as new. While a policy of the
-  group other than `model_params` is on, adding it back takes `read_plans`,
+  group other than `model_params`, `smaller_failed` and `vault_resource` is on,
+  adding it back takes `read_plans`,
   `cancel_plans` and `read_clients` (the `_any_` grants for another owner's
   campaign), so have someone who holds them do both steps.
 - **A plan that cannot be filed again** (`refused_heads`): the plan's document
@@ -415,6 +425,14 @@ carrying its figures as fields:
   summary. `deadlines_restamped` counts the waiting jobs the run moved to the
   earliest horizon of their plans
   ([plan-ingestion.md §7](plan-ingestion.md#the-duplicate-job-merge)).
+
+  `plans_full` counts the full manifests that the run reads. The run reads open
+  plans, their predecessors, and terminal plans that a cancel marker or a queued
+  job's membership marker names. An indexed job lookup also lets teardown
+  find cancelled plans for queued jobs without markers. The run reads no plan
+  summaries, so `plans_summary` is zero. `peak_rss_kib` reports the process's
+  peak resident memory in kibibytes (KiB). Each phase line also has this field.
+
   `bodies_read` counts full job bodies that the run fetches from the
   SQL queue. The count includes these reads:
   - expiration
@@ -425,14 +443,17 @@ carrying its figures as fields:
 - `queue-maintenance: policy pass finished`, once per run with a `[database]`,
   also after queue passes that stopped on an error: the `groups` with a policy
   on and the `groups_skipped`, their `members`, the `members_read` and the
-  `members_not_reached` within the 60 s, the `members_unreadable` and
-  `members_skipped`, the `revisions` with their `rerun_jobs` and `marked_jobs`,
+  `members_not_reached` within the 60 s (members of groups with no policy on
+  left to clear included), the `members_unreadable` and `members_skipped`, the
+  `members_cleared` of groups with no policy on, the
+  `revisions` with their `rerun_jobs` and `marked_jobs`,
   the `reruns_recorded` for them and the `reruns_judged`, whose outcome the run
   recorded, `jobs_waiting_for_rows`, the `body_reads` of submission bodies for
   answered jobs with no rows (including the second reads of re-run candidates),
   the `body_reruns` that those bodies re-ran in
-  revisions that advanced, `members_waiting_for_devices`,
-  `filings_not_advanced`, the `cancel_markers_written` on them,
+  revisions that advanced, `members_waiting_for_devices`, the
+  `filings_deferred` that wait for the interval since the member's last
+  revision, `filings_not_advanced`, the `cancel_markers_written` on them,
   `filings_stopped` by someone stopping the plan they revise, `refused_heads`,
   `other_owner_members`, `jobs_left_for_good`, `models_missing_params`, the
   keys the result rows it read lack a model params entry under,
@@ -1006,20 +1027,17 @@ Under `require_client_preauth_key`, registration takes a minted secret, so each
 occurrence is worth reading on its own. Under the default open policy, any
 anonymous caller can produce these at request rate. Read a burst as probing
 rather than as many separate exposures, and note that each one also leaves a
-durable pending client record behind it. `POST /api/v1/users/register` leaves the same
-kind of residue on the other keyspace when it is asked for an account: a pending
-user record and the claim on the address it asked with, one per distinct
-address. `require_user_preauth_key = true` closes that path the way
-`require_client_preauth_key` closes this one.
+durable pending client record behind it. `POST /api/v1/users/register` leaves
+no such residue: it takes an invite and nothing else.
 
-Each process admits at most 20 registrations without a pre-auth key per
-minute, devices and accounts together, and answers the rest `429`, logging
+Each process admits at most 20 device registrations without a pre-auth key per
+minute and answers the rest `429`, logging
 `refused: too many registrations without a pre-auth key`. A registration with a
 pre-auth key, and a device retrying a registration already on record, are not
-counted; an account request retried with the same keypair is. The count is per
+counted. The count is per
 process, so a deployment of several instances admits that many per instance.
 Of those 20, one client address gets 1, an IPv6 one counted by its `/64`, since
-a device or an account registers once; clients behind one NAT share it. The
+a device registers once; clients behind one NAT share it. The
 address is the `X-Forwarded-For` entry `trusted_proxy_hops` from the right
 (default `1`, the entry one load balancer appends); `0` ignores the header and
 takes the peer. A header with fewer entries names no address, and only the
@@ -1037,8 +1055,8 @@ window full still leaves up to 28,800 pending records a day on each instance.
 A flood from 20 addresses or more still fills the shared budget, and then
 refuses every keyless registration, genuine ones included, for as long as it
 lasts. An
-internet-facing deployment should set `require_client_preauth_key = true` and
-`require_user_preauth_key = true`, which close both paths.
+internet-facing deployment should set `require_client_preauth_key = true`,
+which closes that path.
 
 A reference deployment on AWS runs an Application Load Balancer holding the
 certificate, listening on 443 with 80 redirecting to it, forwarding to the
@@ -1125,17 +1143,14 @@ control**: the address is self-reported, so anyone can register under it. See
 
 ### 6.2. User administration
 
-A machine can ask for an account at `POST /api/v1/users/register` with no key
-([`POST /api/v1/users/register`](api/users/register_user_key.md)). The account waits
-`pending` in `users list`, since nothing here sends mail, until `users approve`
-admits it or `users delete` frees its address and keypair.
-
-There is deliberately **no auto-approve for users**: an address is self-reported
-here as much as on a client, and an operator account is the half of the
-vocabulary that authors work. Set `require_user_preauth_key = true` to refuse
-the keyless request outright, so every account is minted by an operator. The
-one account created without an operator step is a Clerk sign-in's, where Clerk
-has verified the address ([§6.3](#63-console-sign-in-through-clerk)).
+Nothing asks for an account and waits: there is **no self-registration for
+users**, since an address is self-reported here as much as on a client, and an
+operator account is the half of the vocabulary that authors work. An account is
+minted by an operator (`users create`), an administrator
+([`POST /api/v1/users`](api/users/create_user.md)), or a Clerk sign-in, where
+Clerk has verified the address ([§6.3](#63-console-sign-in-through-clerk)).
+`POST /api/v1/users/register` only binds a key to the account an invite names
+([`POST /api/v1/users/register`](api/users/register_user_key.md)).
 
 ### 6.3. Console sign-in through Clerk
 
@@ -1205,11 +1220,12 @@ org = "acme"
 - A `[[clerk.provision]]` rule gives an address at `domain` that no account
   holds an active account on its first sign-in: a member of `org`, holding the
   `org_member` group, as `users create --org-member` and `users set-org` would. The
-  organization must exist and not be disabled. Without a rule, an address signs
-  in only to an account an operator created for it. A keyless account request
-  at the domain is refused, so nobody can claim an address ahead of its owner.
-  A pending request from before the rule is such a claim: `users delete` it
-  rather than approving it, and its owner's next sign-in creates the account.
+  organization must exist and not be disabled. Without a rule, an address at a
+  domain `allowed_domains` lists gets an account on its first sign-in too, in a
+  new organization of its own, named as the sign-in asks or `<email>'s personal org`, which it administers
+  (`org_admin`). With `allowed_domains` unset, an address with no rule signs in
+  only to an account an operator created for it, so sign-up stays closed to
+  addresses nobody listed.
 
 A rule trusts Clerk with the domain: whoever Clerk verifies an address at it for
 gets an account. **Offboard with `users disable`, not `delete`.** A disabled

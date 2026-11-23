@@ -10,21 +10,18 @@ import {
 import type { Model, Runtime, VaultArtifact, VaultResourceDetail } from "../src/lib/api-types";
 import { drawnKeys, stubStorage } from "./picks";
 
-const me = { type: "user", user_id: "user_me" } as const;
-const colleague = { type: "user", user_id: "user_other" } as const;
 const acme = { type: "org", org_id: "org_acme" } as const;
 const rival = { type: "org", org_id: "org_rival" } as const;
 
 describe("the vault", () => {
   test("each branch asks the newest first with the file state and the owners' names", () => {
     expect(vaultQuery({ kind: "all" }, null, "")).toBe("order=newest&object=true&names=true");
-    expect(vaultQuery({ kind: "me" }, "vault_9", "")).toBe("order=newest&object=true&names=true&owner=mine&cursor=vault_9");
+    expect(vaultQuery({ kind: "all" }, "vault_9", "")).toBe("order=newest&object=true&names=true&cursor=vault_9");
     expect(vaultQuery({ kind: "org", org_id: "org_acme", slug: "acme" }, null, "5"))
       .toBe("order=newest&object=true&names=true&owner=org&org_id=org_acme&limit=5");
   });
 
   test("an empty branch says so in the classic words", () => {
-    expect(ownedEmpty({ kind: "me" }, "vault resources")).toBe("You own no vault resources.");
     expect(ownedEmpty({ kind: "org", org_id: "org_acme", slug: "acme" }, "vault resources"))
       .toBe("acme owns no vault resources you may see.");
     expect(ownedEmpty({ kind: "all" }, "vault resources")).toBe("No vault resources you may see.");
@@ -43,7 +40,7 @@ describe("the vault", () => {
   });
 
   test("a vault opens on its models, its runtimes a tab under it", () => {
-    for (const base of ["/app/vault", "/app/me/vault", "/app/orgs/acme/vault"]) {
+    for (const base of ["/app/vault", "/app/orgs/acme/vault"]) {
       const tabs = vaultTabs(base, "runtime");
       expect(tabs.map((tab) => [tab.label, tab.href, tab.current])).toEqual([
         ["Models", base, false], ["Runtimes", `${base}/runtimes`, true],
@@ -141,12 +138,9 @@ describe("the vault", () => {
 
   test("a resource's page sits under its owner's listing, as pages::owner_branch picks it", () => {
     const known = [{ org_id: "org_acme", slug: "acme" }, null];
-    expect(ownerBranch({ user_id: "user_me" }, me, known, VAULT_PAGES))
-      .toEqual({ href: "/app/me/vault", section: [{ label: "Me" }] });
-    expect(ownerBranch({ user_id: "user_me" }, acme, known, VAULT_PAGES))
+    expect(ownerBranch(acme, known, VAULT_PAGES))
       .toEqual({ href: "/app/orgs/acme/vault", section: [{ label: "Organizations", href: "/app/orgs" }, { label: "acme", href: "/app/orgs/acme" }] });
-    expect(ownerBranch({ user_id: "user_me" }, rival, known, VAULT_PAGES)).toEqual({ href: "/app/vault", section: [] });
-    expect(ownerBranch({ user_id: "user_me" }, colleague, known, VAULT_PAGES)).toEqual({ href: "/app/vault", section: [] });
+    expect(ownerBranch(rival, known, VAULT_PAGES)).toEqual({ href: "/app/vault", section: [] });
   });
 
   test("a descriptor's vault sources read under their labels, or the names the read gives their resources", () => {
@@ -183,8 +177,7 @@ describe("the vault", () => {
     expect(namedAs("not json", names)).toEqual([]);
   });
 
-  test("a record from before uploads names its owner as the principal", () => {
+  test("a record names its owning organization as the principal", () => {
     expect(principalOf(acme)).toBe("org_acme");
-    expect(principalOf(me)).toBe("user_me");
   });
 });

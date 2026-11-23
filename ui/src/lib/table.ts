@@ -4,7 +4,7 @@
 
 export type Raw = string | number | boolean | null;
 
-/** One option of a select, and how many rows have it. */
+/** One option of a select, and how many of the rows the other filters keep have it. */
 export interface Choice {
   value: string;
   label: string;
@@ -13,9 +13,14 @@ export interface Choice {
   searchText?: string;
 }
 
+/** The choice of a row with no value in a select, spelled as pipette-datasheet spells it in the address. */
+export const BLANK = "__null__";
+
 /** Whether an option's label, value, or extra search text contains the query. */
 export const choiceMatches = (choice: Choice, query: string): boolean =>
-  `${choice.label}\n${choice.value}\n${choice.searchText ?? ""}`.toLowerCase().includes(query.trim().toLowerCase());
+  // The blank by its label alone: its value would match a search for the flags' `null`.
+  `${choice.label}\n${choice.value === BLANK ? "" : choice.value}\n${choice.searchText ?? ""}`.toLowerCase()
+    .includes(query.trim().toLowerCase());
 
 /** `options`, then each chosen value they lack at a count of 0, so a choice no row has any more can be unchecked. */
 export const offeredChoices = (options: Choice[], chosen: readonly string[], name: (value: string) => string,
@@ -24,6 +29,26 @@ export const offeredChoices = (options: Choice[], chosen: readonly string[], nam
   ...chosen.filter((value) => !options.some((option) => option.value === value))
     .map((value) => ({ value, label: name(value), count: 0 })),
 ];
+
+export const orBlank = (values: readonly string[]): string[] => {
+  const held = values.filter(Boolean);
+  return held.length ? held : [BLANK];
+};
+
+/**
+ * A select's options in `order`, else by label with numbers by size (`_256` before `_1024`), then the blank; a chosen
+ * value no row holds shows at 0.
+ */
+export function countedChoices(counts: ReadonlyMap<string, number>, chosen: readonly string[],
+                               name: (value: string) => string, order?: readonly string[]): Choice[] {
+  const label = (value: string) => (value === BLANK ? "(blank)" : name(value));
+  const found = [...new Map([...chosen.map((value): [string, number] => [value, 0]), ...counts])]
+    .map(([value, count]) => ({ value, label: label(value), count }));
+  const last = (choice: Choice) => Number(choice.value === BLANK);
+  return offeredChoices(order ? [...order, BLANK].flatMap((value) => found.filter((choice) => choice.value === value))
+    : found.sort((a, b) => last(a) - last(b) || a.label.localeCompare(b.label, "en", { numeric: true })),
+  chosen, label);
+}
 
 /** A table's column: its header sorts by `raw`, the value it holds rather than the text drawn. */
 export interface TableColumn<R> {
@@ -77,8 +102,8 @@ export interface ServerFilter {
 
 export interface TableSpec<R> {
   columns: TableColumn<R>[];
-  /** The sort the table shows when the address names none, as `TableState.sort` spells it. */
-  sort?: string;
+  /** The sort the table opens in, which the address then names, as `TableState.sort` spells it. */
+  sort: string;
   texts?: TextFilter<R>[];
   server?: ServerFilter[];
   choices?: ChoiceFilter<R>[];
@@ -94,17 +119,32 @@ export interface TableState {
   sort: string;
 }
 
-/** The state the address sets, a sort by a column the table lacks dropped, the spec's sort where it names none. */
+/** The state the address sets, the spec's sort where it names none or a column the table lacks. */
 export function tableState<R>(spec: TableSpec<R>, query: URLSearchParams): TableState {
-  const sort = query.get("sort") || spec.sort || "";
+  const sort = query.get("sort") ?? "";
   return {
     texts: Object.fromEntries([...spec.texts ?? [], ...spec.server ?? []].map(({ key }) =>
       [key, query.get(key)?.trim() ?? ""])),
     choices: Object.fromEntries((spec.choices ?? []).map(({ key }) =>
       [key, [...new Set(query.getAll(key).filter(Boolean))]])),
-    sort: spec.columns.some((column) => column.key === sort.replace(/^-/, "")) ? sort : "",
+    sort: spec.columns.some((column) => column.key === sort.replace(/^-/, "")) ? sort : spec.sort,
   };
 }
+
+/**
+ * The address pairs of the table `name` names, their keys bare. Where a page draws several tables, each but one has
+ * a name, which leads its keys as `<name>.`; the unnamed one reads the address whole.
+ */
+export const ownQuery = (query: URLSearchParams, name: string): URLSearchParams => (name
+  ? new URLSearchParams([...query].flatMap(([key, value]) =>
+    (key.startsWith(`${name}.`) ? [[key.slice(name.length + 1), value]] : [])))
+  : query);
+
+/** The other tables' pairs of `query`, then `pairs` under `name`: what a link of that table carries. */
+export const withOthers = (query: URLSearchParams, name: string, pairs: [string, string][]): [string, string][] => [
+  ...[...query].filter(([key]) => (name ? !key.startsWith(`${name}.`) : key.includes("."))),
+  ...pairs.map(([key, value]): [string, string] => [name ? `${name}.${key}` : key, value]),
+];
 
 /** The columns that the reader toggled, by key. `true` draws a column and `false` hides it. */
 export type Picks = Record<string, boolean>;
@@ -157,19 +197,24 @@ export function keepsRow<R>(spec: TableSpec<R>, state: TableState, row: R): bool
     return !want || texts(row).some((text) => text?.toLowerCase().includes(want));
   }) && (spec.choices ?? []).every(({ key, values }) => {
     const chosen = state.choices[key] ?? [];
-    return !chosen.length || values(row).some((value) => chosen.includes(value));
+    return !chosen.length || orBlank(values(row)).some((value) => chosen.includes(value));
   });
 }
 
-/** Each select's options over all of `rows`, counted, and those of `chosen` no row has. */
-export function choicesOf<R>(spec: TableSpec<R>, rows: readonly R[], chosen: TableState["choices"],
-): Record<string, Choice[]> {
-  return Object.fromEntries((spec.choices ?? []).map(({ key, values, name = (v) => v, order }) => {
+/**
+ * Each select's options, counted over the rows every other filter keeps, the text boxes included, so each value left
+ * to add stays offered, as on pipette-datasheet. A select no row has a value for, with none chosen, is left out.
+ */
+export function choicesOf<R>(spec: TableSpec<R>, rows: readonly R[], state: TableState): Record<string, Choice[]> {
+  return Object.fromEntries((spec.choices ?? []).flatMap(({ key, values, name = (v) => v, order }) => {
+    const chosen = state.choices[key] ?? [];
+    if (!chosen.length && !rows.some((row) => values(row).some(Boolean))) return [];
+    const others = { ...state, choices: { ...state.choices, [key]: [] } };
     const counts = new Map<string, number>();
-    for (const row of rows) for (const value of new Set(values(row))) if (value) counts.set(value, (counts.get(value) ?? 0) + 1);
-    const found = [...counts].map(([value, count]) => ({ value, label: name(value), count }));
-    return [key, offeredChoices(order ? order.flatMap((value) => found.filter((choice) => choice.value === value))
-      : found.sort((a, b) => a.label.localeCompare(b.label, "en", { numeric: true })), chosen[key] ?? [], name)];
+    for (const row of rows.filter((row) => keepsRow(spec, others, row))) {
+      for (const value of new Set(orBlank(values(row)))) counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    return [[key, countedChoices(counts, chosen, name, order)]];
   }));
 }
 
@@ -203,11 +248,11 @@ export function sortBy<T>(items: readonly T[], columns: readonly { key: string; 
 export const tableView = <R>(spec: TableSpec<R>, state: TableState, rows: readonly R[]): R[] =>
   sortBy(rows.filter((row) => keepsRow(spec, state, row)), spec.columns, state.sort);
 
-/** Rows past which a table kept in the page offers its filters; a shorter one is read at a glance. */
+/** Rows past which a table that is not its page's listing offers its filters; a shorter one is read at a glance. */
 export const FILTERS_FROM = 10;
 
-/** A table kept in the page, before the reader sorts or filters it. */
-export const unsorted = <R>(spec: TableSpec<R>): TableState => tableState(spec, new URLSearchParams());
+/** A table as it opens: no filter set, in the spec's sort. */
+export const unfiltered = <R>(spec: TableSpec<R>): TableState => tableState(spec, new URLSearchParams());
 
 /**
  * A CSV field, quoted where it holds a comma, a quote or a line break; text led by

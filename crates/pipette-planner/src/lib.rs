@@ -34,6 +34,8 @@ pub enum PlanParseError {
     Invalid(#[from] toml::de::Error),
     #[error("the document is not a valid scheduler plan")]
     Structure(#[from] SchedulerPlanError),
+    #[error("benchmark `{benchmark}` is a session. A plan cannot name a session.")]
+    RootSession { benchmark: BenchmarkId },
     /// The bare `NAME` form, which inherits the device's own value, is allowed.
     #[error(
         "variant {variant}: `runtime_flags` sets {name} to a value; remove the \
@@ -56,6 +58,14 @@ pub fn parse(
     // Two steps rather than serde's `try_from`, which would flatten the
     // structural fault into a string.
     let intake: scheduler_plan::SchedulerPlanIntake = toml::from_str(document)?;
+    if let Some(benchmark) = intake
+        .root_benchmark_ids()
+        .find(|id| types.get(*id) == Some(&BenchmarkType::Session))
+    {
+        return Err(PlanParseError::RootSession {
+            benchmark: benchmark.clone(),
+        });
+    }
     let plan = SchedulerPlan::from_intake(intake, types)?;
     plan.variants
         .iter()
@@ -207,6 +217,48 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.20.0", flavor = "macos-a
             anyhow::bail!("expected a structural fault");
         };
         assert_eq!(error.index(), 1, "{error}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::root(
+        "benchmarks = [\"decode_throughput_512_100\", \"shell\"]\n{MLX_VARIANT}",
+        None
+    )]
+    #[case::overridden_root(
+        "benchmarks = [\"shell\"]\n{MLX_VARIANT}benchmarks = [\"decode_throughput_512_100\"]\n",
+        None
+    )]
+    #[case::variant(
+        "benchmarks = [\"decode_throughput_512_100\"]\n{MLX_VARIANT}\n{MLX_VARIANT}benchmarks = [\"shell\"]\n",
+        Some(1)
+    )]
+    fn a_plan_cannot_name_a_session(
+        #[case] template: &str,
+        #[case] index: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let document = template.replace("{MLX_VARIANT}", MLX_VARIANT);
+        let types = BTreeMap::from([
+            (
+                BenchmarkId::try_new("decode_throughput_512_100")?,
+                BenchmarkType::DecodeThroughput,
+            ),
+            (BenchmarkId::try_new("shell")?, BenchmarkType::Session),
+        ]);
+        let message = match (super::parse(&document, &types), index) {
+            (Err(PlanParseError::RootSession { benchmark }), None) => {
+                PlanParseError::RootSession { benchmark }.to_string()
+            }
+            (Err(PlanParseError::Structure(error)), Some(index)) => {
+                assert_eq!(error.index(), index, "{error}");
+                error.to_string()
+            }
+            (result, _) => anyhow::bail!("expected the session to be refused, got {result:?}"),
+        };
+        anyhow::ensure!(
+            message.contains("`shell` is a session") && message.contains("cannot name a session"),
+            "{message}"
+        );
         Ok(())
     }
 

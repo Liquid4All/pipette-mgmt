@@ -313,6 +313,7 @@ mod tests {
             public_key: public_key.clone(),
             organization: pipette_plan_types::NonEmptyTrimmedString::try_new("test-org")?,
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: pipette_plan_types::ContactEmail::try_new("test@example.com")?,
             status: pipette_core::client::ClientStatus::Pending,
             registered_at: Timestamp::now(),

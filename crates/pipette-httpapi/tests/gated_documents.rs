@@ -624,16 +624,15 @@ async fn test_a_gated_document_sent_again_changes_nothing() -> anyhow::Result<()
 
 /// A document revision whose campaign changes its owner during the import is
 /// refused with `409`. The campaign stays on its plan, so the records of the
-/// old owner never back the new owner's jobs. It goes to the filer's own
-/// organization, which the filer still files into; an owner the filer cannot
-/// file for is a `403`.
+/// old owner never back the new owner's jobs. It goes to the organization the
+/// filer moves to at the same time, which the filer still files into; an owner
+/// the filer cannot file for is a `403`.
 #[tokio::test]
 async fn test_a_revision_refuses_an_owner_change_during_the_import() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let hub = gated_hub().await?;
     let (state, signer) = import_state(dir.path(), &hub).await?;
     let acme = seed_org(&state, "acme").await?.org_id;
-    set_user_org(&state, &signer.1, Some(acme.clone())).await?;
     let (campaign_id, first) = created_campaign(&state, &signer, &[("name", "Gated")]).await?;
     let campaign_id: pipette_plan_types::CampaignId = campaign_id.parse()?;
     let campaign = state
@@ -642,7 +641,9 @@ async fn test_a_revision_refuses_an_owner_change_during_the_import() -> anyhow::
         .await?
         .context("the campaign exists")?;
     let handed = pipette_core::campaign::Campaign {
-        owner: pipette_core::campaign::CampaignOwner::Org { org_id: acme },
+        owner: pipette_core::campaign::CampaignOwner::Org {
+            org_id: acme.clone(),
+        },
         ..campaign
     };
     let uri = format!("/api/v1/campaigns/{campaign_id}/document?base_plan_id={first}");
@@ -652,6 +653,7 @@ async fn test_a_revision_refuses_an_owner_change_during_the_import() -> anyhow::
     let hand_off = async {
         hub.arrived().await;
         state.campaign_store.put_campaign(&handed).await?;
+        set_user_org(&state, &signer.1, Some(acme.clone())).await?;
         drop(held);
         anyhow::Ok(())
     };

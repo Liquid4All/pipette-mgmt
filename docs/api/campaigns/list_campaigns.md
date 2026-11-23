@@ -7,7 +7,7 @@ widen it. Naming an owner outside it gives an empty page rather than a `403`:
 
 | Query parameter | Meaning |
 |---|---|
-| `owner` | `mine` for the caller's own, `org` for organization-owned |
+| `owner` | `org` for organization-owned, which is every campaign; any other value is a `400` |
 | `org_id` | One organization's. Usable on its own |
 | `order` | `oldest` (the default) or `newest` ([pagination](../../httpapi.md#13-pagination)) |
 | `names=true` | `names` beside the page, for the owners of its rows ([names](../../httpapi.md#14-names)) |
@@ -58,8 +58,4 @@ job id.
 | Status | When |
 |--------|------|
 | 200 | A page of campaigns |
-| 400 | A malformed `plan_id` |
-| 400 | A `cursor` with `plan_id` |
-| 400 | A `limit` outside the allowed range |
-| 400 | An unknown `state` |
-| 400 | `models=true` without `plan=true` |
+| 400 | An `owner` other than `org`, a `cursor` with `plan_id`, a `limit` outside the allowed range, an unknown `state`, or `models=true` without `plan=true` |

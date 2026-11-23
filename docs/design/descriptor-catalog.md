@@ -257,7 +257,8 @@ created it.
 ## Offer rules: what a device is offered
 
 **Offer rules live in the server configuration.** Each rule maps a runtime type
-and a flavor to clauses over capability flags. The clauses use the plan
+and a flavor to clauses over capability flags. A runtime type without flavors
+takes a rule with no flavor. The clauses use the plan
 vocabulary, `requires` and `any_of`, and the existing matching code evaluates
 them. They are a separate set of rules: they do not change the planner's
 capability rules, and they never reach a job. The configuration is kept in git with the rest
@@ -274,6 +275,13 @@ clients in the deployment report `runtime:mlx`. The iOS proxy reports
 descriptor build flags. These flags describe iOS app builds, and the rule does
 not test them.
 
+Apple Foundation has no flavor, so its rule gives only the runtime type
+`apple_foundation`. The engine and its model ship with iOS. The app reports
+`runtime:apple_foundation` on every device, also on a device that cannot run
+the model. So the recommended rule requires `os:ios` and lists, in `any_of`,
+the iPhones that the planner's capability rules accept for Apple Foundation:
+the iPhone 15 Pro and each newer iPhone. Add each new iPhone to that list.
+
 **A member with no rule is not offered.** The catalog offers a member to a
 device only if a rule exists and the device satisfies its clauses. So no
 exclusion rules are necessary.
@@ -284,7 +292,9 @@ a rule change can change the member that a name selects for a device. That is
 correct, because the earlier selection was wrong.
 
 **The server checks the rules at load.** Every flag must be canonical, and every
-flavor must be a flavor that the plan types know. The server also logs each
+flavor must be a flavor that the plan types know. A rule for a runtime type
+with flavors must give a flavor. A rule for a runtime type without flavors must
+not give one. The server also logs each
 known flavor that has no rule.
 
 **A gap is visible.** A query that withholds members reports how many it
@@ -1005,6 +1015,8 @@ the global entry:
 | `hide`, `unhide` | moves an entry between active and hidden |
 | `rename <name> <new-name>` | gives a hand-made entry a new name, or merges it into the live hand-made entry with that name ([below](#renames)); `--dry-run` writes nothing |
 | `relabel <name>` | changes the quantization label of a model member, with `--format`, `--from` and `--to`; `--dry-run` writes nothing |
+| `set-family <name> <family>` | sets the family of a model entry, or clears it with `--default`; `--dry-run` writes nothing |
+| `set-family-logo <family> <uri>` | sets the logo of a model family, or removes it with `--clear`; `--dry-run` writes nothing |
 | `tombstone` | tombstones an entry; it asks for the name again as confirmation, or takes `--yes` for scripts |
 | `alias --scan` | adds the verified aliases for the result rows in the warehouse; `--dry-run` writes nothing |
 | `coverage` | reports how many recent result rows get a name, and why the others do not |
@@ -1118,6 +1130,53 @@ files that serve that model in different formats and quantizations. One entry
 per model keeps the list short. The entry page shows the members as a table of
 formats and quantizations.
 
+**A model entry belongs to one family, for example `LFM2.5`.** The model
+pickers of the iOS and Android apps group entries by family, so a long list
+of models becomes a short list of families. An operator can set the family of
+an entry, for example to put `LFM2`, `LFM2.5` and `LFM3` in one `LFM` family.
+
+If no operator set a family, it is the text of the entry name before its first
+hyphen, or the whole name if it has no hyphen. The store keeps only the family that
+an operator set, so a rename changes the default family. A runtime entry has
+no family.
+
+**A model family can have a logo.** The model pickers show the logo with the
+family. The store keeps one logo for each scope and family. The store ignores
+the case of the family. An organization entry uses the logo of its organization
+for its family. If there is none, it uses the global logo for that family. A
+logo URI is under `https://pipette.liquid.ai/logos/`, the one remote image
+source that the content security policy of the web console admits. A logo URI
+can also be a data URI that holds the image, so a logo needs no image host.
+
+A catalog read gives the SHA-256 digest of the logo URI. The digest reduces
+the response size when several entries in a family share a large data URI.
+A client fetches each logo by its digest. A digest identifies one URI, so a
+changed logo has a new digest.
+
+Two routes give a logo by its digest:
+
+- An account uses `GET /api/v1/descriptor-catalog/family-logos/{sha256}`.
+- A device uses `GET /clients/me/descriptor-catalog/family-logos/{sha256}`.
+
+Each route returns a logo only from a scope that the caller can read. The
+store uses the digest index to find one matching URI in the readable scopes.
+The routes set `Cache-Control: private, no-store`
+so HTTP caches request the logo under the caller's current access.
+
+A logo URI is data, not a page. A client shows it as an image only, because
+an SVG image can hold a script. The audit event for a logo change holds the
+whole URI, so an operator can see the logo that a change set. The log event
+gives only the digest.
+
+An operator can set a logo only for a family that a model entry in the scope
+has, where the entry is not tombstoned. This check catches a typo in the family. A logo stays when the
+last entry of its family is renamed or tombstoned. It then has no effect until
+an entry has the family again.
+
+A move of an org entry to global scope copies the organization's logo for the
+family to global, unless global has a logo for that family. The promoted
+entry then shows the same logo as before the move.
+
 **A model member key has two parts: a format and a quantization.**
 
 - **The format** comes from the model type, through a fixed table:
@@ -1129,7 +1188,10 @@ formats and quantizations.
   | `torch` | `torch` |
   | `openvino` | `openvino` |
   | `onnx_genai` | `onnx` |
+  | `apple_foundation_text` | `system` |
 
+  A `system` model ships with the operating system. It names no files, so the
+  server pins nothing for it and records a download size of 0 bytes.
   One entry cannot hold two model types with the same format.
 - **The quantization** is a label that the operator gives in the `create` file,
   for example `q4_0`, `q4_k_m`, `4bit`, `int4` or `bf16`. A model descriptor
@@ -1227,7 +1289,7 @@ list shows every model member that the device is offered, not one.
 The check counts every member of a pinned or active runtime entry that the
 offer rules offer to the device. This includes the members that precedence
 does not select. Offer rules exist only for the runtime types with a flavor
-table. A model member that only an MLX runtime can load stays withheld until
+table, and for `apple_foundation`, which has no flavor. A model member that only an MLX runtime can load stays withheld until
 MLX has offer rules. The withheld reason names the model type: "no offered
 runtime loads `mlx`".
 
@@ -1250,6 +1312,14 @@ the same refusal. The error names the selector.
   `model_catalog_name` column with the selector.
 - The filters of the full list name a descriptor type, a runtime or a model,
   and then a runtime type or a model type.
+- The model list, the entry page and a device's short list show the family of
+  each model entry.
+- The entry page shows the logo of the family. The catalog reads and a
+  device's short list give its digest in `family_logo_sha256`. The page
+  fetches the logo with the digest.
+- The model list has a column for the family logo. The column is off until a
+  reader turns it on. The page fetches logos when it draws the column.
+  Concurrent requests for the same signer and digest share one lookup.
 - The entry page shows the model parameter table's counts for each member. The
   member's `model_key` finds the row. The members of one entry can have
   different keys, because they come from different repositories.
@@ -1290,9 +1360,11 @@ first two versions stays global.
   `runtime_flags` too would repeat the flags in a longer string.
 - **No names for one account.** An entry belongs to the global scope or to one
   organization. An account with no organization uses the global names.
-- **No move between scopes.** An org entry never becomes a global entry. An
-  operator who wants a global name for the same build creates a global entry
-  with the same members, and the two names are synonyms.
+- **No move from global scope into an organization.** An operator can move an
+  org entry to global scope ([above](#moves-to-global-scope)), but a global
+  entry stays global. An organization that wants its own name for a global
+  build creates an org entry with the same members, and the two names are
+  synonyms.
 - **No change to matching or eligibility.** Job eligibility clauses,
   capability matching and the planner's capability rules stay as they are.
   The offer rules are a separate set, and only the catalog reads them.

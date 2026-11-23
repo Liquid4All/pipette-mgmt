@@ -1,7 +1,4 @@
-# Example plan: unified pipette client, vLLM Docker runtime over SSH.
-#
-# State written to
-# .pipette-ctl/plans/torch-oai-vllm-linux-example/state.jsonl.
+# Example plan: vLLM in Docker on a Linux GPU host over ssh.
 
 plan_id = "torch-oai-vllm-linux-example"
 benchmarks = ["prefill_throughput_512", "decode_throughput_512_100", "eval_smoke"]
@@ -31,7 +28,7 @@ runtimes = [
 runtime_flags = [
   { benchmark_type = "eval", runtime_type = "docker_vllm", model_type = "torch", max_model_len = 4096 },
 ]
-# Model-generation flags, keyed on (benchmark, model); eval-only.
+# Model-generation flags are keyed on (benchmark, model); a torch model takes them on eval only.
 model_flags = [
   { benchmark_type = "eval", model_type = "torch", enable_thinking = true },
 ]

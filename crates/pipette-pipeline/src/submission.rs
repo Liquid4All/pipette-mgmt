@@ -74,6 +74,7 @@ impl SubmissionInputExt for SubmissionInput {
                     requested_benchmark_flags: None,
                     rescored_from: None,
                     run_submitted_at: None,
+                    replaced_model_descriptor: None,
                 }))
             }
             Self::Failure(mut wire) => Submission::Failure(Box::new(FailureSubmission {
@@ -289,6 +290,33 @@ impl SuccessInputExt for SuccessInput {
                     return Err(ValidationError::MissingMetric("decision_latency_batch_ms"));
                 }
             }
+            BenchmarkDefinition::Session(_) => {
+                session_duration_seconds(self.session_duration)?;
+                if let Some((field, _)) = [
+                    ("model_name", self.model_name.is_some()),
+                    ("model_quant", self.model_quant.is_some()),
+                    (
+                        "model_params_total_millions",
+                        self.model_params_total_millions.is_some(),
+                    ),
+                    (
+                        "model_params_active_millions",
+                        self.model_params_active_millions.is_some(),
+                    ),
+                    ("model_descriptor", self.model_descriptor.is_some()),
+                    ("model_flags", self.model_flags.is_some()),
+                    ("runtime_name", self.runtime_name.is_some()),
+                    ("runtime_version", self.runtime_version.is_some()),
+                    ("runtime_descriptor", self.runtime_descriptor.is_some()),
+                    ("runtime_flags", self.runtime_flags.is_some()),
+                    ("runtime_cpu_variant", self.runtime_cpu_variant.is_some()),
+                ]
+                .into_iter()
+                .find(|&(_, present)| present)
+                {
+                    return Err(ValidationError::SessionCarriesModelOrRuntime(field));
+                }
+            }
         }
 
         validate_json_ref("model_descriptor", self.model_descriptor.as_deref())?;
@@ -461,6 +489,17 @@ fn asr_beyond_model_audio_limit(extras: &AsrClientExtras) -> Result<bool, Valida
 
 fn required<T>(value: Option<T>, field: &'static str) -> Result<T, ValidationError> {
     value.ok_or(ValidationError::MissingMetric(field))
+}
+
+pub(crate) fn session_duration_seconds(value: Option<u64>) -> Result<u64, ValidationError> {
+    // The warehouse stores this metric as Float32. Every integer through
+    // this bound is exact.
+    const MAX_SECONDS: u64 = 1 << f32::MANTISSA_DIGITS;
+    let seconds = required(value, "session_duration")?;
+    if seconds > MAX_SECONDS {
+        return Err(ValidationError::SessionDurationTooLong { max: MAX_SECONDS });
+    }
+    Ok(seconds)
 }
 
 fn out_of_range(field: String, detail: &'static str) -> ValidationError {
@@ -672,6 +711,21 @@ pub struct SuccessSubmission {
     /// or is not a success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_submitted_at: Option<Timestamp>,
+    /// On a `replace_model` copy, the descriptor the device reported; the
+    /// copy's `wire.model_descriptor` names the new model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_model_descriptor: Option<String>,
+}
+
+impl SuccessSubmission {
+    /// The job whose source names this record's descriptors: a re-scored
+    /// copy's source, else this job.
+    pub(crate) fn descriptors_job(&self) -> &JobId {
+        match (&self.rescored_from, &self.replaced_model_descriptor) {
+            (Some(ran), None) => ran,
+            _ => &self.job_id,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -719,7 +773,8 @@ pub fn answers_every_sample(
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::VlSpecDecode(_)
         | BenchmarkDefinition::DecisionLatency(_)
-        | BenchmarkDefinition::DecisionMaxMemory(_) => return Ok(()),
+        | BenchmarkDefinition::DecisionMaxMemory(_)
+        | BenchmarkDefinition::Session(_) => return Ok(()),
     };
     let samples = usize::try_from(sample_count.into_inner()).unwrap_or(usize::MAX);
     let failed = completions
@@ -775,6 +830,10 @@ pub enum ValidationError {
     NpuVramRequiresNpuModel,
     #[error("missing {0}")]
     MissingMetric(&'static str),
+    #[error("session_duration must be at most {max} seconds")]
+    SessionDurationTooLong { max: u64 },
+    #[error("a session has no model or runtime. Omit {0}.")]
+    SessionCarriesModelOrRuntime(&'static str),
     #[error("{field} is present but not valid JSON: {detail}")]
     InvalidJsonRef { field: &'static str, detail: String },
     #[error("{field} is over its {limit}-byte limit")]
@@ -1810,6 +1869,50 @@ parameter_decode_tokens = 64
             (Ok(input), Ok(())) => input.validate(&vl_throughput_entry()?)?,
             (Err(e), Err(refusal)) => assert!(e.to_string().contains(refusal), "{extra}: {e}"),
             (parsed, _) => anyhow::bail!("{extra}: wrong verdict: {parsed:?}"),
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::complete(json!({"session_duration": 90}), Ok(()))]
+    #[case::zero(json!({"session_duration": 0}), Ok(()))]
+    #[case::at_limit(json!({"session_duration": 16_777_216_u64}), Ok(()))]
+    #[case::over_limit(
+        json!({"session_duration": 16_777_217_u64}),
+        Err("session_duration must be at most 16777216 seconds")
+    )]
+    #[case::absent(json!({}), Err("session_duration"))]
+    #[case::fractional(json!({"session_duration": 1.5}), Err("expected u64"))]
+    #[case::negative(json!({"session_duration": -1}), Err("expected u64"))]
+    #[case::model_name(json!({"session_duration": 90, "model_name": "model"}), Err("Omit model_name"))]
+    #[case::model_descriptor(json!({"session_duration": 90, "model_descriptor": "{}"}), Err("Omit model_descriptor"))]
+    #[case::runtime_name(json!({"session_duration": 90, "runtime_name": "runtime"}), Err("Omit runtime_name"))]
+    #[case::runtime_descriptor(json!({"session_duration": 90, "runtime_descriptor": "{}"}), Err("Omit runtime_descriptor"))]
+    #[case::runtime_flags(json!({"session_duration": 90, "runtime_flags": "{}"}), Err("Omit runtime_flags"))]
+    fn a_session_body_carries_its_duration(
+        #[case] extra: serde_json::Value,
+        #[case] expected: Result<(), &str>,
+    ) -> anyhow::Result<()> {
+        let session = Benchmark::from_toml("session", r#"benchmark_type = "session""#)?;
+        let body = merged(
+            json!({
+                "benchmark_id": "session",
+                "device_name": "d",
+                "device_form_factor": "desktop",
+                "device_os_name": "Linux",
+                "device_os_version": "24.04",
+                "device_chip_model": "AMD Ryzen 9",
+                "device_ram_bytes": 68_719_476_736_i64,
+            }),
+            extra.clone(),
+        )?;
+        let verdict = serde_json::from_value::<SuccessInput>(body)
+            .map_err(|e| e.to_string())
+            .and_then(|input| input.validate(&session).map_err(|e| e.to_string()));
+        match (verdict, expected) {
+            (Ok(()), Ok(())) => {}
+            (Err(e), Err(refusal)) => assert!(e.contains(refusal), "{extra}: {e}"),
+            (verdict, _) => anyhow::bail!("{extra}: wrong verdict: {verdict:?}"),
         }
         Ok(())
     }

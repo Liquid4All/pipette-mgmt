@@ -1,0 +1,2 @@
+DROP INDEX plans_cancelled_by_lineage;
+DROP INDEX plan_job_spans_members_by_job;

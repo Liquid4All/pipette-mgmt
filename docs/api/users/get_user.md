@@ -17,4 +17,3 @@ retype to a service
 | Status | When |
 |--------|------|
 | 200 | The account, what the reader may do to it, and, to a reader whose `manage_orgs` covers its organization, `awaits_sign_in` |
-| 404 | The account is outside the caller's scope or does not exist |

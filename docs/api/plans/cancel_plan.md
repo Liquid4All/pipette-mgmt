@@ -15,7 +15,7 @@ Re-cancelling is a no-op: the marker is a plain idempotent write.
 
 | Plan | Permission |
 |---|---|
-| One filed into the caller's own campaign or its organization's, whoever filed it, or into a disabled member's personal one the caller winds down ([campaigns: who may do what](../campaigns.md#who-may-do-what)) | `cancel_plans` |
+| One filed into a campaign of the caller's organization, whoever filed it ([campaigns: who may do what](../campaigns.md#who-may-do-what)) | `cancel_plans` |
 | One the caller filed outside every campaign | `cancel_plans` |
 | Any other: another owner's campaign's, a deleted campaign's, or one attributed to nobody outside a campaign | `cancel_any_plans` |
 
@@ -49,7 +49,6 @@ already read.
 | Status | When |
 |--------|------|
 | 202 | The request is recorded; the work is accepted rather than done, and the plan's status has not moved yet |
-| 400 | `plan_id` in the path contains characters outside `[A-Za-z0-9-]` |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | The caller holds no cancel grant; or it holds only `cancel_plans`, and the plan is outside its scope ([permissions](#permissions)) or does not exist |
 | 404 | No such plan, for a caller that holds `cancel_any_plans` |

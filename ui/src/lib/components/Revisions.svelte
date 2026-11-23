@@ -30,6 +30,7 @@
   const counts = (row: CampaignPlanRow) => row.plan?.counts;
   // A plan the reader may not read is its id alone.
   const spec: TableSpec<CampaignPlanRow> = $derived({
+    sort: "-created_at",
     columns: [
       { key: "plan_id", label: "plan_id", raw: (row) => row.plan_id },
       { key: "tags", label: "tags", raw: (row) => row.tags?.map((tag) => tag.name).join(", ") || null },

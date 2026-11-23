@@ -39,8 +39,9 @@ failure's code. What becomes of a cell still flagged after that is
 the check's own: `swap` and `spread` mark it failed, and the others keep their
 result. A check that keeps the result takes at least 1 re-run, `failed` for
 each code it lists, as with none it would do nothing; `spread` takes at least 1
-too, so a cell is re-run before it is marked. `model_params` and `smaller_failed`
-only flag: they re-run and mark nothing, so they take no re-run. Every
+too, so a cell is re-run before it is marked. `model_params`, `smaller_failed`
+and `vault_resource` only flag: they re-run and mark nothing, so they take no
+re-run. Every
 `queue-maintenance` run applies the policies that are on
 ([when a policy acts](#when-a-policy-acts)), and reads no `smaller_failed`.
 [`GET …/policy-preview`](campaign-groups/preview_campaign_group_policies.md)
@@ -61,6 +62,7 @@ judged.
 | `ttft_over_e2e` | its time to first token is over its end-to-end latency | 3, from 1 to 15 | keeps its result | `{}` |
 | `model_params` | a result row's model has no entry in the [model params table](model-params.md), so the pages show the row without a total or active parameter count | 0, only 0 | keeps its result | `{}` |
 | `smaller_failed` | it failed, for any reason, while a cell of its family at larger sizes has rows and no failure | 0, only 0 | keeps its result | `{}` |
+| `vault_resource` | its model or runtime is a vault resource: its job source names a `vault_*` source under `spec.model` or `spec.runtime`, a gated Hugging Face model copied into the vault included | 0, only 0 | keeps its result | `{}` |
 
 A cell's family is the campaign's cells that differ from it only in their
 sizes, as the queue groups them to hand out smaller runs first: prompt and
@@ -138,6 +140,14 @@ and on every later one.
   their ids and leases.
 - **One at a time.** A campaign gets no new revision while a job that the
   policies' last revision of it queued still waits for a device.
+- **Spaced by the work left.** After a revision, queue maintenance defers the
+  campaign's next revision until an interval ends. The interval is one minute
+  for each whole job that waits per busy device. The minimum is one minute and
+  the maximum is 30 minutes. Jobs that no device can run do not count. The
+  next revision includes the re-runs and marks that still qualify. Queue
+  maintenance files without waiting if the plan's earliest deadline comes at
+  or before one maintenance tick after the interval ends. The campaign's [overview](campaigns/get_campaign_overview.md)
+  shows what waits.
 - **16 runs at most.** A job whose re-run chain holds 16 runs, itself and 15
   earlier, is not re-run again: swap and spread mark it failed, and the others
   keep its result.
@@ -159,11 +169,23 @@ and on every later one.
   first run of a release that changes what a policy does with a job it flags,
   once per campaign. A Turn off stops every later revision, and one being filed
   as it lands still goes through.
+- **A group with no policy on is cleared.** Once a group's last policy is
+  turned off, the next run clears what it kept of each member campaign: the
+  policies it read the campaign under, which of them triggered, a refused
+  plan, a deferred revision, and its job states, so the campaign listing shows
+  no policy for it.
+  The campaign's last filing stays, so a policy turned on again later still
+  holds the campaign while that filing's jobs wait; until that hold ends, the
+  listing shows no policy for the campaign.
 - **Missing model params are logged.** While `model_params` is on, each run
   logs the result rows it reads that lack model params, by the key an entry
   for their model would take, with the row and job counts. It files nothing.
   Turning it on makes the next run read every answered job's rows once, so it
   logs every key; later runs read only the jobs answered since.
+- **Vault resources are read from the job.** `vault_resource` reads each job's
+  source, the body it was queued with, so it flags a job whose device reported
+  a failure, though such rows record no model or runtime. Like the other
+  checks, it flags a job once its rows are in pipette-duckdb.
 - **Each policy is kept as cleared or triggered.** A run keeps, for each job
   it reads, which checks of the policies that are on flag it. A policy is
   triggered while it flags a job of the campaign's plan, or while a re-run it
@@ -227,10 +249,10 @@ campaigns ([who may do what](campaigns.md#who-may-do-what)):
 | Create | `submit_plans` | Whoever may create a campaign for the owner |
 | List, read, read the policies | `read_plans` or `manage_orgs` | Whoever reads the owner's campaigns. A campaign reader reads no group |
 | Preview the policies, read their re-run results | `read_plans` and `read_clients` | Whoever reads the owner's campaigns, over the members whose plans it reads |
-| Rename, delete | `submit_plans` or `manage_orgs` | The owner itself with `submit_plans`, an organization's administrators for its group and a disabled member's, and `manage_any_orgs` for any |
-| Add or remove members, write a policy | `submit_plans` | The owner itself, an organization's members for its group, and `manage_any_orgs` for any. A policy write that leaves a policy other than `model_params` on, and adding members while such a policy is on, also take a re-run's grants: `read_plans` and `cancel_plans` (`read_any_plans` and `cancel_any_plans` for an owner other than the caller and its organization) and `read_clients` |
+| Rename, delete | `submit_plans` or `manage_orgs` | An organization's members holding `submit_plans` (not a service account) and its administrators for its group, and `manage_any_orgs` for any |
+| Add or remove members, write a policy | `submit_plans` | An organization's members for its group, and `manage_any_orgs` for any. A policy write that leaves a policy other than `model_params`, `smaller_failed` and `vault_resource` on, and adding members while such a policy is on, also take a re-run's grants: `read_plans` and `cancel_plans` (`read_any_plans` and `cancel_any_plans` for an owner other than the caller's organization) and `read_clients` |
 
-So an organization's members fill its groups, and its administrators rename
-and delete them, as they do with its campaigns. A group outside the caller's
+So an organization's members fill, rename and delete its groups, as they do
+with its campaigns. A group outside the caller's
 scope is a `403`, as a campaign is: a group id is minted, so a caller that
 names one was given it.

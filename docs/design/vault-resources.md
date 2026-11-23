@@ -37,8 +37,8 @@ Four properties follow, and each is the reason for a decision below:
 
 ## The two keyspaces, and why the split is the boundary
 
-The bytes live under `vault-resources/{principal_id}/blobs/{sha256}` and the
-records under `vault/{resource_id}.json`
+The bytes live under `vault-resources/{principal_id}/blobs/{sha256}` in the
+object store, and the records are rows of the `vault` table in `[database]`
 ([storage.md §3.4](../storage.md#34-the-vault)).
 
 **The record is deliberately not under `vault-resources/`.** A record decides
@@ -70,22 +70,13 @@ another record still names.
 
 ## Who may fetch
 
-| Record owner | Devices that may fetch | Accounts that may fetch |
-|---|---|---|
-| `{"type": "user", "user_id": …}` | devices that account owns | that account; `manage_any_orgs` |
-| `{"type": "org", "org_id": …}` | devices the organization owns, and devices owned by an account on it | its members; `manage_any_orgs` |
+An organization owns every record. The devices it owns may fetch them, and so
+may its members and `manage_any_orgs`.
 
 A device holds no user permission, so its entitlement is not a grant but a
-**relation**: `pipette_pipeline::org::owning_org` resolves an org-owned device
-directly and a user-owned device through its owner's current membership. Two
-consequences are deliberate:
-
-- **A device moves with the account that owns it.** Moving an account between
-  organizations moves what its devices can fetch, because ownership is derived
-  at fetch time rather than copied onto the device.
-- **A personal artifact does not follow its owner's organization.** A record
-  owned by an account is reachable by that account's devices alone, whatever
-  team the account joins, as `campaigns/` reads the same field.
+**relation**: `pipette_pipeline::org::owning_org` reads the device's owner at
+fetch time, so a device handed to another organization fetches that
+organization's records from its next request.
 
 An **unowned device reaches nothing**. Registration is open, so a machine that
 registered itself and was never claimed is exactly the identity the vault must
@@ -95,8 +86,8 @@ On the operator side there are **no new permission names**
 ([Vault: Who may do what](../api/vault.md#who-may-do-what)). New names would have
 left every existing operator granted nothing here until somebody re-granted
 them, for a line the roster vocabulary already draws: a team's resources are
-its members' to read and upload, and its administrators' to delete, the line a
-campaign draws. Uploading for the team gives a member no reach it lacked, since
+its members' to read, upload and delete, and its administrators' to set model
+parameter counts on. Uploading for the team gives a member no reach it lacked, since
 it already reads the team's records, and runs nothing until a plan names the
 record. Server-wide it is `manage_any_orgs` and not `read_any_orgs`, because
 private weights are not roster data.
@@ -116,36 +107,50 @@ private weights are not roster data.
   origin groups with the runs from HuggingFace; the row keeps the device's
   descriptor in `model_vault_descriptor`
   ([storage.md § `model_descriptor`](../storage.md#model_descriptor--runtime_descriptor)).
+  An upload has no origin, so its runs keep naming the vault file. A campaign
+  revision's `replace_model` moves them onto the public model: it copies each
+  run under the public descriptor
+  ([Carrying jobs into a revision](../api/campaigns.md#carrying-jobs-into-a-revision)).
 
 Ingestion writes records itself when a model carries an `auth_token`, so no
 token reaches storage
 ([plan-ingestion.md §6.2](../plan-ingestion.md#the-import-of-a-gated-model)).
-The campaign's owner owns them, so only the owner's devices can run the job: a
-foreign device claims it and gets `403` (see **Open**). The iOS and Android
-clients have no vault fetch, so a gated job runs on no mobile device.
+The campaign's owner owns them, so only the owner's devices run the job
+([Fetching](#fetching)). The iOS and Android clients have no vault fetch, so a
+gated job runs on no mobile device.
 
 ## Fetching
+
+A device outside the record's organization never reaches the fetch: the claim
+check turns it away first.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Client (device)
+    participant D as Device
     participant M as pipette-mgmt
+    participant DB as PostgreSQL (vault table)
     participant S as Object store
 
-    C->>M: POST /plans/claim
-    M-->>C: 200: job, whose model source is a vault_* arm<br/>{url, principal_id}
-    C->>M: GET /vault/resources/{id}/content (client-signed)
-    M->>M: approved + perform_work?
-    M->>S: GET vault/{id}.json
-    alt no record
-        M-->>C: 404
-    else the device's owner is not the record's
-        M-->>C: 403
+    D->>M: POST /plans/claim
+    M->>M: does the device's organization own<br/>every vault record the job names?
+    alt no
+        M->>M: deny the job to this device, put it back for another
+        M-->>D: the next job it may run, or 204
+    else yes
+        M-->>D: 200: job, whose model source names a vault record
     end
-    M->>S: GET vault-resources/{object_key}
-    M-->>C: 200 application/octet-stream<br/>Content-Length from the object, ETag = the pinned sha256
-    C->>C: sha256(body) == the plan's / the record's digest?
+    Note over D,M: a heartbeat or reclaim on a job the device<br/>no longer may fetch: 403, the job put back denied to it
+    D->>M: GET /vault/resources/{id}/content (device-signed)
+    M->>DB: read the record
+    alt no record
+        M-->>D: 404
+    else the device's organization does not own it
+        M-->>D: 403
+    end
+    M->>S: GET vault-resources/{principal_id}/blobs/{sha256}
+    M-->>D: 200 application/octet-stream, ETag = the record's sha256<br/>(206 for a Range resume)
+    D->>D: sha256(body) == the pinned digest?
 ```
 
 Every refusal happens before the first byte. A user may fetch the same URL with
@@ -200,15 +205,15 @@ claim-time rule could later rest on.
   the owner, the object, the digest and the label only. Records written before
   uploads went through mgmt carry no variant and are not backfilled; once the
   check lands, a plan naming one is refused.
-- **Claim-time eligibility.** A job whose sources are all one principal's could
-  be made claimable only by that principal's devices, which would turn a
-  fetch-time `403` into a scheduling decision. Its precondition is met:
-  `principal_id` is checked at ingestion. What remains is the matcher, and it is
-  not small: `pipette_core::matching::job_matches_client` judges a body against
-  a `Client` alone, a user-owned device's organization is a roster read the
-  matcher does not make, and the eligible index is cached per capability set,
-  so it would need a reindex marker on every ownership change. Until then a
-  foreign device claims, fetches, and reports a terminal `403`.
+- **Claim-time eligibility.** The claim check ([Fetching](#fetching)) turns
+  foreign devices away one claim at a time. A job whose sources are all one
+  principal's could instead be kept out of their eligibility, so they are never
+  offered it. Its precondition is met: `principal_id` is checked at ingestion.
+  What remains is the matcher, and it is not small:
+  `pipette_core::matching::job_matches_client` judges a body against a `Client`
+  alone, a device's owner is a read the matcher does not make, and the eligible
+  index is cached per capability set, so it would need a reindex marker on every
+  ownership change.
 - **Presigned redirects.** mgmt streams the object today, so a fleet pulling a
   large checkpoint puts that bandwidth through the service. A presigned URL
   issued only after the gate passes would take mgmt out of the byte path without

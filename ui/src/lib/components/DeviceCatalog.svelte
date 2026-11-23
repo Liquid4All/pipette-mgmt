@@ -17,9 +17,9 @@
   $effect(() => { const id = clientId; read.run(() => deviceCatalog(session.signer, id)); });
 </script>
 
-{#snippet evidenceHead(member: string)}
+{#snippet evidenceHead(member: string, family: boolean)}
   <tr>
-    <th>name</th><th>{member}</th><th>last success on this device</th><th>last failure on this device</th>
+    <th>name</th>{#if family}<th>family</th>{/if}<th>{member}</th><th>last success on this device</th><th>last failure on this device</th>
     <th>{ANY_DEVICE_LABEL}</th><th>release</th>
   </tr>
 {/snippet}
@@ -27,6 +27,7 @@
 {#snippet evidenceRow(item: DescriptorCatalogShortListItem, first: boolean, member: DescriptorMemberView)}
   <tr>
     <td>{#if first}<a href={entryHref(item)}>{item.display_name}</a>{/if}</td>
+    {#if item.descriptor_kind === "model"}<td>{#if first}{item.family ?? ""}{/if}</td>{/if}
     <td><code>{member.selector}</code></td>
     <td>{thisDeviceText(member, "last_success")}</td>
     <td>{thisDeviceText(member, "last_failure")}</td>
@@ -45,8 +46,8 @@
       {#if list.unreadable}<p class="err">{list.unreadable} unreadable catalog entry(s)</p>{/if}
       <h3>Runtimes</h3>
       {#if sections.runtime.length}
-        <table>
-          <thead>{@render evidenceHead("member")}</thead>
+        <div class="scroll"><table>
+          <thead>{@render evidenceHead("member", false)}</thead>
           <tbody>
             {#each sections.runtime as item (catalogRowId(item))}
               {#each item.members as member (member.digest)}
@@ -54,12 +55,12 @@
               {/each}
             {/each}
           </tbody>
-        </table>
+        </table></div>
       {:else}<p class="muted">No runtime entry offers this device a member.</p>{/if}
       <h3>Models</h3>
       {#if sections.model.length}
-        <table>
-          <thead>{@render evidenceHead("members")}</thead>
+        <div class="scroll"><table>
+          <thead>{@render evidenceHead("members", true)}</thead>
           <tbody>
             {#each sections.model as item (catalogRowId(item))}
               {#each item.members as member, index (member.digest)}
@@ -67,7 +68,7 @@
               {/each}
             {/each}
           </tbody>
-        </table>
+        </table></div>
       {:else}<p class="muted">No model entry offers this device a member.</p>{/if}
       {#if summary}
         <details class="withheld">
@@ -89,6 +90,10 @@
 <style>
   .catalog { margin: 24px 0; }
   .catalog td { vertical-align: top; }
+  /* A short list can hold many entries. Each table scrolls inside its box, and its header stays in view. */
+  .scroll { max-height: 24em; overflow-y: auto; margin: 8px 0 14px; }
+  .scroll table { margin: 0; }
+  .scroll th { position: sticky; top: 0; z-index: 1; }
   .withheld { margin-top: 12px; }
   .withheld summary { cursor: pointer; }
 </style>

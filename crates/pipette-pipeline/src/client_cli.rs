@@ -356,6 +356,7 @@ mod tests {
             ))?,
             organization: NonEmptyTrimmedString::try_new("org")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
             registered_at: jiff::Timestamp::now(),

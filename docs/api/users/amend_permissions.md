@@ -33,4 +33,3 @@ it back.
 | 200 | `UserPermissionsAmended`: the resolved set, `changed` and `still_granted` |
 | 400 | Neither `add` nor `remove`; or the caller removing its own `manage_orgs` or `manage_any_orgs`; or a service account granted `manage_orgs`, `manage_clients` or an `_any_` name |
 | 403 | `add` names a name the caller does not hold, and the refusal names every one; or, for a scoped caller, the account holds a server-wide name it lacks; or the caller is a service account |
-| 404 | The account is outside the caller's scope or does not exist |

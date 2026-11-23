@@ -737,6 +737,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -832,6 +834,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -978,6 +982,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }

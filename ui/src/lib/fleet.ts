@@ -65,7 +65,6 @@ export function pagePairs(filters: FleetFilters): [string, string][] {
 /** The devices a listing draws (the classic `Branch`); an org's `count` is `OrgView.client_count`, `null` unread. */
 export type DeviceBranch =
   | { kind: "all" }
-  | { kind: "me" }
   | ({ kind: "org"; count: number | null } & OrgRef)
   | { kind: "server" };
 
@@ -73,7 +72,6 @@ export type DeviceBranch =
 function scope(branch: DeviceBranch): [string, string][] {
   switch (branch.kind) {
     case "all": return [];
-    case "me": return [["owner", "mine"]];
     case "org": return [["org_id", branch.org_id]];
     case "server": return [["owned", "false"]];
   }
@@ -101,7 +99,7 @@ export function emptyNotice(branch: DeviceBranch, filters: FleetFilters, cursor:
     return "Capability filters need at least one requires flag. Other clauses only narrow the selection.";
   }
   if (branch.kind === "org" && branch.count === 0) {
-    return `${orgName(branch)} owns no devices, directly or through a member.`;
+    return `${orgName(branch)} owns no devices.`;
   }
   if (cursor) return "No clients at this position. Go back to the first page.";
   if (filtering(filters)) {
@@ -109,9 +107,8 @@ export function emptyNotice(branch: DeviceBranch, filters: FleetFilters, cursor:
   }
   switch (branch.kind) {
     case "all": return status ? `No client is ${status}.` : "No clients registered.";
-    case "me": return status ? `You own no ${status} devices.` : "You own no devices.";
     case "org": return status ? `${orgName(branch)} owns no ${status} devices.`
-      : `${orgName(branch)} owns no devices, directly or through a member.`;
+      : `${orgName(branch)} owns no devices.`;
     case "server": return status ? `No unclaimed device is ${status}.` : "Every device has an owner.";
   }
 }
@@ -148,28 +145,23 @@ export function activity(row: ClientListRow, now: number): Activity {
   return now - Date.parse(row.last_seen_at) <= ACTIVE_WINDOW_MS ? "active" : "inactive";
 }
 
-/** The accounts a page's rows are owned through, each once, for the `owned` column's names. */
-export const throughOwners = (rows: ClientListRow[]): string[] =>
-  [...new Set(rows.flatMap((row) => (row.owner?.type === "user" ? [row.owner.user_id] : [])))];
+export const deviceLabel = (row: Pick<ClientListRow, "client_id" | "name" | "client_details" | "device_name">): string =>
+  row.name || row.client_details || row.device_name || row.client_id;
 
-/**
- * A device listing's columns and filters; `owned` where it names whom a row is owned through, by `names`.
- * The `activity` column and filter compare each row with `now`.
- */
-export function deviceTable(owned: boolean, names: Record<string, string>, now: number): TableSpec<ClientListRow> {
-  const through = (row: ClientListRow) =>
-    (row.owner?.type === "user" ? names[row.owner.user_id] ?? row.owner.user_id : "directly");
+/** A device listing's columns and filters; the `activity` column and filter compare each row with `now`. */
+export function deviceTable(now: number): TableSpec<ClientListRow> {
   const list = (items: readonly string[] | undefined) => (items?.length ? JSON.stringify(items) : null);
   return {
+    sort: "name",
     columns: [
       { key: "client_id", label: "client_id", raw: (row) => row.client_id, href: (row) => clientLink(row.client_id) },
+      { key: "name", label: "name", raw: deviceLabel },
       { key: "device_name", label: "device_name", raw: (row) => row.device_name ?? null },
       { key: "status", label: "status", raw: (row) => row.status, as: "state" },
       { key: "activity", label: "activity", raw: (row) => activity(row, now), as: "state" },
       { key: "device_os_name", label: "device_os_name", raw: (row) => row.device_os_name ?? null },
       { key: "device_os_version", label: "device_os_version", raw: (row) => row.device_os_version ?? null, shown: false },
       { key: "device_chip_model", label: "device_chip_model", raw: (row) => row.device_chip_model ?? null },
-      ...(owned ? [{ key: "owned", label: "owned", raw: through }] : []),
       { key: "permissions", label: "permissions", raw: (row) => list(row.permissions), as: "json" },
       { key: "standing", label: "standing", raw: standing },
       { key: "backlog", label: "backlog", raw: (row) => row.backlog?.job_count ?? null, num: true },
@@ -187,8 +179,9 @@ export function deviceTable(owned: boolean, names: Record<string, string>, now: 
     ],
     texts: [
       { key: "id", label: "client_id", texts: (row) => [row.client_id] },
-      { key: "q", label: "device_name, OS or chip",
-        texts: (row) => [row.device_name, row.contact_email, row.device_os_name, row.device_chip_model] },
+      { key: "q", label: "name, device_name, OS or chip",
+        texts: (row) => [row.name, row.client_details, row.device_name, row.contact_email, row.device_os_name,
+          row.device_chip_model] },
     ],
     choices: [
       { key: "os", label: "device_os_name", values: (row) => [row.device_os_name ?? ""] },

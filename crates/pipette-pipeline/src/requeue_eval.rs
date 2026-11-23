@@ -181,7 +181,8 @@ fn not_in_catalog_error(
             | BenchmarkDefinition::AsrMaxMemory(_)
             | BenchmarkDefinition::VlSpecDecode(_)
             | BenchmarkDefinition::DecisionLatency(_)
-            | BenchmarkDefinition::DecisionMaxMemory(_) => None,
+            | BenchmarkDefinition::DecisionMaxMemory(_)
+            | BenchmarkDefinition::Session(_) => None,
         })
         .collect();
     if benchmark_ids.is_empty() {

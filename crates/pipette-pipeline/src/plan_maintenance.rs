@@ -15,7 +15,8 @@ use pipette_core::plan::{ExpiredJob, PlanManifest, ProgressSnapshot, SettledOutc
 use pipette_core::todo_filename::Lease;
 use pipette_plan_types::{ClientId, Counts, ExpiresAt, JobId, PlanId, PlanStatus};
 use pipette_store::{
-    AvailEntry, JobPlanMarker, MembershipEnd, PlanStore, SubmissionStore, TodoStore,
+    AvailEntry, JobPlanMarker, MembershipEnd, PLANS_PREFIX, PlanListing, PlanStore,
+    SubmissionStore, TodoStore,
 };
 
 use crate::plan_ingestion::requirement_key;
@@ -35,6 +36,10 @@ impl Membership {
                 .push((marker.plan_id, marker.expires_at));
             acc
         }))
+    }
+
+    pub(crate) fn has_markers(&self, job_id: &JobId) -> bool {
+        self.0.contains_key(job_id)
     }
 
     /// Whether `plan_id` released this job in an earlier pass: another plan
@@ -108,6 +113,7 @@ pub(crate) struct TeardownOutcome {
 pub(crate) async fn tear_down_plans(
     plans: &dyn PlanStore,
     manifests: &[PlanManifest],
+    markerless_jobs: &BTreeMap<PlanId, Vec<JobId>>,
     markers: &HashSet<PlanId>,
     membership: &Membership,
     avail: Vec<AvailEntry>,
@@ -115,14 +121,18 @@ pub(crate) async fn tear_down_plans(
     now: Timestamp,
     creating_max_age: Duration,
 ) -> anyhow::Result<TeardownOutcome> {
-    let doomed: Vec<(&PlanManifest, Cause)> = manifests
+    let mut doomed: BTreeMap<&PlanId, (Cause, &[JobId])> = markerless_jobs
         .iter()
-        .filter_map(|m| teardown_cause(m, markers, now, creating_max_age).map(|cause| (m, cause)))
+        .map(|(plan_id, jobs)| (plan_id, (Cause::Cancelled, jobs.as_slice())))
         .collect();
+    doomed.extend(manifests.iter().filter_map(|manifest| {
+        let cause = teardown_cause(manifest, markers, now, creating_max_age)?;
+        Some((&manifest.plan_id, (cause, manifest.job_ids.as_slice())))
+    }));
     let stranded: HashSet<PlanId> = doomed
         .iter()
-        .filter(|(_, cause)| *cause == Cause::CreatingStranded)
-        .map(|(m, _)| m.plan_id.clone())
+        .filter(|(_, (cause, _))| *cause == Cause::CreatingStranded)
+        .map(|(plan_id, _)| (*plan_id).clone())
         .collect();
     if doomed.is_empty() {
         return Ok(TeardownOutcome {
@@ -149,14 +159,14 @@ pub(crate) async fn tear_down_plans(
     let mut released: HashMap<PlanId, HashSet<JobId>> = HashMap::new();
     let mut perturbed: HashSet<PlanId> = HashSet::new();
     let mut failures = 0usize;
-    for (manifest, cause) in doomed {
+    for (plan_id, (cause, jobs)) in doomed {
         let mut jobs_retired = 0usize;
         let mut jobs_released = 0usize;
         let mut jobs_already_gone = 0usize;
-        for job_id in &manifest.job_ids {
+        for job_id in jobs {
             // Released in an earlier pass: redoing it would only re-read the
             // tree every run for as long as the shared job lives.
-            if membership.released_by(job_id, &manifest.plan_id) {
+            if membership.released_by(job_id, plan_id) {
                 continue;
             }
             let entry = avail_by_job.get(job_id).copied();
@@ -165,12 +175,12 @@ pub(crate) async fn tear_down_plans(
                 // Finished, retired by an earlier pass, or never promoted.
                 continue;
             }
-            match plans.end_membership(job_id, &manifest.plan_id).await {
+            match plans.end_membership(job_id, plan_id).await {
                 Ok(MembershipEnd::Retired) => {
                     retired.insert(job_id.clone());
                     jobs_retired += 1;
                     tracing::debug!(
-                        plan_id = %manifest.plan_id,
+                        %plan_id,
                         job_id = %job_id,
                         cause = cause.label(),
                         "queue-maintenance: retired a job of an ending plan"
@@ -178,12 +188,12 @@ pub(crate) async fn tear_down_plans(
                 }
                 Ok(MembershipEnd::Released { surviving_plans }) => {
                     released
-                        .entry(manifest.plan_id.clone())
+                        .entry(plan_id.clone())
                         .or_default()
                         .insert(job_id.clone());
                     jobs_released += 1;
                     tracing::info!(
-                        plan_id = %manifest.plan_id,
+                        %plan_id,
                         job_id = %job_id,
                         surviving_plans,
                         cause = cause.label(),
@@ -194,12 +204,12 @@ pub(crate) async fn tear_down_plans(
                 // the plan's outstanding set.
                 Ok(MembershipEnd::Absent) => {
                     released
-                        .entry(manifest.plan_id.clone())
+                        .entry(plan_id.clone())
                         .or_default()
                         .insert(job_id.clone());
                     jobs_already_gone += 1;
                     tracing::info!(
-                        plan_id = %manifest.plan_id,
+                        %plan_id,
                         job_id = %job_id,
                         cause = cause.label(),
                         "queue-maintenance: dropped the membership of a job that had already left the queue"
@@ -207,7 +217,7 @@ pub(crate) async fn tear_down_plans(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        plan_id = %manifest.plan_id,
+                        %plan_id,
                         job_id = %job_id,
                         error = %e,
                         "queue-maintenance: failed to retire a job of a cancelled plan"
@@ -217,11 +227,11 @@ pub(crate) async fn tear_down_plans(
             }
         }
         if jobs_retired > 0 {
-            perturbed.insert(manifest.plan_id.clone());
+            perturbed.insert(plan_id.clone());
         }
         if jobs_retired + jobs_released + jobs_already_gone > 0 {
             tracing::info!(
-                plan_id = %manifest.plan_id,
+                %plan_id,
                 jobs_retired,
                 jobs_released,
                 jobs_already_gone,
@@ -272,8 +282,7 @@ fn teardown_cause(
     creating_max_age: Duration,
 ) -> Option<Cause> {
     match manifest.status {
-        // `cancelled` is re-checked to catch a straggler, such as a lease a
-        // heartbeat renamed under an earlier delete.
+        // Re-check a cancelled plan if one of its jobs is still queued.
         PlanStatus::Cancelling | PlanStatus::Cancelled => Some(Cause::Cancelled),
         // A marker naming a `complete` plan is stray; reconciliation collects it.
         PlanStatus::Complete => None,
@@ -967,18 +976,25 @@ pub(crate) struct PlanIndexGc {
 /// Every arm is gated on `plan_creating_max_age_secs`: two-sighting alone is far
 /// shorter than a slow ingest, whose markers it would collect. A marker whose
 /// plan disowns a live job is collected too, or it pins a `never`-expiry job.
+/// The caller reads the plans named by the live jobs' markers.
 pub(crate) async fn gc_plan_index(
     plans: &dyn PlanStore,
-    manifests: &[PlanManifest],
+    listing: &PlanListing,
     markers: &[JobPlanMarker],
     live_ids: &HashSet<JobId>,
     prior: &HashSet<String>,
     now: Timestamp,
     creating_max_age: Duration,
 ) -> PlanIndexGc {
-    let plan_jobs: HashMap<&PlanId, HashSet<&JobId>> = manifests
+    let plan_jobs: HashMap<&PlanId, HashSet<&JobId>> = listing
+        .items
         .iter()
         .map(|m| (&m.plan_id, m.job_ids.iter().collect()))
+        .collect();
+    let unreadable: HashSet<&str> = listing
+        .unreadable
+        .iter()
+        .filter_map(|error| error.key.strip_prefix(PLANS_PREFIX)?.strip_suffix(".json"))
         .collect();
     let mut next = HashSet::new();
     let mut failures = 0usize;
@@ -1029,9 +1045,11 @@ pub(crate) async fn gc_plan_index(
 
     for marker in markers {
         let job_dead = !live_ids.contains(&marker.job_id);
-        let plan_disowns_job = plan_jobs
-            .get(&marker.plan_id)
-            .is_none_or(|held| !held.contains(&marker.job_id));
+        // A failed plan read cannot establish that it disowns a live job.
+        let plan_disowns_job = match plan_jobs.get(&marker.plan_id) {
+            Some(held) => !held.contains(&marker.job_id),
+            None => !unreadable.contains(marker.plan_id.as_str()),
+        };
         if !(job_dead || plan_disowns_job) || !past_gate(marker.written_at, now, creating_max_age) {
             continue;
         }
@@ -1373,8 +1391,20 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::owned_live_job_kept(true, false, true, false)]
+    #[case::owned_dead_job_collected(true, false, false, true)]
+    #[case::unknown_plan_live_job_collected(false, false, true, true)]
+    #[case::unknown_plan_dead_job_collected(false, false, false, true)]
+    #[case::unreadable_plan_live_job_kept(false, true, true, false)]
+    #[case::unreadable_plan_dead_job_collected(false, true, false, true)]
     #[tokio::test]
-    async fn marker_arm_runs_when_the_content_key_listing_fails() -> anyhow::Result<()> {
+    async fn marker_arm_runs_when_the_content_key_listing_fails(
+        #[case] plan_holds_job: bool,
+        #[case] plan_unreadable: bool,
+        #[case] job_live: bool,
+        #[case] collected: bool,
+    ) -> anyhow::Result<()> {
         let now: Timestamp = "2026-06-01T00:00:00Z".parse()?;
         let marker = JobPlanMarker {
             job_id: JobId::from_uuid(uuid::Uuid::from_u128(1)),
@@ -1382,7 +1412,6 @@ mod tests {
             expires_at: ExpiresAt::Never,
             written_at: now - jiff::SignedDuration::from_hours(1),
         };
-        // The prior run staged the marker's key, so this run may collect it.
         let prior = HashSet::from([format!(
             "{PLAN_INDEX_KEY_PREFIX}job-plans/{}/{}",
             marker.job_id,
@@ -1395,12 +1424,35 @@ mod tests {
             deleted: std::sync::Mutex::new(Vec::new()),
             unexpected: pipette_store_testkit::UnexpectedCalls::default(),
         };
+        let mut listing = PlanListing::default();
+        if plan_holds_job {
+            listing.items.push(PlanManifest {
+                job_ids: vec![marker.job_id.clone()],
+                ..pipette_core::plan::sample_manifest(
+                    marker.plan_id.clone(),
+                    PlanStatus::Complete,
+                    false,
+                )?
+            });
+        }
+        if plan_unreadable {
+            listing
+                .unreadable
+                .push(pipette_store::UnreadableObjectError {
+                    key: format!("{PLANS_PREFIX}{}.json", marker.plan_id),
+                    reason: "plan read failed".into(),
+                });
+        }
+        let live_ids: HashSet<JobId> = job_live
+            .then(|| marker.job_id.clone())
+            .into_iter()
+            .collect();
 
         let PlanIndexGc { failures, .. } = gc_plan_index(
             &plans,
-            &[],
+            &listing,
             std::slice::from_ref(&marker),
-            &HashSet::new(),
+            &live_ids,
             &prior,
             now,
             Duration::ZERO,
@@ -1409,13 +1461,16 @@ mod tests {
 
         assert_eq!(failures, 1, "the listing failure is reported");
         plans.unexpected.none()?;
+        let expected: Vec<_> = collected
+            .then_some((marker.job_id, marker.plan_id))
+            .into_iter()
+            .collect();
         assert_eq!(
             *plans
                 .deleted
                 .lock()
                 .map_err(|e| anyhow::anyhow!("poisoned: {e}"))?,
-            vec![(marker.job_id.clone(), marker.plan_id.clone())],
-            "the marker of a job that left the queue is collected anyway"
+            expected,
         );
         Ok(())
     }
@@ -1519,6 +1574,7 @@ mod tests {
         let outcome = tear_down_plans(
             &*stores.plans,
             &[manifest],
+            &BTreeMap::new(),
             &HashSet::new(),
             &membership,
             avail,
@@ -1615,6 +1671,7 @@ mod tests {
         let outcome = tear_down_plans(
             stores.plans.as_ref(),
             &[manifest],
+            &BTreeMap::new(),
             &HashSet::new(),
             &membership,
             avail,

@@ -15,4 +15,3 @@ other's work, and a stored name this build does not define stays where it is.
 | 200 | `ChangedClientPermissions`; `changed: false` means the device already held what was asked for |
 | 400 | Neither `add` nor `remove`, a name in both, or a name a device cannot hold |
 | 403 | The caller does not hold `manage_clients`; the device is another organization's; or it is nobody's and the caller is scoped to one |
-| 404 | No such device |

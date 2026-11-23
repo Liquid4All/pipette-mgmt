@@ -196,6 +196,48 @@ impl DescriptorCatalogStore for Memory {
         anyhow::bail!("the importer never relabels a member")
     }
 
+    async fn set_family(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _family: Option<&CatalogName>,
+        _actor: Option<&pipette_plan_types::AuditActor>,
+    ) -> anyhow::Result<pipette_store::SetFamilyOutcome> {
+        anyhow::bail!("the importer never sets a family")
+    }
+
+    async fn set_family_logo(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _family: &CatalogName,
+        _logo_uri: Option<&pipette_plan_types::LogoUri>,
+        _actor: Option<&pipette_plan_types::AuditActor>,
+    ) -> anyhow::Result<pipette_store::SetFamilyLogoOutcome> {
+        anyhow::bail!("the importer never sets a family logo")
+    }
+
+    async fn family_logos(
+        &self,
+        _scopes: &[pipette_plan_types::CatalogScope],
+    ) -> anyhow::Result<Vec<pipette_plan_types::FamilyLogoDigest>> {
+        Ok(Vec::new())
+    }
+
+    async fn family_logos_with_digest(
+        &self,
+        _sha256: &pipette_plan_types::Sha256,
+    ) -> anyhow::Result<Vec<pipette_plan_types::FamilyLogo>> {
+        Ok(Vec::new())
+    }
+
+    async fn family_logo_uri_by_digest(
+        &self,
+        _sha256: &pipette_plan_types::Sha256,
+        _scopes: Option<&[pipette_plan_types::CatalogScope]>,
+    ) -> anyhow::Result<Option<pipette_plan_types::LogoUri>> {
+        Ok(None)
+    }
+
     async fn remove_member(
         &self,
         _scope: &pipette_plan_types::CatalogScope,
@@ -296,6 +338,16 @@ impl DescriptorCatalogStore for Memory {
         _org_id: &pipette_plan_types::OrgId,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn fill_member_size(
+        &self,
+        _scope: &pipette_plan_types::CatalogScope,
+        _name: &CatalogName,
+        _digest: &str,
+        _size_bytes: u64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("the importer never sizes a member")
     }
 }
 

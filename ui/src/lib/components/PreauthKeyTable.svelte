@@ -11,8 +11,10 @@
   import DataTable from "./DataTable.svelte";
   import { Busy } from "./work.svelte";
 
-  let { keys, usage, busy, onrevoke, empty }: {
+  let { keys, name, usage, busy, onrevoke, empty }: {
     keys: K[];
+    /** What leads the table's keys in the address, on a page that draws another table. */
+    name?: string;
     usage?: (key: K) => string;
     /** Another write of the page is under way. */
     busy: boolean;
@@ -39,6 +41,7 @@
   const expiry = (key: K) => (key.expired ? "expired" : key.expires_at ? "expires" : "never");
 
   const spec: TableSpec<K> = $derived({
+    sort: "-created_at",
     columns: [
       { key: "key_id", label: "key_id", raw: (key) => key.key_id, as: "id" },
       ...(usage ? [{ key: "usage", label: "usage", raw: (key: K) => usage(key) }] : []),
@@ -67,6 +70,6 @@
           aria-label="Revoke {key.key_id}" onclick={() => ask(key.key_id)}>Revoke</button>
 {/snippet}
 
-<DataTable {spec} rows={keys} id={(key) => key.key_id} noun="keys" {empty} cells={{ expires_at, minted_by }}
+<DataTable {spec} rows={keys} id={(key) => key.key_id} noun="keys" {name} {empty} cells={{ expires_at, minted_by }}
            action={revoke} />
 <ConfirmDialog bind:this={confirm} />

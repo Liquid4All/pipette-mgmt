@@ -576,17 +576,14 @@ mod tests {
     #[tokio::test]
     async fn an_alias_within_a_scope_reads_only_its_records_origins() -> anyhow::Result<()> {
         let (id, resource) = record(V1, Some(hf("LFM2-700M-GGUF", 'a', Some("m.gguf"))))?;
-        let pipette_core::vault::VaultOwner::User { user_id } = resource.owner.clone() else {
-            anyhow::bail!("the fixture is a user's upload");
+        let owner = VaultScope::Own {
+            org: Some(resource.owner.org_id().clone()),
         };
         let store = Records(Some([(id, resource)].into_iter().collect()));
-        let owner = VaultScope::Own {
-            user: user_id,
-            org: None,
-        };
         let stranger = VaultScope::Own {
-            user: pipette_plan_types::UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
-            org: None,
+            org: Some(pipette_plan_types::OrgId::try_new(
+                "org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
+            )?),
         };
         for (scope, aliased) in [(VaultScope::Every, true), (owner, true), (stranger, false)] {
             let alias = model_alias_within(&store, Some(&vault(V1)), &scope).await?;

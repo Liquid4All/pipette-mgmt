@@ -12,8 +12,8 @@ use pipette_core::plan::{PlanManifest, sample_manifest};
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
-    CampaignId, ClientId, ClientOwner, ClientPermission, ExpiresAt, NonEmptyTrimmedString, OrgId,
-    PlanId, PlanStatus, Tag, UserId, UserKeyId, UserPermission,
+    CampaignId, ClientId, ClientPermission, ExpiresAt, NonEmptyTrimmedString, PlanId, PlanStatus,
+    Tag, UserId, UserKeyId, UserPermission,
 };
 use pipette_web_testkit::{
     approved_client, approved_object_client, approved_queue_client, authed_get, authed_post,
@@ -66,12 +66,9 @@ async fn read_conforming(
 #[case::invalid_limit("limit=abc")]
 #[case::owned("owned=nobody")]
 #[case::owned_repeat("owned=true&owned=false")]
-#[case::owner_unknown("owner=org")]
-#[case::owner_repeat("owner=mine&owner=mine")]
 #[case::org_handle("org_id=acme")]
-#[case::owned_and_owner("owned=true&owner=mine")]
 #[case::owned_and_org("owned=false&org_id=org_00000000-0000-0000-0000-000000000000")]
-#[case::owner_and_org("owner=mine&org_id=org_00000000-0000-0000-0000-000000000000")]
+#[case::owner_mine("owner=mine")]
 #[tokio::test]
 async fn test_fleet_rejects_bad_query(#[case] query: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1038,18 +1035,12 @@ async fn test_a_second_request_within_the_wait_does_not_stamp(
     Ok(())
 }
 
-/// What one reader may do to a device, and the organization it rolls up to.
-#[derive(Debug, PartialEq)]
-struct Reach {
-    may_administer: bool,
-    owning_org_id: Option<String>,
-}
-
-async fn reach_of(
+/// Whether one reader may administer a device, as its single read says.
+async fn may_administer(
     state: &AppState,
     signer: &pipette_web_testkit::UserSigner,
     client_id: &ClientId,
-) -> anyhow::Result<Reach> {
+) -> anyhow::Result<bool> {
     let (key, user_id, key_id) = signer;
     let resp = authed_user_get(
         state,
@@ -1062,29 +1053,12 @@ async fn reach_of(
     anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
     let body = body_json(resp).await?;
     crate::api_schema::assert_conforms("ClientDetail", &body)?;
-    let flag = |field: &str| {
-        body.get(field)
-            .and_then(Value::as_bool)
-            .context("a flag is always there")
-    };
-    Ok(Reach {
-        may_administer: flag("may_administer")?,
-        owning_org_id: body
-            .get("owning_org_id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    })
+    body.get("may_administer")
+        .and_then(Value::as_bool)
+        .context("the flag is always there")
 }
 
-fn reach(may_administer: bool, owning_org_id: Option<&OrgId>) -> Reach {
-    Reach {
-        may_administer,
-        owning_org_id: owning_org_id.map(ToString::to_string),
-    }
-}
-
-/// The forms follow the device scope; the owning organization is named only to
-/// a reader of that roster or that organization's own device administrator.
+/// The forms follow the device scope.
 #[tokio::test]
 async fn test_the_single_read_says_what_the_reader_may_do() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1095,17 +1069,8 @@ async fn test_the_single_read_says_what_the_reader_may_do() -> anyhow::Result<()
     let (_key, theirs) = pipette_web_testkit::register_and_approve(&state).await?;
     let (_key, unowned) = pipette_web_testkit::register_pending(&state).await?;
 
-    let member = registered_user(&state, &[]).await?;
-    pipette_web_testkit::set_user_org(&state, &member.1, Some(acme.clone())).await?;
     pipette_web_testkit::own_client_by_org(&state, &ours, &acme).await?;
-    pipette_web_testkit::own_client(
-        &state,
-        &members,
-        ClientOwner::User {
-            user_id: member.1.clone(),
-        },
-    )
-    .await?;
+    pipette_web_testkit::own_client_by_org(&state, &members, &acme).await?;
     pipette_web_testkit::own_client_by_org(&state, &theirs, &rival).await?;
 
     // acme's device administrator, who reads its roster too.
@@ -1116,66 +1081,54 @@ async fn test_the_single_read_says_what_the_reader_may_do() -> anyhow::Result<()
     .await?;
     pipette_web_testkit::set_user_org(&state, &lead.1, Some(acme.clone())).await?;
     for (client_id, expected) in [
-        (&ours, reach(true, Some(&acme))),
-        (&members, reach(true, Some(&acme))),
-        (&theirs, reach(false, None)),
+        (&ours, true),
+        (&members, true),
+        (&theirs, false),
         // A server admin's alone.
-        (&unowned, reach(false, None)),
+        (&unowned, false),
     ] {
         assert_eq!(
-            reach_of(&state, &lead, client_id).await?,
+            may_administer(&state, &lead, client_id).await?,
             expected,
             "{client_id}"
         );
     }
 
-    // Scoped to acme without its roster: the rollup is what its forms reach.
+    // Scoped to acme without its roster: the owner is what its forms reach.
     let scoped = registered_user(&state, &[UserPermission::ManageClients]).await?;
     pipette_web_testkit::set_user_org(&state, &scoped.1, Some(acme.clone())).await?;
-    assert_eq!(
-        reach_of(&state, &scoped, &members).await?,
-        reach(true, Some(&acme))
-    );
+    assert!(may_administer(&state, &scoped, &members).await?);
 
-    // The fleet's administrator without the roster grant learns no membership.
     let fleet = registered_user(&state, &[UserPermission::ManageAnyClients]).await?;
-    assert_eq!(reach_of(&state, &fleet, &members).await?, reach(true, None));
+    assert!(may_administer(&state, &fleet, &theirs).await?);
 
-    // A reader of every roster is told it, and may do nothing.
+    // Reading every roster and the fleet administers nothing.
     let roster = registered_user(
         &state,
         &[UserPermission::ReadClients, UserPermission::ReadAnyOrgs],
     )
     .await?;
-    for (client_id, owning) in [
-        (&members, Some(&acme)),
-        (&theirs, Some(&rival)),
-        (&unowned, None),
-    ] {
-        assert_eq!(
-            reach_of(&state, &roster, client_id).await?,
-            reach(false, owning),
+    for client_id in [&members, &theirs, &unowned] {
+        assert!(
+            !may_administer(&state, &roster, client_id).await?,
             "{client_id}"
         );
     }
-
-    // The fleet grant alone reads the device and nothing past it.
-    let reader = registered_user(&state, &[UserPermission::ReadClients]).await?;
-    assert_eq!(
-        reach_of(&state, &reader, &members).await?,
-        reach(false, None)
-    );
     Ok(())
 }
 
 /// Status is checked before permissions.
 #[tokio::test]
-async fn test_a_pending_account_reads_no_fleet() -> anyhow::Result<()> {
+async fn test_a_disabled_account_reads_no_fleet() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadAnyClients]).await?;
-    pipette_web_testkit::set_user_status(&state, &user_id, pipette_plan_types::UserStatus::Pending)
-        .await?;
+    pipette_web_testkit::set_user_status(
+        &state,
+        &user_id,
+        pipette_plan_types::UserStatus::Disabled,
+    )
+    .await?;
 
     for path in [
         "/api/v1/clients".to_string(),
@@ -1185,7 +1138,7 @@ async fn test_a_pending_account_reads_no_fleet() -> anyhow::Result<()> {
         assert_eq!(
             resp.status(),
             StatusCode::FORBIDDEN,
-            "{path} admitted a pending account"
+            "{path} admitted a disabled account"
         );
     }
     Ok(())
@@ -1415,12 +1368,16 @@ async fn test_the_capability_vocabulary_refuses_a_client_and_an_anonymous_caller
 }
 
 #[tokio::test]
-async fn test_a_pending_account_reads_no_capability_vocabulary() -> anyhow::Result<()> {
+async fn test_a_disabled_account_reads_no_capability_vocabulary() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, _client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadAnyClients]).await?;
-    pipette_web_testkit::set_user_status(&state, &user_id, pipette_plan_types::UserStatus::Pending)
-        .await?;
+    pipette_web_testkit::set_user_status(
+        &state,
+        &user_id,
+        pipette_plan_types::UserStatus::Disabled,
+    )
+    .await?;
 
     let resp = authed_user_get(
         &state,

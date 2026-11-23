@@ -167,7 +167,9 @@ impl PolicyKind {
                 },
             ),
             Self::TtftOverE2e => (3, PolicySettings::default()),
-            Self::ModelParams | Self::SmallerFailed => (0, PolicySettings::default()),
+            Self::ModelParams | Self::SmallerFailed | Self::VaultResource => {
+                (0, PolicySettings::default())
+            }
         };
         CampaignGroupPolicy {
             group_id,
@@ -187,7 +189,11 @@ impl PolicyKind {
     /// re-runs.
     pub fn min_reruns(self) -> u32 {
         match self {
-            Self::Swap | Self::Failed | Self::ModelParams | Self::SmallerFailed => 0,
+            Self::Swap
+            | Self::Failed
+            | Self::ModelParams
+            | Self::SmallerFailed
+            | Self::VaultResource => 0,
             Self::Spread | Self::TtftOverE2e => 1,
         }
     }
@@ -196,17 +202,17 @@ impl PolicyKind {
     pub fn max_reruns(self) -> u32 {
         match self {
             Self::Swap | Self::Spread | Self::TtftOverE2e => MAX_RERUNS,
-            Self::Failed | Self::ModelParams | Self::SmallerFailed => 0,
+            Self::Failed | Self::ModelParams | Self::SmallerFailed | Self::VaultResource => 0,
         }
     }
 
     /// Whether this kind's policy re-runs or marks jobs, which queue-maintenance
-    /// files with the host's authority; `model_params` and `smaller_failed`
-    /// only flag.
+    /// files with the host's authority; `model_params`, `smaller_failed` and
+    /// `vault_resource` only flag.
     pub fn reruns_or_marks(self) -> bool {
         match self {
             Self::Swap | Self::Spread | Self::Failed | Self::TtftOverE2e => true,
-            Self::ModelParams | Self::SmallerFailed => false,
+            Self::ModelParams | Self::SmallerFailed | Self::VaultResource => false,
         }
     }
 
@@ -216,7 +222,11 @@ impl PolicyKind {
     pub fn marks(self) -> bool {
         match self {
             Self::Swap | Self::Spread => true,
-            Self::Failed | Self::TtftOverE2e | Self::ModelParams | Self::SmallerFailed => false,
+            Self::Failed
+            | Self::TtftOverE2e
+            | Self::ModelParams
+            | Self::SmallerFailed
+            | Self::VaultResource => false,
         }
     }
 
@@ -262,7 +272,11 @@ impl PolicyKind {
                 (Some(ms), Some(short)) if positive(ms) && positive(short) => Ok(()),
                 _ => Err(PolicySettingsError::ShortRepetition),
             },
-            Self::Swap | Self::TtftOverE2e | Self::ModelParams | Self::SmallerFailed => {
+            Self::Swap
+            | Self::TtftOverE2e
+            | Self::ModelParams
+            | Self::SmallerFailed
+            | Self::VaultResource => {
                 if numbers.iter().all(Option::is_none) {
                     Ok(())
                 } else {
@@ -614,9 +628,9 @@ mod tests {
     use super::*;
 
     /// Each kind's default re-runs and settings, which pass its check, its
-    /// range, and whether it re-runs or marks, in kind order: model_params and
-    /// smaller_failed come last, off with no re-run and no settings, and take
-    /// neither.
+    /// range, and whether it re-runs or marks, in kind order: model_params,
+    /// smaller_failed and vault_resource come last, off with no re-run and no
+    /// settings, and take neither.
     #[test]
     fn model_params_takes_no_rerun_and_no_setting() -> anyhow::Result<()> {
         let group_id = CampaignGroupId::try_new("group_x")?;
@@ -660,6 +674,7 @@ mod tests {
                 ),
                 (PolicyKind::ModelParams, 0, none.clone(), 0, 0, false),
                 (PolicyKind::SmallerFailed, 0, none.clone(), 0, 0, false),
+                (PolicyKind::VaultResource, 0, none.clone(), 0, 0, false),
             ]
         );
         let kind = PolicyKind::ModelParams;
@@ -771,6 +786,11 @@ mod tests {
         PolicyKind::SmallerFailed,
         codes(&[(FailureCode::DeviceError, 2)]),
         Err(PolicySettingsError::UnexpectedCodes(PolicyKind::SmallerFailed))
+    )]
+    #[case::percent_on_vault_resource(
+        PolicyKind::VaultResource,
+        settings(Some(5.0), None, None),
+        Err(PolicySettingsError::Unexpected(PolicyKind::VaultResource))
     )]
     fn each_kind_takes_its_own_settings(
         #[case] kind: PolicyKind,

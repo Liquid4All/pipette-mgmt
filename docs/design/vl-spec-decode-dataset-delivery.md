@@ -74,6 +74,12 @@ sequenceDiagram
     alt metadata missing (never built)
         M->>A: dataset_cache_missing
         M-->>C: 503 dataset not built (Retry-After)
+    else metadata built from another pin
+        M->>A: dataset_pin_conflict
+        M-->>C: 502 artifact does not match the pin
+    else an asr_eval entry states another sample count
+        M->>A: dataset_sample_count_mismatch
+        M-->>C: 502 artifact does not hold the entry's samples
     else probe.checked_at older than probe_max_age
         M->>A: dataset_probe_stale
         M-->>C: 503 upstream check stale (Retry-After)

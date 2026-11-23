@@ -1,34 +1,23 @@
-# Example plan: unified pipette client, the VL spec-decode benchmark on
-# llama.cpp.
+# Example plan: the VL spec-decode benchmark on llama.cpp.
 #
 # `vl_spec_decode` runs one VL model over an MMSpec dataset and produces one
-# row. This plan runs it twice over the same six datasets: once with a regular
-# model (speculation off) and once with the spec-decoding model (speculation
-# on). Both variants run the same benchmark ids, so their rows share the corpus
-# and the draft length by construction. The comparison between them (decode
-# speedup, end-to-end speedup, greedy identity) is computed outside the
-# management server, from the rows it stores; no client ever sees both rows.
+# row. This plan runs six datasets twice: with a regular model (speculation
+# off) and with a spec-decoding model (speculation on). Both variants run the
+# same benchmark ids, so their rows share the corpus and draft length. The
+# speedup is computed outside the management server from its stored rows; no
+# client ever sees both rows.
 #
-# `speculative_enabled` is the cell's switch. Unset, it follows the model: on
-# for a spec-decoding model, off for a regular one. It is written out below so
-# the plan says what each variant measures.
+# `speculative_enabled` unset follows the model (on for a spec-decoding model,
+# off for a regular one); it is written out so the plan says what it measures.
 #
-# Six datasets rather than one, so they can land on different days, keep
-# `bench_timeout_seconds` sized for one subset, and let one broken dataset fail
-# alone.
+# Six datasets rather than one so each can run on its own day and fail alone.
 #
-# The benchmark ids are the management server's: its catalog pins the corpus and
-# serves it, and there is no local form of this benchmark. `pipette sync` first.
+# The benchmark ids are the management server's: its catalog serves the corpus
+# and there is no local form of this benchmark, so run `pipette sync` first. The
+# `_k8` suffix is `parameter_draft_length`; the catalog also publishes k7 and
+# k9, and listing those in both variants sweeps the draft length.
 #
-# An id's `_k8` suffix is its `parameter_draft_length`; the catalog publishes
-# each subset at k7, k8 and k9. This plan runs the reference condition; listing
-# the siblings sweeps the draft length, both variants together.
-#
-# State written to
-# .pipette-ctl/plans/llamacpp-macos-vl-spec-decode-example/state.jsonl.
-#
-# To queue the same cells on the management server instead, submit the
-# scheduler-mode twin, scheduler/llamacpp-vl-spec-decode.toml.
+# The scheduler-mode twin is scheduler/llamacpp-vl-spec-decode.toml.
 
 plan_id = "llamacpp-macos-vl-spec-decode-example"
 benchmarks = [
@@ -50,19 +39,18 @@ shell       = "posix"
 [retry]
 max_consecutive_failures = 2
 
-# The runtime is the reference harness's own build, not a ggml-org release: the
-# fused drafter (`--spec-type draft-fused`) and the fused markov op
-# (`DRAFT_FUSED`, `GGML_DRAFT_DELTA`) exist only on a llama.cpp fork that
-# publishes no release. Build the reference harness's pinned revision and host
-# the archive once, then point `url` at it:
+# The runtime is the reference harness's llama.cpp fork, which publishes no
+# release: only it has the fused drafter (`--spec-type draft-fused`) and the
+# fused markov op (`DRAFT_FUSED`, `GGML_DRAFT_DELTA`). Build its pinned revision,
+# host the archive, and point `url` at it:
 #
 #   cmake -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build -j --target llama-server llama-bench
 #   tar -czf llama-fork-bin-macos-arm64.tar.gz -C build bin
 #
-# The archive must hold `llama-server` and `llama-bench` (anywhere in it) and the
-# libraries beside them. Both variants run on it, so the two rows differ in the
-# model alone.
+# The archive must hold `llama-server` and `llama-bench` (anywhere in it) and
+# the libraries beside them. Both variants use it, so the rows differ only in
+# the model.
 
 # The regular model: speculation off. `raw` may carry no speculation flag, and
 # `speculative_enabled = true` would be refused: there is no drafter to enable.
@@ -74,29 +62,24 @@ models = [
 runtimes = [
   { type = "llamacpp_cli_stock_tools", source = "remote_archive", url = "https://REPLACE_WITH_HOST/llamacpp/llama-fork-bin-macos-arm64.tar.gz", flavor = "macos-arm64" },
 ]
-# `mmap = true` is load-bearing, and is not the same as leaving it unset. Unset,
-# the client overlays `--load-mode none` (it pins weights in RAM by default).
-# That would (a) diverge from the published protocol, whose server takes no
-# load flag at all and so mmaps, and (b) fail at launch on any build without
-# `--load-mode` (upstream b10105 on); a fork archive has no release tag for the
-# client to check. Authoring `mmap = true` suppresses the overlay and renders no
-# flag at all, which is exactly what the reference harness runs.
+# `mmap = true` is load-bearing. Unset, the client adds `--load-mode none`
+# (weights pinned in RAM), which diverges from the reference protocol (no load
+# flag, so mmap) and fails on a build without `--load-mode` (before b10105).
+# `mmap = true` renders no flag at all, matching the reference harness.
 runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision", speculative_enabled = false, flash_attention = "on", number_gpu_layers = 99, ctx_size = 8192, mmap = true },
 ]
-# `bench_timeout_seconds` bounds the traversal, gate waits included: one
-# readiness gate per sample.
+# `http_timeout_seconds` bounds one turn. `vl_spec_decode` has no default
+# `attempt_timeout_seconds`; one set here would bound each sample, all its
+# turns together.
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision", http_timeout_seconds = 600 },
 ]
 
-# The spec-decoding model: speculation on. The spec-decoding release merges the
-# drafter into the weights, so there is no `draft` file here; a drafter shipped
-# separately would add `draft = "..."` beside `model` and `mmproj`. The fork's
-# release config is ordinary `envs` and `raw`: there is one server, so there is
-# one launch surface. The draft length comes from the benchmark's
-# `parameter_draft_length` and a separate drafter from the model, so neither
-# may be restated.
+# The spec-decoding model: speculation on. Its drafter is merged into the
+# weights, so there is no `draft` file; a separate drafter would add
+# `draft = "..."` beside `model` and `mmproj`. The draft length comes from the
+# benchmark and the drafter from the model, so `raw` may restate neither.
 [[variants]]
 clients = ["mac-m4-max"]
 models = [
@@ -109,5 +92,5 @@ runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision_speculative", speculative_enabled = true, flash_attention = "on", number_gpu_layers = 99, ctx_size = 8192, mmap = true, envs = ["DRAFT_FUSED=1", "GGML_DRAFT_DELTA=16"], raw = ["--spec-type", "draft-fused", "--spec-draft-n-min", "0"] },
 ]
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision_speculative", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "llamacpp_cli_stock_tools", model_type = "gguf_vision_speculative", http_timeout_seconds = 600 },
 ]

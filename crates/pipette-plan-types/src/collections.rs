@@ -26,6 +26,10 @@ impl<T> NonEmptyVec<T> {
         self.0
     }
 
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+        self.0.iter_mut()
+    }
+
     /// The first item, which every `NonEmptyVec` has.
     #[allow(
         clippy::indexing_slicing,

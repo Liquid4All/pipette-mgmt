@@ -35,6 +35,7 @@ pub(super) fn auth_test_client(id: &str, pk_suffix: &str, org: &str) -> anyhow::
         public_key,
         organization: pipette_plan_types::NonEmptyTrimmedString::try_new(org)?,
         client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
+        name: None,
         contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
         status: pipette_core::client::ClientStatus::Approved,
         registered_at: Timestamp::now(),

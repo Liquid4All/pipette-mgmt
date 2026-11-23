@@ -77,7 +77,7 @@
   </p>
   <Loaded of={keys}>
     {#snippet children(listed)}
-      <PreauthKeyTable keys={listed} usage={(key) => usage(key.usage)} busy={work.busy} onrevoke={revoke}
+      <PreauthKeyTable keys={listed} name="keys" usage={(key) => usage(key.usage)} busy={work.busy} onrevoke={revoke}
                        empty="None outstanding. A single-use key is gone once it registers a device." />
     {/snippet}
   </Loaded>

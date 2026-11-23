@@ -1,4 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { render } from "svelte/server";
+import { describe, expect, test, vi } from "vitest";
+import TableBar from "../src/lib/components/TableBar.svelte";
 import { rosterTable } from "../src/lib/accounts";
 import { benchmarkTable } from "../src/lib/benchmarks";
 import { campaignTable, progressText } from "../src/lib/campaigns";
@@ -7,16 +9,20 @@ import { ORG_TABLE } from "../src/lib/orgs";
 import { planTable } from "../src/lib/plans";
 import { vaultTable } from "../src/lib/vault";
 import {
-  ariaSort, choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, rowCount, sortBy, statePairs,
-  tableState,
-  tableView, toggledIn, withCursor, type CursorPage, type Picks, type TableSpec,
+  BLANK, ariaSort, choicesOf, cleared, compareRaw, drawnColumns, everyPage, filtering, nextSort, ownQuery, rowCount, sortBy,
+  statePairs, tableState,
+  tableView, toggledIn, unfiltered, withCursor, withOthers, type CursorPage, type Picks, type TableSpec,
 } from "../src/lib/table";
 import { PickedColumns } from "../src/lib/picked.svelte";
 import type { CampaignView, ClientListRow, OrgView, PlanView } from "../src/lib/api-types";
 import { drawnKeys, stubStorage } from "./picks";
 
+// TableBar imports it, and it reads `location` as it loads.
+vi.mock("../src/lib/route.svelte", () => ({ redirect: () => {} }));
+
 interface Row { id: string; name: string; size: number | null; tags: string[] }
 const SPEC: TableSpec<Row> = {
+  sort: "name",
   columns: [
     { key: "name", label: "name", raw: (row) => row.name },
     { key: "size", label: "size", raw: (row) => row.size },
@@ -32,13 +38,23 @@ const ROWS: Row[] = [
 const view = (query: string) => tableView(SPEC, tableState(SPEC, new URLSearchParams(query)), ROWS).map((r) => r.id);
 
 describe("a table read in the browser", () => {
-  test("reads its state from the address, a sort by a missing column dropped, and writes it back", () => {
+  test("reads its state from the address, its own sort for a missing column, and writes it back", () => {
     const state = tableState(SPEC, new URLSearchParams("q=%20box%20&tag=a&tag=a&tag=&sort=-size&offset=50"));
     expect(state).toEqual({ texts: { q: "box" }, choices: { tag: ["a"] }, sort: "-size" });
     expect(statePairs(state)).toEqual([["q", "box"], ["tag", "a"], ["sort", "-size"]]);
-    expect(tableState(SPEC, new URLSearchParams("sort=nope")).sort).toBe("");
+    expect(["sort=nope", ""].map((query) => tableState(SPEC, new URLSearchParams(query)).sort)).toEqual(["name", "name"]);
     expect([filtering(state), filtering(cleared(state)), cleared(state).sort]).toEqual([true, false, "-size"]);
     expect(toggledIn(toggledIn(state, "tag", "b", true), "tag", "a", false).choices).toEqual({ tag: ["b"] });
+  });
+
+  test("a named table reads its own pairs of the address, and its links keep the other tables'", () => {
+    const query = new URLSearchParams("sort=-filed&policy=spread&gaps.sort=rows&gaps.offset=50&filings.q=aa");
+    expect(ownQuery(query, "gaps").toString()).toBe("sort=rows&offset=50");
+    expect(ownQuery(query, "")).toBe(query);
+    expect(withOthers(query, "gaps", [["sort", "-jobs"]]))
+      .toEqual([["sort", "-filed"], ["policy", "spread"], ["filings.q", "aa"], ["gaps.sort", "-jobs"]]);
+    expect(withOthers(query, "", [["sort", "name"]]))
+      .toEqual([["gaps.sort", "rows"], ["gaps.offset", "50"], ["filings.q", "aa"], ["sort", "name"]]);
   });
 
   test("counts what the filters keep, one row by its singular", () => {
@@ -48,10 +64,12 @@ describe("a table read in the browser", () => {
   });
 
   test("keeps a row whose text holds the box's, case aside, and any of a select's choices", () => {
-    expect(view("q=BOX")).toEqual(["r1", "r2"]);
+    // By name, the spec's sort: `Box 9` before `box 10`.
+    expect(view("q=BOX")).toEqual(["r2", "r1"]);
     expect(view("tag=b")).toEqual(["r2"]);
     expect(view("tag=a&tag=b&q=crate")).toEqual([]);
-    expect(view("")).toEqual(["r1", "r2", "r3"]);
+    expect(view(`tag=${BLANK}`)).toEqual(["r3"]);
+    expect(view("")).toEqual(["r2", "r1", "r3"]);
   });
 
   test("sorts numbers by size and text with its numbers by size, none last either way", () => {
@@ -66,7 +84,49 @@ describe("a table read in the browser", () => {
   });
 
   test("offers each select's values counted, in the order it fixes, else by name", () => {
-    expect(choicesOf(SPEC, ROWS, {}).tag).toEqual([{ value: "b", label: "b", count: 1 }, { value: "a", label: "a", count: 2 }]);
+    expect(choicesOf(SPEC, ROWS, unfiltered(SPEC)).tag).toEqual([{ value: "b", label: "b", count: 1 },
+      { value: "a", label: "a", count: 2 }, { value: BLANK, label: "(blank)", count: 1 }]);
+  });
+
+  test("counts a select over the rows the other filters keep, never narrowing it by its own choices", () => {
+    const tags = (query: string) => choicesOf(SPEC, ROWS, tableState(SPEC, new URLSearchParams(query))).tag
+      ?.map((c) => [c.value, c.count]);
+    expect(tags("tag=a")).toEqual([["b", 1], ["a", 2], [BLANK, 1]]);
+    expect(tags("q=10")).toEqual([["a", 1]]);
+    expect(tags("q=crate&tag=b")).toEqual([["b", 0], [BLANK, 1]]);
+    expect(tags("q=10&tag=b")).toEqual([["b", 0], ["a", 1]]);
+    // Emptied by the text box, the select stays to be drawn; with no row holding a tag, it is left out.
+    expect(tags("q=zzz")).toEqual([]);
+    expect(choicesOf(SPEC, [ROWS[2]!], unfiltered(SPEC)).tag).toBeUndefined();
+  });
+
+  test("counts each value as the rows a pick of it alone lists, offering every value that lists one", () => {
+    const check = <R>(spec: TableSpec<R>, rows: readonly R[], ...queries: string[]) => queries.forEach((query) => {
+      const state = tableState(spec, new URLSearchParams(query));
+      const choices = choicesOf(spec, rows, state);
+      Object.entries(choicesOf(spec, rows, unfiltered(spec))).forEach(([key, every]) => every.forEach(({ value }) => {
+        const count = choices[key]?.find((choice) => choice.value === value)?.count ?? 0;
+        const picked = { ...state, choices: { ...state.choices, [key]: [value] } };
+        expect([query, key, value, count]).toEqual([query, key, value, tableView(spec, picked, rows).length]);
+      }));
+    });
+    check(SPEC, ROWS, "", "q=box", "tag=b", `tag=${BLANK}`, "q=zzz");
+    const device = (client_id: string, device_os_name: string, device_chip_model: string | null) =>
+      ({ client_id, device_os_name, device_chip_model, permissions: [], reindex_pending: false }) as unknown as ClientListRow;
+    check(deviceTable(0), [device("c1", "iOS", "A17"), device("c2", "iOS", null), device("c3", "Android", "SD8")],
+          "", "os=iOS", `chip=${BLANK}`, "os=Android&chip=A17");
+  });
+
+  test("draws a select the other filters empty, and leaves out one no row has a value for", () => {
+    const bar = (rows: readonly Row[], query: string) => {
+      const state = tableState(SPEC, new URLSearchParams(query));
+      return render(TableBar<Row>, { props: {
+        spec: SPEC, state, choices: choicesOf(SPEC, rows, state), kept: 0, total: rows.length, noun: "rows",
+        link: () => "",
+      } }).body;
+    };
+    expect(bar(ROWS, "q=zzz")).toMatch(/<span[^>]*>tag<\/span>[\s\S]*Nothing to choose\./);
+    expect(bar([ROWS[2]!], "")).not.toMatch(/<span[^>]*>tag<\/span>/);
   });
 
   test("reads every page of a cursor listing, the names and unreadable records of all", async () => {
@@ -175,16 +235,18 @@ describe("the listings' tables", () => {
       .toEqual([["campaign_1"], ["campaign_2"], ["campaign_2"], ["campaign_1", "campaign_2"]]);
     expect(spec.texts).toMatchObject([{ key: "q", label: "search", placeholder: "campaign id, name, label, model or tag", wide: true }]);
     expect(ids("status=not_started")).toEqual(["c2"]);
-    expect(choicesOf(spec, rows, {}).status!.map((c) => c.label)).toEqual(["active", "complete", "not started"]);
+    expect(choicesOf(spec, rows, unfiltered(spec)).status!.map((c) => c.label)).toEqual(["active", "complete", "not started"]);
     // A locked campaign's status is `locked` whatever its plan runs, as an archived one's is `archived`.
     const locked: CampaignView = { ...row("c4", 5, "active"), state: "locked", state_note: "release" };
     expect(tableView(spec, tableState(spec, new URLSearchParams("status=locked")), [...rows, locked])
       .map((r) => r.campaign_id)).toEqual(["c4"]);
-    expect(choicesOf(spec, rows, {}).owner).toEqual([{ value: "org_a", label: "Acme", count: 3 }]);
-    // A choice the address holds that no row has is offered under its name, so it can be unchecked.
-    const started = choicesOf(spec, [rows[0]!, rows[2]!], { status: ["active", "not_started"], owner: ["org_gone"] });
-    expect(started.status!.map((c) => [c.label, c.count])).toEqual([["active", 1], ["complete", 1], ["not started", 0]]);
-    expect(started.owner).toEqual([{ value: "org_a", label: "Acme", count: 2 }, { value: "org_gone", label: "org_gone", count: 0 }]);
+    expect(choicesOf(spec, rows, unfiltered(spec)).owner).toEqual([{ value: "org_a", label: "Acme", count: 3 }]);
+    // A choice the address holds that no row has is offered under its name, so it can be unchecked. The owner chosen
+    // keeps no row, so no status counts one.
+    const started = choicesOf(spec, [rows[0]!, rows[2]!],
+                              tableState(spec, new URLSearchParams("status=active&status=not_started&owner=org_gone")));
+    expect(started.status!.map((c) => [c.label, c.count])).toEqual([["active", 0], ["not started", 0]]);
+    expect(started.owner).toEqual([{ value: "org_a", label: "Acme", count: 1 }, { value: "org_gone", label: "org_gone", count: 0 }]);
   });
 
   test("plans, organizations and devices name their submitters, counts and makes", () => {
@@ -205,17 +267,22 @@ describe("the listings' tables", () => {
       .toEqual(["z", "a"]);
     // A click past descending returns to that order.
     expect(nextSort("-display_name", "display_name")).toBe("");
-    const device = (client_id: string, device_os_name: string) =>
-      ({ client_id, device_os_name, permissions: [], reindex_pending: false }) as unknown as ClientListRow;
-    const devices = deviceTable(false, {}, 0);
-    expect(choicesOf(devices, [device("c1", "iOS"), device("c2", "iOS"), device("c3", "Android")], {}).os)
+    const device = (client_id: string, device_os_name: string, device_chip_model: string) =>
+      ({ client_id, device_os_name, device_chip_model, permissions: [], reindex_pending: false }) as unknown as ClientListRow;
+    const devices = deviceTable(0);
+    const fleet = [device("c1", "iOS", "A17"), device("c2", "iOS", "A18"), device("c3", "Android", "SD8")];
+    expect(choicesOf(devices, fleet, unfiltered(devices)).os)
       .toEqual([{ value: "Android", label: "Android", count: 1 }, { value: "iOS", label: "iOS", count: 2 }]);
+    // An OS chosen narrows the chips to its own, and the OS select still offers the other.
+    const ios = choicesOf(devices, fleet, tableState(devices, new URLSearchParams("os=iOS")));
+    expect([ios.os!.map((c) => [c.value, c.count]), ios.chip!.map((c) => [c.value, c.count])])
+      .toEqual([[["Android", 1], ["iOS", 2]], [["A17", 1], ["A18", 1]]]);
   });
 
   test("every listing opens on its record's id, which links to its page and has a filter box of its own but a campaign's", () => {
     const specs: Record<string, TableSpec<never>> = {
       campaign_id: campaignTable({}, true), plan_id: planTable({}, true), org_id: ORG_TABLE,
-      client_id: deviceTable(true, {}, 0), user_id: rosterTable({ kind: "all" }, () => null),
+      client_id: deviceTable(0), user_id: rosterTable({ kind: "all" }, () => null),
       resource_id: vaultTable({}, "model"), benchmark_id: benchmarkTable([]),
     };
     for (const [id, spec] of Object.entries(specs)) {
@@ -227,6 +294,8 @@ describe("the listings' tables", () => {
       if (id !== "campaign_id") expect(spec.texts![0], id).toMatchObject({ key: "id", label: id });
       // A sort and a pick go by key, so no two columns share one.
       expect(new Set(spec.columns.map((column) => column.key)).size, id).toBe(spec.columns.length);
+      // The sort it opens in, which the address then names, is by a column it has.
+      expect(spec.columns.map((column) => column.key), id).toContain(spec.sort.replace(/^-/, ""));
     }
   });
 });

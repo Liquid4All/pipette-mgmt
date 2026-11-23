@@ -39,9 +39,6 @@ pub struct UserPermissionSet(pub BTreeSet<String>);
 #[strum(serialize_all = "snake_case")]
 pub enum UserStatus {
     Active,
-    /// Requested, unadmitted: it authenticates nothing until an operator admits
-    /// it.
-    Pending,
     Disabled,
 }
 
@@ -260,7 +257,7 @@ pub struct CreateUserRequest {
     #[serde(default)]
     pub permissions: Vec<UserPermission>,
     /// Which organization it joins; omitted by a scoped caller, the caller's
-    /// own.
+    /// own, and by a server admin, a new one the account administers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub org_id: Option<OrgId>,
@@ -423,20 +420,15 @@ pub struct UserPreauthKeyMinted {
     pub token: UserPreauthKey,
 }
 
-/// `PUT /api/v1/users/{user_id}/org` request body. A `null` `org_id` clears
-/// the membership; the key is required and unknown keys are refused, so `{}`
-/// is a `400` rather than a clear.
+/// `PUT /api/v1/users/{user_id}/org` request body: the organization the account
+/// moves to. An account always belongs to one; disabling it takes it out of
+/// service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SetUserOrgRequest {
-    // Required though nullable: derive alone reads a missing `Option` as `None`.
-    #[serde(deserialize_with = "Option::deserialize")]
-    #[cfg_attr(
-        feature = "schemars",
-        schemars(required, schema_with = "crate::body_values::nullable::<String>")
-    )]
-    pub org_id: Option<OrgId>,
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub org_id: OrgId,
 }
 
 /// An account as the membership routes answer it: the record and its
@@ -451,9 +443,9 @@ pub struct OrgUserRow {
     pub org_id: Option<OrgId>,
 }
 
-/// `POST /api/v1/users/register` request body: exactly one of
-/// `user_preauth_key` (an operator's invite naming the account) and
-/// `contact_email` (a request for a new, pending account).
+/// `POST /api/v1/users/register` request body: a key for the account an
+/// invite names. Nothing asks for an account here: one comes from a Clerk
+/// sign-in or an administrator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -462,11 +454,7 @@ pub struct RegisterUserKeyRequest {
     pub public_key: PublicKeyHex,
     /// The invite an administrator minted for the account: the `token` the
     /// mint answered, `user_preauth_{key_id}.{secret}`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_preauth_key: Option<UserPreauthKey>,
-    /// Where to reach whoever asks for a new account, which starts `pending`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contact_email: Option<ContactEmail>,
+    pub user_preauth_key: UserPreauthKey,
     /// The machine the key lives on, e.g. `"work laptop"`; at most 4096 characters.
     pub key_details: NonEmptyTrimmedString,
 }
@@ -498,6 +486,10 @@ pub struct RegisterClerkUserKeyRequest {
     /// The browser the key lives in, as the account's key listing shows it; at
     /// most 4096 characters.
     pub key_details: NonEmptyTrimmedString,
+    /// The name of the organization a first sign-in creates for the account;
+    /// `<email>'s personal org` when omitted. Ignored once the account exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<NonEmptyTrimmedString>,
 }
 
 #[cfg(test)]

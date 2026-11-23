@@ -9,16 +9,12 @@ they sign in with.
 [Accounts and keys](#accounts-and-keys) describes the user
 model, and how a user signs its requests.
 
-An account comes to exist one of three ways, and each ends at an
-administrator's decision: `pipette-mgmt users create` mints one directly, an
-account holding `manage_orgs` creates one with
-[`POST /api/v1/users`](users/create_user.md), or a machine **requests** one at
-[`POST /api/v1/users/register`](users/register_user_key.md) and it stays
-`pending` until `pipette-mgmt users approve` or a `manage_any_orgs` holder at
-[`PATCH /api/v1/users/{user_id}`](users/update_user.md) admits it (a requested
-account belongs to no organization, so a scoped caller cannot reach it,
-[the rules that make delegation safe](#the-rules-that-make-delegation-safe)).
-The first two register no key, so the holder signs in only by registering with
+An account comes to exist one of three ways: `pipette-mgmt users create` mints
+one directly, an account holding `manage_orgs` creates one with
+[`POST /api/v1/users`](users/create_user.md), or a first Clerk sign-in creates
+it ([signing in through Clerk](#signing-in-through-clerk)). Nothing asks for an
+account and waits: there is no `pending` account. The first two register no
+key, so the holder signs in only by registering with
 a user pre-auth key ([`POST /api/v1/users/register`](users/register_user_key.md)),
 which an administrator of the account mints over HTTP
 ([`POST /api/v1/users/{user_id}/preauth-keys`](users/mint_preauth_key.md)) or an
@@ -55,7 +51,7 @@ holds one of each.
 
 | Field | What it means to a caller |
 |---|---|
-| `status` | `active`: signs and acts. `pending`: an account a machine requested, which reaches only [`GET /api/v1/users/me`](users/get_own_user.md) until an operator admits it. `disabled`: offboarded, refused everywhere, every key included; enabling restores the keys. An account an operator or an administrator creates, or a Clerk provision rule, starts `active` |
+| `status` | `active`: signs and acts. `disabled`: offboarded, refused everywhere, every key included; enabling restores the keys. Every account starts `active` |
 | `account_type` | `human`, or `service` for a job's account, which works for one organization, administers nothing, and never signs in through Clerk ([the rules that make delegation safe](#the-rules-that-make-delegation-safe)) |
 | `contact_email` | Stored case-folded and **unique across accounts**: `Operator@` and `operator@` are one account, `operator+ci@` is another. Never verified by this server |
 | `campaign_scope` | Only on a campaign reader: the campaigns it reads, and the only ones |
@@ -107,7 +103,7 @@ The public key goes over the wire as 64 hex characters. The key id is
 never has to ask for it. `key.pem` is the only secret, and it never leaves the
 machine.
 
-**2. Register it to an account.** Use one of four routes:
+**2. Register it to an account.** Use one of three routes:
 
 - **Approving it in the app.** A person who signs in to the app adds the key
   to their own account. Open this link, sign in if asked, and type the code it
@@ -140,11 +136,6 @@ machine.
   one the key signs until it is revoked. Only an `active` account may do this,
   and not a service account or a campaign reader: their administrator mints a
   pre-auth key instead.
-- **Asking for an account.** Send `POST /api/v1/users/register` with
-  `public_key`, `key_details` and a `contact_email`, and no pre-auth key. The
-  account is created `pending` and reaches nothing but `GET /api/v1/users/me`
-  until an operator runs `pipette-mgmt users approve <user_id>`
-  ([user routes](#user-routes)).
 
 **3. Sign every request** in the RFC 9421 profile that the `userSignature` scheme describes. The signature base
 is one line per covered component, then the parameters line, with no newline
@@ -232,8 +223,7 @@ If `sign.sh` fails, curl still runs, unsigned, and the answer is a `401`, so run
 It signs as its account, and the account's standing and permissions decide every
 request:
 
-- **Standing** is checked first. A `pending` account reaches only
-  `GET /api/v1/users/me`, and a `disabled` one reaches nothing.
+- **Standing** is checked first. A `disabled` account reaches nothing.
 - **Permissions** come next ([permissions](#permissions)). Each is one
   operation at one scope: a bare name such as `read_plans` reaches the
   caller's own organization and campaigns, and its `_any_` form reaches every
@@ -265,7 +255,7 @@ A refusal tells you which check failed:
 - `401` means the signature or the key: a malformed or stale signature, a
   spent nonce, an `@authority` the server does not answer to, or a key that is
   unknown, expired or revoked.
-- `403` means the account: it is `pending` or `disabled`, or it lacks the
+- `403` means the account: it is `disabled`, or it lacks the
   permission the route names, as in `user lacks the read_any_plans permission`
   ([status, then permission](#status-then-permission)).
 
@@ -343,16 +333,21 @@ the standing check a signed request does. What else is refused:
 
 | Status | When |
 |---|---|
-| 403 | The address is outside `allowed_domains` (its domain matched exactly), when set; the account is `pending` or `disabled`; it is a service account; no account holds the address and no provision rule covers its domain; or the rule's organization is disabled |
+| 403 | The address is outside `allowed_domains` (its domain matched exactly), when set; the account is `disabled`; it is a service account; no account holds the address, no provision rule covers its domain and `allowed_domains` is empty; or the rule's organization is disabled |
 | 409 | The keypair is registered to another principal, or a claim on the address was left unfinished; retry |
 
 An address no account holds, at a domain a provision rule names, gets an
 account created `active` in that rule's organization, holding the `org_member`
-group ([defaults](#defaults-and-groups)). A sign-in counts as the account's
+group ([defaults](#defaults-and-groups)). At a domain listed in
+`allowed_domains` that no rule names, it gets an account created `active` in a
+new organization of its own, holding the `org_admin` group. The body's
+`org_name` names it, `<email>'s personal org` when omitted, and its slug is
+`u-` followed by the account's id: `u-` is reserved, so no organization create
+takes one. With `allowed_domains`
+empty, such an address is refused, so an empty list never opens sign-up to
+every address. A sign-in counts as the account's
 first, so from then on no administrator can mint a pre-auth key that signs in
-as it ([`POST /api/v1/users/{user_id}/preauth-keys`](users/mint_preauth_key.md)),
-and a keyless [`POST /api/v1/users/register`](users/register_user_key.md) for
-an address a rule covers is refused, so nobody can claim that account first.
+as it ([`POST /api/v1/users/{user_id}/preauth-keys`](users/mint_preauth_key.md)).
 Clerk vouches for addresses, so it reaches every account whose address it can
 verify within `allowed_domains`, not only the ones it created.
 
@@ -429,10 +424,8 @@ routes that return device records need `read_clients` as well
 Every route checks, in order, and stops at the first refusal:
 
 1. **Authentication**: a missing or failing signature is `401`.
-2. **Status**: `403` with `user is pending an operator's approval` or
-   `user is disabled` (a device: `client is not approved`). A pending account
-   reaches [`GET /api/v1/users/me`](users/get_own_user.md) alone, so it can
-   watch for its admission.
+2. **Status**: `403` with `user is disabled` (a device:
+   `client is not approved`).
 3. **Permission**: `403` with `user lacks the {permission} permission`, or, for
    a name the account's type can never hold,
    `a service account cannot hold the {permission} permission` or
@@ -455,11 +448,11 @@ effect on the next one.
 
 Some rights need no permission: anyone browses the public benchmark catalog,
 and an active account reads its own record and keys, revokes its own keys
-and, unless it is a service account, adds one, and reaches its own vault
-resources and, by membership, its organization's catalog and vault resources.
+and, unless it is a service account, adds one, and reaches, by membership, its
+organization's catalog and vault resources.
 A campaign reader still reads its own record and gets the public catalog. It
-is refused (`403`) on the routes that add or revoke its own keys and on its own
-and its organization's vault resources and private catalog, since they scope by
+is refused (`403`) on the routes that add or revoke its own keys and on its
+organization's vault resources and private catalog, since they scope by
 owner or membership rather than by its campaigns.
 
 ### Defaults and groups
@@ -469,8 +462,7 @@ time: a create states its set ([`POST /api/v1/users`](users/create_user.md)), an
 administrator changes it
 ([`PUT`](users/set_permissions.md) and
 [`PATCH /api/v1/users/{user_id}/permissions`](users/amend_permissions.md)),
-and a requested account holds nothing until an operator admits and grants it. A
-user pre-auth key carries no grant, and registering a key never changes the
+and a Clerk sign-in grants its group. A user pre-auth key carries no grant, and registering a key never changes the
 set. A device's registration holds `submit_results` unless the client
 pre-auth key it used carries a template
 ([client pre-auth keys](devices.md#client-pre-auth-keys)).
@@ -525,7 +517,7 @@ grantable to an account, nor the reverse.
 
 ## Account administration
 
-Listing, creating, admitting and disabling accounts, granting what they hold,
+Listing, creating and disabling accounts, granting what they hold,
 and the keys they sign in with. **This is the delegation surface**: an
 organization onboards its people without a server admin. `pipette-mgmt users`
 is the shell-side equivalent.
@@ -602,8 +594,7 @@ up after one. Rank still limits whose names it may revoke.
 
 **A pre-auth key onboards; it never takes over.** Whoever holds one registers a
 key that signs as the account, and some of what an account reaches is its own
-rather than a grant: its own vault resources, its campaigns, the plans it
-filed. So an administrator mints one only for an account **nobody has signed in
+rather than a grant: its keys and the plans it filed. So an administrator mints one only for an account **nobody has signed in
 as yet**, and only when the caller holds every name in the account's resolved
 set and the account holds no name this build cannot compare. Registration
 checks all of it again
@@ -642,7 +633,7 @@ other ([who may do what](campaigns.md#who-may-do-what)).
 **A campaign reader reads its campaigns alone.** A service account with a
 `campaign_scope` reads the campaigns it names and their plans while its own
 organization owns them, and nothing else: not its organization's other
-campaigns, not a personal campaign, nor any plan filed outside a campaign. A
+campaigns, nor any plan filed outside a campaign. A
 campaign handed to another organization drops out of its reach though the scope
 still names it. It is what a job that publishes results signs as.
 [`POST /api/v1/users`](users/create_user.md) creates one, and
@@ -683,10 +674,9 @@ An account **cannot disable itself**, nor remove its own `manage_orgs` or
 (`400` each), so a caller cannot lock itself out of the surface that would
 undo it.
 
-**No route deletes an account.** Offboarding is a disable: the account's
-campaigns, vault resources and filed plans keep naming a principal that exists,
-where a delete would leave them under an id that never resolves again. The host's
-[`users delete`](../cli.md#pipette-mgmt-users-createlistshowapproveset-typeset-campaignsdisableenabledeleterelease-claimset-org)
-remains for an account created in error. It refuses while the account owns a
-campaign or a vault resource, and while it owns a device unless `--detach`
-releases the devices.
+**No route deletes an account.** Offboarding is a disable: the account's filed
+plans keep naming a principal that exists, where a delete would leave them
+under an id that never resolves again. The host's
+[`users delete`](../cli.md#pipette-mgmt-users-createlistshowset-typeset-campaignsdisableenabledeleterelease-claimset-org)
+remains for an account created in error. An account owns nothing, so it
+refuses nothing.

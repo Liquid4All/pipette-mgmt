@@ -25,11 +25,16 @@ pub struct ClientUpdate {
     pub organization: Option<NonEmptyTrimmedString>,
     pub client_details: Option<NonEmptyTrimmedString>,
     pub contact_email: Option<ContactEmail>,
+    /// A blank string clears the name.
+    pub name: Option<String>,
 }
 
 impl ClientUpdate {
     pub fn is_empty(&self) -> bool {
-        self.organization.is_none() && self.client_details.is_none() && self.contact_email.is_none()
+        self.organization.is_none()
+            && self.client_details.is_none()
+            && self.contact_email.is_none()
+            && self.name.is_none()
     }
 }
 
@@ -89,6 +94,9 @@ pub async fn update(
     client_id: &ClientId,
     update: ClientUpdate,
 ) -> Result<Applied<(Client, Vec<String>)>, ClientAdminError> {
+    let name = update
+        .name
+        .map(|name| NonEmptyTrimmedString::try_new(name).ok());
     let applied = replace(clients, client_id, |client| {
         let mut changes = Vec::new();
         if let Some(value) = &update.organization
@@ -117,6 +125,12 @@ pub async fn update(
                 client.contact_email, value
             ));
             client.contact_email = value.clone();
+        }
+        if let Some(value) = &name
+            && client.name != *value
+        {
+            changes.push(format!("name: {:?} -> {:?}", client.name, value));
+            client.name = value.clone();
         }
         (!changes.is_empty()).then_some(changes)
     })
@@ -453,6 +467,7 @@ mod tests {
             public_key: pipette_plan_types::PublicKeyHex::try_new("ab".repeat(32))?,
             organization: NonEmptyTrimmedString::try_new("lab")?,
             client_details: NonEmptyTrimmedString::try_new("rig")?,
+            name: None,
             contact_email: ContactEmail::try_new("ops@example.test")?,
             status: ClientStatus::Pending,
             registered_at: Timestamp::now(),

@@ -36,10 +36,10 @@
   <p class="err" role="alert">{refusal}</p>
 {:else}
   <p class="muted">
-    An organization is addressed by its handle: lower-case letters, digits,
-    <code>-</code> and <code>_</code>, at most 64 characters, never starting with
-    <code>org_</code>, and it never changes. The display name is what a person
-    reads, and changes freely.
+    Use up to 64 ASCII letters, digits, hyphens, or underscores. The handle is stored
+    in lowercase and cannot change. It cannot start with <code>org_</code>.
+    The descriptor catalog reserves <code>global</code> for <code>global/&lt;name&gt;</code>.
+    You can change the display name later.
   </p>
   {#if work.error}<p class="err" role="alert">{work.error}</p>{/if}
   <form onsubmit={create}>

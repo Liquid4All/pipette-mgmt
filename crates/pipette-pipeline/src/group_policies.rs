@@ -1,10 +1,10 @@
 //! Campaign group policies: the four checks that re-run and mark, read as the
-//! console reads them, and the model params and smaller failed checks, which
-//! only flag; what the policies would re-run and mark in one member campaign's
-//! current plan, job by job, as its results land, the revision that files it,
-//! the queue-maintenance pass that does so for every group and records how each
-//! re-run answers, and the backfill of the re-runs filed before it recorded
-//! them.
+//! console reads them, and the model params, smaller failed and vault resource
+//! checks, which only flag; what the policies would re-run and mark in one
+//! member campaign's current plan, job by job, as its results land, the
+//! revision that files it, the queue-maintenance pass that does so for every
+//! group and records how each re-run answers, and the backfill of the re-runs
+//! filed before it recorded them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -24,12 +24,13 @@ use pipette_core::campaign::{
     Campaign, CampaignGroup, GroupFiling, GroupPolicyState, JobPolicyState, RecordedModel, Refusal,
 };
 use pipette_core::config::Config;
-use pipette_core::plan::{PlanManifest, PlanSummary};
+use pipette_core::plan::{PlanManifest, PlanSummary, ProgressSnapshot};
 use pipette_plan_types::{
     AuditAction, AuditOutcome, AuditTarget, BenchmarkId, CampaignGroupId, CampaignGroupPolicy,
     CampaignId, ExpiresAt, FailureCode, FailureSource, JobId, MAX_RERUNS, ModelParamsGap,
-    NonEmptyTrimmedString, PlanId, PlanStatus, PolicyCheckCounts, PolicyKind, PolicyMemberState,
-    PolicyRerun, PolicySettings, PolicySkipReason, RerunOutcome, RevisionChange, SmallerFailure,
+    NonEmptyTrimmedString, PlanId, PlanStatus, PolicyCheckCounts, PolicyDeferral, PolicyKind,
+    PolicyMemberState, PolicyRerun, PolicySettings, PolicySkipReason, RerunOutcome, RevisionChange,
+    SmallerFailure, names_vault_source,
 };
 use pipette_store::{
     CampaignGroupStore, GroupMember, JobHolder, JobHolderListing, JobStateChanges, PlanStore,
@@ -119,11 +120,80 @@ pub struct Evaluation {
     /// What holds the member before its rows are read, for the states
     /// `waiting_for_devices`, `filing_not_advanced` and `refused`.
     pub hold: Option<Hold>,
+    /// The head's progress snapshot supplies the counts that set the interval
+    /// between filings. This is `None` if the evaluation has no snapshot.
+    pub pace: Option<Pace>,
+    /// The saved filing time or the creation time of a recovered group filing.
+    pub last_filed_at: Option<Timestamp>,
     /// What the policy pass keeps of a member whose rows it read, or failed to
     /// read, which [`file()`] completes with its filing, or of one its queued
     /// re-runs or a refusal holds; `None` from the preview and for a member not
     /// read.
     pub record: Option<GroupPolicyState>,
+}
+
+/// The longest interval between filings into one member, and the interval for
+/// each job that waits per busy device. A filing costs work in proportion to
+/// the whole plan, so it waits while devices have work.
+const MAX_FILING_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const INTERVAL_PER_WAITING_JOB: Duration = Duration::from_secs(60);
+
+/// The job counts from the progress snapshot of a member's head. `remaining`
+/// jobs wait for a device that can run them. `running` jobs are on devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    remaining: u64,
+    running: u64,
+}
+
+impl Pace {
+    fn of(snapshot: &ProgressSnapshot) -> Self {
+        let starved: usize = snapshot
+            .starved
+            .iter()
+            .map(|group| group.job_ids.len())
+            .sum();
+        Self {
+            remaining: snapshot
+                .counts
+                .available
+                .saturating_sub(u64::try_from(starved).unwrap_or(u64::MAX)),
+            running: snapshot.counts.running,
+        }
+    }
+
+    /// The interval is one minute for each whole job that waits per busy
+    /// device. It is at least one minute and at most 30 minutes.
+    fn interval(&self) -> Duration {
+        let per_device = self.remaining / self.running.max(1);
+        INTERVAL_PER_WAITING_JOB
+            .saturating_mul(u32::try_from(per_device).unwrap_or(u32::MAX))
+            .clamp(INTERVAL_PER_WAITING_JOB, MAX_FILING_INTERVAL)
+    }
+}
+
+/// The next eligible filing time, if that time is after `now`. The result is
+/// `None` if the previous filing time or the pace is missing. It is also
+/// `None` if the deadline comes at or before one maintenance tick after the
+/// interval ends, so the filing is not late. A wait longer than one interval
+/// from `now` means that the clock stepped back, so the result is `None`.
+fn not_before(
+    filed_at: Option<Timestamp>,
+    pace: Option<Pace>,
+    deadline: Option<Timestamp>,
+    now: Timestamp,
+) -> Option<Timestamp> {
+    let interval = pace?.interval();
+    let until = filed_at?.checked_add(interval).ok()?;
+    let before_deadline = deadline.is_none_or(|deadline| {
+        until
+            .checked_add(BUDGET)
+            .is_ok_and(|next_tick| next_tick < deadline)
+    });
+    let within_interval = now
+        .checked_add(interval)
+        .is_ok_and(|latest| until <= latest);
+    (until > now && within_interval && before_deadline).then_some(until)
 }
 
 /// Why the policy pass reads no rows of a member this round.
@@ -198,12 +268,12 @@ pub struct BodyReads<'a> {
 /// does one whose own read fails or times out. A member whose last group
 /// filing has not been taken up, or whose head was refused under this build
 /// and the same policies that re-run or mark, is held; the preview still reads
-/// the rows of one that waits for devices or was refused, for the model params
-/// check. The policy pass leaves out the jobs decided under the same policies
-/// and counts only the policies that are on; the preview reads every answered
-/// job and counts each policy, on or off. With [`Pass::bodies`], the rows of
-/// an answered job with none in pipette-duckdb come from its submission body,
-/// and they act only by a re-run. It writes nothing: the policy pass
+/// the rows of one that waits for devices or was refused, for the checks that
+/// only flag. The policy pass leaves out the jobs decided under the same
+/// policies and counts only the policies that are on; the preview reads every
+/// answered job and counts each policy, on or off. With [`Pass::bodies`], the
+/// rows of an answered job with none in pipette-duckdb come from its submission
+/// body, and they act only by a re-run. It writes nothing: the policy pass
 /// cancels the filing a [`Hold::NotAdvanced`] names. Failed plan-store reads
 /// return errors. Failed submission-body or vault-name reads leave jobs
 /// waiting for result rows.
@@ -251,6 +321,8 @@ pub async fn evaluate(
         read: Vec::new(),
         job_states: None,
         hold: None,
+        pace: None,
+        last_filed_at: None,
         record: None,
     };
     if let Some(hold) = unadvanced(plans, pass.state, campaign).await? {
@@ -263,15 +335,21 @@ pub async fn evaluate(
     let head = match head(plans, group, campaign).await? {
         Ok(head) => head,
         Err(state) => {
+            let record =
+                (!pass.preview && pass.state.deferred.is_some()).then(|| GroupPolicyState {
+                    deferred: None,
+                    ..pass.state.clone()
+                });
             return Ok(Evaluation {
                 state,
+                record,
                 ..evaluation
             });
         }
     };
     let sources = Sources::new(plans, head.settled_jobs.keys().cloned().collect());
     let settled = performance_jobs(&head, &sources).await?;
-    let read = Evaluation {
+    let mut read = Evaluation {
         answered_job_count: settled.len(),
         earliest_deadline: head.job_expiry.map(|expiry| expiry.earliest),
         ..evaluation
@@ -283,7 +361,19 @@ pub async fn evaluate(
         });
     };
     let acting = acting(&group.group_id, stored);
-    if let Some(hold) = held(plans, &pass, &head, &acting).await? {
+    let filed = pass.state.filed.as_ref();
+    let head_group =
+        if filed.is_none_or(|filed| filed.plan_id != head.plan_id) && !head.rerun_of.is_empty() {
+            group_filing(plans, &head.plan_id).await?
+        } else {
+            None
+        };
+    if !pass.preview {
+        let recovered = (head_group.as_ref() == Some(&group.group_id)).then_some(head.created_at);
+        read.last_filed_at = filed.map(|filed| filed.filed_at).max(recovered);
+        read.pace = head.progress_snapshot.as_ref().map(Pace::of);
+    }
+    if let Some(hold) = held(&pass, &head, &acting, head_group.is_some()).await? {
         let held = Evaluation {
             state: hold.state(),
             hold: Some(hold),
@@ -311,11 +401,15 @@ pub async fn evaluate(
             return Ok(held);
         };
         let families = families(&sources, pass.catalog, &campaign.campaign_id, &settled).await?;
+        let vault = vault_jobs(&sources, &settled).await?;
         drop(sources);
         return Ok(match results.all_job_results(&settled).await {
             Ok(rows) => {
                 let rows = rows_by_job(rows);
-                with_smaller_failed(families.as_ref(), &rows, with_params(table, &rows, held))
+                let scored: Vec<&JobId> = rows.keys().collect();
+                let held = with_params(table, &rows, held);
+                let held = with_smaller_failed(families.as_ref(), &rows, held);
+                with_vault(&vault, &scored, &policies, held)
             }
             Err(error) => {
                 unanswered(&campaign.campaign_id, error);
@@ -348,8 +442,16 @@ pub async fn evaluate(
     let tallied = if pass.preview { &policies } else { &acting };
     let unrecorded = unrecorded(pass.submissions, &head, pass.waiting).await?;
     let families = families(&sources, pass.catalog, &campaign.campaign_id, &answered).await?;
-    // The bodies are not needed past the families, so they are not held through
-    // the result rows that `judge` reads.
+    let vault = if tallied
+        .iter()
+        .any(|policy| policy.kind == PolicyKind::VaultResource)
+    {
+        vault_jobs(&sources, &answered).await?
+    } else {
+        HashSet::new()
+    };
+    // The bodies are not needed past the families and the vault jobs, so they
+    // are not held through the result rows that `judge` reads.
     drop(sources);
     let judged = judge(
         plans,
@@ -360,6 +462,7 @@ pub async fn evaluate(
         tallied,
         pass.table,
         families.as_ref(),
+        &vault,
         &answered,
         pass.waiting,
         &unrecorded,
@@ -379,6 +482,7 @@ pub async fn evaluate(
                 refusal: None,
                 unreadable_at: None,
                 rules: RULES,
+                deferred: None,
             };
             Ok(Evaluation {
                 record: Some(record),
@@ -630,16 +734,13 @@ async fn unadvanced(
 /// plan and `head` is a group filing: the record a lost member row or a failed
 /// write did not keep.
 async fn held(
-    plans: &dyn PlanStore,
     pass: &Pass<'_>,
     head: &PlanManifest,
     acting: &[CampaignGroupPolicy],
+    head_filed: bool,
 ) -> anyhow::Result<Option<Hold>> {
     let state = pass.state;
     let filed = state.filed.as_ref();
-    let head_filed = filed.is_none_or(|filed| filed.plan_id != head.plan_id)
-        && !head.rerun_of.is_empty()
-        && group_filing(plans, &head.plan_id).await?;
     let queued: Vec<JobId> = filed
         .into_iter()
         .flat_map(|filed| &filed.queued)
@@ -679,17 +780,17 @@ async fn still_runs(plans: &dyn PlanStore, plan_id: &PlanId) -> anyhow::Result<b
     })
 }
 
-/// Whether `plan_id` was filed by the policies of a campaign group, any group.
-async fn group_filing(plans: &dyn PlanStore, plan_id: &PlanId) -> anyhow::Result<bool> {
-    Ok(summary(plans, plan_id).await?.is_some_and(|summary| {
-        matches!(
-            summary.change,
-            Some(RevisionChange::Rerun {
-                group_id: Some(_),
-                ..
-            })
-        )
-    }))
+/// The group whose policies filed `plan_id`, if any.
+async fn group_filing(
+    plans: &dyn PlanStore,
+    plan_id: &PlanId,
+) -> anyhow::Result<Option<CampaignGroupId>> {
+    Ok(summary(plans, plan_id)
+        .await?
+        .and_then(|summary| match summary.change {
+            Some(RevisionChange::Rerun { group_id, .. }) => group_id,
+            _ => None,
+        }))
 }
 
 /// `plan_id`'s summary, with its change; `None` if it is gone.
@@ -705,10 +806,11 @@ async fn summary(plans: &dyn PlanStore, plan_id: &PlanId) -> anyhow::Result<Opti
 
 /// Check `answered`, jobs of `head`: one row read covers them, a job without
 /// rows waits, and each flagged job's chain is walked before its [`Outcome`]
-/// counts. With `table`, the rows read are also checked for model params. Each
-/// of the `waiting` re-runs is judged on its rows once they land; the rows of
-/// one `head` no longer holds are read apart, and such a one without rows is
-/// dropped if `unrecorded` holds its job.
+/// counts. With `table`, the rows read are also checked for model params. The
+/// jobs with rows that `vault` holds are flagged as on a vault model or
+/// runtime. Each of the `waiting` re-runs is judged on its rows once they land;
+/// the rows of one `head` no longer holds are read apart, and such a one
+/// without rows is dropped if `unrecorded` holds its job.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is distinct context the caller already holds; a bundle type \
@@ -723,6 +825,7 @@ async fn judge(
     policies: &[CampaignGroupPolicy],
     table: Option<&ModelParamTable>,
     families: Option<&Families>,
+    vault: &HashSet<JobId>,
     answered: &[JobId],
     waiting: &[PolicyRerun],
     unrecorded: &HashSet<JobId>,
@@ -791,6 +894,7 @@ async fn judge(
     scored
         .iter()
         .for_each(|job_id| evaluation.count(job_id, chains.get(job_id), group_id));
+    evaluation = with_vault(vault, &scored, policies, evaluation);
     let missing = table
         .map(|table| missing_by_job(table, &rows))
         .unwrap_or_default();
@@ -1060,6 +1164,25 @@ async fn families(
         .map(Some)
 }
 
+/// The jobs of `jobs` whose model or runtime is a vault resource: their source
+/// names a `vault_*` source under `spec.model` or `spec.runtime`. A job with no
+/// source is left out.
+async fn vault_jobs(sources: &Sources<'_>, jobs: &[JobId]) -> anyhow::Result<HashSet<JobId>> {
+    let bodies = sources.bodies(jobs).await?;
+    Ok(jobs
+        .iter()
+        .filter(|job_id| {
+            bodies.get(*job_id).is_some_and(|body| {
+                ["/spec/model", "/spec/runtime"]
+                    .into_iter()
+                    .filter_map(|pointer| body.pointer(pointer))
+                    .any(names_vault_source)
+            })
+        })
+        .cloned()
+        .collect())
+}
+
 /// The jobs of `sources`, all `plan`'s, that the policies judge: those of a
 /// performance benchmark. An eval's cell (`eval`, `vlm_eval`, `asr_eval`), which
 /// the server scores, is never flagged, re-run or marked. A job is typed by the
@@ -1117,6 +1240,43 @@ fn with_smaller_failed(
             check.kept = found.len();
         });
     evaluation.smaller_failed = found;
+    evaluation
+}
+
+/// `evaluation` with the jobs of `scored` that `vault` holds, which the
+/// vault_resource check flags and, as it only flags, keeps. Only a policy of
+/// `policies` that is on flags their job states.
+fn with_vault(
+    vault: &HashSet<JobId>,
+    scored: &[&JobId],
+    policies: &[CampaignGroupPolicy],
+    mut evaluation: Evaluation,
+) -> Evaluation {
+    let found: Vec<&JobId> = scored
+        .iter()
+        .copied()
+        .filter(|job_id| vault.contains(*job_id))
+        .collect();
+    evaluation
+        .checks
+        .iter_mut()
+        .filter(|check| check.kind == PolicyKind::VaultResource)
+        .for_each(|check| {
+            check.flagged = found.len();
+            check.kept = found.len();
+        });
+    let on = policies
+        .iter()
+        .any(|policy| policy.kind == PolicyKind::VaultResource && policy.enabled);
+    if on {
+        found.into_iter().for_each(|job_id| {
+            evaluation
+                .flagged
+                .entry(job_id.clone())
+                .or_default()
+                .insert(PolicyKind::VaultResource);
+        });
+    }
     evaluation
 }
 
@@ -1607,8 +1767,8 @@ fn flags(policy: &CampaignGroupPolicy, rows: &[ResultRow]) -> bool {
             .filter_map(|pairs| share(rows, pairs))
             .any(|share| ((share - 100.0) * 10.0).round() > 0.0),
         // They re-run and mark nothing: `missing_params` and
-        // `smaller_failures` read their rows.
-        PolicyKind::ModelParams | PolicyKind::SmallerFailed => false,
+        // `smaller_failures` read their rows, `vault_jobs` their job sources.
+        PolicyKind::ModelParams | PolicyKind::SmallerFailed | PolicyKind::VaultResource => false,
     }
 }
 
@@ -1633,7 +1793,7 @@ fn value(policy: &CampaignGroupPolicy, rows: &[ResultRow]) -> Option<f64> {
             .iter()
             .filter_map(|pairs| share(rows, pairs))
             .max_by(f64::total_cmp),
-        PolicyKind::ModelParams | PolicyKind::SmallerFailed => None,
+        PolicyKind::ModelParams | PolicyKind::SmallerFailed | PolicyKind::VaultResource => None,
     }
 }
 
@@ -1643,7 +1803,10 @@ fn threshold(policy: &CampaignGroupPolicy) -> Option<f64> {
         PolicyKind::Swap => Some(0.0),
         PolicyKind::Spread => policy.settings.percent,
         PolicyKind::TtftOverE2e => Some(100.0),
-        PolicyKind::Failed | PolicyKind::ModelParams | PolicyKind::SmallerFailed => None,
+        PolicyKind::Failed
+        | PolicyKind::ModelParams
+        | PolicyKind::SmallerFailed
+        | PolicyKind::VaultResource => None,
     }
 }
 
@@ -2309,7 +2472,8 @@ const BUDGET: Duration = Duration::from_secs(60);
 /// queue-maintenance's policy pass, after its queue passes: file what each
 /// group's policies that are on find in its members' current plans, one
 /// revision per campaign, and keep what they decided and how each re-run they
-/// filed answers. No member starts once the run is [`BUDGET`] past `started`,
+/// filed answers; clear what it kept of the members of a group with no policy
+/// on. No member starts once the run is [`BUDGET`] past `started`,
 /// the CLI arm's start. `validate_index` probes the plan index backend before
 /// the first filing. An item that fails is logged and skipped, and fails the
 /// call once the pass's line is logged. Without a `[database]` there are no
@@ -2337,6 +2501,7 @@ where
         members_not_reached = counts.members_not_reached,
         members_unreadable = counts.members_unreadable,
         members_skipped = counts.members_skipped,
+        members_cleared = counts.members_cleared,
         revisions = counts.revisions,
         rerun_jobs = counts.rerun_jobs,
         marked_jobs = counts.marked_jobs,
@@ -2346,6 +2511,7 @@ where
         body_reads = counts.body_reads,
         body_reruns = counts.body_reruns,
         members_waiting_for_devices = counts.members_waiting_for_devices,
+        filings_deferred = counts.filings_deferred,
         filings_not_advanced = counts.filings_not_advanced,
         cancel_markers_written = counts.cancel_markers_written,
         filings_stopped = counts.filings_stopped,
@@ -2373,8 +2539,8 @@ struct PassCounts {
     /// Groups with a policy on, past those skipped for a policy.
     groups: usize,
     /// Groups with a policy that does not decode or is on with settings its
-    /// kind refuses (failed without codes), and groups whose record or members
-    /// did not read.
+    /// kind refuses (failed without codes), and groups, with or without a
+    /// policy on, whose record or members did not read.
     groups_skipped: usize,
     members: usize,
     members_read: usize,
@@ -2384,8 +2550,12 @@ struct PassCounts {
     /// member's failed read left unread.
     members_unreadable: usize,
     /// Members whose kept state does not decode, or whose campaign, plans or
-    /// waiting re-runs did not read.
+    /// waiting re-runs did not read, and members of a group with no policy on
+    /// whose kept state did not clear.
     members_skipped: usize,
+    /// Members of groups with no policy on whose kept policies this round
+    /// cleared.
+    members_cleared: usize,
     /// Filings the campaign moved onto, and the jobs they re-ran and marked.
     revisions: usize,
     rerun_jobs: usize,
@@ -2400,6 +2570,8 @@ struct PassCounts {
     body_reads: usize,
     body_reruns: usize,
     members_waiting_for_devices: usize,
+    /// The members whose filing waits for the interval this round.
+    filings_deferred: usize,
     /// This round's filings the campaign did not move onto, and earlier ones
     /// that still run and hold their campaign.
     filings_not_advanced: usize,
@@ -2416,7 +2588,8 @@ struct PassCounts {
     failed_items: usize,
 }
 
-/// One round of the policy pass over every group with a policy on.
+/// One round of the policy pass: clear what it kept of the members of each
+/// group with no policy on, then take every group with a policy on.
 async fn round<Validate, Validated>(
     config: &Config,
     stores: &Stores,
@@ -2457,6 +2630,7 @@ where
         failed_items: unreadable.len(),
         ..PassCounts::default()
     };
+    let counts = clear_off_groups(groups, &enabled.off, started, counts).await;
     if on.is_empty() {
         return Ok(counts);
     }
@@ -2554,6 +2728,97 @@ async fn members(
         return Ok(None);
     };
     Ok(Some((group, groups.policy_states(group_id).await?)))
+}
+
+/// Clear what the pass kept of each member of the `off` groups, so the
+/// campaign listing shows no policy for them. The last filing stays, so a
+/// policy turned on again still holds the campaign while its jobs wait, or
+/// cancels that filing. No member is cleared once the run is [`BUDGET`] past
+/// `started`. A group or member that does not read or clear is skipped, a
+/// failed item.
+async fn clear_off_groups(
+    groups: &dyn CampaignGroupStore,
+    off: &[CampaignGroupId],
+    started: Instant,
+    counts: PassCounts,
+) -> PassCounts {
+    futures::stream::iter(off)
+        .fold(counts, |mut counts, group_id| async move {
+            let members = match groups.policy_states(group_id).await {
+                Ok(members) => members,
+                Err(error) => {
+                    tracing::warn!(
+                        %group_id,
+                        error = %format!("{error:#}"),
+                        "queue-maintenance: failed to read the members of a campaign group with \
+                         no policy on, skipped this round"
+                    );
+                    counts.groups_skipped += 1;
+                    counts.failed_items += 1;
+                    return counts;
+                }
+            };
+            futures::stream::iter(members)
+                .fold(counts, |mut counts, member| async move {
+                    let campaign_id = &member.campaign_id;
+                    // A member held after a clear and a turn-on keeps
+                    // triggered checks with no policies.
+                    let cleared = match member.policy_state {
+                        Ok(Some(kept))
+                            if !kept.policies.is_empty() || !kept.triggered.is_empty() =>
+                        {
+                            // A refusal and a deferral hold only under the
+                            // policies they were found under, so they go too.
+                            GroupPolicyState {
+                                policies: Vec::new(),
+                                triggered: BTreeSet::new(),
+                                refusal: None,
+                                deferred: None,
+                                ..kept
+                            }
+                        }
+                        Ok(_) => return counts,
+                        Err(bad) => {
+                            tracing::warn!(
+                                %group_id,
+                                %campaign_id,
+                                key = %bad.key,
+                                reason = %bad.reason,
+                                "queue-maintenance: unreadable campaign group member state, skipped"
+                            );
+                            counts.members_skipped += 1;
+                            counts.failed_items += 1;
+                            return counts;
+                        }
+                    };
+                    if started.elapsed() > BUDGET {
+                        counts.members_not_reached += 1;
+                        return counts;
+                    }
+                    match groups
+                        .clear_policy_state(group_id, campaign_id, &cleared)
+                        .await
+                    {
+                        Ok(true) => counts.members_cleared += 1,
+                        // It left the group meanwhile.
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                %group_id,
+                                %campaign_id,
+                                error = %format!("{error:#}"),
+                                "queue-maintenance: failed to clear a campaign group member with \
+                                 no policy on, skipped this round"
+                            );
+                            counts.members_skipped += 1;
+                            counts.failed_items += 1;
+                        }
+                    }
+                    counts
+                })
+                .await
+        })
+        .await
 }
 
 /// A round takes members by when the pass last filed into each or failed to
@@ -2743,7 +3008,7 @@ where
             bodies,
         };
         let plans = &*self.stores.plans;
-        let evaluation = match evaluate(plans, results, group, &campaign, stored, pass).await {
+        let mut evaluation = match evaluate(plans, results, group, &campaign, stored, pass).await {
             Ok(evaluation) => evaluation,
             Err(error) => {
                 tracing::warn!(
@@ -2786,7 +3051,35 @@ where
             return Some((evaluation, None));
         }
         let finds = !(evaluation.rerun_job_ids.is_empty() && evaluation.marked.is_empty());
-        let filing = if evaluation.state == PolicyMemberState::Evaluated && finds {
+        let files = evaluation.state == PolicyMemberState::Evaluated && finds;
+        let filed_at = evaluation.last_filed_at;
+        let deferred = files
+            .then(|| {
+                let deadline = evaluation.earliest_deadline.and_then(ExpiresAt::instant);
+                not_before(filed_at, evaluation.pace, deadline, Timestamp::now())
+            })
+            .flatten()
+            .map(|until| {
+                counts.filings_deferred += 1;
+                tracing::info!(
+                    group_id = %group.group_id,
+                    %campaign_id,
+                    interval_secs = evaluation.pace.map(|pace| pace.interval().as_secs()),
+                    remaining = evaluation.pace.map(|pace| pace.remaining),
+                    running = evaluation.pace.map(|pace| pace.running),
+                    filed_at = filed_at.map(tracing::field::display),
+                    next_filing_at = %until,
+                    rerun_jobs = evaluation.rerun_job_ids.len(),
+                    marked_jobs = evaluation.marked.len(),
+                    "queue-maintenance: a campaign group filing waits for its interval"
+                );
+                PolicyDeferral {
+                    until,
+                    rerun_job_count: evaluation.rerun_job_ids.len(),
+                    marked_job_count: evaluation.marked.len(),
+                }
+            });
+        let filing = if files && deferred.is_none() {
             self.revise(group, stored, &campaign, &evaluation, counts)
                 .await
         } else {
@@ -2794,7 +3087,12 @@ where
         };
         let record = match &filing {
             Some(filing) => filing.record.as_ref(),
-            None => evaluation.record.as_ref(),
+            None => {
+                if let Some(record) = &mut evaluation.record {
+                    record.deferred = deferred;
+                }
+                evaluation.record.as_ref()
+            }
         };
         let changes = evaluation
             .job_states
@@ -4388,8 +4686,8 @@ runtimes = [
                 },
                 pipette_store_testkit::no_queue(),
             )?);
-            let owner = CampaignOwner::User {
-                user_id: UserId::try_new("user_nightly")?,
+            let owner = CampaignOwner::Org {
+                org_id: OrgId::try_new("org_nightly")?,
             };
             let group = CampaignGroup::new(
                 NonEmptyTrimmedString::try_new("aa-perf")?,
@@ -4511,6 +4809,58 @@ runtimes = [
         /// What the member row keeps; `None` before the first write.
         async fn kept(&self) -> anyhow::Result<Option<GroupPolicyState>> {
             self.kept_of(&self.campaign.campaign_id).await
+        }
+
+        /// Subtract [`MAX_FILING_INTERVAL`] from the stored filing time so the
+        /// next round can file immediately.
+        async fn later(&self) -> anyhow::Result<()> {
+            let kept = self.kept().await?.context("a kept state")?;
+            let filed = kept.filed.context("a kept filing")?;
+            let filed_at = filed.filed_at.checked_sub(MAX_FILING_INTERVAL)?;
+            self.put_state(&GroupPolicyState {
+                filed: Some(GroupFiling { filed_at, ..filed }),
+                ..kept
+            })
+            .await
+        }
+
+        /// Give the head ten jobs that wait for its one busy device, so a
+        /// filing waits ten minutes. No device of this world can run the
+        /// queued jobs, so its own snapshot reads them as starved.
+        async fn give_pace(&self) -> anyhow::Result<()> {
+            let head = self.current().await?.current_plan_id.context("a head")?;
+            let manifest = self.manifest(&head).await?;
+            let snapshot = manifest.progress_snapshot.clone().context("a snapshot")?;
+            self.stores
+                .plans
+                .put_plan(&PlanManifest {
+                    progress_snapshot: Some(ProgressSnapshot {
+                        counts: pipette_plan_types::Counts {
+                            available: 10,
+                            running: 1,
+                            ..snapshot.counts
+                        },
+                        starved: Vec::new(),
+                        ..snapshot
+                    }),
+                    ..manifest
+                })
+                .await
+        }
+
+        /// Write `state` for the campaign and leave its job states as they are.
+        async fn put_state(&self, state: &GroupPolicyState) -> anyhow::Result<()> {
+            let written = self
+                .groups()?
+                .set_policy_state(
+                    &self.group.group_id,
+                    &self.campaign.campaign_id,
+                    state,
+                    &JobStateChanges::default(),
+                )
+                .await?;
+            anyhow::ensure!(written, "the member's state was not written");
+            Ok(())
         }
 
         /// The campaign's job states, in job id order.
@@ -4680,6 +5030,7 @@ runtimes = [
                 )?,
                 organization: NonEmptyTrimmedString::try_new("lab")?,
                 client_details: NonEmptyTrimmedString::try_new("mac mini")?,
+                name: None,
                 contact_email: pipette_plan_types::ContactEmail::try_new("lab@example.test")?,
                 status: pipette_core::client::ClientStatus::Approved,
                 registered_at: Timestamp::now(),
@@ -4847,6 +5198,9 @@ runtimes = [
             self.finish(&[job]).await?;
             self.maintain().await?;
             self.answer(&[(job.as_str(), rows)]).await;
+            if self.kept().await?.is_some_and(|kept| kept.filed.is_some()) {
+                self.later().await?;
+            }
             self.pass(stored).await?;
             self.reruns()
                 .await?
@@ -4958,12 +5312,13 @@ runtimes = [
             Ok(())
         }
 
-        /// Store each job's source, naming its benchmark.
-        async fn source(&self, jobs: &[(&str, &str)]) -> anyhow::Result<()> {
+        /// Store each job's source, its `spec`.
+        async fn source(&self, jobs: &[(&str, Value)]) -> anyhow::Result<()> {
             let plans = &*self.stores.plans;
-            futures::future::try_join_all(jobs.iter().map(|(job_id, benchmark)| async move {
-                let body = json!({ "spec": { "benchmark": benchmark } });
-                plans.put_job_source(&job(job_id), &body).await
+            futures::future::try_join_all(jobs.iter().map(|(job_id, spec)| async move {
+                plans
+                    .put_job_source(&job(job_id), &json!({ "spec": spec }))
+                    .await
             }))
             .await?;
             Ok(())
@@ -5205,7 +5560,8 @@ runtimes = [
     ];
 
     /// The rows of a `decode_throughput_512_100` run of job-perf that `kind`'s
-    /// check flags. A measured row records [`MODEL`] with no parameter counts.
+    /// check flags, vault_resource's with the job's source. A measured row
+    /// records [`MODEL`] with no parameter counts.
     fn flagged_by(kind: PolicyKind) -> Vec<Value> {
         let measured = |metric: &str, unit: &str, value: f64, stddev: f64, swap: u32| {
             json!([
@@ -5232,7 +5588,9 @@ runtimes = [
                 measured("ttft", "ms", 200.0, 1.0, 0),
                 measured("end_to_end_latency", "ms", 100.0, 1.0, 0),
             ],
-            PolicyKind::ModelParams => vec![measured("decode", "tokens/sec", 100.0, 1.0, 0)],
+            PolicyKind::ModelParams | PolicyKind::VaultResource => {
+                vec![measured("decode", "tokens/sec", 100.0, 1.0, 0)]
+            }
             PolicyKind::Failed | PolicyKind::SmallerFailed => vec![json!([
                 "job-perf",
                 "decode_throughput_512_100",
@@ -5257,6 +5615,7 @@ runtimes = [
     /// never read, so none is answered, waits, is flagged, re-run or marked, or
     /// keeps a job state, while each check flags the decode cell beside them, in
     /// the preview and in the pass. A larger clean decode cell is its family's.
+    /// For vault_resource, every cell but the larger one runs a vault runtime.
     #[rstest::rstest]
     #[case::swap(PolicyKind::Swap, true)]
     #[case::spread(PolicyKind::Spread, true)]
@@ -5264,6 +5623,7 @@ runtimes = [
     #[case::ttft_over_e2e(PolicyKind::TtftOverE2e, true)]
     #[case::model_params(PolicyKind::ModelParams, false)]
     #[case::smaller_failed(PolicyKind::SmallerFailed, false)]
+    #[case::vault_resource(PolicyKind::VaultResource, false)]
     #[tokio::test]
     async fn no_policy_judges_an_eval(
         #[case] kind: PolicyKind,
@@ -5295,9 +5655,15 @@ runtimes = [
             ..world.plan(HEAD, &cells.map(|(job_id, ..)| (job_id, None)))?
         };
         world.put(std::slice::from_ref(&head)).await?;
-        world
-            .source(&cells.map(|(job_id, benchmark, _)| (job_id, benchmark)))
-            .await?;
+        let specs = cells.map(|(job_id, benchmark, _)| {
+            let runtime =
+                (kind == PolicyKind::VaultResource && job_id != "job-larger").then(vault_runtime);
+            (
+                job_id,
+                json!({ "benchmark": benchmark, "runtime": runtime }),
+            )
+        });
+        world.source(&specs).await?;
         let evals: Vec<Mock<'_>> = futures::stream::iter(["job-eval", "job-vlm", "job-asr"])
             .then(|job_id| {
                 world.duckdb.mock_async(move |when, then| {
@@ -5480,8 +5846,8 @@ runtimes = [
         let cases = [
             (
                 Campaign {
-                    owner: CampaignOwner::User {
-                        user_id: UserId::try_new("user_other")?,
+                    owner: CampaignOwner::Org {
+                        org_id: OrgId::try_new("org_other")?,
                     },
                     ..world.campaign.clone()
                 },
@@ -6471,7 +6837,9 @@ runtimes = [
             ..world.plan(HEAD, &[("job-1", None)])?
         };
         world.put(&[head]).await?;
-        world.source(&[("job-1", "eval_math_500")]).await?;
+        world
+            .source(&[("job-1", json!({ "benchmark": "eval_math_500" }))])
+            .await?;
         world
             .submit(&job("job-1"), &decode_body("job-1", 4096))
             .await?;
@@ -6957,6 +7325,7 @@ runtimes = [
             .answer(&[(stays.as_str(), run(stays.as_str(), &swap))])
             .await;
         world.db.execute(REFUSE_OUTCOME_WRITE).await?;
+        world.later().await?;
         let (_, unfiled, counted) = world.pass(&stored).await?;
         assert_eq!(
             (
@@ -7139,8 +7508,8 @@ runtimes = [
         );
         world
             .source(&[
-                ("job-c", "eval_math_500"),
-                ("job-d", "decode_throughput_512_100"),
+                ("job-c", json!({ "benchmark": "eval_math_500" })),
+                ("job-d", json!({ "benchmark": "decode_throughput_512_100" })),
             ])
             .await?;
         let swap = [PolicyKind::Swap];
@@ -7650,6 +8019,10 @@ runtimes = [
         let head = world.current().await?.current_plan_id.context("a head")?;
         let (held, _, _) = world.pass(&stored).await?;
         assert_eq!(
+            held.last_filed_at,
+            Some(world.manifest(&head).await?.created_at)
+        );
+        assert_eq!(
             (held.state, held.hold),
             (
                 PolicyMemberState::WaitingForDevices,
@@ -7968,8 +8341,8 @@ runtimes = [
                 }
             }
             Moved::Owner => Campaign {
-                owner: CampaignOwner::User {
-                    user_id: UserId::try_new("user_other")?,
+                owner: CampaignOwner::Org {
+                    org_id: OrgId::try_new("org_other")?,
                 },
                 ..campaign.clone()
             },
@@ -8271,16 +8644,7 @@ runtimes = [
             }),
             ..GroupPolicyState::default()
         };
-        let written = world
-            .groups()?
-            .set_policy_state(
-                &world.group.group_id,
-                &world.campaign.campaign_id,
-                &earlier,
-                &JobStateChanges::default(),
-            )
-            .await?;
-        anyhow::ensure!(written, "the member's state was not written");
+        world.put_state(&earlier).await?;
 
         let (_, filing, _) = world.pass(&stored).await?;
         let outcome = filing.map(|filing| filing.outcome);
@@ -8302,12 +8666,7 @@ runtimes = [
         let Some(world) = World::filed().await? else {
             return Ok(());
         };
-        let (org_id, owner) = (OrgId::mint(), UserId::try_new("user_nightly")?);
-        world
-            .stores
-            .orgs
-            .set_membership(&owner, Some(org_id.clone()))
-            .await?;
+        let org_id = OrgId::try_new("org_nightly")?;
         let turned_on_by = UserId::try_new("user_admin")?;
         world
             .swapped(CampaignGroupPolicy {
@@ -8372,7 +8731,9 @@ runtimes = [
                 },
                 AuditTarget::Plan { plan_id: head },
                 AuditTarget::Plan { plan_id: filed },
-                AuditTarget::User { user_id: owner },
+                AuditTarget::Org {
+                    org_id: org_id.clone()
+                },
                 AuditTarget::User {
                     user_id: turned_on_by
                 },
@@ -8453,6 +8814,7 @@ runtimes = [
         world
             .answer(&[(theirs.as_str(), run(theirs.as_str(), &swap))])
             .await;
+        world.later().await?;
         let second = round(&config, &world.stores, groups, Instant::now(), &probed).await?;
         let filed_at = |record: Option<GroupPolicyState>| {
             record
@@ -8467,6 +8829,249 @@ runtimes = [
             [(2, 1), (2, 2)]
         );
         assert!(filed_first.filed_at < theirs_at && theirs_at < mine_at);
+        Ok(())
+    }
+
+    /// The interval is between one and 30 minutes. With no busy device, each
+    /// waiting job counts in full.
+    #[rstest::rstest]
+    #[case::nothing_waits(0, 10, 60)]
+    #[case::fewer_than_the_devices(5, 10, 60)]
+    #[case::five_each(50, 10, 300)]
+    #[case::thousands(4_000, 10, 1_800)]
+    #[case::no_busy_device(3, 0, 180)]
+    #[case::no_busy_device_and_many(40, 0, 1_800)]
+    fn the_interval_grows_with_the_jobs_each_busy_device_has_left(
+        #[case] remaining: u64,
+        #[case] running: u64,
+        #[case] secs: u64,
+    ) {
+        let pace = Pace { remaining, running };
+        assert_eq!(pace.interval(), Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn a_pace_leaves_out_the_starved_jobs() -> anyhow::Result<()> {
+        let snapshot: ProgressSnapshot = serde_json::from_value(serde_json::json!({
+            "computed_at": "2026-11-19T00:00:00Z",
+            "counts": { "total": 10, "finished": 0, "running": 2, "available": 8, "failed": 0 },
+            "starved": [{
+                "requires": ["npu"], "any_of": [], "clients": [],
+                "job_ids": ["job-1", "job-2", "job-3"],
+            }],
+        }))?;
+        assert_eq!(
+            Pace::of(&snapshot),
+            Pace {
+                remaining: 5,
+                running: 2
+            }
+        );
+        Ok(())
+    }
+
+    /// A filing waits until the interval after the last filing ends. It does
+    /// not wait if the member has no earlier filing or no pace. It also does
+    /// not wait if the deadline comes before the next maintenance tick, or if
+    /// the clock stepped back past the last filing.
+    #[rstest::rstest]
+    #[case::within_the_interval(Some(-60), Some((10, 1)), None, Some(600))]
+    #[case::past_the_interval(Some(-900), Some((10, 1)), None, None)]
+    #[case::never_filed(None, Some((10, 1)), None, None)]
+    #[case::no_pace(Some(-60), None, None, None)]
+    #[case::minimum_interval(Some(-30), Some((0, 1)), None, Some(60))]
+    #[case::minimum_interval_elapsed(Some(-60), Some((0, 1)), None, None)]
+    #[case::deadline_first(Some(-60), Some((10, 1)), Some(300), None)]
+    #[case::deadline_before_next_tick(Some(-60), Some((10, 1)), Some(570), None)]
+    #[case::deadline_at_next_tick(Some(-60), Some((10, 1)), Some(600), None)]
+    #[case::deadline_after_next_tick(Some(-60), Some((10, 1)), Some(601), Some(600))]
+    #[case::deadline_after(Some(-60), Some((10, 1)), Some(900), Some(600))]
+    #[case::clock_stepped_back(Some(3600), Some((10, 1)), None, None)]
+    fn a_filing_waits_for_its_interval_unless_it_cannot(
+        #[case] filed_secs_ago: Option<i64>,
+        #[case] pace: Option<(u64, u64)>,
+        #[case] deadline_in_secs: Option<i64>,
+        #[case] interval_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let now = Timestamp::now();
+        let at = |secs: i64| now.checked_add(jiff::SignedDuration::from_secs(secs));
+        let filed_at = filed_secs_ago.map(at).transpose()?;
+        let deadline = deadline_in_secs.map(at).transpose()?;
+        let pace = pace.map(|(remaining, running)| Pace { remaining, running });
+        let until = interval_secs
+            .zip(filed_at)
+            .map(|(secs, filed_at)| filed_at.checked_add(Duration::from_secs(secs)))
+            .transpose()?;
+        assert_eq!(not_before(filed_at, pace, deadline, now), until);
+        Ok(())
+    }
+
+    /// The pass records a deferral when it finds a re-run before the interval
+    /// ends. After the interval, it files both re-runs in one revision and
+    /// clears the deferral.
+    #[tokio::test]
+    async fn finds_within_the_interval_wait_and_file_together() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let [first, second, third, ..] = world.jobs.as_slice() else {
+            anyhow::bail!("five jobs, not {:?}", world.jobs);
+        };
+        let stored = [world.on(PolicyKind::Swap, 3)];
+        world.turn_on(&stored).await?;
+        let swap = [PolicyKind::Swap];
+        world.finish(&[first]).await?;
+        world.maintain().await?;
+        world
+            .answer(&[(first.as_str(), run(first.as_str(), &swap))])
+            .await;
+        let (_, filing, _) = world.pass(&stored).await?;
+        anyhow::ensure!(filing.is_some(), "the first find is filed");
+        let filed = world
+            .kept()
+            .await?
+            .and_then(|kept| kept.filed)
+            .context("a filing")?;
+        // A device takes the re-run, so the filing no longer holds the member.
+        world
+            .lease(filed.queued.first().context("the re-run")?)
+            .await?;
+
+        world.finish(&[second]).await?;
+        world.maintain().await?;
+        world
+            .answer(&[(second.as_str(), run(second.as_str(), &swap))])
+            .await;
+        world.give_pace().await?;
+        let (_, filing, counts) = world.pass(&stored).await?;
+        let kept = world.kept().await?.context("the deferral's record")?;
+        let deferred = kept.deferred.context("a deferral")?;
+        assert_eq!(
+            (
+                filing.is_none(),
+                counts.filings_deferred,
+                counts.revisions,
+                kept.filed.as_ref(),
+                (deferred.rerun_job_count, deferred.marked_job_count)
+            ),
+            (true, 1, 0, Some(&filed), (1, 0))
+        );
+        assert!(deferred.until > Timestamp::now());
+
+        // The round reads the waiting find's rows again, with the new one's.
+        world.finish(&[third]).await?;
+        world.maintain().await?;
+        world.duckdb.reset_async().await;
+        world
+            .answer(&[
+                (second.as_str(), run(second.as_str(), &swap)),
+                (third.as_str(), run(third.as_str(), &swap)),
+            ])
+            .await;
+        world.later().await?;
+        let (_, filing, counts) = world.pass(&stored).await?;
+        let Some(FilingOutcome::Advanced {
+            plan_id,
+            result: Ok(revised),
+        }) = filing.map(|filing| filing.outcome)
+        else {
+            anyhow::bail!("the collected finds are filed");
+        };
+        // The head carries the first filing's re-run, which still runs.
+        let rerun_of: BTreeSet<JobId> = world
+            .manifest(&plan_id)
+            .await?
+            .rerun_of
+            .into_values()
+            .collect();
+        let kept = world.kept().await?.context("the filing's record")?;
+        assert_eq!(
+            (
+                counts.filings_deferred,
+                revised.rerun_job_count,
+                rerun_of,
+                kept.deferred
+            ),
+            (
+                0,
+                2,
+                BTreeSet::from([first.clone(), second.clone(), third.clone()]),
+                None
+            )
+        );
+        Ok(())
+    }
+
+    /// A mark-only find waits for the interval, as a re-run does: a mark
+    /// revision costs as much as a re-run revision.
+    #[tokio::test]
+    async fn a_mark_alone_waits_for_the_interval() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let [first, second, ..] = world.jobs.as_slice() else {
+            anyhow::bail!("five jobs, not {:?}", world.jobs);
+        };
+        // No re-run is left, so each flagged job is marked.
+        let stored = [world.on(PolicyKind::Swap, 0)];
+        world.turn_on(&stored).await?;
+        let swap = [PolicyKind::Swap];
+        world.finish(&[first]).await?;
+        world.maintain().await?;
+        world
+            .answer(&[(first.as_str(), run(first.as_str(), &swap))])
+            .await;
+        let (_, filing, _) = world.pass(&stored).await?;
+        anyhow::ensure!(filing.is_some(), "the first mark is filed");
+
+        world.finish(&[second]).await?;
+        world.maintain().await?;
+        world
+            .answer(&[(second.as_str(), run(second.as_str(), &swap))])
+            .await;
+        world.give_pace().await?;
+        let (_, filing, counts) = world.pass(&stored).await?;
+        let deferred = world
+            .kept()
+            .await?
+            .and_then(|kept| kept.deferred)
+            .context("a deferral")?;
+        assert_eq!(
+            (
+                filing.is_none(),
+                counts.filings_deferred,
+                (deferred.rerun_job_count, deferred.marked_job_count)
+            ),
+            (true, 1, (0, 1))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stopped_head_clears_the_saved_deferral() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let stored = world.one_swapped().await?;
+        let head = world.current().await?.current_plan_id.context("a head")?;
+        let kept = GroupPolicyState {
+            policies: stored.to_vec(),
+            ..GroupPolicyState::default()
+        };
+        let deferred = GroupPolicyState {
+            deferred: Some(PolicyDeferral {
+                until: Timestamp::now(),
+                rerun_job_count: 1,
+                marked_job_count: 0,
+            }),
+            ..kept.clone()
+        };
+        world.put_state(&deferred).await?;
+        world.stores.plans.write_cancel_marker(&head).await?;
+        let (evaluation, filing, _) = world.pass(&stored).await?;
+        assert_eq!(evaluation.state, PolicyMemberState::Cancelled);
+        assert!(filing.is_none());
+        assert_eq!(world.kept().await?, Some(kept));
         Ok(())
     }
 
@@ -8593,7 +9198,8 @@ runtimes = [
     }
 
     /// A group with a policy or a record that does not decode is skipped, a
-    /// failed item that fails the run.
+    /// failed item that fails the run, and what the pass kept of its members
+    /// stays.
     #[rstest::rstest]
     #[case::policy("UPDATE campaign_group_policies SET body = 'not a policy'")]
     #[case::group("UPDATE campaign_groups SET body = 'not a group'")]
@@ -8604,7 +9210,14 @@ runtimes = [
         let Some(world) = World::filed().await? else {
             return Ok(());
         };
-        world.turn_on(&[world.on(PolicyKind::Swap, 3)]).await?;
+        let swap = world.on(PolicyKind::Swap, 3);
+        world.turn_on(std::slice::from_ref(&swap)).await?;
+        let kept = GroupPolicyState {
+            policies: vec![swap],
+            triggered: BTreeSet::from([PolicyKind::Swap]),
+            ..GroupPolicyState::default()
+        };
+        world.keep(&kept, &[]).await?;
         world.db.execute(unreadable).await?;
         let counts = round(
             &world.config(),
@@ -8615,9 +9228,15 @@ runtimes = [
         )
         .await?;
         assert_eq!(
-            (counts.groups_skipped, counts.members, counts.failed_items),
-            (1, 0, 1)
+            (
+                counts.groups_skipped,
+                counts.members,
+                counts.members_cleared,
+                counts.failed_items
+            ),
+            (1, 0, 0, 1)
         );
+        assert_eq!(world.kept().await?, Some(kept));
         let ran = apply(&world.config(), &world.stores, Instant::now(), probed).await;
         let error = format!("{:#}", ran.err().context("the run passed")?);
         assert!(error.contains("1 policy pass item(s) failed"), "{error}");
@@ -8855,6 +9474,296 @@ runtimes = [
             (1, 1, 1)
         );
         assert_eq!(world.kept().await?, None);
+        Ok(())
+    }
+
+    /// A llama.cpp build filed in the vault.
+    fn vault_runtime() -> Value {
+        json!({
+            "type": "llamacpp_cli_stock_tools",
+            "source": "vault_remote_archive",
+            "url": "/vault/resources/vault_1/content",
+            "principal_id": "org_1",
+            "flavor": "linux-x64-rocm",
+        })
+    }
+
+    /// vault_resource flags a job by its source: a vault model, a vault
+    /// runtime, or a runtime installed from a vault wheelhouse, a job its
+    /// device failed included, though its rows record no descriptor. The
+    /// preview counts them with the policy off. With it on, the pass files and
+    /// marks nothing, keeps them decided and flagged, and the next round keeps
+    /// the flags without reading their rows again. Turned off while swap stays
+    /// on, the next round reads every job again and keeps no flag.
+    #[tokio::test]
+    async fn vault_resource_flags_a_job_by_its_source() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        let vault_model = json!({
+            "type": "gguf_text",
+            "source": "vault_url",
+            "url": "/vault/resources/vault_2/content",
+            "principal_id": "org_1",
+        });
+        let wheelhouse = json!({
+            "type": "uv_vllm",
+            "server_version": "0.31.0",
+            "build": "cu128",
+            "python_version": "3.12",
+            "source": {
+                "type": "vault_wheelhouse",
+                "url": "/vault/resources/vault_3/content",
+                "contents": "vllm==0.22.0\n",
+                "principal_id": "org_1",
+            },
+        });
+        let model: Value = serde_json::from_str(MODEL)?;
+        let pip = json!({
+            "type": "mlx_macos_pipette",
+            "version": "0.31.3",
+            "flavor": "macos-arm64",
+            "source": { "type": "pip_requirements_text", "contents": "mlx-lm==0.31.3\n" },
+        });
+        let spec = |model: Value, runtime: Value| {
+            json!({
+                "benchmark": "decode_throughput_512_100",
+                "model": model,
+                "runtime": runtime,
+            })
+        };
+        // Each job's spec and rows, and whether vault_resource flags it.
+        let cases = [
+            (
+                "job-model",
+                spec(vault_model, pip.clone()),
+                run("job-model", &[]),
+                true,
+            ),
+            (
+                "job-runtime",
+                spec(model.clone(), vault_runtime()),
+                failed_run("job-runtime", "client", "runtime_error"),
+                true,
+            ),
+            (
+                "job-wheelhouse",
+                spec(model.clone(), wheelhouse),
+                run("job-wheelhouse", &[]),
+                true,
+            ),
+            ("job-plain", spec(model, pip), run("job-plain", &[]), false),
+        ];
+        let head: Vec<(&str, Option<&str>)> =
+            cases.iter().map(|(job_id, ..)| (*job_id, None)).collect();
+        world.put(&[world.plan(HEAD, &head)?]).await?;
+        let specs: Vec<(&str, Value)> = cases
+            .iter()
+            .map(|(job_id, spec, ..)| (*job_id, spec.clone()))
+            .collect();
+        world.source(&specs).await?;
+        let runs: Vec<(&str, Vec<Value>)> = cases
+            .iter()
+            .map(|(job_id, _, rows, _)| (*job_id, rows.clone()))
+            .collect();
+        world.answer(&runs).await;
+
+        let preview = world.read(&world.campaign, &[]).await?;
+        assert_eq!(
+            (counts(&preview, PolicyKind::VaultResource), preview.flagged),
+            (Some((3, 0, 0, 3)), BTreeMap::new())
+        );
+
+        // Swap stays on, so the third round changes only vault_resource.
+        let swap = world.on(PolicyKind::Swap, 3);
+        let stored = [swap.clone(), world.on(PolicyKind::VaultResource, 0)];
+        let first = world
+            .round(&world.campaign, &stored, Some(&GroupPolicyState::default()))
+            .await?;
+        assert_eq!(world.outcomes(&first), Vec::<String>::new());
+        assert_eq!(first.kinds, BTreeSet::new());
+        let record = first.record.clone().context("the first round's record")?;
+        let job_states = first
+            .job_states
+            .clone()
+            .context("the first round's job states")?;
+        let flagged: Vec<(&str, bool, bool)> = job_states
+            .iter()
+            .map(|job_state| {
+                (
+                    job_state.job_id.as_str(),
+                    job_state.decided,
+                    job_state.flagged.contains(&PolicyKind::VaultResource),
+                )
+            })
+            .collect();
+        let mut expected: Vec<(&str, bool, bool)> = cases
+            .iter()
+            .map(|(job_id, .., vault)| (*job_id, true, *vault))
+            .collect();
+        expected.sort();
+        assert_eq!(flagged, expected);
+        assert_eq!(
+            record.triggered,
+            BTreeSet::from([PolicyKind::VaultResource])
+        );
+
+        world.keep(&record, &job_states).await?;
+        // No query is answered now, so a round that read rows would read
+        // unreadable.
+        world.duckdb.reset_async().await;
+        let second = world.round(&world.campaign, &stored, Some(&record)).await?;
+        assert_eq!(
+            (second.state, second.record, second.job_states),
+            (
+                PolicyMemberState::Evaluated,
+                Some(record.clone()),
+                Some(job_states)
+            )
+        );
+
+        world.answer(&runs).await;
+        let off = world.round(&world.campaign, &[swap], Some(&record)).await?;
+        let flagged: Vec<BTreeSet<PolicyKind>> = off
+            .job_states
+            .context("the third round's job states")?
+            .into_iter()
+            .map(|job_state| job_state.flagged)
+            .collect();
+        assert_eq!(
+            (off.record.map(|record| record.triggered), flagged),
+            (Some(BTreeSet::new()), vec![BTreeSet::new(); cases.len()])
+        );
+        Ok(())
+    }
+
+    /// Once its group's last policy is turned off, a round clears what the
+    /// pass kept of a member that a swap filing holds: the policies, the
+    /// triggered checks, a refusal, a deferral and the job states, one that
+    /// does not decode included. A round past its minute leaves it for the
+    /// next. Its last filing stays, the next round clears nothing, and with
+    /// swap on again the filing still holds it.
+    #[tokio::test]
+    async fn a_round_clears_a_member_of_a_group_with_no_policy_on() -> anyhow::Result<()> {
+        let Some(world) = World::filed().await? else {
+            return Ok(());
+        };
+        let stored = world.one_swapped().await?;
+        let (_, filing, _) = world.pass(&stored).await?;
+        let filed = filing
+            .and_then(|filing| filing.record?.filed)
+            .context("the filing's record")?;
+        let job_states = world.job_states().await?;
+        anyhow::ensure!(!job_states.is_empty(), "the filing's job states");
+        let kept = GroupPolicyState {
+            refusal: Some(Refusal {
+                plan_id: filed.plan_id.clone(),
+                reason: "the deadline has passed".to_owned(),
+                build: BUILD_VERSION.to_owned(),
+            }),
+            deferred: Some(PolicyDeferral {
+                until: Timestamp::now(),
+                rerun_job_count: 1,
+                marked_job_count: 0,
+            }),
+            ..world.kept().await?.context("the filing's record")?
+        };
+        world.keep(&kept, &job_states).await?;
+        world
+            .db
+            .execute("UPDATE campaign_group_job_states SET body = 'not a job state'")
+            .await?;
+        let [swap] = &stored;
+        let off = CampaignGroupPolicy {
+            enabled: false,
+            ..swap.clone()
+        };
+        let (config, groups) = (world.config(), world.groups()?);
+        anyhow::ensure!(groups.replace_policy(swap, &off).await?);
+        let late = Instant::now()
+            .checked_sub(Duration::from_secs(61))
+            .context("a minute ago")?;
+        let unreached = round(&config, &world.stores, groups, late, &probed).await?;
+        assert_eq!(
+            (unreached.members_not_reached, unreached.members_cleared),
+            (1, 0)
+        );
+        assert_eq!(world.kept().await?, Some(kept.clone()));
+        let first = round(&config, &world.stores, groups, Instant::now(), &probed).await?;
+        assert_eq!((first.members_cleared, first.failed_items), (1, 0));
+        assert_eq!(
+            (world.kept().await?, world.job_states().await?),
+            (
+                Some(GroupPolicyState {
+                    policies: Vec::new(),
+                    triggered: BTreeSet::new(),
+                    refusal: None,
+                    deferred: None,
+                    ..kept
+                }),
+                Vec::new()
+            )
+        );
+        let second = round(&config, &world.stores, groups, Instant::now(), &probed).await?;
+        assert_eq!(second.members_cleared, 0);
+
+        anyhow::ensure!(groups.replace_policy(&off, swap).await?);
+        // A held member reads no rows.
+        world.duckdb.reset_async().await;
+        let (held, _, counted) = world.pass(&stored).await?;
+        assert_eq!(
+            (held.hold, counted.members_waiting_for_devices),
+            (
+                Some(Hold::Queued {
+                    plan_id: filed.plan_id,
+                    waiting: 1
+                }),
+                1
+            )
+        );
+        Ok(())
+    }
+
+    /// A member of a group with no policy on whose kept state does not decode
+    /// is skipped, a failed item, and left as it is with its job states.
+    #[tokio::test]
+    async fn an_unreadable_member_of_a_group_with_no_policy_on_is_skipped() -> anyhow::Result<()> {
+        let Some(world) = World::new().await? else {
+            return Ok(());
+        };
+        world.enroll().await?;
+        let swap = world.on(PolicyKind::Swap, 3);
+        let kept = GroupPolicyState {
+            policies: vec![swap.clone()],
+            triggered: BTreeSet::from([PolicyKind::Swap]),
+            ..GroupPolicyState::default()
+        };
+        let job_states = [decided_state("job-1", &[PolicyKind::Swap])?];
+        world.keep(&kept, &job_states).await?;
+        world.turn_on(std::slice::from_ref(&swap)).await?;
+        let off = CampaignGroupPolicy {
+            enabled: false,
+            ..swap.clone()
+        };
+        let (config, groups) = (world.config(), world.groups()?);
+        anyhow::ensure!(groups.replace_policy(&swap, &off).await?);
+        world
+            .db
+            .execute("UPDATE campaign_group_members SET policy_state = 'not a state'")
+            .await?;
+        let counts = round(&config, &world.stores, groups, Instant::now(), &probed).await?;
+        assert_eq!(
+            (
+                counts.members_skipped,
+                counts.failed_items,
+                counts.members_cleared
+            ),
+            (1, 1, 0)
+        );
+        let member = world.member(&world.campaign.campaign_id).await?;
+        assert!(member.policy_state.is_err(), "{:?}", member.policy_state);
+        assert_eq!(world.job_states().await?, job_states.to_vec());
         Ok(())
     }
 }

@@ -15,8 +15,8 @@ use pipette_pipeline::plan_document::{SourceRead, read_source};
 use pipette_plan_types::{
     CampaignGroup, CampaignId, CampaignListQuery, CampaignOverview, CampaignOverviewQuery,
     CampaignPlanRow, CampaignPlans, CampaignReadQuery, CampaignView, DeviceTimeTotal, Highlights,
-    ListPage, Named, OrgId, OwnedListQuery, OwnerFilter, OwnerLookupQuery, PlanId, PlanReadQuery,
-    PlanSummary, PolicyCheck, UserId, UserPermission,
+    ListPage, Named, OrgId, OwnedListQuery, OwnerLookupQuery, PlanId, PlanReadQuery, PlanSummary,
+    PolicyCheck, PolicyDeferral, UserPermission,
 };
 use pipette_store::{STORAGE_CONCURRENCY, drain_campaigns};
 
@@ -29,7 +29,7 @@ use crate::extract::{ApiPath, ApiQuery, Parsed};
 use crate::list::list_limit;
 use crate::names::{owner_labels, submitter_addresses};
 use crate::owner::{OwnedPage, admits_filter, page_within_reach};
-use crate::owner_choices::{boundary_of, campaign_choices};
+use crate::owner_choices::campaign_choices;
 use crate::state::AppState;
 
 // GET /api/v1/campaigns
@@ -45,7 +45,6 @@ pub async fn list_campaigns(
         return Err(AppError::BadRequest("`models` needs `plan=true`".into()));
     }
     let caller = active.caller();
-    let user = caller.user;
     let reach = CampaignReach::over_records(&state, caller).await?;
     let OwnedPage { page, drained } = match &filter.plan_id {
         Some(plan_id) => {
@@ -58,7 +57,7 @@ pub async fn list_campaigns(
                 ));
             }
             OwnedPage {
-                page: filed_into(&state, plan_id, &query, &filter, &user.user_id, &reach).await?,
+                page: filed_into(&state, plan_id, &query, &filter, &reach).await?,
                 drained: None,
             }
         }
@@ -66,7 +65,6 @@ pub async fn list_campaigns(
             page_within_reach(
                 &state.config,
                 query,
-                &user.user_id,
                 |campaign: &Campaign| reach.admits(campaign) && in_state(&filter, campaign),
                 "campaigns",
                 |after, limit| {
@@ -253,7 +251,6 @@ async fn filed_into(
     plan_id: &PlanId,
     query: &OwnedListQuery,
     filter: &CampaignListQuery,
-    caller: &UserId,
     reach: &CampaignReach,
 ) -> Result<ListPage<Campaign>, AppError> {
     let manifest = state
@@ -274,7 +271,7 @@ async fn filed_into(
             .into_iter()
             .filter(|campaign| {
                 reach.admits(campaign)
-                    && admits_filter(query.owner, query.org_id.as_ref(), &campaign.owner, caller)
+                    && admits_filter(query.org_id.as_ref(), &campaign.owner)
                     && in_state(filter, campaign)
             })
             .collect(),
@@ -421,13 +418,7 @@ pub async fn org_campaigns(
     // Newest first; the store returns creation order, so a reversal suffices.
     let campaigns = Highlights::of(
         listing.items.iter().rev().filter(|campaign| {
-            reach.admits(campaign)
-                && admits_filter(
-                    Some(OwnerFilter::Org),
-                    Some(org_id),
-                    &campaign.owner,
-                    &caller.user.user_id,
-                )
+            reach.admits(campaign) && admits_filter(Some(org_id), &campaign.owner)
         }),
         shown,
     );
@@ -460,19 +451,16 @@ async fn may_administer(
     campaign: &Campaign,
 ) -> Result<bool, AppError> {
     match CampaignAuthority::resolve(state, caller).await {
-        Ok(authority) => Ok(authority.may_administer(&campaign.owner)
-            || authority
-                .offboards(state, caller.rights, &campaign.owner)
-                .await?),
+        Ok(authority) => Ok(authority.may_administer(&campaign.owner)),
         Err(AppError::Forbidden(_)) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
 /// The organization where `caller` may create a descriptor catalog entry for
-/// `campaign`'s descriptors: the owning organization, or the current
-/// organization of the owning user. The caller must belong to it and hold
-/// `edit_catalog`, or belong to no organization and hold `edit_any_catalog`.
+/// `campaign`'s descriptors: the owning organization. The caller must belong
+/// to it and hold `edit_catalog`, or belong to no organization and hold
+/// `edit_any_catalog`.
 /// This rule keeps the caller from reading the catalog names of another
 /// organization. Advisory: the create route decides.
 async fn catalog_org(
@@ -485,12 +473,12 @@ async fn catalog_org(
     {
         return Ok(None);
     }
-    let target = boundary_of(state, &campaign.owner).await?;
-    let own = user_org(state, &caller.user.user_id).await?;
-    Ok(target.filter(|target| match &own {
-        Some(own) => own == target,
+    let target = campaign.owner.org_id();
+    let allowed = match user_org(state, &caller.user.user_id).await? {
+        Some(own) => &own == target,
         None => caller.rights.holds(UserPermission::EditAnyCatalog),
-    }))
+    };
+    Ok(allowed.then(|| target.clone()))
 }
 
 /// Whether a page drawing `plan_id` may offer to re-run its jobs: it is the
@@ -562,7 +550,7 @@ pub(crate) async fn overview(
         campaign.current_plan_id.is_some() && links.first().is_some_and(|(_, plan)| plan.is_some());
     let may_administer = may_administer(state, caller, &campaign).await?;
     let catalog_org_id = catalog_org(state, caller, &campaign).await?;
-    let group = readable_group(state, reach, &campaign.campaign_id).await?;
+    let (group, policy_deferral) = readable_group(state, reach, &campaign).await?;
     let revisable = if head_readable {
         CampaignReviser::revisable_head(state, caller, &campaign).await?
     } else {
@@ -596,6 +584,7 @@ pub(crate) async fn overview(
         body: CampaignOverview {
             campaign: campaign.into(),
             group,
+            policy_deferral,
             may_administer,
             may_edit_variants: revisable.is_some(),
             // [`may_rerun`]'s rule, from the reads above.
@@ -623,30 +612,55 @@ pub(crate) async fn overview(
     })
 }
 
-/// The group `campaign_id` is in, if `reach` admits its owner as
-/// `GET /api/v1/campaign-groups/{group_id}` does.
+/// The campaign's group and its deferral. The group is `None` if `reach` does
+/// not admit the group's owner, the same check that
+/// `GET /api/v1/campaign-groups/{group_id}` makes. The deferral is `None` if
+/// the stored state cannot be decoded, an enabled policy has settings that
+/// fail their check, or no enabled policy re-runs or marks.
 async fn readable_group(
     state: &AppState,
     reach: &CampaignReach,
-    campaign_id: &CampaignId,
-) -> Result<Option<CampaignGroup>, AppError> {
+    campaign: &Campaign,
+) -> Result<(Option<CampaignGroup>, Option<PolicyDeferral>), AppError> {
     let Some(store) = state.campaign_group_store.as_deref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let group_id = store
-        .group_of(campaign_id)
+    let membership = store
+        .group_and_member(&campaign.campaign_id)
         .await
         .map_err(|e| AppError::internal(e.context("failed to read the campaign's group")))?;
-    let Some(group_id) = group_id else {
-        return Ok(None);
+    let Some((group, member)) = membership.filter(|(group, _)| reach.admits_owner(&group.owner))
+    else {
+        return Ok((None, None));
     };
-    let group = store
-        .get_group(&group_id)
-        .await
-        .map_err(|e| AppError::internal(e.context("failed to read the campaign group")))?;
-    Ok(group
-        .filter(|group| reach.admits_owner(&group.owner))
-        .map(CampaignGroup::from))
+    let mut deferral = member
+        .policy_state
+        .ok()
+        .flatten()
+        .and_then(|state| state.deferred)
+        .filter(|_| campaign.state.is_active());
+    if deferral.is_some() {
+        let can_file = match store.list_policies(&group.group_id).await {
+            // The pass skips a whole group if one enabled policy's settings fail.
+            Ok(policies) => {
+                let enabled = || policies.iter().filter(|policy| policy.enabled);
+                enabled().all(|policy| policy.kind.check_settings(&policy.settings).is_ok())
+                    && enabled().any(|policy| policy.kind.reruns_or_marks())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    group_id = %group.group_id,
+                    error = %format!("{error:#}"),
+                    "failed to read campaign group policies for the deferral hint"
+                );
+                false
+            }
+        };
+        if !can_file {
+            deferral = None;
+        }
+    }
+    Ok((Some(CampaignGroup::from(group)), deferral))
 }
 
 /// A scope is `None` unless the reader may read each of its plans; the

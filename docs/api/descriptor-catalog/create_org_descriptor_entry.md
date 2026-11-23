@@ -13,6 +13,10 @@ nonempty ordered arrays:
   `[a-z0-9_]+(@[a-z0-9_]+)?`, for example `q4_k_m@unsloth`. The server derives
   the format from the model type.
 
+The optional `family` sets the family of a model entry. It follows the catalog
+name grammar. Without it, the family is the text of the name before its first
+hyphen. A runtime entry refuses a `family`.
+
 The optional `release_time` follows Request for Comments (RFC) 3339. Runtime
 and model members can use vault resources owned by that organization. The
 server checks each resource's owner, record, and pinned digest. A resource
@@ -51,6 +55,5 @@ not prevent creation. The response is the catalog entry view with its complete
 | 201 | The API created the entry |
 | 400 | The body or a member fails catalog validation, or Hugging Face refuses a repository, or a repository is private or gated |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable, or the server has no database catalog |
 | 409 | An entry in this organization already holds the name |
 | 502 | Hugging Face failed or limited the rate of the requests |

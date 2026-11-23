@@ -88,6 +88,8 @@ describe("the plan page", () => {
     expect(changeText({ type: "document" })).toBe("Document revised.");
     expect(changeText({ type: "document", carry_earlier: true, carry_across_limit: true }))
       .toBe("Document revised. Carries runs of earlier plans. Carries runs across a changed attempt limit.");
+    expect(changeText({ type: "document", inherit_failed: true, inherit_from: ["plan-a"] }))
+      .toBe("Document revised. Carries failed runs. Inherits runs of plan-a.");
     expect(changeText({ type: "revert", to_plan_id: "plan-a" })).toBe("Reverted to plan-a.");
     expect(changeText({
       type: "variants", removed_variant_count: 1, added_variant_count: 2, inherit_from: ["plan-a"],
@@ -99,6 +101,15 @@ describe("the plan page", () => {
       inherit_from: ["plan-a", "plan-b"],
     }))
       .toBe("Variant edit: 1 removed, 0 added. Carries runs of earlier plans. Inherits runs of plan-a, plan-b.");
+    expect(changeText({
+      type: "document", inherit_from: ["plan-a"],
+      replace_model: [
+        { from: "/vault/resources/vault_1/content", to: "org/repo@abc:m.gguf", verified: true },
+        { from: "org/repo@def:m.gguf", to: "org/repo@abc:m.gguf", verified: false },
+      ],
+    })).toBe("Document revised. Inherits runs of plan-a. "
+      + "Replaces model /vault/resources/vault_1/content with org/repo@abc:m.gguf. "
+      + "Replaces model org/repo@def:m.gguf with org/repo@abc:m.gguf on the filer's word.");
   });
 
   test("a reason keeps its last bytes behind an ellipsis, on a character boundary", () => {

@@ -3,11 +3,12 @@
   // record, and the forms that administer it for a reader whose device scope
   // reaches it. Each write reads the device again, as the classic form redirected.
   import {
-    account as accountOf, amendClientPermissions, approveClient, client, deleteClient, deviceOwners, rejectClient,
-    setClientOwner,
+    amendClientPermissions, approveClient, client, deleteClient, deviceOwners, rejectClient,
+    setClientOwner, updateClient,
   } from "../lib/api";
   import DangerRow from "../lib/components/DangerRow.svelte";
   import DeviceCatalog from "../lib/components/DeviceCatalog.svelte";
+  import DeviceName from "../lib/components/DeviceName.svelte";
   import { latest } from "../lib/components/guard";
   import Loaded from "../lib/components/Loaded.svelte";
   import OwnerCell from "../lib/components/OwnerCell.svelte";
@@ -24,9 +25,10 @@
   } from "../lib/devices";
   import { auditAction } from "../lib/audit";
   import { DELETES, REJECT_DEVICE } from "../lib/danger";
-  import { standing } from "../lib/fleet";
+  import { deviceLabel, standing } from "../lib/fleet";
   import { when } from "../lib/format";
   import { orgName } from "../lib/orgs";
+  import { principalOf } from "../lib/owned";
   import { ownerOf } from "../lib/owners";
   import { toggled } from "../lib/rights";
   import { here, navigateFrom } from "../lib/route.svelte";
@@ -44,33 +46,29 @@
 
   const record = $derived(device.data);
   const branch = $derived(record && session.account
-    ? deviceBranch(record, session.account, record.owning_org_id ? session.knownOrg(record.owning_org_id) : null)
+    ? deviceBranch(record, session.account, record.owner ? session.knownOrg(record.owner.org_id) : null)
     : null);
   const listing = $derived(branch ? listingPath(branch) : null);
   $effect(() => { here.under = listing; });
 
-  // The owner as strings, so the effects below rerun when it changes, not on every reread.
-  const ownerKind = $derived(record?.owner?.type ?? "");
-  const ownerId = $derived(record?.owner ? (record.owner.type === "org" ? record.owner.org_id : record.owner.user_id) : "");
+  // The owner as a string, so the effects below rerun when it changes, not on every reread.
+  const ownerId = $derived(record?.owner ? principalOf(record.owner) : "");
   const administers = $derived(!!record?.may_administer);
 
   // The owner's name, only for a reader of the roster it is on (`owner_labels`
-  // behind `read.covers`), which `GET /api/v1/orgs` and `GET /api/v1/users` refuse any other.
+  // behind `read.covers`), which `GET /api/v1/orgs` refuses any other.
   const named = $derived(!!record && !!session.account && namesOwner(record, session.account));
   let names = $state<Record<string, string>>({});
   $effect(() => {
-    const [kind, owner] = [ownerKind, ownerId];
+    const owner = ownerId;
     if (!owner || !named) return;
-    const asked = kind === "org"
-      ? session.resolveOrg(owner).then((org) => (org ? orgName(org) : undefined))
-      : accountOf(session.signer, owner).then((read) => read.contact_email);
-    asked.then((name) => { if (name) names = { ...names, [owner]: name }; }).catch(() => {});
+    session.resolveOrg(owner)
+      .then((org) => { if (org) names = { ...names, [owner]: orgName(org) }; }).catch(() => {});
   });
-  // The reader and the organizations the session holds are named without a roster read.
+  // The organizations the session holds are named without a roster read.
   const shownNames = $derived.by(() => {
     const held: Record<string, string> = {};
     for (const org of session.known) if (org) held[org.org_id] = orgName(org);
-    if (session.account) held[session.account.user_id] = session.account.contact_email;
     return { ...held, ...names };
   });
 
@@ -86,19 +84,25 @@
       .catch(() => { if (mine()) handsOn = false; });
   });
 
-  // The boxes as drawn from the last read; a save diffs against what was drawn.
+  // Keep unsaved ticks when a reread leaves the stored permissions unchanged.
+  const storedPermissions = $derived(record?.permissions.slice().sort().join(",") ?? "");
   let ticked = $state(new Set<ClientPermission>());
   $effect(() => {
-    ticked = new Set(CLIENT_PERMISSIONS.filter((name) => record?.permissions.includes(name)));
+    void id;
+    const held = storedPermissions.split(",");
+    ticked = new Set(CLIENT_PERMISSIONS.filter((name) => held.includes(name)));
   });
   const tick = (name: ClientPermission, on: boolean) => { ticked = toggled(ticked, name, on); };
 
   let picker = $state<ReturnType<typeof OwnerPicker>>();
 
-  const act = (write: () => Promise<unknown>) => work.attempt(async () => {
-    await write();
-    await reread();
-  });
+  async function act(write: () => Promise<unknown>) {
+    if (work.busy) return;
+    await work.attempt(async () => {
+      await write();
+      await reread();
+    });
+  }
 
   // Either removes the registration: back to its listing, a rejection to its pending devices.
   let left = { from: "", to: null as string | null };
@@ -112,12 +116,12 @@
 
   async function handOver(event: SubmitEvent) {
     event.preventDefault();
-    await work.attempt(async () => {
-      if (!picker) return;
-      const choice = await picker.chosen();
+    const choosing = picker;
+    if (!choosing) return;
+    await act(async () => {
+      const choice = await choosing.chosen();
       await setClientOwner(session.signer, id, { owner: ownerOf(choice) });
-      picker.clear();
-      await reread();
+      choosing.clear();
     });
   }
 
@@ -129,7 +133,7 @@
   }
 </script>
 
-<PageHead trail={branch ? deviceTrail(branch) : []} title={record?.device_name ?? id}
+<PageHead trail={branch ? deviceTrail(branch) : []} title={record ? deviceLabel(record) : id}
           action={session.account ? auditAction(session.account, id) : null} />
 {#if work.error}<p class="err" role="alert">{work.error}</p>{/if}
 
@@ -140,6 +144,7 @@
     {@const disagrees = backlogDisagrees(view)}
     <dl>
       <dt>client_id</dt><dd class="id">{view.client_id}</dd>
+      <dt>name</dt><dd>{view.name || "—"}</dd>
       <dt>status</dt><dd><StatusPill status={view.status} /></dd>
       <dt>standing</dt><dd>{standing(view)}</dd>
       <dt>owner</dt><dd>
@@ -203,6 +208,11 @@
               {/snippet}
             </SettingRow>
           {/if}
+          <DeviceName name={view.name ?? null} fallback={deviceLabel({ ...view, name: null })} busy={work.busy}
+                      save={(to, saved) => act(async () => {
+                        await updateClient(session.signer, id, { name: to });
+                        saved();
+                      })} />
           <SettingRow title="Owner"
                       text="An organization holds a shared device, and it stays when whoever racked it leaves. A person holds their own, and it follows them between organizations. Either way the owner says which organization the device rolls up to, and so which vault artifacts it may fetch. Detached, it belongs to nobody, fetches nothing private, and waits among the unclaimed devices for a server admin.">
             {#snippet children()}
@@ -235,11 +245,11 @@
 
         <DangerZone>
           {#if view.status === "pending"}
-            <DangerRow title="Reject this registration" ask={`Reject ${view.device_name ?? view.client_id}?`}
+            <DangerRow title="Reject this registration" ask={`Reject ${deviceLabel(view)}?`}
                        pending="Rejecting…" phrase={REJECT_DEVICE} run={reject} done={gone} locked={work.busy}
                        text="Deletes the registration and frees its keypair. The device authenticates nothing; registering again makes it a new pending device." />
           {/if}
-          <DangerRow title="Delete this device" ask={`Delete ${view.device_name ?? view.client_id}?`} pending="Deleting…"
+          <DangerRow title="Delete this device" ask={`Delete ${deviceLabel(view)}?`} pending="Deleting…"
                      phrase={DELETES.device} run={remove} done={gone} locked={work.busy}
                      text="Removes the registration, releases its keypair and clears its queue state. The device authenticates nothing afterwards; registering again makes it a new pending device." />
         </DangerZone>

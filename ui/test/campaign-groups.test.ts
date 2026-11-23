@@ -3,10 +3,10 @@ import { describe, expect, test, vi } from "vitest";
 import schema from "../src/lib/api-schema.json";
 import {
   FAILURE_CODES, MAX_RERUNS, changeText, checkLines, checkText, codesProblem, filingsTable, gapsTable, groupTabs,
-  groupsCrumb, listingTabs, mayAdminister, mayFile, memberOffers, memberRows, outcomeText, paramsGaps, paramsWrite,
+  groupsCrumb, listingTabs, mayFile, memberOffers, memberRows, outcomeText, paramsGaps, paramsWrite,
   percentProblem, policyBody, policyPreviewTable, policyText, policyTitle, previewLacks, recentFilings,
-  rerunSummaryText, rerunTitle, rerunValue, rerunsCsv, rerunsProblem, rerunsTable, shortProblem, smallerFailedRows,
-  smallerFailedTable, stateTitle, togetherText, turnOffText, turnOnText,
+  rerunSummaryText, rerunTitle, rerunValue, rerunsCsv, rerunsOrMarks, rerunsProblem, rerunsTable, shortProblem,
+  smallerFailedRows, smallerFailedTable, stateTitle, togetherText, turnOffText, turnOnText,
 } from "../src/lib/campaign-groups";
 import { CAMPAIGN_PAGES } from "../src/lib/campaigns";
 import CampaignGroupBody from "../src/lib/components/CampaignGroupBody.svelte";
@@ -16,7 +16,7 @@ import RerunResults from "../src/lib/components/RerunResults.svelte";
 import { Loader } from "../src/lib/components/work.svelte";
 import { ownerBranch } from "../src/lib/owned";
 import { match, pathOf } from "../src/lib/routes";
-import { tableView, unsorted } from "../src/lib/table";
+import { tableView, unfiltered } from "../src/lib/table";
 import type {
   CampaignGroupPolicy, CampaignGroupPolicyPreview, CampaignGroupRerunResults, CampaignView, FailureCode,
   MemberPolicyPreview, ModelParamsGap, OwnUserView, PolicyCheckCounts, PolicyFiling, PolicyKind, PolicyMemberState,
@@ -26,7 +26,7 @@ import { abilitiesOf } from "./abilities";
 
 // The table imports it, and it reads `location` as it loads; the re-runs' table reads an empty address.
 vi.mock("../src/lib/route.svelte", async () => ({
-  here: { query: new URLSearchParams() }, href: (await import("../src/lib/routes")).href,
+  here: { path: "/app/campaign-groups/group_1", query: new URLSearchParams() }, href: (await import("../src/lib/routes")).href,
 }));
 
 const reader = (permissions: UserPermission[], org_id?: string): OwnUserView => ({
@@ -34,7 +34,6 @@ const reader = (permissions: UserPermission[], org_id?: string): OwnUserView => 
   permissions, keys: [], may: abilitiesOf(permissions, org_id), ...(org_id ? { org_id, org_slug: "acme" } : {}),
 });
 
-const [mine, theirs]: PrincipalOwner[] = [{ type: "user", user_id: "user_me" }, { type: "user", user_id: "user_x" }];
 const [acme, rival]: PrincipalOwner[] = [{ type: "org", org_id: "org_acme" }, { type: "org", org_id: "org_rival" }];
 
 const campaign = (campaign_id: string, owner: PrincipalOwner, fields: Partial<CampaignView> = {}): CampaignView =>
@@ -42,8 +41,7 @@ const campaign = (campaign_id: string, owner: PrincipalOwner, fields: Partial<Ca
 
 describe("the group pages' tabs", () => {
   test("an owner's campaign listing opens on its campaigns, its groups a tab beside them", () => {
-    const listings = [["/app/me/campaigns", "me-campaigns", "me-campaign-groups"],
-                      ["/app/orgs/acme/campaigns", "org-campaigns", "org-campaign-groups"]] as const;
+    const listings = [["/app/orgs/acme/campaigns", "org-campaigns", "org-campaign-groups"]] as const;
     for (const [base, ...pages] of listings) {
       expect(listingTabs(base, false).map((tab) => [tab.label, tab.href, tab.current])).toEqual([
         ["Campaigns", base, true], ["Groups", `${base}/groups`, false],
@@ -75,33 +73,20 @@ describe("the group pages' tabs", () => {
 
   test("a group's page sits under its owner's Groups tab, which the listing of every campaign has none of", () => {
     const crumb = (owner: PrincipalOwner) =>
-      groupsCrumb(ownerBranch({ user_id: "user_me" }, owner, [{ org_id: "org_acme", slug: "acme" }], CAMPAIGN_PAGES));
-    expect(crumb(mine)).toEqual({ label: "Groups", href: "/app/me/campaigns/groups" });
+      groupsCrumb(ownerBranch(owner, [{ org_id: "org_acme", slug: "acme" }], CAMPAIGN_PAGES));
     expect(crumb(acme)).toEqual({ label: "Groups", href: "/app/orgs/acme/campaigns/groups" });
-    expect([rival, theirs].map(crumb)).toEqual([null, null]);
+    expect(crumb(rival)).toBeNull();
   });
 });
 
 describe("who the group pages offer a write to", () => {
   test("a create and a member change go to a reader who files into the owner's campaigns", () => {
-    const owners = [mine, theirs, acme, rival];
-    expect(owners.map((owner) => mayFile(reader(["submit_plans"], "org_acme"), owner))).toEqual([true, false, true, false]);
-    expect(owners.map((owner) => mayFile(reader(["submit_plans", "manage_any_orgs"]), owner))).toEqual([true, true, true, true]);
+    const owners = [acme, rival];
+    expect(owners.map((owner) => mayFile(reader(["submit_plans"], "org_acme"), owner))).toEqual([true, false]);
+    expect(owners.map((owner) => mayFile(reader(["submit_plans", "manage_any_orgs"]), owner))).toEqual([true, true]);
     // The routes' gate is submit_plans, which administering an organization does not give.
-    expect([mine, acme].map((owner) => mayFile(reader(["manage_orgs", "read_plans"], "org_acme"), owner))).toEqual([false, false]);
+    expect(mayFile(reader(["manage_orgs", "read_plans"], "org_acme"), acme)).toBe(false);
     expect(mayFile(reader(["manage_any_orgs"]), rival)).toBe(false);
-  });
-
-  test("a rename and a delete go to whoever renames the owner's campaigns, and to an administrator on another account's group", () => {
-    expect([mine, theirs, acme].map((owner) => mayAdminister(reader(["submit_plans"], "org_acme"), owner)))
-      .toEqual([true, false, false]);
-    // The other account may be a disabled member, whose group its administrator winds down.
-    expect([acme, rival, theirs, mine].map((owner) => mayAdminister(reader(["manage_orgs"], "org_acme"), owner)))
-      .toEqual([true, false, true, false]);
-    expect([rival, theirs].map((owner) => mayAdminister(reader(["manage_any_orgs"]), owner))).toEqual([true, true]);
-    expect(mayAdminister(reader(["read_any_plans"]), theirs)).toBe(false);
-    // Reading every plan, it opens any account's group, not only a disabled member's.
-    expect(mayAdminister(reader(["manage_orgs", "read_any_plans"], "org_acme"), theirs)).toBe(false);
   });
 });
 
@@ -125,7 +110,7 @@ describe("a group's members", () => {
       { value: "campaign_3", label: "aa-perf S26", searchText: "device=S26 Ultra" },
       { value: "campaign_2", label: "aa-perf iPhone (archived)", searchText: "" },
     ]);
-    expect(memberOffers(listed, { owner: theirs, members: [] })).toEqual([]);
+    expect(memberOffers(listed, { owner: { type: "org", org_id: "org_other" }, members: [] })).toEqual([]);
   });
 });
 
@@ -143,10 +128,10 @@ describe("the group page", () => {
 
   test("marks each policy that is on cleared or triggered per member, and counts the members every one cleared", () => {
     const checks = (triggered: boolean): PolicyCheck[] => [{ kind: "swap", triggered: false }, { kind: "spread", triggered }];
-    const body = draw(reader([]), mine, [
-      campaign("campaign_1", mine, { name: "flagged", policy_checks: checks(true) }),
-      campaign("campaign_2", mine, { name: "clean", policy_checks: checks(false) }),
-      campaign("campaign_3", mine, { name: "not read yet" }),
+    const body = draw(reader([]), acme, [
+      campaign("campaign_1", acme, { name: "flagged", policy_checks: checks(true) }),
+      campaign("campaign_2", acme, { name: "clean", policy_checks: checks(false) }),
+      campaign("campaign_3", acme, { name: "not read yet" }),
     ]).replace(/<!--.*?-->/g, "");
     expect(body).toContain("1 of 2 campaigns cleared on every policy that is on.");
     expect(body).toContain('<span data-state="cleared">swap cleared</span> <span data-state="triggered">spread triggered</span>');
@@ -154,11 +139,11 @@ describe("the group page", () => {
   });
 
   test("counts nothing while queue-maintenance has read no member", () => {
-    expect(draw(reader([]), mine)).not.toContain("cleared on every policy");
+    expect(draw(reader([]), acme)).not.toContain("cleared on every policy");
   });
 
   test("links each member to its campaign and offers only the owner's other campaigns", () => {
-    const body = draw(reader(["submit_plans"]), mine);
+    const body = draw(reader(["submit_plans"], "org_acme"), acme);
     expect(body).toContain('<a href="/app/campaigns/campaign_1">listed member</a>');
     expect(body).toContain('<a href="/app/campaigns/campaign_2">unlisted member</a>');
     expect(body).toMatch(/class="name[^"]*">outsider</);
@@ -166,7 +151,7 @@ describe("the group page", () => {
   });
 
   test("names the progress counts once, in the header, outside its sort control", () => {
-    expect(draw(reader([]), mine).replace(/<!--.*?-->/g, "")).toContain('</button> <span class="key">finished · '
+    expect(draw(reader([]), acme).replace(/<!--.*?-->/g, "")).toContain('</a> <span class="key">finished · '
       + '<i class="swatch" data-of="failed"></i>failed · <i class="swatch" data-of="running"></i>running / total</span>');
   });
 
@@ -216,13 +201,17 @@ describe("a group's policies", () => {
     expect(policyText(policy("smaller_failed", 0))).toBe("Flags the result rows whose job failed while a job of the "
       + "same cell at larger sizes, such as a longer context, ran with no failure. It re-runs and marks nothing, and "
       + "queue-maintenance does not read it: the jobs it flags are on the Activity tab.");
+    expect(policyText(policy("vault_resource", 0))).toBe("Flags the jobs whose model or runtime is a vault resource, "
+      + "a gated Hugging Face model copied into the vault included. It re-runs and marks nothing: a campaign with such "
+      + "a job shows the policy triggered.");
   });
 
   test("a policy is titled by its check, spread at its stored percent, and marked where the Activity tab finds it off", () => {
     expect([policy("swap", 5), policy("spread", 3, { settings: { percent: 7.5 } }), policy("failed", 0),
-            policy("ttft_over_e2e", 3), policy("model_params", 0), policy("smaller_failed", 0)].map(policyTitle))
+            policy("ttft_over_e2e", 3), policy("model_params", 0), policy("smaller_failed", 0),
+            policy("vault_resource", 0)].map(policyTitle))
       .toEqual(["Swap", "Stddev over 7.5%", "Failures by type", "TTFT over E2E latency", "Missing model params",
-                "Failed below a clean larger run"]);
+                "Failed below a clean larger run", "Vault model or runtime"]);
     expect([policy("model_params", 0), policy("model_params", 0, { enabled: true })].map(stateTitle))
       .toEqual(["Missing model params (off)", "Missing model params"]);
   });
@@ -300,9 +289,9 @@ describe("a group's policies", () => {
     expect((["spread", "ttft_over_e2e"] as const)
       .map((kind) => [rerunsProblem(kind, "0"), rerunsProblem(kind, "1")]))
       .toEqual(Array(2).fill(["Enter a whole number of re-runs from 1 to 15", ""]));
-    // Model params re-runs nothing, and failed takes its re-runs per code, so each takes 0 alone.
-    expect((["model_params", "failed"] as const).map((kind) => ["0", "1"].map((typed) => rerunsProblem(kind, typed))))
-      .toEqual(Array(2).fill(["", "Enter a whole number of re-runs from 0 to 0"]));
+    // Failed takes its re-runs per code, so it takes 0 alone.
+    expect(["0", "1"].map((typed) => rerunsProblem("failed", typed)))
+      .toEqual(["", "Enter a whole number of re-runs from 0 to 0"]);
     expect(["", "0", "-2"].map((typed) => percentProblem("spread", typed)))
       .toEqual(Array(3).fill("Enter a percent above 0"));
     expect(percentProblem("spread", "7.5")).toBe("");
@@ -415,28 +404,35 @@ describe("a group's policies", () => {
     expect(body).toMatch(/<button type="button" id="[^"]+-switch" [^>]*aria-disabled="false"[^>]*>Turn off<\/button>/);
   });
 
-  test("offers a filer the model params policy's Turn on and Turn off alone, with what turning it off stops", () => {
+  test("offers a filer the model params policy's Turn on alone while it is off", () => {
     const off = row(policy("model_params", 0), true, ["S26 CPU: 2 jobs whose rows lack model params"]);
     expect(off).toContain('data-state="off"');
     expect(off).toMatch(/<button type="button" id="[^"]+-switch" [^>]*aria-haspopup="dialog"[^>]*>Turn on<\/button>/);
     expect(off).not.toMatch(/<(form|input)\b|Save changes|class="body"/);
-    const on = row(policy("model_params", 0, { enabled: true, enabled_by: "user_me", enabled_at: "2026-11-11T12:00:00Z" }),
-                   true);
-    expect(on).toContain(">Turn off</button>");
-    expect(on).toContain('class="hint">Turning it off stops queue-maintenance logging these rows from its next run; the '
-                         + "Activity tab still shows them.</div>");
-    expect(on).not.toMatch(/<(form|input)\b/);
   });
 
-  test("the smaller failed policy takes no re-run, and turning it on or off changes only its state", () => {
-    expect(["0", "1"].map((typed) => rerunsProblem("smaller_failed", typed)))
+  test.each([
+    { kind: "model_params" as const,
+      turnOn: " From the next queue-maintenance run on, it logs the rows that lack model params in each campaign's "
+        + "current plan, jobs that finished before it was turned on included.",
+      hint: "Turning it off stops queue-maintenance logging these rows from its next run; the Activity tab still shows "
+        + "them." },
+    { kind: "smaller_failed" as const, turnOn: "",
+      hint: "Turning it off only marks it off; the Activity tab still shows these jobs." },
+    { kind: "vault_resource" as const,
+      turnOn: " From the next queue-maintenance run on, it flags the jobs of each campaign's current plan, jobs that "
+        + "finished before it was turned on included.",
+      hint: "Turning it off stops flagging jobs from the next queue-maintenance run; the Activity tab still counts "
+        + "these jobs." },
+  ])("the $kind policy takes no re-run, and says what turning it on and off does", ({ kind, turnOn, hint }) => {
+    expect(rerunsOrMarks(kind)).toBe(false);
+    expect(["0", "1"].map((typed) => rerunsProblem(kind, typed)))
       .toEqual(["", "Enter a whole number of re-runs from 0 to 0"]);
-    expect(turnOnText(policy("smaller_failed", 0))).toBe(policyText(policy("smaller_failed", 0)));
-    expect(turnOffText("smaller_failed"))
-      .toBe("Turning it off only marks it off; the Activity tab still shows these jobs.");
-    const on = row(policy("smaller_failed", 0, { enabled: true, enabled_by: "user_me",
-                                                  enabled_at: "2026-11-12T12:00:00Z" }), true);
-    expect(on).toContain(`class="hint">${turnOffText("smaller_failed")}</div>`);
+    expect(turnOnText(policy(kind, 0))).toBe(`${policyText(policy(kind, 0))}${turnOn}`);
+    expect(turnOffText(kind)).toBe(hint);
+    const on = row(policy(kind, 0, { enabled: true, enabled_by: "user_me", enabled_at: "2026-11-12T12:00:00Z" }), true);
+    expect(on).toContain(">Turn off</button>");
+    expect(on).toContain(`class="hint">${hint}</div>`);
     expect(on).not.toMatch(/<(form|input)\b/);
   });
 });
@@ -481,6 +477,8 @@ describe("a group's policy preview", () => {
                 "2 jobs whose rows lack model params"]);
     expect([counts("smaller_failed", 1, 0, 0, 1), counts("smaller_failed", 2, 0, 0, 2)].map(checkText))
       .toEqual(["1 failed job below a clean larger run", "2 failed jobs below a clean larger run"]);
+    expect([counts("vault_resource", 0), counts("vault_resource", 1, 0, 0, 1)].map(checkText))
+      .toEqual(["0 jobs on a vault model or runtime", "1 job on a vault model or runtime"]);
   });
 
   test("the policies that are on read what they would re-run and mark failed together", () => {
@@ -523,9 +521,6 @@ describe("a group's policy preview", () => {
       "Re-runs a job whose device swapped memory during the run, up to 3 times. If it still swaps, the job is marked "
       + "failed. From the next queue-maintenance run on, it acts on each campaign's current plan, jobs that finished "
       + "before it was turned on included.");
-    expect(turnOnText(policy("model_params", 0))).toBe(`${policyText(policy("model_params", 0))} From the next `
-      + "queue-maintenance run on, it logs the rows that lack model params in each campaign's current plan, jobs that "
-      + "finished before it was turned on included.");
     const rows = [checked, member("campaign_2", { state: "other_owner" }), member("campaign_3", { state: "not_ready" })];
     const members = [campaign("campaign_1", acme, { name: "S26 CPU" }), campaign("campaign_2", acme, { name: "Pixel" })];
     // Spread is off, and counts all the same.
@@ -775,7 +770,7 @@ describe("a group's re-run results", () => {
        "2026-11-11T09:00:00Z", null],
     ]);
     const shown = (choices: Record<string, string[]>, sort = "") =>
-      tableView(spec, { ...unsorted(spec), choices: { ...unsorted(spec).choices, ...choices }, sort }, rows)
+      tableView(spec, { ...unfiltered(spec), choices: { ...unfiltered(spec).choices, ...choices }, sort }, rows)
         .map((row) => row.rerun_job_id);
     expect(shown({}, "change")).toEqual(["job-6", "job-4", "job-2"]);
     expect(shown({ campaign: ["campaign_1"] })).toEqual(["job-2", "job-6"]);

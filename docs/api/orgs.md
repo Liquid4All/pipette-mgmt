@@ -67,6 +67,12 @@ operator typed. An `org_`-prefixed value is read as an id and anything else as a
 handle, so `GET /api/v1/orgs/acme` and `GET /api/v1/orgs/org_0195c3e2-…` reach one record and nobody
 has to look an id up before every read.
 
+Organization creation rejects the handle `global` after trimming whitespace
+and converting uppercase letters to lowercase. The descriptor catalog uses
+`global/<name>` to refer to entries in its global scope. It also rejects a
+handle starting `u-`: that is the slug of the organization an account gets at
+sign-up, `u-` followed by the account's id.
+
 A mutation (`PATCH`, `PUT`, `POST`, `DELETE`) takes **the id only**: a handle there is a
 `400`. A write names the record it changes by what never changes, so a handle
 released and claimed by another organization cannot redirect it.
@@ -84,10 +90,12 @@ can only ever name a record that exists. The first is a roster write under
 grants a permission, yet each moves what an account or a device reaches and who
 administers it, so each is an authority write.
 
-A `null` value clears the relation. That is why neither has a `DELETE` twin:
-"belongs to nobody" is a value the field takes, not an absence of the relation.
+A `null` `owner` clears an ownership. That is why that route has no `DELETE`
+twin: "belongs to nobody" is a value the field takes, not an absence of the
+relation. A membership is never cleared: an account always belongs to an
+organization, and disabling it takes it out of service.
 
-The `404` for an organization or an account named in the *body* is the
+The `404` for an organization named in the *body* is the
 load-bearing one. Resolving the target before writing is
 what lets an absent `owner` be read as "belongs to no organization" rather than
 "points at something gone", and it is why a membership can never name a record
@@ -173,9 +181,7 @@ outcome is `failed` unless the campaign moved onto the revision.
 Beside the request event, the log also records an account's first Clerk
 sign-in when the account already held keys. The `first_clerk_sign_in` action
 names each key ([Users: Signing in through Clerk](users.md#signing-in-through-clerk)).
-Only a `[database]` keeps the audit log. Without a `[database]`, the server
-records nothing and both routes answer `404`. The
-`AuditEvent` schema in the OpenAPI document
+The `AuditEvent` schema in the OpenAPI document
 ([the OpenAPI document](../httpapi.md#15-the-openapi-document)) is the shape of
 an event.
 

@@ -11,15 +11,16 @@ use sqlx::{Connection, FromRow, PgConnection};
 
 use pipette_plan_types::{
     AuditAction, AuditActor, AuditOutcome, AuditTarget, CatalogName, CatalogScope, DescriptorEntry,
-    DescriptorEntryKind, DescriptorEntryState, DescriptorMember, DescriptorMemberDescriptor,
-    DescriptorMemberKey, ModelFormat, NonEmptyVec, OrgId, QuantizationLabel,
+    DescriptorEntryKind, DescriptorEntryState, DescriptorKind, DescriptorMember,
+    DescriptorMemberDescriptor, DescriptorMemberKey, FamilyLogo, FamilyLogoDigest, LogoUri,
+    ModelFormat, NonEmptyVec, OrgId, QuantizationLabel, Sha256,
 };
 use pipette_store::{
     AppendOutcome, CatalogEntryKey, CatalogEntryLock, CreateEntryOutcome, DescriptorCatalogStore,
     DescriptorEntryFilter, DescriptorEntryPage, DigestHit, MergeOutcome, MoveToGlobalOutcome,
-    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetStateOutcome, TransitionOutcome,
-    UnknownCursorError, UnreadableObjectError, merge_outcome, move_to_global_outcome,
-    remove_outcome,
+    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetFamilyLogoOutcome, SetFamilyOutcome,
+    SetStateOutcome, TransitionOutcome, UnknownCursorError, UnreadableObjectError, merge_outcome,
+    move_to_global_outcome, remove_outcome,
 };
 
 use crate::db::SqlDatabase;
@@ -27,7 +28,7 @@ use crate::retry::retry;
 
 /// The members of a set of entries, grouped by entry in the order of precedence.
 const MEMBERS_OF: &str = "SELECT m.scope, m.name_key, m.descriptor_type, m.descriptor, m.digest,
-     m.alias_digest,
+     m.alias_digest, m.size_bytes,
      m.flavor, m.format, m.quantization, m.added_at
      FROM descriptor_members m
      JOIN unnest($1::text[], $2::text[]) AS keys(scope, name_key) USING (scope, name_key)
@@ -39,7 +40,7 @@ const IMPORTER_ENTRIES_LOCK_KEY: i64 = 0x6c6c616d61636370;
 /// appends and state changes to the same entry.
 const LOCK_ENTRY: &str =
     "SELECT scope, name_key, name, kind, state, descriptor_kind, descriptor_type,
-     release_time, created_at, created_by
+     release_time, created_at, created_by, family
      FROM descriptor_entries WHERE scope = $1 AND name_key = $2 FOR UPDATE";
 
 /// If another write takes the new name first, retry the rename or the move to
@@ -185,6 +186,7 @@ struct EntryRow {
     release_time: jiff_sqlx::Timestamp,
     created_at: jiff_sqlx::Timestamp,
     created_by: String,
+    family: Option<String>,
 }
 
 /// A `descriptor_members` row before the store parses it.
@@ -196,6 +198,7 @@ struct MemberRow {
     descriptor: String,
     digest: String,
     alias_digest: Option<String>,
+    size_bytes: Option<i64>,
     flavor: Option<String>,
     format: Option<String>,
     quantization: Option<String>,
@@ -232,13 +235,23 @@ impl MemberRow {
         };
         let member =
             DescriptorMember::verified(descriptor, &self.digest, &key, self.added_at.to_jiff())?
-                .with_alias_digest(self.alias_digest);
+                .with_alias_digest(self.alias_digest)
+                .with_size_bytes(self.size_bytes.map(u64::try_from).transpose()?);
         anyhow::ensure!(
             member.descriptor_type() == self.descriptor_type,
             "member descriptor type mismatch"
         );
         Ok(member)
     }
+}
+
+/// The family logo that a `descriptor_family_logos` row records.
+fn family_logo(scope: &str, family: String, logo_uri: String) -> anyhow::Result<FamilyLogo> {
+    Ok(FamilyLogo {
+        scope: CatalogScope::from_sql_key(scope)?,
+        family: CatalogName::try_new(family)?,
+        logo_uri: LogoUri::try_new(logo_uri)?,
+    })
 }
 
 impl EntryRow {
@@ -260,7 +273,9 @@ impl EntryRow {
             created_at: self.created_at.to_jiff(),
             created_by: self.created_by.parse()?,
             members,
-        };
+            family: None,
+        }
+        .with_family(self.family.map(CatalogName::try_new).transpose()?)?;
         anyhow::ensure!(entry.name.key() == self.name_key, "entry name key mismatch");
         DescriptorEntry::validate_identity(
             &entry.scope,
@@ -290,6 +305,7 @@ struct NewMember<'a> {
     quantization: Option<&'a str>,
     digest: &'a str,
     alias_digest: Option<&'a str>,
+    size_bytes: Option<i64>,
     descriptor: String,
     added_at: jiff_sqlx::Timestamp,
 }
@@ -308,6 +324,7 @@ fn new_members(members: &[DescriptorMember]) -> anyhow::Result<Vec<NewMember<'_>
                 quantization: model_key.map(|(_, quantization)| quantization.as_str()),
                 digest: member.digest(),
                 alias_digest: member.alias_digest(),
+                size_bytes: member.size_bytes().map(i64::try_from).transpose()?,
                 descriptor: pipette_plan_types::canonical_json(&serde_json::to_value(
                     member.descriptor(),
                 )?),
@@ -328,8 +345,8 @@ async fn insert_members(
     for member in members {
         sqlx::query(
             "INSERT INTO descriptor_members (scope, name_key, position, descriptor_type, flavor,
-             format, quantization, digest, alias_digest, descriptor, added_at)
-             VALUES ($1, $2, $3 + $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             format, quantization, digest, alias_digest, size_bytes, descriptor, added_at)
+             VALUES ($1, $2, $3 + $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(scope)
         .bind(key)
@@ -341,6 +358,7 @@ async fn insert_members(
         .bind(member.quantization)
         .bind(member.digest)
         .bind(member.alias_digest)
+        .bind(member.size_bytes)
         .bind(&member.descriptor)
         .bind(member.added_at)
         .execute(&mut *tx)
@@ -415,8 +433,8 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 let mut tx = self.db.begin().await?;
                 let inserted = sqlx::query(
                     "INSERT INTO descriptor_entries (scope, name_key, name, kind, state, descriptor_kind,
-                     descriptor_type, release_time, created_at, created_by)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     descriptor_type, release_time, created_at, created_by, family)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                      ON CONFLICT (scope, name_key) DO NOTHING",
                 )
                 .bind(scope)
@@ -429,6 +447,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 .bind(entry.release_time.to_sqlx())
                 .bind(entry.created_at.to_sqlx())
                 .bind(&created_by)
+                .bind(entry.family.as_ref().map(CatalogName::as_str))
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
@@ -478,7 +497,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 let row: Option<EntryRow> = sqlx::query_as(
                     "UPDATE descriptor_entries SET state = state WHERE scope = $1 AND name_key = $2
                      RETURNING scope, name_key, name, kind, state, descriptor_kind,
-                     descriptor_type, release_time, created_at, created_by",
+                     descriptor_type, release_time, created_at, created_by, family",
                 )
                 .bind(scopes[0])
                 .bind(&keys[0])
@@ -728,6 +747,28 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                     Ok(moved) => moved,
                     Err(error) => return Ok(Err(error)),
                 };
+                let sized_duplicates: Vec<_> = merge
+                    .skipped
+                    .iter()
+                    .filter(|member| member.size_bytes().is_some())
+                    .map(DescriptorMember::digest)
+                    .collect();
+                if !sized_duplicates.is_empty() {
+                    sqlx::query(
+                        "UPDATE descriptor_members AS target SET size_bytes = source.size_bytes
+                         FROM descriptor_members AS source
+                         WHERE target.scope = $1 AND target.name_key = $2
+                           AND source.scope = target.scope AND source.name_key = $3
+                           AND source.digest = target.digest AND source.digest = ANY($4)
+                           AND target.size_bytes IS NULL",
+                    )
+                    .bind(scopes[0])
+                    .bind(target_key)
+                    .bind(source_key)
+                    .bind(&sized_duplicates)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query("DELETE FROM descriptor_entries WHERE scope = $1 AND name_key = $2")
                     .bind(scopes[0])
                     .bind(source_key)
@@ -822,6 +863,224 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
             })
         })
         .await?
+    }
+
+    async fn set_family(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        family: Option<&CatalogName>,
+        actor: Option<&AuditActor>,
+    ) -> anyhow::Result<SetFamilyOutcome> {
+        let keys = [name.key()];
+        let scopes = [scope.sql_key()];
+        retry("set_descriptor_entry_family", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                let row: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                    .bind(scopes[0])
+                    .bind(&keys[0])
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let Some(mut row) = row else {
+                    return Ok(Ok(SetFamilyOutcome::NoSuchEntry));
+                };
+                if row.state == DescriptorEntryState::Tombstoned.as_ref() {
+                    return Ok(Ok(SetFamilyOutcome::Tombstoned));
+                }
+                if row.descriptor_kind != DescriptorKind::Model.as_ref() {
+                    return Ok(Ok(SetFamilyOutcome::RuntimeEntry));
+                }
+                sqlx::query(
+                    "UPDATE descriptor_entries SET family = $3 WHERE scope = $1 AND name_key = $2",
+                )
+                .bind(scopes[0])
+                .bind(&keys[0])
+                .bind(family.map(CatalogName::as_str))
+                .execute(&mut *tx)
+                .await?;
+                row.family = family.map(|family| family.as_str().to_owned());
+                let members: Vec<MemberRow> = sqlx::query_as(MEMBERS_OF)
+                    .bind(&scopes[..])
+                    .bind(&keys[..])
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let entry = match row.parse(members) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Some(actor) = actor {
+                    let mut event = pipette_core::audit::new_event(
+                        actor.clone(),
+                        AuditAction::CatalogSetFamily {
+                            scope: scope.clone(),
+                            name: entry.name.clone(),
+                            family: entry.family.clone(),
+                        },
+                        AuditOutcome::Succeeded,
+                    );
+                    if let CatalogScope::Org(org_id) = scope {
+                        event.org_ids.insert(org_id.clone());
+                        event.targets.insert(AuditTarget::Org {
+                            org_id: org_id.clone(),
+                        });
+                    }
+                    crate::audit::append_in_transaction(&mut tx, &event).await?;
+                }
+                tx.commit().await?;
+                Ok(Ok(SetFamilyOutcome::Set(entry)))
+            })
+        })
+        .await?
+    }
+
+    async fn set_family_logo(
+        &self,
+        scope: &CatalogScope,
+        family: &CatalogName,
+        logo_uri: Option<&LogoUri>,
+        actor: Option<&AuditActor>,
+    ) -> anyhow::Result<SetFamilyLogoOutcome> {
+        let family_key = family.key();
+        retry("set_descriptor_family_logo", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                let outcome = match logo_uri {
+                    Some(logo_uri) => {
+                        // The SQL form of `default_family` in pipette-plan-types:
+                        // `split_part` gives the whole name when it has no hyphen.
+                        let (known,): (bool,) = sqlx::query_as(
+                            "SELECT EXISTS (SELECT 1 FROM descriptor_entries
+                             WHERE scope = $1 AND descriptor_kind = $3 AND state <> $4
+                             AND lower(coalesce(family, split_part(name, '-', 1)) COLLATE \"C\") = $2)",
+                        )
+                        .bind(scope.sql_key())
+                        .bind(&family_key)
+                        .bind(DescriptorKind::Model.as_ref())
+                        .bind(DescriptorEntryState::Tombstoned.as_ref())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        if !known {
+                            return Ok(Ok(SetFamilyLogoOutcome::NoSuchFamily));
+                        }
+                        sqlx::query(
+                            "INSERT INTO descriptor_family_logos
+                                 (scope, family_key, family, logo_uri)
+                             VALUES ($1, $2, $3, $4)
+                             ON CONFLICT (scope, family_key)
+                             DO UPDATE SET family = EXCLUDED.family, logo_uri = EXCLUDED.logo_uri",
+                        )
+                        .bind(scope.sql_key())
+                        .bind(&family_key)
+                        .bind(family.as_str())
+                        .bind(logo_uri.as_str())
+                        .execute(&mut *tx)
+                        .await?;
+                        SetFamilyLogoOutcome::Set(FamilyLogo {
+                            scope: scope.clone(),
+                            family: family.clone(),
+                            logo_uri: logo_uri.clone(),
+                        })
+                    }
+                    None => {
+                        let removed: Option<(String, String)> = sqlx::query_as(
+                            "DELETE FROM descriptor_family_logos WHERE scope = $1 AND family_key = $2
+                             RETURNING family, logo_uri",
+                        )
+                        .bind(scope.sql_key())
+                        .bind(&family_key)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        let removed = removed
+                            .map(|(family, logo_uri)| family_logo(scope.sql_key(), family, logo_uri))
+                            .transpose();
+                        match removed {
+                            Ok(removed) => SetFamilyLogoOutcome::Cleared(removed),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                };
+                // A clear that found no logo changed nothing, so it records nothing.
+                let changed = outcome != SetFamilyLogoOutcome::Cleared(None);
+                if let Some(actor) = actor.filter(|_| changed) {
+                    let mut event = pipette_core::audit::new_event(
+                        actor.clone(),
+                        AuditAction::CatalogSetFamilyLogo {
+                            scope: scope.clone(),
+                            family: family.clone(),
+                            logo_uri: logo_uri.cloned(),
+                        },
+                        AuditOutcome::Succeeded,
+                    );
+                    if let CatalogScope::Org(org_id) = scope {
+                        event.org_ids.insert(org_id.clone());
+                        event.targets.insert(AuditTarget::Org {
+                            org_id: org_id.clone(),
+                        });
+                    }
+                    crate::audit::append_in_transaction(&mut tx, &event).await?;
+                }
+                tx.commit().await?;
+                Ok(Ok(outcome))
+            })
+        })
+        .await?
+    }
+
+    async fn family_logos(&self, scopes: &[CatalogScope]) -> anyhow::Result<Vec<FamilyLogoDigest>> {
+        let keys: Vec<&str> = scopes.iter().map(CatalogScope::sql_key).collect();
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT scope, family, logo_sha256 FROM descriptor_family_logos WHERE scope = ANY($1)",
+        )
+        .bind(&keys[..])
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.into_iter()
+            .map(|(scope, family, sha256)| {
+                Ok(FamilyLogoDigest {
+                    scope: CatalogScope::from_sql_key(&scope)?,
+                    family: CatalogName::try_new(family)?,
+                    sha256: Sha256::try_new(sha256)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn family_logos_with_digest(&self, sha256: &Sha256) -> anyhow::Result<Vec<FamilyLogo>> {
+        let rows: Vec<(String, String, String)> = self
+            .db
+            .fetch_all("family_logos_with_digest", || {
+                sqlx::query_as(
+                    "SELECT scope, family, logo_uri FROM descriptor_family_logos WHERE logo_sha256 = $1",
+                )
+                .bind(sha256.as_ref())
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(scope, family, logo_uri)| family_logo(&scope, family, logo_uri))
+            .collect()
+    }
+
+    async fn family_logo_uri_by_digest(
+        &self,
+        sha256: &Sha256,
+        scopes: Option<&[CatalogScope]>,
+    ) -> anyhow::Result<Option<LogoUri>> {
+        let keys =
+            scopes.map(|scopes| scopes.iter().map(CatalogScope::sql_key).collect::<Vec<_>>());
+        let row: Option<(String,)> = self
+            .db
+            .fetch_optional("family_logo_uri_by_digest", || {
+                sqlx::query_as(
+                    "SELECT logo_uri FROM descriptor_family_logos
+                     WHERE logo_sha256 = $1 AND ($2::text[] IS NULL OR scope = ANY($2))
+                     LIMIT 1",
+                )
+                .bind(sha256.as_ref())
+                .bind(keys.as_deref())
+            })
+            .await?;
+        Ok(row.map(|(uri,)| LogoUri::try_new(uri)).transpose()?)
     }
 
     async fn remove_member(
@@ -958,6 +1217,31 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                             }
                             moved => moved?,
                         };
+                        // The promoted entry keeps its logo: global takes the
+                        // org's logo for the family when global has none.
+                        if let Some(family) = entry.family() {
+                            let copied = sqlx::query(
+                                "INSERT INTO descriptor_family_logos
+                                     (scope, family_key, family, logo_uri)
+                                 SELECT $3, family_key, family, logo_uri
+                                 FROM descriptor_family_logos
+                                 WHERE scope = $1 AND family_key = $2
+                                 ON CONFLICT (scope, family_key) DO NOTHING",
+                            )
+                            .bind(scopes[0])
+                            .bind(family.to_ascii_lowercase())
+                            .bind(global)
+                            .execute(&mut *tx)
+                            .await?;
+                            if copied.rows_affected() > 0 {
+                                tracing::info!(
+                                    org_id = %org,
+                                    catalog_name = %entry.name,
+                                    family,
+                                    "catalog family logo copied to global scope"
+                                );
+                            }
+                        }
                         let mut event = pipette_core::audit::new_event(
                             actor.clone(),
                             AuditAction::CatalogMoveToGlobal {
@@ -996,7 +1280,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 let mut tx = self.db.begin().await?;
                 let entry: Option<EntryRow> = sqlx::query_as(
                     "SELECT scope, name_key, name, kind, state, descriptor_kind, descriptor_type,
-                     release_time, created_at, created_by
+                     release_time, created_at, created_by, family
                      FROM descriptor_entries WHERE scope = $1 AND name_key = $2",
                 )
                 .bind(scopes[0])
@@ -1074,7 +1358,7 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
                 let mut tx = self.db.begin().await?;
                 let entries: Vec<EntryRow> = sqlx::query_as(
                     "SELECT scope, name_key, name, kind, state, descriptor_kind, descriptor_type,
-             release_time, created_at, created_by FROM descriptor_entries e WHERE
+             release_time, created_at, created_by, family FROM descriptor_entries e WHERE
              scope = ANY($1) AND
              (cardinality($2::text[]) = 0 OR kind = ANY($2)) AND
              (cardinality($3::text[]) = 0 OR state = ANY($3)) AND
@@ -1231,6 +1515,43 @@ impl DescriptorCatalogStore for SqlDescriptorCatalogStore {
             .await?;
         Ok(())
     }
+
+    async fn fill_member_size(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        digest: &str,
+        size_bytes: u64,
+    ) -> anyhow::Result<bool> {
+        let size_bytes = i64::try_from(size_bytes)?;
+        let name_key = name.key();
+        retry("fill_descriptor_member_size", || {
+            Box::pin(async {
+                let mut tx = self.db.begin().await?;
+                let entry: Option<EntryRow> = sqlx::query_as(LOCK_ENTRY)
+                    .bind(scope.sql_key())
+                    .bind(&name_key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if entry.is_none_or(|row| row.state == DescriptorEntryState::Tombstoned.as_ref()) {
+                    return Ok(false);
+                }
+                let updated = sqlx::query(
+                    "UPDATE descriptor_members SET size_bytes = $4
+                     WHERE scope = $1 AND name_key = $2 AND digest = $3 AND size_bytes IS NULL",
+                )
+                .bind(scope.sql_key())
+                .bind(&name_key)
+                .bind(digest)
+                .bind(size_bytes)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(updated.rows_affected() > 0)
+            })
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1264,8 +1585,6 @@ async fn importer_lock_serializes_operator_state_changes_with_one_pooled_connect
 
 #[cfg(test)]
 mod tests {
-    use pipette_plan_types::DescriptorKind;
-
     use super::*;
     use crate::testing::test_db_or_skip;
 
@@ -1611,6 +1930,7 @@ mod tests {
             }))?,
             Timestamp::now(),
         )?;
+        // The family shows that a move keeps the override.
         let model = an_org_entry(
             "org_acme",
             "AcmeLM",
@@ -1618,7 +1938,8 @@ mod tests {
                 a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?,
                 a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?,
             ],
-        )?;
+        )?
+        .with_family(Some(CatalogName::try_new("Acme")?))?;
         let dead = an_org_entry("org_acme", "Dead", vec![runtime()?])?;
         let gone = a_descriptor_entry("Gone", DescriptorEntryKind::HandMade, 1, runtime()?)?;
         let entries = [
@@ -1763,6 +2084,69 @@ mod tests {
         Ok(())
     }
 
+    /// A move gives global the org's logo for the family of the entry, unless
+    /// global has a logo for that family. The org keeps its own logo.
+    #[rstest::rstest]
+    #[case::copied(None, "acme.svg")]
+    #[case::global_kept(Some("global.svg"), "global.svg")]
+    #[tokio::test]
+    async fn a_move_to_global_carries_the_family_logo(
+        #[case] global_logo: Option<&str>,
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let model = seed_movable(&store).await?;
+        let family = CatalogName::try_new("Acme")?;
+        let uri = |file: &str| LogoUri::try_new(format!("{}{file}", LogoUri::PREFIX));
+        let acme_logo = uri("acme.svg")?;
+        store
+            .set_family_logo(&model.scope, &family, Some(&acme_logo), None)
+            .await?;
+        if let Some(file) = global_logo {
+            let logo = uri(file)?;
+            sqlx::query(
+                "INSERT INTO descriptor_family_logos
+                     (scope, family_key, family, logo_uri)
+                 VALUES ('', 'acme', 'Acme', $1)",
+            )
+            .bind(logo.as_str())
+            .execute(test_db.db().pool())
+            .await?;
+        }
+
+        let outcome = store
+            .move_entry_to_global(
+                &OrgId::try_new("org_acme")?,
+                &model.name,
+                &pipette_plan_types::AuditActor::Unverified { claimed_id: None },
+            )
+            .await?;
+        assert!(
+            matches!(outcome, MoveToGlobalOutcome::Moved { .. }),
+            "{outcome:?}"
+        );
+        let logos = |scope: CatalogScope| {
+            let store = &store;
+            async move {
+                anyhow::Ok(
+                    store
+                        .family_logos(std::slice::from_ref(&scope))
+                        .await?
+                        .into_iter()
+                        .map(|logo| logo.sha256.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        assert_eq!(
+            logos(CatalogScope::Global).await?,
+            [uri(expected)?.sha256()]
+        );
+        assert_eq!(logos(model.scope.clone()).await?, [acme_logo.sha256()]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn racing_moves_to_global_give_the_name_to_one_org() -> anyhow::Result<()> {
         let test_db = test_db_or_skip!();
@@ -1893,6 +2277,169 @@ mod tests {
         let test_db = test_db_or_skip!();
         let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
         pipette_store_testkit::assert_descriptor_catalog_rename_contract(&store).await
+    }
+
+    #[tokio::test]
+    async fn meets_the_family_contract() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        pipette_store_testkit::assert_descriptor_catalog_family_contract(&store).await
+    }
+
+    #[tokio::test]
+    async fn family_change_rolls_back_if_audit_indexing_fails() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let entry = an_org_entry(
+            "org_acme",
+            "AcmeLM",
+            vec![pipette_store_testkit::a_model_member(
+                "gguf_text",
+                "AcmeLM-GGUF",
+                "q4_0",
+            )?],
+        )?
+        .with_family(Some(CatalogName::try_new("Original")?))?;
+        assert_eq!(
+            store.create_entry(&entry).await?,
+            CreateEntryOutcome::Created
+        );
+        test_db
+            .execute(
+                "ALTER TABLE audit_event_orgs ADD CONSTRAINT reject_family_org
+                 CHECK (org_id <> 'org_acme')",
+            )
+            .await?;
+
+        let new_family = CatalogName::try_new("Replacement")?;
+        let actor = AuditActor::Unverified { claimed_id: None };
+        let Err(error) = store
+            .set_family(&entry.scope, &entry.name, Some(&new_family), Some(&actor))
+            .await
+        else {
+            anyhow::bail!("the audit index write succeeded despite the constraint");
+        };
+        let database_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>());
+        assert!(
+            matches!(
+                database_error,
+                Some(sqlx::Error::Database(error))
+                    if error.constraint() == Some("reject_family_org")
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.get_entry(&entry.scope, &entry.name).await?,
+            Some(entry)
+        );
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(events, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn meets_the_family_logo_contract() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        pipette_store_testkit::assert_descriptor_catalog_family_logo_contract(&store).await
+    }
+
+    /// The table refuses every URI that `LogoUri` refuses, so a read never
+    /// meets a row that it cannot parse.
+    #[rstest::rstest]
+    #[case("https://pipette.liquid.ai/logos/lfm.svg", true)]
+    #[case("https://pipette.liquid.ai/logos/vendors/Qwen_3-x.png", true)]
+    #[case("https://pipette.liquid.ai/logos/", false)]
+    #[case("https://pipette.liquid.ai/logos/../x.png", false)]
+    #[case("https://pipette.liquid.ai/logos/a//b.png", false)]
+    #[case("https://pipette.liquid.ai/logos/a.png?v=1", false)]
+    #[case("https://pipette.liquid.ai/logos/a b.png", false)]
+    #[case("https://pipette.liquid.ai.example.com/logos/a.png", false)]
+    #[case("data:image/png;base64,iVBORw0KGgo=", true)]
+    #[case("data:image/svg+xml;base64,PHN2Zy8+", true)]
+    #[case("data:image/webp;base64,UklGRg==", true)]
+    #[case("data:image/png;base64,", false)]
+    #[case("data:image/png;base64,abc", false)]
+    #[case("data:image/png;base64,a===", false)]
+    #[case("data:image/png,abcd", false)]
+    #[case("data:image/jpeg;base64,abcd", false)]
+    #[case("data:text/html;base64,abcd", false)]
+    #[tokio::test]
+    async fn the_logo_table_holds_only_a_valid_logo_uri(
+        #[case] uri: &str,
+        #[case] ok: bool,
+    ) -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let inserted = sqlx::query(
+            "INSERT INTO descriptor_family_logos (scope, family_key, family, logo_uri)
+             VALUES ('', 'lfm', 'LFM', $1)",
+        )
+        .bind(uri)
+        .execute(test_db.db().pool())
+        .await;
+        assert_eq!(inserted.is_ok(), ok, "{uri}: {inserted:?}");
+        assert_eq!(LogoUri::try_new(uri).is_ok(), ok, "{uri}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn family_logo_change_rolls_back_if_audit_indexing_fails() -> anyhow::Result<()> {
+        let test_db = test_db_or_skip!();
+        let store = SqlDescriptorCatalogStore::new(test_db.db().clone());
+        let entry = an_org_entry(
+            "org_acme",
+            "AcmeLM",
+            vec![pipette_store_testkit::a_model_member(
+                "gguf_text",
+                "AcmeLM-GGUF",
+                "q4_0",
+            )?],
+        )?;
+        assert_eq!(
+            store.create_entry(&entry).await?,
+            CreateEntryOutcome::Created
+        );
+        test_db
+            .execute(
+                "ALTER TABLE audit_event_orgs ADD CONSTRAINT reject_logo_org
+                 CHECK (org_id <> 'org_acme')",
+            )
+            .await?;
+
+        let logo_uri = LogoUri::try_new(format!("{}acme.svg", LogoUri::PREFIX))?;
+        let actor = AuditActor::Unverified { claimed_id: None };
+        let Err(error) = store
+            .set_family_logo(&entry.scope, &entry.name, Some(&logo_uri), Some(&actor))
+            .await
+        else {
+            anyhow::bail!("the audit index write succeeded despite the constraint");
+        };
+        let database_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>());
+        assert!(
+            matches!(
+                database_error,
+                Some(sqlx::Error::Database(error))
+                    if error.constraint() == Some("reject_logo_org")
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            store
+                .family_logos(std::slice::from_ref(&entry.scope))
+                .await?,
+            []
+        );
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(test_db.db().pool())
+            .await?;
+        assert_eq!(events, 0);
+        Ok(())
     }
 
     #[tokio::test]

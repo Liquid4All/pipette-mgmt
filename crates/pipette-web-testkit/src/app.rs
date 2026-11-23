@@ -413,14 +413,6 @@ pub async fn make_state_require_client_preauth(dir: &std::path::Path) -> anyhow:
     make_state_from_config(config).await
 }
 
-/// Build an [`AppState`] with `require_user_preauth_key` toggled on, for the
-/// tests that close the keyless request for an account.
-pub async fn make_state_require_user_preauth(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    let mut config = test_config(dir);
-    config.require_user_preauth_key = true;
-    make_state_from_config(config).await
-}
-
 pub async fn make_state_with_evals_url(
     dir: &std::path::Path,
     evals_url: &str,

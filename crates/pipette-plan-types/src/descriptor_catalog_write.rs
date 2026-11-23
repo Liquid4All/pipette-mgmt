@@ -3,7 +3,7 @@
 use jiff::Timestamp;
 use serde::Deserialize;
 
-use crate::{CatalogName, Model, ModelFormat, NonEmptyVec, QuantizationLabel, Runtime};
+use crate::{CatalogName, LogoUri, Model, ModelFormat, NonEmptyVec, QuantizationLabel, Runtime};
 
 /// A new entry with exactly one kind of member: `runtimes` or `models`.
 #[derive(Debug, Deserialize)]
@@ -15,6 +15,10 @@ pub struct CreateDescriptorEntryRequest {
     pub release_time: Option<Timestamp>,
     pub runtimes: Option<NonEmptyVec<Runtime>>,
     pub models: Option<NonEmptyVec<ModelMemberRequest>>,
+    /// The family of a model entry. Without it, readers see the text of the
+    /// name before its first hyphen. A runtime entry refuses a family.
+    #[serde(default)]
+    pub family: Option<CatalogName>,
 }
 
 /// One model member: the model table of a plan and the quantization label.
@@ -45,6 +49,39 @@ pub struct AddDescriptorMemberRequest {
 pub struct ChangeDescriptorEntryStateRequest {
     pub action: DescriptorEntryAction,
     pub confirmation: Option<String>,
+}
+
+/// A new family override for a model entry. Omit `family` to leave it as stored.
+/// Use `null` to clear the override and use the default family.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SetDescriptorEntryFamilyRequest {
+    #[serde(default, deserialize_with = "deserialize_family")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<CatalogName>"))]
+    pub family: Option<Option<CatalogName>>,
+}
+
+fn deserialize_family<'de, D>(deserializer: D) -> Result<Option<Option<CatalogName>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<CatalogName>::deserialize(deserializer).map(Some)
+}
+
+/// A new logo for a model family. Use `null` to remove the logo.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SetDescriptorFamilyLogoRequest {
+    // A field with `deserialize_with` and no default is required, so a body
+    // must give `null` to remove a logo.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(required, schema_with = "crate::body_values::nullable::<LogoUri>")
+    )]
+    pub logo_uri: Option<LogoUri>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

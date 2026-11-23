@@ -68,6 +68,11 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         // The device's own record.
         ("GET", "/clients/me".into()),
         ("PATCH", "/clients/me".into()),
+        ("GET", "/clients/me/descriptor-catalog".into()),
+        (
+            "GET",
+            format!("/clients/me/descriptor-catalog/family-logos/{SHA256}"),
+        ),
         // The fleet and its administration.
         ("GET", "/api/v1/clients".into()),
         ("GET", "/api/v1/clients/capabilities".into()),
@@ -116,6 +121,10 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         ),
         ("GET", "/api/v1/descriptor-catalog/names".into()),
         ("GET", "/api/v1/descriptor-catalog/by-digest".into()),
+        (
+            "GET",
+            format!("/api/v1/descriptor-catalog/family-logos/{SHA256}"),
+        ),
         ("POST", format!("/api/v1/orgs/{ORG}/descriptor-catalog")),
         (
             "POST",
@@ -132,6 +141,14 @@ fn signed_routes() -> Vec<(&'static str, String)> {
         (
             "POST",
             format!("/api/v1/orgs/{ORG}/descriptor-catalog/{CATALOG_NAME}/members/remove"),
+        ),
+        (
+            "POST",
+            format!("/api/v1/orgs/{ORG}/descriptor-catalog/{CATALOG_NAME}/family"),
+        ),
+        (
+            "POST",
+            format!("/api/v1/orgs/{ORG}/descriptor-families/{CATALOG_NAME}/logo"),
         ),
         (
             "POST",
@@ -203,8 +220,8 @@ fn signed_routes() -> Vec<(&'static str, String)> {
             format!("/api/v1/campaign-groups/{GROUP}/rerun-results"),
         ),
         // The vault.
-        ("PUT", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
-        ("HEAD", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
+        ("PUT", format!("/api/v1/vault/blobs/{ORG}/{SHA256}")),
+        ("HEAD", format!("/api/v1/vault/blobs/{ORG}/{SHA256}")),
         ("GET", "/api/v1/vault/types".into()),
         ("GET", "/api/v1/vault/resources".into()),
         ("POST", "/api/v1/vault/resources".into()),
@@ -330,6 +347,8 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
                 "POST",
                 "/api/v1/orgs/{}/descriptor-catalog/{}/members/remove",
             ),
+            ("POST", "/api/v1/orgs/{}/descriptor-catalog/{}/family"),
+            ("POST", "/api/v1/orgs/{}/descriptor-families/{}/logo"),
             ("POST", "/api/v1/orgs/{}/descriptor-catalog/{}/state"),
         ],
     ),
@@ -467,10 +486,9 @@ const REFUSALS: &[(&str, &[(&str, &str)])] = &[
         "user lacks the cancel_plans permission",
         &[("POST", "/api/v1/plans/{}/cancel")],
     ),
-    // `Active`, refused by the handler's scope: the path names another account.
+    // `Active`, refused by the handler's scope: the path names another organization.
     (
-        "you may only upload to the vault for yourself, your organization, or a member of an \
-         organization you administer",
+        "you may only upload to the vault for your organization",
         &[("PUT", "/api/v1/vault/blobs/{}/{}")],
     ),
 ];
@@ -866,9 +884,9 @@ async fn a_method_a_path_does_not_register_is_a_405_before_authentication() -> a
         ("PUT", format!("/vault/resources/{RESOURCE}")),
         ("PATCH", format!("/vault/resources/{RESOURCE}")),
         ("POST", format!("/vault/resources/{RESOURCE}")),
-        ("GET", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
-        ("POST", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
-        ("DELETE", format!("/api/v1/vault/blobs/{USER}/{SHA256}")),
+        ("GET", format!("/api/v1/vault/blobs/{ORG}/{SHA256}")),
+        ("POST", format!("/api/v1/vault/blobs/{ORG}/{SHA256}")),
+        ("DELETE", format!("/api/v1/vault/blobs/{ORG}/{SHA256}")),
         ("GET", "/benchmarks/batch".into()),
         ("PUT", format!("/benchmarks/{BENCHMARK}")),
         ("DELETE", format!("/benchmarks/{BENCHMARK}")),

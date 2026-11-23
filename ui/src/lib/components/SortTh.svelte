@@ -1,20 +1,18 @@
 <script lang="ts">
   // A header that sorts its table by its column: up, down, then back to the
-  // listing's order, kept in the address, or where `onsort` is given, in the page.
+  // table's own sort, kept in the address.
   // Where `resize` is given, a grip on its right edge drags the column's width.
   import type { Snippet } from "svelte";
   import { redirect } from "../route.svelte";
   import { ariaSort, nextSort } from "../table";
   import type { Resize } from "../widths.svelte";
 
-  let { key, label, sort, link, onsort, num = false, resize, extra }: {
+  let { key, label, sort, link, num = false, resize, extra }: {
     key: string;
     label: string;
     sort: string;
     /** The table's address under a sort. */
-    link?: (sort: string) => string;
-    /** A sort the page keeps, for a table that shares its address with another. */
-    onsort?: (sort: string) => void;
+    link: (sort: string) => string;
     /** Right-aligned, as figures are. */
     num?: boolean;
     resize?: Resize;
@@ -23,13 +21,13 @@
   } = $props();
 
   const dir = $derived(ariaSort(sort, key));
-  const to = $derived(link?.(nextSort(sort, key)));
+  const to = $derived(link(nextSort(sort, key)));
 
   // In place, as a filter applies, so the page does not jump to its top.
   function click(event: MouseEvent) {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
-    redirect(to!);
+    redirect(to);
   }
 
   let th = $state<HTMLTableCellElement>();
@@ -72,9 +70,8 @@
   d="M3 7.5 6 4.5 9 7.5" />{:else if dir === "descending"}<path d="M3 4.5 6 7.5 9 4.5" />{:else}<path
   d="M3.5 4.5 6 2 8.5 4.5M3.5 7.5 6 10 8.5 7.5" />{/if}</svg>{/snippet}
 
-<th bind:this={th} class:num aria-sort={dir} data-key={key}>{#if onsort}<button type="button" class="sort" class:on={dir}
-  onclick={() => onsort(nextSort(sort, key))}>{label}{@render arrow()}</button>{:else}<a class="sort" class:on={dir}
-  href={to} onclick={click}>{label}{@render arrow()}</a>{/if}{#if extra}{" "}{@render extra()}{/if}{#if resize}
+<th bind:this={th} class:num aria-sort={dir} data-key={key}><a class="sort" class:on={dir}
+  href={to} onclick={click}>{label}{@render arrow()}</a>{#if extra}{" "}{@render extra()}{/if}{#if resize}
   <!-- A focusable separator is a control, as ARIA's window splitter is, though Svelte counts the role as static. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div class="grip" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Width of {label}"
@@ -85,7 +82,6 @@
   th { position: relative; }
   th.num { text-align: right; }
   .sort { color: inherit; text-decoration: none; }
-  button.sort { padding: 0; border: 0; background: none; font: inherit; text-align: inherit; cursor: pointer; }
   .sort:hover, .sort.on { color: var(--accent); }
   .arrow { width: 12px; height: 12px; margin-left: 3px; vertical-align: -2px; fill: none; stroke: currentColor;
            stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }

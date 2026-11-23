@@ -11,6 +11,5 @@ is removed too.
 | Status | When |
 |--------|------|
 | 204 | The entry is deleted |
-| 400 | `org_id` is not an organization id |
 | 403 | The caller does not hold `manage_orgs` |
 | 404 | The organization is outside the caller's reach or does not exist: not the caller's own or unaffiliated, for a write. Also an id the organization keeps nothing under |

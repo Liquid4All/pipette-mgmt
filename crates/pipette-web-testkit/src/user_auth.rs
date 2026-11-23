@@ -154,27 +154,6 @@ pub async fn register_user_key(
     )?)
 }
 
-/// Ask for an account with no invite, the way `pipette-ctl auth register
-/// --contact-email` does. Returns the raw response, because half the tests here
-/// are about which refusal it is.
-pub async fn request_user_account(
-    state: &AppState,
-    email: &str,
-    signing_key: &SigningKey,
-    key_details: &str,
-) -> anyhow::Result<axum::http::Response<Body>> {
-    super::request::unauthed_post(
-        state,
-        "/api/v1/users/register",
-        &json!({
-            "public_key": hex::encode(signing_key.verifying_key().as_bytes()),
-            "contact_email": email,
-            "key_details": key_details,
-        }),
-    )
-    .await
-}
-
 /// The contact address `names=true` gives `user_id`.
 pub async fn user_address(state: &AppState, user_id: &UserId) -> anyhow::Result<String> {
     let user = state
@@ -185,17 +164,28 @@ pub async fn user_address(state: &AppState, user_id: &UserId) -> anyhow::Result<
     Ok(user.contact_email.to_string())
 }
 
-/// The grants of an account that may revise its own campaign: it files plans,
-/// cancels the plan a revision replaces, and reads the documents it revises at
-/// the full tier.
+/// The grants of an account that may revise its organization's campaign: it
+/// files plans, cancels the plan a revision replaces, and reads the documents
+/// it revises at the full tier.
 pub const FULL_EDITOR: &[UserPermission] = &[
     UserPermission::SubmitPlans,
     UserPermission::CancelPlans,
     UserPermission::ReadClients,
 ];
 
-/// An active account holding exactly `permissions`, with one key registered
-/// over HTTP — the setup most user-route tests open with.
+/// [`FULL_EDITOR`] and `manage_orgs`: what an account holds over the
+/// organization it made for itself, whose campaigns it also renames, hands
+/// over and deletes.
+pub const FULL_OWNER: &[UserPermission] = &[
+    UserPermission::SubmitPlans,
+    UserPermission::CancelPlans,
+    UserPermission::ReadClients,
+    UserPermission::ManageOrgs,
+];
+
+/// An active account holding exactly `permissions`, in a personal organization
+/// of its own, with one key registered over HTTP: the setup most user-route
+/// tests open with.
 pub async fn registered_user(
     state: &AppState,
     permissions: &[UserPermission],
@@ -206,6 +196,9 @@ pub async fn registered_user(
         hex::encode(uuid::Uuid::now_v7().as_bytes())
     );
     let user = create_user(state, &email).await?;
+    // Every account belongs to an organization, its own unless a test moves it.
+    let personal = pipette_pipeline::org::create_personal(&*state.org_store, &user, None).await?;
+    set_user_org(state, &user.user_id, Some(personal.org_id)).await?;
     // An empty set writes no object, as an account nobody granted holds none.
     if !permissions.is_empty() {
         grant_user(state, &user.user_id, permissions).await?;
@@ -474,6 +467,27 @@ pub async fn seed_org_named(
         .await?;
     state.org_store.put_org(&org).await?;
     Ok(org)
+}
+
+/// The organizations a test made, without the personal one each
+/// [`registered_user`] account gets.
+pub async fn team_orgs(state: &AppState) -> anyhow::Result<Vec<Organization>> {
+    Ok(state
+        .org_store
+        .list_orgs()
+        .await?
+        .into_iter()
+        .filter(|org| !org.slug.as_str().starts_with(OrgSlug::PERSONAL_PREFIX))
+        .collect())
+}
+
+/// The organization `user_id` belongs to.
+pub async fn org_of(state: &AppState, user_id: &UserId) -> anyhow::Result<OrgId> {
+    state
+        .org_store
+        .get_membership(user_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{user_id} belongs to no organization"))
 }
 
 /// Set `user_id`'s membership through the store, as `users set-org` would.

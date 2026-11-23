@@ -32,6 +32,7 @@ pub struct MockFile {
     pub lfs: bool,
     /// The listing gives no size.
     pub sizeless: bool,
+    reported_size: Option<u64>,
     /// A download answers `403`.
     pub refused: bool,
     /// A download answers `500`.
@@ -51,6 +52,7 @@ impl MockFile {
             bytes: bytes.to_vec(),
             lfs: true,
             sizeless: false,
+            reported_size: None,
             refused: false,
             failing: false,
             rate_limited: false,
@@ -69,6 +71,14 @@ impl MockFile {
     pub fn sizeless(self) -> Self {
         Self {
             sizeless: true,
+            ..self
+        }
+    }
+
+    /// Override the listed size without allocating a file of that size.
+    pub fn with_reported_size(self, size: u64) -> Self {
+        Self {
+            reported_size: Some(size),
             ..self
         }
     }
@@ -297,12 +307,15 @@ async fn revision(
         .iter()
         .map(|file| {
             let mut sibling = serde_json::Map::new();
+            let size = file
+                .reported_size
+                .map_or_else(|| json!(file.bytes.len()), |size| json!(size));
             sibling.insert("rfilename".to_owned(), json!(file.path));
             if !file.sizeless {
-                sibling.insert("size".to_owned(), json!(file.bytes.len()));
+                sibling.insert("size".to_owned(), size.clone());
             }
             if file.lfs {
-                let lfs = json!({"sha256": file.sha256(), "size": file.bytes.len()});
+                let lfs = json!({"sha256": file.sha256(), "size": size});
                 sibling.insert("lfs".to_owned(), lfs);
             }
             serde_json::Value::Object(sibling)

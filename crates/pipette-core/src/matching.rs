@@ -748,6 +748,7 @@ mod tests {
             )?,
             organization: NonEmptyTrimmedString::try_new("org")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: crate::client::ClientStatus::Approved,
             registered_at: "2026-01-01T00:00:00Z".parse()?,

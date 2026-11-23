@@ -1,7 +1,4 @@
-# Example plan: unified pipette client, MLX runtime on a single Mac over SSH.
-#
-# State written to
-# .pipette-ctl/plans/mlx-macstudio-example/state.jsonl.
+# Example plan: MLX on a single Mac over ssh.
 
 plan_id = "mlx-macstudio-example"
 benchmarks = [

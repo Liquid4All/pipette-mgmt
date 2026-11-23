@@ -145,7 +145,7 @@ pub(super) fn operations() -> Vec<Operation> {
             Devices,
             gated!(Needs(ManageClients)),
         )
-        .summary("Edit a device's label, details or contact")
+        .summary("Edit a device's name, label, details or contact")
         .human_only()
         .errors(&[409])
         .body(json_body::<pt::UpdateClientRequest>())
@@ -253,7 +253,7 @@ pub(super) fn operations() -> Vec<Operation> {
             Users,
             Auth::Open,
         )
-        .summary("Register a key: an invite's, or a new account's")
+        .summary("Register a key with an invite")
         .errors(&[401, 403, 409, 429])
         .body(json_body::<pt::RegisterUserKeyRequest>())
         .reply(201, "Registered", [json::<pt::UserKeyRegistered>()])
@@ -310,7 +310,7 @@ pub(super) fn operations() -> Vec<Operation> {
             Users,
             gated!(Needs(ManageOrgs)),
         )
-        .summary("Set or clear an account's organization")
+        .summary("Move an account to another organization")
         .human_only()
         .errors(&[409])
         .body(json_body::<pt::SetUserOrgRequest>())
@@ -612,6 +612,19 @@ pub(super) fn operations() -> Vec<Operation> {
             [json::<pt::DescriptorDigestNames>()],
         ),
         op(
+            M::GET,
+            "/api/v1/descriptor-catalog/family-logos/{sha256}",
+            "get_descriptor_family_logo",
+            DescriptorCatalog,
+            gated!(Active),
+        )
+        .summary("Get a model family logo by the SHA-256 of its URI")
+        .reply(
+            200,
+            "The logo URI and its digest",
+            [json::<pt::DescriptorFamilyLogo>()],
+        ),
+        op(
             M::POST,
             "/api/v1/orgs/{org_id}/descriptor-catalog",
             "create_org_descriptor_entry",
@@ -685,6 +698,35 @@ pub(super) fn operations() -> Vec<Operation> {
             200,
             "The entry without the member",
             [json::<pt::DescriptorEntryListRow>()],
+        ),
+        op(
+            M::POST,
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/family",
+            "set_org_descriptor_entry_family",
+            DescriptorCatalog,
+            gated!(EDIT_ORG_CATALOG),
+        )
+        .summary("Set the family of an organization model entry")
+        .errors(&[409])
+        .body(json_body::<pt::SetDescriptorEntryFamilyRequest>())
+        .reply(
+            200,
+            "The updated entry",
+            [json::<pt::DescriptorEntryListRow>()],
+        ),
+        op(
+            M::POST,
+            "/api/v1/orgs/{org_id}/descriptor-families/{family}/logo",
+            "set_org_descriptor_family_logo",
+            DescriptorCatalog,
+            gated!(EDIT_ORG_CATALOG),
+        )
+        .summary("Set or remove the logo of an organization model family")
+        .body(json_body::<pt::SetDescriptorFamilyLogoRequest>())
+        .reply(
+            200,
+            "The family and its logo",
+            [json::<pt::DescriptorFamilyLogoView>()],
         ),
         op(
             M::POST,

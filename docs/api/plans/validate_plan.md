@@ -42,9 +42,11 @@ before any import, and the error's message is part of their refusal's message.
 
 **Where a position comes from.** A TOML fault is placed at the span the parser
 reports, except a fault of the whole document, such as a missing `variants`,
-which has no position. A fault of one variant, and each warning, is placed at
-the line where the variant starts: its `[[variants]]` header, or the opening
-brace of its inline table. An unknown benchmark is placed at the first string
+which has no position. When validation has the span of an invalid runtime name
+or model selector, it reports the string's line and column. For other variant
+faults and for warnings, it reports where the variant starts at its
+`[[variants]]` header or the opening brace of its inline table.
+An unknown benchmark is placed at the first string
 that names it in a `benchmarks` list, the top-level list first. Any other fault
 has no position.
 
@@ -88,8 +90,9 @@ the benchmark catalog or the vault answers `500`, its message redacted.
 | 415 | The `Content-Type` is not `application/toml` |
 
 The answer includes `document`: the rewritten plan with the model tokens
-removed, or `null` if expansion fails. Catalog names in `runtimes` resolve in
-the filer's organization and the global catalog. The answer holds an error issue
-for each name that is unknown, tombstoned, or not offered to every admitted
-device. Each such issue gives the line and column if they are known. A hidden
-name adds a warning issue. Validation stores nothing.
+removed, or `null` if expansion fails. Catalog names in `runtimes`, and model
+selectors in `models`, resolve in the filer's organization and the global
+catalog. Validation rejects unknown names and tombstoned entries. A bare
+runtime name must resolve to a member offered to every admitted device.
+A model selector must be complete and select a member with a compatible
+runtime in its variant. A hidden entry adds a warning. Validation stores nothing.

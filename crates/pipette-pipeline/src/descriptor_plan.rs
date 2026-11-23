@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashSet};
 
 use pipette_core::config::DescriptorCatalogConfig;
 use pipette_plan_types::{
-    DescriptorEntry, DescriptorEntryState, DescriptorMember, MemberSelector, QualifiedCatalogName,
-    VaultResourceId,
+    DescriptorEntry, DescriptorEntryState, DescriptorKind, DescriptorMember, MemberSelector,
+    QualifiedCatalogName, VaultResourceId,
 };
 
 use crate::{
@@ -138,7 +138,10 @@ pub fn resolve<'a>(
         Vec::new()
     };
 
-    if let Some((_, explicit_member)) = selector.split_once("::") {
+    // A model selector must name a member. If it lacks a format or a
+    // quantization, the error lists the available members.
+    let explicit_member = selector.split_once("::").map(|(_, member)| member);
+    if explicit_member.is_some() || entry.descriptor_kind() == DescriptorKind::Model {
         let selected = MemberSelector::parse_for_entry(selector, entry).map_err(|error| {
             ResolveError::InvalidSelector {
                 selector: selector.to_owned(),
@@ -152,7 +155,7 @@ pub fn resolve<'a>(
             .find(|member| member.key() == selected.member_key)
             .ok_or_else(|| ResolveError::UnknownMember {
                 name: name.clone(),
-                member: explicit_member.to_owned(),
+                member: explicit_member.unwrap_or_default().to_owned(),
                 available: available.clone(),
             })?;
         check_resources(member, &name, &available, available_resources)?;
@@ -634,6 +637,51 @@ requires = ["os:ios"]
         assert!(error.contains("selects `macos-arm64`"));
         assert!(error.contains("Available members: macos-arm64, macos-x64"));
         assert!(error.contains("Add a `requires`. Alternatively, select a member with `::`."));
+        Ok(())
+    }
+
+    /// A model selector must name its member; ingestion never picks a
+    /// quantization.
+    #[rstest]
+    #[case::bare_name("model")]
+    #[case::format_only("model::gguf")]
+    fn incomplete_model_selector_lists_the_members(#[case] selector: &str) -> anyhow::Result<()> {
+        let members = [("example-q4", "q4_0"), ("example-q8", "q8_0")]
+            .iter()
+            .map(|(repo, quantization)| {
+                pipette_store_testkit::a_model_member("gguf_text", repo, quantization)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let entry = DescriptorEntry::new(
+            CatalogScope::Global,
+            CatalogName::try_new("model")?,
+            DescriptorEntryKind::HandMade,
+            DescriptorEntryState::Active,
+            Timestamp::now(),
+            Timestamp::now(),
+            DescriptorEntryCreator::Operator,
+            NonEmptyVec::try_new(members)?,
+        )?;
+        let result = resolve(
+            selector,
+            Some(&entry),
+            Eligibility {
+                requires: &BTreeSet::new(),
+                any_of: &[],
+                clients: &[],
+            },
+            &config()?,
+            &HashSet::new(),
+        );
+        let Err(error @ ResolveError::InvalidSelector { .. }) = result else {
+            anyhow::bail!("expected an incomplete-selector refusal, got {result:?}");
+        };
+        let message = error.to_string();
+        assert!(message.contains("name::format::quantization"), "{message}");
+        assert!(
+            message.contains("Available members: gguf::q4_0, gguf::q8_0"),
+            "{message}"
+        );
         Ok(())
     }
 

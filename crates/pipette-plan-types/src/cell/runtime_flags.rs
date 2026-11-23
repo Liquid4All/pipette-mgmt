@@ -398,6 +398,18 @@ pub struct MaxMemoryUsageUvOpenvinoOpenvino {
     pub generate_hint: Option<OpenvinoGenerateHint>,
 }
 
+/// The flags of the `vl_throughput` and `vl_max_memory` cells on OpenVINO GenAI with
+/// an IR: the text cells' pipeline properties. Both carry these, and differ only in the
+/// benchmark axis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema), schemars(inline))]
+pub struct VlUvOpenvinoOpenvino {
+    pub device: Option<OpenvinoDevice>,
+    pub max_prompt_len: Option<PositiveCount>,
+    pub min_response_len: Option<PositiveCount>,
+    pub generate_hint: Option<OpenvinoGenerateHint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema), schemars(inline))]
 pub struct PrefillThroughputOvmsOpenvino {
@@ -519,6 +531,11 @@ cell_flags!(PrefillThroughputUvOpenvinoOpenvino: PrefillThroughputUvOpenvinoOpen
 cell_flags!(DecodeThroughputUvOpenvinoOpenvino: DecodeThroughputUvOpenvinoOpenvino);
 cell_flags!(EndToEndLatencyUvOpenvinoOpenvino: EndToEndLatencyUvOpenvinoOpenvino);
 cell_flags!(MaxMemoryUsageUvOpenvinoOpenvino: MaxMemoryUsageUvOpenvinoOpenvino);
+cell_flags!(
+    VlUvOpenvinoOpenvino:
+        VlThroughputUvOpenvinoOpenvino,
+        VlMaxMemoryUvOpenvinoOpenvino
+);
 cell_flags!(PrefillThroughputOvmsOpenvino: PrefillThroughputOvmsOpenvino);
 cell_flags!(DecodeThroughputOvmsOpenvino: DecodeThroughputOvmsOpenvino);
 cell_flags!(EndToEndLatencyOvmsOpenvino: EndToEndLatencyOvmsOpenvino);
@@ -993,13 +1010,15 @@ pub enum RuntimeFlags {
     EvalMlxIosPipetteMlx {
         n_ubatch: Option<u32>,
     },
-    // OpenVINO x IR. No `raw`: the runtime takes typed `LLMPipeline` properties, not a
+    // OpenVINO x IR. No `raw`: the runtime takes typed pipeline properties, not a
     // command line. `device` is `Option` like every flag field, but a cell naming none is
     // refused rather than defaulted, since OpenVINO would silently pick CPU.
     PrefillThroughputUvOpenvinoOpenvino(PrefillThroughputUvOpenvinoOpenvino),
     DecodeThroughputUvOpenvinoOpenvino(DecodeThroughputUvOpenvinoOpenvino),
     EndToEndLatencyUvOpenvinoOpenvino(EndToEndLatencyUvOpenvinoOpenvino),
     MaxMemoryUsageUvOpenvinoOpenvino(MaxMemoryUsageUvOpenvinoOpenvino),
+    VlThroughputUvOpenvinoOpenvino(VlUvOpenvinoOpenvino),
+    VlMaxMemoryUvOpenvinoOpenvino(VlUvOpenvinoOpenvino),
     // OVMS x IR: `uv_openvino`'s knobs plus `prefix_caching`. `device` is required here
     // too, since OVMS silently picks a GPU, and `prefix_caching` resolves to off because
     // OVMS defaults it on.
@@ -1086,6 +1105,12 @@ impl RuntimeFlags {
             }
             RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. } => {
                 (B::MaxMemoryUsage, R::UvOpenvino, M::Openvino)
+            }
+            RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. } => {
+                (B::VlThroughput, R::UvOpenvino, M::Openvino)
+            }
+            RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. } => {
+                (B::VlMaxMemory, R::UvOpenvino, M::Openvino)
             }
             RuntimeFlags::PrefillThroughputOvmsOpenvino { .. } => {
                 (B::PrefillThroughput, R::Ovms, M::Openvino)
@@ -1362,6 +1387,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -1447,6 +1474,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -1530,6 +1559,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -1654,6 +1685,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -1775,6 +1808,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -1874,6 +1909,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -2013,6 +2050,8 @@ impl RuntimeFlags {
             | RuntimeFlags::DecodeThroughputUvOpenvinoOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyUvOpenvinoOpenvino { .. }
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino { .. }
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | RuntimeFlags::PrefillThroughputOvmsOpenvino { .. }
             | RuntimeFlags::DecodeThroughputOvmsOpenvino { .. }
             | RuntimeFlags::EndToEndLatencyOvmsOpenvino { .. }
@@ -3313,7 +3352,9 @@ impl TryFrom<RuntimeFlagRef> for RuntimeFlags {
             (B::PrefillThroughput, R::UvOpenvino, M::Openvino)
             | (B::DecodeThroughput, R::UvOpenvino, M::Openvino)
             | (B::EndToEndLatency, R::UvOpenvino, M::Openvino)
-            | (B::MaxMemoryUsage, R::UvOpenvino, M::Openvino) => {
+            | (B::MaxMemoryUsage, R::UvOpenvino, M::Openvino)
+            | (B::VlThroughput, R::UvOpenvino, M::Openvino)
+            | (B::VlMaxMemory, R::UvOpenvino, M::Openvino) => {
                 r.deny_llama_knobs()?;
                 r.deny_server_knobs()?;
                 r.deny_n_ubatch()?;
@@ -3358,18 +3399,33 @@ impl TryFrom<RuntimeFlagRef> for RuntimeFlags {
                             generate_hint,
                         },
                     ),
+                    B::VlThroughput => {
+                        RuntimeFlags::VlThroughputUvOpenvinoOpenvino(VlUvOpenvinoOpenvino {
+                            device,
+                            max_prompt_len,
+                            min_response_len,
+                            generate_hint,
+                        })
+                    }
+                    B::VlMaxMemory => {
+                        RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino(VlUvOpenvinoOpenvino {
+                            device,
+                            max_prompt_len,
+                            min_response_len,
+                            generate_hint,
+                        })
+                    }
                     // Spelled out rather than `_`, so a new benchmark fails to
                     // compile instead of routing silently.
                     B::Eval
                     | B::VlmEval
                     | B::AsrEval
-                    | B::VlThroughput
-                    | B::VlMaxMemory
                     | B::AsrMaxMemory
                     | B::VlSpecDecode
                     | B::AsrThroughput
                     | B::DecisionLatency
-                    | B::DecisionMaxMemory => {
+                    | B::DecisionMaxMemory
+                    | B::Session => {
                         return Err(RuntimeFlagsError::NoSuchCombination {
                             benchmark: r.benchmark_type,
                             runtime: r.runtime_type,
@@ -3442,7 +3498,8 @@ impl TryFrom<RuntimeFlagRef> for RuntimeFlags {
                     | B::VlSpecDecode
                     | B::AsrThroughput
                     | B::DecisionLatency
-                    | B::DecisionMaxMemory => {
+                    | B::DecisionMaxMemory
+                    | B::Session => {
                         return Err(RuntimeFlagsError::NoSuchCombination {
                             benchmark: r.benchmark_type,
                             runtime: r.runtime_type,
@@ -4287,6 +4344,18 @@ impl From<RuntimeFlags> for RuntimeFlagRef {
                 },
             )
             | RuntimeFlags::MaxMemoryUsageUvOpenvinoOpenvino(MaxMemoryUsageUvOpenvinoOpenvino {
+                device,
+                max_prompt_len,
+                min_response_len,
+                generate_hint,
+            })
+            | RuntimeFlags::VlThroughputUvOpenvinoOpenvino(VlUvOpenvinoOpenvino {
+                device,
+                max_prompt_len,
+                min_response_len,
+                generate_hint,
+            })
+            | RuntimeFlags::VlMaxMemoryUvOpenvinoOpenvino(VlUvOpenvinoOpenvino {
                 device,
                 max_prompt_len,
                 min_response_len,
@@ -5349,6 +5418,10 @@ mod tests {
         ("end_to_end_latency", "uv_openvino", "openvino",
          &["device", "max_prompt_len", "min_response_len", "generate_hint"]),
         ("max_memory_usage", "uv_openvino", "openvino",
+         &["device", "max_prompt_len", "min_response_len", "generate_hint"]),
+        ("vl_throughput", "uv_openvino", "openvino",
+         &["device", "max_prompt_len", "min_response_len", "generate_hint"]),
+        ("vl_max_memory", "uv_openvino", "openvino",
          &["device", "max_prompt_len", "min_response_len", "generate_hint"]),
         // OVMS: the OpenVINO knobs plus `prefix_caching`.
         ("prefill_throughput", "ovms", "openvino",

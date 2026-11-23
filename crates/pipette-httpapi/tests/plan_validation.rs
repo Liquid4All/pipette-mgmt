@@ -14,7 +14,7 @@ use pipette_plan_types::{UserPermission, UserStatus};
 use pipette_store_testkit::an_org_benchmark;
 use pipette_web_testkit::{
     UserSigner, assert_nothing_staged, auth_headers, body_json, json_str,
-    make_state_with_plan_body_limit, make_state_with_plan_max_jobs, post_plan_document,
+    make_state_with_plan_body_limit, make_state_with_plan_max_jobs, org_of, post_plan_document,
     raw_request, register_and_approve, registered_user, seed_org, seeded_state, set_user_org,
     set_user_status, setup_benchmarks, setup_scheduler_benchmarks, upload_gguf_text,
     user_auth_headers,
@@ -181,7 +181,7 @@ const TEST_PLAN_BODY_LIMIT: usize = 256 * 1024;
 enum Refused {
     Unsigned,
     Device,
-    PendingUser,
+    DisabledUser,
     /// An account without `submit_plans`, sending a body over the ceiling.
     UngrantedUser,
     Json,
@@ -201,11 +201,7 @@ enum Refused {
     StatusCode::FORBIDDEN,
     "a device cannot check a plan; sign the request as a user account"
 )]
-#[case::pending_user(
-    Refused::PendingUser,
-    StatusCode::FORBIDDEN,
-    "user is pending an operator's approval"
-)]
+#[case::disabled_user(Refused::DisabledUser, StatusCode::FORBIDDEN, "user is disabled")]
 #[case::ungranted_user(
     Refused::UngrantedUser,
     StatusCode::FORBIDDEN,
@@ -236,9 +232,9 @@ async fn the_gate_refuses_before_the_check(
             let headers = auth_headers(&key, &client_id, "POST", URI)?;
             raw_request(&state, "POST", URI, &headers, toml, AFM_MLX).await?
         }
-        Refused::PendingUser => {
+        Refused::DisabledUser => {
             let signer = registered_user(&state, &[UserPermission::SubmitPlans]).await?;
-            set_user_status(&state, &signer.1, UserStatus::Pending).await?;
+            set_user_status(&state, &signer.1, UserStatus::Disabled).await?;
             post_plan_document(&state, &signer, URI, AFM_MLX).await?
         }
         Refused::UngrantedUser => {
@@ -324,7 +320,7 @@ async fn a_vault_resource_out_of_reach_reads_as_unknown() -> anyhow::Result<()> 
     let resource_id =
         upload_gguf_text(&state, &owner, None, pipette_web_testkit::VAULT_GGUF).await?;
     let outsider = registered_user(&state, &[UserPermission::SubmitPlans]).await?;
-    let principal = owner.1.to_string();
+    let principal = org_of(&state, &owner.1).await?.to_string();
 
     assert_hidden_reads_as_absent(
         &state,

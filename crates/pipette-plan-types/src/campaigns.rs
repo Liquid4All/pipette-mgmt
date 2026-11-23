@@ -7,7 +7,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::owners::PrincipalOwner;
-use crate::plans::{Answered, PlanDryRun, PlanFiled, PlanSummary, RestoredVariant, RevisionChange};
+use crate::plans::{
+    Answered, ModelReplacement, PlanDryRun, PlanFiled, PlanSummary, RestoredVariant, RevisionChange,
+};
 use crate::{
     CampaignGroupId, CampaignId, Changed, ElapsedMillis, JobId, Labels, NonEmptyTrimmedString,
     OrgId, PlanId, PolicyKind, UserId, VaultPrincipalId,
@@ -195,8 +197,11 @@ pub struct Revised {
     pub marked_job_count: usize,
     /// Its jobs whose completions the new plan scores again as new jobs.
     pub recalculated_job_count: usize,
-    /// Its jobs the new plan neither holds, runs again, scores again nor marks
-    /// failed.
+    /// Runs the new plan copies under a `replace_model` model.
+    #[serde(default)]
+    pub replaced_job_count: usize,
+    /// Its jobs the new plan neither holds, runs again, scores again, copies
+    /// nor marks failed.
     pub dropped_job_count: usize,
     /// `false` when it had already ended, or was already being cancelled.
     pub cancel_requested: bool,
@@ -233,12 +238,17 @@ pub struct RevisionPreview {
     /// hold that run for and not queue.
     #[serde(default)]
     pub satisfied_job_count: usize,
-    /// Finished jobs of the campaign's earlier plans the revision would hold
+    /// Jobs of the campaign's earlier plans the revision would hold
     /// (`carry_earlier`).
     pub restored_job_count: usize,
-    /// Finished jobs of the `inherit_from` plans the revision would hold.
+    /// Jobs of the `inherit_from` plans the revision would hold.
     #[serde(default)]
     pub inherited_job_count: usize,
+    /// Failed runs of other plans the revision would hold
+    /// (`inherit_failed`), counted in `restored_job_count` or
+    /// `inherited_job_count` too.
+    #[serde(default)]
+    pub inherited_failed_job_count: usize,
     /// The head's jobs the revision would run again, as named or as `answered`
     /// picks them.
     pub rerun_job_ids: Vec<JobId>,
@@ -247,8 +257,16 @@ pub struct RevisionPreview {
     #[serde(default)]
     pub marked_job_ids: Vec<JobId>,
     pub recalculated_job_count: usize,
-    /// The head's jobs the revision would neither hold, run again, score again
-    /// nor mark failed, so it would stop them.
+    /// Runs the revision would copy under a `replace_model` model.
+    #[serde(default)]
+    pub replaced_job_count: usize,
+    /// Each body that would take a copy, and the job it copies.
+    #[serde(default)]
+    pub replaced_jobs: Vec<HeldJob>,
+    #[serde(default)]
+    pub replaced_models: Vec<crate::plans::ReplacedModel>,
+    /// The head's jobs the revision would neither hold, run again, score
+    /// again, copy nor mark failed, so it would stop them.
     pub dropped_job_ids: Vec<JobId>,
     /// Each body that would hold an existing job, and the plan the job comes
     /// from. A body not listed queues a new job or takes an earlier finished
@@ -270,6 +288,9 @@ pub struct HeldJob {
     /// The head, a plan before it, or an `inherit_from` plan.
     pub plan_id: PlanId,
     pub job_id: JobId,
+    /// The job is a failed run that `inherit_failed` lets the body take.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 /// A revision's dry run: the document it would file, with every model token
@@ -488,6 +509,18 @@ pub struct PolicyCheck {
     pub triggered: bool,
 }
 
+/// Re-runs and marks that queue maintenance deferred for a member campaign.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct PolicyDeferral {
+    /// The earliest filing time that the last evaluation calculated. This can
+    /// move earlier as fewer jobs wait for devices.
+    #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
+    pub until: Timestamp,
+    pub rerun_job_count: usize,
+    pub marked_job_count: usize,
+}
+
 /// The device time a set of plans spent, each job at its latest scoring run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -526,6 +559,10 @@ pub struct CampaignOverview {
     /// `[database]`, and when the reader may not read the group, as a campaign
     /// reader may not.
     pub group: Option<CampaignGroup>,
+    /// The counts of re-runs and marks that the group's policies defer. The
+    /// value is `null` if no deferral exists, `group` is `null`, or the group
+    /// has no enabled policy that can file a revision.
+    pub policy_deferral: Option<PolicyDeferral>,
     /// Whether the reader may rename it and hand it over.
     pub may_administer: bool,
     /// Whether a revision would admit this reader; the variant edit takes the
@@ -628,9 +665,19 @@ pub struct ReviseCampaignQuery {
     /// with, or the limit the head holds it under, is the cell's (none on both
     /// sides included) or, both being set, is not above the cell's, or when a
     /// plan on offer lists its job for the cell's very body. A failed run runs
-    /// again. Alone, it does not file the head's own document.
+    /// again unless `inherit_failed` takes it. Alone, it does not file the
+    /// head's own document.
     #[serde(default)]
     pub carry_across_limit: bool,
+    /// Let a cell that no finished run answers take a failed run of the head,
+    /// or of a plan that `carry_earlier`, `inherit_from`, `add_from` or
+    /// `restore` offers: a device's timeout, out-of-memory,
+    /// runtime or device error, a skip after a smaller run's timeout or
+    /// out-of-memory, or a mark. A timeout, a skip after one, or a mark answers
+    /// a cell whose limit is not above the run's; the others answer any
+    /// limit. Alone, it does not file the head's own document.
+    #[serde(default)]
+    pub inherit_failed: bool,
     /// Plans of any campaign, comma-separated, whose finished runs a cell the
     /// head has not answered may take, as it takes one of the head's. Files the
     /// head's own document too. At most 32, `add_from`'s and `restore`'s
@@ -666,6 +713,17 @@ pub struct ReviseCampaignQuery {
     )]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub restore: Option<Vec<RestoredVariant>>,
+    /// `<old>=<new>` pairs, comma-separated, each a model as the server prints
+    /// it. A cell naming `<new>` takes a copy of its cell's finished success
+    /// under `<old>`. Refused when both checksums of a file are read and differ;
+    /// a file the server cannot read is taken on the filer's word.
+    #[serde(
+        default,
+        with = "crate::comma_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub replace_model: Option<Vec<ModelReplacement>>,
 }
 
 /// The query string of `…/rerun` and `…/recalculate`.

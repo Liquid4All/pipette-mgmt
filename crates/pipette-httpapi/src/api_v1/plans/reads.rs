@@ -982,7 +982,7 @@ async fn plan_jobs(
             let started = Instant::now();
             let campaign = PlanCampaign::read(state, user, &read.rights, &manifest).await?;
             let result = Ok::<_, AppError>((
-                cancel_grant(state, user, &read.rights, &manifest, campaign.as_ref()).await?,
+                cancel_grant(user, &manifest, campaign.as_ref()),
                 note_editable(user, &read.rights, &manifest, campaign.as_ref()),
             ));
             if let Some(timing) = timing {
@@ -2613,7 +2613,7 @@ impl PlanCampaign {
         )?;
         Ok(Some(Self {
             campaign,
-            authority: CampaignAuthority::of(user, rights, member_of),
+            authority: CampaignAuthority::of(rights, member_of),
         }))
     }
 }
@@ -2648,29 +2648,24 @@ fn note_editable(
 
 /// The cancel grant a plan wants. Shared with the plan page, so its button and
 /// [`cancel`] agree.
-async fn cancel_grant(
-    state: &AppState,
+fn cancel_grant(
     user: &User,
-    rights: &UserRights,
     manifest: &PlanManifest,
     campaign: Option<&PlanCampaign>,
-) -> Result<UserPermission, AppError> {
+) -> UserPermission {
     let reaches = match campaign {
         None => manifest.submitted_by.as_ref() == Some(&user.user_id),
         Some(PlanCampaign {
             campaign: Some(campaign),
             authority,
-        }) => {
-            authority.runs(&campaign.owner)
-                || authority.offboards(state, rights, &campaign.owner).await?
-        }
+        }) => authority.runs(&campaign.owner),
         Some(PlanCampaign { campaign: None, .. }) => false,
     };
-    Ok(if reaches {
+    if reaches {
         UserPermission::CancelPlans
     } else {
         UserPermission::CancelAnyPlans
-    })
+    }
 }
 
 /// Record a cancellation request, and what it did.
@@ -2701,7 +2696,7 @@ pub(crate) async fn cancel(
     // Refused naming the grant this plan wants, so a holder of plain
     // `cancel_plans` is told which one it lacks.
     let campaign = PlanCampaign::read(state, user, rights, &manifest).await?;
-    rights.require(cancel_grant(state, user, rights, &manifest, campaign.as_ref()).await?)?;
+    rights.require(cancel_grant(user, &manifest, campaign.as_ref()))?;
     if let Some(campaign) = campaign.as_ref().and_then(|read| read.campaign.as_ref()) {
         pipette_pipeline::campaign_admin::require_cancellable(campaign, plan_id)?;
     }

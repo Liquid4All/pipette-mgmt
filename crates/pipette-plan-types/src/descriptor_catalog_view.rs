@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind,
     DescriptorEntryState, DescriptorKind, DescriptorMemberDescriptor, DescriptorMemberKey,
-    ListPage, ModelFormat, ModelKey, PositiveCount, QualifiedCatalogName, QualifiedNameError,
-    QuantizationLabel, QuantizationLabelError, empty_as_none,
+    ListPage, LogoUri, ModelFormat, ModelKey, PositiveCount, QualifiedCatalogName,
+    QualifiedNameError, QuantizationLabel, QuantizationLabelError, Sha256, empty_as_none,
 };
 
 /// The complete name of one catalog member: the entry's name, then the
@@ -177,11 +177,27 @@ pub struct DescriptorMemberView {
     /// when the table has no such row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<DescriptorMemberParameters>,
+    /// The download size in bytes for a model member, or null when no size
+    /// is recorded. Runtime members omit this field.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_size_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<u64>"))]
+    pub size_bytes: Option<Option<u64>>,
     /// What happened when this member ran. The evidence never selects an
     /// entry. The server includes it on the short list, and on a name lookup
     /// that asks for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<DescriptorMemberEvidence>,
+}
+
+fn deserialize_size_bytes<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer).map(Some)
 }
 
 /// The run evidence of one member. A run can fail because of the model or the
@@ -262,6 +278,34 @@ pub struct DescriptorEntryListRow {
     pub member_summaries: Vec<DescriptorMemberSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<DescriptorMemberView>>,
+    /// Model pickers group entries by this family. The default is the part of
+    /// the entry name before its first hyphen. A runtime entry has no family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// The SHA-256 of the family's logo URI: the logo of the entry's scope,
+    /// or else the global logo. Lookup ignores the case of the family. Fetch
+    /// the logo with this digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_logo_sha256: Option<Sha256>,
+}
+
+/// A family logo that a client requests by its digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct DescriptorFamilyLogo {
+    /// [`LogoUri::sha256`] of `logo_uri`.
+    pub sha256: Sha256,
+    pub logo_uri: LogoUri,
+}
+
+/// A model family and its logo, as a logo change left them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct DescriptorFamilyLogoView {
+    pub scope: CatalogScope,
+    pub family: CatalogName,
+    /// `null` when the family has no logo in this scope.
+    pub logo_uri: Option<LogoUri>,
 }
 
 /// One global or caller's-org catalog entry offered to a named device. Each
@@ -280,6 +324,15 @@ pub struct DescriptorCatalogShortListItem {
     #[cfg_attr(feature = "schemars", schemars(with = "String", extend("format" = "date-time")))]
     pub release_time: Timestamp,
     pub descriptor_kind: DescriptorKind,
+    /// Model pickers group entries by this family. The default is the part of
+    /// the entry name before its first hyphen. A runtime entry has no family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// The SHA-256 of the family's logo URI: the logo of the entry's scope,
+    /// or else the global logo. Lookup ignores the case of the family. Fetch
+    /// the logo with this digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_logo_sha256: Option<Sha256>,
     /// The members offered to the device. A runtime entry gives the one
     /// member that the device resolves. A model entry has no precedence, so it
     /// gives every model member that an offered runtime can load.

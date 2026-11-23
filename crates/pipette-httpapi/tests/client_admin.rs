@@ -4,7 +4,6 @@
 
 use anyhow::Context;
 use axum::http::StatusCode;
-use futures::TryStreamExt;
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -202,11 +201,6 @@ async fn the_device_writes_are_gated_on_manage_clients() -> anyhow::Result<()> {
 
 /// The account's standing outranks every grant, `manage_any_clients` included.
 #[rstest::rstest]
-#[case::pending(
-    Some(UserStatus::Pending),
-    StatusCode::FORBIDDEN,
-    "user is pending an operator's approval"
-)]
 #[case::disabled(Some(UserStatus::Disabled), StatusCode::FORBIDDEN, "user is disabled")]
 // `None` deletes the record and keeps the key, so the request reaches the lookup.
 #[case::gone(None, StatusCode::UNAUTHORIZED, "user not found")]
@@ -587,6 +581,66 @@ async fn an_update_writes_only_what_it_names() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The device's own `PATCH` keeps the name, and a blank name clears it.
+#[tokio::test]
+async fn an_update_names_the_device() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let state = make_state(dir.path()).await?;
+    let admin = device_admin(&state).await?;
+    let (sk, client_id) = register_and_approve(&state).await?;
+    let uri = format!("/api/v1/clients/{client_id}");
+
+    let body = body_json(
+        signed_json(
+            &state,
+            &admin,
+            "PATCH",
+            &uri,
+            &json!({ "name": " bench phone 2 " }),
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(body["changed"], true);
+    assert_eq!(json_str(&body, "name")?, "bench phone 2");
+
+    let resp = authed_patch(
+        &state,
+        &sk,
+        &client_id,
+        "/clients/me",
+        &json!({ "client_details": "A069P", "device_name": "A069P" }),
+    )
+    .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .context("the device survives")?;
+    assert_eq!(
+        stored.name.as_ref().map(|n| n.as_str()),
+        Some("bench phone 2")
+    );
+
+    let body =
+        body_json(signed_json(&state, &admin, "PATCH", &uri, &json!({ "name": "  " })).await?)
+            .await?;
+    assert_eq!(body["changed"], true);
+    assert!(
+        body.get("name").is_none(),
+        "a cleared name is absent: {body}"
+    );
+    let stored = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .context("the device survives")?;
+    assert_eq!(stored.name, None);
+    Ok(())
+}
+
 /// Each lands in its own field, answered and stored; `client_details` stays.
 #[tokio::test]
 async fn an_update_writes_the_organization_label_and_contact_email() -> anyhow::Result<()> {
@@ -927,17 +981,17 @@ async fn a_bulk_assignment_with_one_device_outside_the_scope_writes_none() -> an
     )
     .await?;
     assert_eq!(resp.status(), StatusCode::OK, "the org admin joins acme");
-    // A member's own device rolls up to acme, so acme's admin may take it.
+    // An acme device, so acme's admin may take it.
     let (_, member_owned) = register_pending(&state).await?;
     let resp = signed_json(
         &state,
         &server_admin,
         "PUT",
         &format!("/api/v1/clients/{member_owned}/owner"),
-        &json!({ "owner": { "type": "user", "user_id": org_admin.1 } }),
+        &json!({ "owner": { "type": "org", "org_id": acme } }),
     )
     .await?;
-    assert_eq!(resp.status(), StatusCode::OK, "a member owns the device");
+    assert_eq!(resp.status(), StatusCode::OK, "acme owns the device");
     let member_owner = state.org_store.get_ownership(&member_owned).await?;
     let (_, theirs) = register_and_approve(&state).await?;
     assign(&state, &server_admin, &rival, &[theirs.as_str()]).await?;
@@ -1108,30 +1162,7 @@ async fn an_org_admin_reaches_its_own_organizations_devices_only() -> anyhow::Re
     .await?;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // Nor to a person outside its roster: the device would leave the
-    // organization pointing at a principal the caller does not administer.
-    let outsider = registered_user(&state, &[]).await?;
-    let resp = signed_json(
-        &state,
-        &admin,
-        "PUT",
-        &format!("/api/v1/clients/{ours}/owner"),
-        &json!({ "owner": { "type": "user", "user_id": outsider.1 } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // Detaching outright, and handing to one of its own members, both stay
-    // within the scope.
-    let resp = signed_json(
-        &state,
-        &admin,
-        "PUT",
-        &format!("/api/v1/clients/{ours}/owner"),
-        &json!({ "owner": { "type": "user", "user_id": admin.1 } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Detaching outright stays within the scope.
     let resp = signed_json(
         &state,
         &admin,
@@ -1194,8 +1225,8 @@ async fn a_device_is_detached_by_null_only() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A scoped caller cannot confirm an organization or account id by naming it as
-/// a device's owner; only the fleet scope hears that an owner is missing.
+/// A scoped caller cannot confirm an organization id by naming it as a device's
+/// owner; only the fleet scope hears that an owner is missing.
 #[tokio::test]
 async fn an_owner_move_does_not_confirm_an_owner_outside_the_scope() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1225,44 +1256,36 @@ async fn an_owner_move_does_not_confirm_an_owner_outside_the_scope() -> anyhow::
         &json!({ "org_id": acme }),
     )
     .await?;
-    let outsider = create_user(&state, "outsider@example.test").await?;
     let (_, ours) = register_and_approve(&state).await?;
     assign(&state, &server_admin, &acme, &[ours.as_str()]).await?;
 
     let real_org = json!({ "type": "org", "org_id": rival });
     let missing_org =
         json!({ "type": "org", "org_id": "org_00000000-0000-0000-0000-000000000000" });
-    let real_user = json!({ "type": "user", "user_id": outsider.user_id });
-    let missing_user =
-        json!({ "type": "user", "user_id": "user_00000000-0000-0000-0000-000000000000" });
     let uri = format!("/api/v1/clients/{ours}/owner");
 
     // A real owner outside the scope and a made-up one read alike.
-    futures::stream::iter(
-        [
-            (&real_org, &missing_org, "this move is outside"),
-            (&real_user, &missing_user, "another person's"),
-        ]
-        .map(anyhow::Ok),
+    let resp = signed_json(&state, &admin, "PUT", &uri, &json!({ "owner": real_org })).await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{real_org}");
+    let refused = body_json(resp).await?;
+    assert!(
+        json_str(&refused, "error")?.contains("this move is outside"),
+        "{refused}"
+    );
+    let resp = signed_json(
+        &state,
+        &admin,
+        "PUT",
+        &uri,
+        &json!({ "owner": missing_org }),
     )
-    .try_for_each(|(real, missing, token)| {
-        let (state, admin, uri) = (&state, &admin, &uri);
-        async move {
-            let resp = signed_json(state, admin, "PUT", uri, &json!({ "owner": real })).await?;
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{real}");
-            let refused = body_json(resp).await?;
-            assert!(json_str(&refused, "error")?.contains(token), "{refused}");
-            let resp = signed_json(state, admin, "PUT", uri, &json!({ "owner": missing })).await?;
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{missing}");
-            assert_eq!(
-                body_json(resp).await?,
-                refused,
-                "{missing} must read as {real}"
-            );
-            Ok(())
-        }
-    })
     .await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{missing_org}");
+    assert_eq!(
+        body_json(resp).await?,
+        refused,
+        "{missing_org} must read as {real_org}"
+    );
     assert_eq!(
         owner_org(&state, &server_admin, &acme).await?,
         vec![ours.to_string()],
@@ -1271,33 +1294,22 @@ async fn an_owner_move_does_not_confirm_an_owner_outside_the_scope() -> anyhow::
 
     // The fleet scope may hand a device anywhere, so it is told the owner is
     // missing rather than refused.
-    for (missing, token) in [
-        (&missing_org, "no organization"),
-        (&missing_user, "no user"),
-    ] {
-        let resp = signed_json(
-            &state,
-            &server_admin,
-            "PUT",
-            &uri,
-            &json!({ "owner": missing }),
-        )
-        .await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{missing}");
-        let error = json_str(&body_json(resp).await?, "error")?.to_string();
-        assert!(error.contains(token), "{missing}: {error}");
-    }
+    let resp = signed_json(
+        &state,
+        &server_admin,
+        "PUT",
+        &uri,
+        &json!({ "owner": missing_org }),
+    )
+    .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{missing_org}");
+    let error = json_str(&body_json(resp).await?, "error")?.to_string();
+    assert!(error.contains("no organization"), "{missing_org}: {error}");
 
     // An unknown device is the device's `404` whatever the body names, the
     // answer every other device write gives.
     for signer in [&admin, &server_admin] {
-        for owner in [
-            &Value::Null,
-            &real_org,
-            &missing_org,
-            &real_user,
-            &missing_user,
-        ] {
+        for owner in [&Value::Null, &real_org, &missing_org] {
             let resp = signed_json(
                 &state,
                 signer,
@@ -1704,9 +1716,8 @@ fn offered(body: &Value) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// What the app's owner field offers: an organization's device goes to it, to
-/// the caller, or (for the fleet scope) to its members, organizations first,
-/// never to one the roster grant hides.
+/// What the app's owner field offers: an organization's device stays with it,
+/// never going to one the roster grant hides.
 #[tokio::test]
 async fn the_owner_lookup_offers_where_the_device_may_go() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1720,10 +1731,8 @@ async fn the_owner_lookup_offers_where_the_device_may_go() -> anyhow::Result<()>
     )
     .await?;
     let member = registered_user(&state, &[]).await?;
-    let outsider = registered_user(&state, &[]).await?;
     set_user_org(&state, &lead.1, Some(acme.clone())).await?;
     set_user_org(&state, &member.1, Some(acme.clone())).await?;
-    set_user_org(&state, &outsider.1, Some(rival.clone())).await?;
     let (_, ours) = register_and_approve(&state).await?;
     let (_, theirs) = register_and_approve(&state).await?;
     own_client_by_org(&state, &ours, &acme).await?;
@@ -1731,20 +1740,7 @@ async fn the_owner_lookup_offers_where_the_device_may_go() -> anyhow::Result<()>
 
     let (status, body) = owners(&state, &lead, ours.as_str(), "q=").await?;
     assert_eq!(status, StatusCode::OK);
-    let values = offered(&body)?;
-    assert_eq!(values.first(), Some(&acme.to_string()), "{body}");
-    // A scoped caller names only itself: a colleague's device fetches their vault.
-    [
-        (lead.1.to_string(), true),
-        (member.1.to_string(), false),
-        (rival.to_string(), false),
-        (outsider.1.to_string(), false),
-    ]
-    .into_iter()
-    .for_each(|(principal, wanted)| {
-        assert_eq!(values.contains(&principal), wanted, "{principal}: {body}");
-    });
-
+    assert_eq!(offered(&body)?, [acme.to_string()], "{body}");
     let (_, body) = owners(&state, &lead, ours.as_str(), "q=&type=org").await?;
     assert_eq!(offered(&body)?, [acme.to_string()]);
     let address = state
@@ -1771,16 +1767,13 @@ async fn the_owner_lookup_offers_where_the_device_may_go() -> anyhow::Result<()>
         &format!("q={}", address.to_uppercase()),
     )
     .await?;
-    assert_eq!(offered(&body)?, [member.1.to_string()]);
+    assert_eq!(
+        offered(&body)?,
+        Vec::<String>::new(),
+        "no account is offered"
+    );
     let values = offered(&owners(&state, &admin, ours.as_str(), "q=").await?.1)?;
-    for (principal, wanted) in [
-        (acme.to_string(), true),
-        (member.1.to_string(), true),
-        (rival.to_string(), false),
-        (outsider.1.to_string(), false),
-    ] {
-        assert_eq!(values.contains(&principal), wanted, "{principal}");
-    }
+    assert_eq!(values, [acme.to_string()]);
 
     // Without the roster grant nobody is named, whatever is typed, so an id
     // never resolves to an address.

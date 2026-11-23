@@ -133,8 +133,8 @@ impl PlanStatus {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum RequestedScope {
-    /// The plans of this account's campaigns and its organization's, and the
-    /// ones it filed outside any campaign.
+    /// The plans of its organization's campaigns, and the ones it filed
+    /// outside any campaign.
     Mine,
     /// Every plan. Refused with `403` without `read_any_plans`.
     All,
@@ -857,6 +857,49 @@ impl std::fmt::Display for RestoredVariant {
     }
 }
 
+/// One `replace_model` pair, `<from>=<to>`, each side a model as its `Display`
+/// prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct ModelReplacement {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("a model replacement is `<old>=<new>` with one `=`; {0:?} is not")]
+pub struct ModelReplacementError(String);
+
+impl std::str::FromStr for ModelReplacement {
+    type Err = ModelReplacementError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.split('=').map(str::trim).collect::<Vec<_>>().as_slice() {
+            [from, to] if !from.is_empty() && !to.is_empty() => Ok(Self {
+                from: (*from).to_owned(),
+                to: (*to).to_owned(),
+            }),
+            _ => Err(ModelReplacementError(s.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelReplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.from, self.to)
+    }
+}
+
+/// A [`ModelReplacement`] as applied. `verified` is `false` when some file was
+/// taken on the filer's word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct ReplacedModel {
+    pub from: String,
+    pub to: String,
+    pub verified: bool,
+}
+
 /// The JSON answer of `GET /api/v1/plans/{plan_id}/variants`: each variant of
 /// the plan as its own standalone `[[variants]]` block, in the order that a
 /// variant edit's `restore` numbers them.
@@ -881,18 +924,26 @@ pub enum RevisionChange {
         carry_earlier: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_across_limit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inherit_failed: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         restored: Vec<RestoredVariant>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace_model: Vec<ReplacedModel>,
     },
     Document {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_across_limit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inherit_failed: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace_model: Vec<ReplacedModel>,
     },
     /// `answered` is absent when the filer named the jobs. `marked_job_count`
     /// counts the jobs it marked failed (`fail`). `group_id` and `policies`
@@ -951,84 +1002,112 @@ fn filed_by_group(
 /// own format.
 impl std::fmt::Display for RevisionChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (carry_earlier, carry_across_limit, inherit_from) = match self {
-            Self::Variants {
-                removed_variant_count: removed,
-                added_variant_count: added,
-                carry_earlier,
-                carry_across_limit,
-                inherit_from,
-                restored,
-            } => {
-                write!(f, "Variant edit: {removed} removed, {added} added.")?;
-                for variant in restored {
-                    write!(
-                        f,
-                        " Restored variant {} of {}.",
-                        variant.variant_index, variant.plan_id
-                    )?;
-                }
-                (*carry_earlier, *carry_across_limit, inherit_from.as_slice())
-            }
-            Self::Document {
-                carry_earlier,
-                carry_across_limit,
-                inherit_from,
-            } => {
-                f.write_str("Document revised.")?;
-                (*carry_earlier, *carry_across_limit, inherit_from.as_slice())
-            }
-            Self::Rerun {
-                answered: None,
-                job_count: 0,
-                marked_job_count,
-                group_id,
-                policies,
-            } if *marked_job_count > 0 => {
-                write!(f, "Marked {} failed.", counted(*marked_job_count, "job"))?;
-                return filed_by_group(f, group_id.as_ref(), policies);
-            }
-            Self::Rerun {
-                answered,
-                job_count,
-                marked_job_count,
-                group_id,
-                policies,
-            } => {
-                match answered {
-                    None => write!(f, "Re-run of {}", counted(*job_count, "job"))?,
-                    Some(Answered::Failed) => write!(f, "Re-run of all failed jobs ({job_count})")?,
-                    Some(Answered::All) => {
-                        write!(f, "Re-run of all finished or failed jobs ({job_count})")?;
+        let (carry_earlier, carry_across_limit, inherit_failed, inherit_from, replace_model) =
+            match self {
+                Self::Variants {
+                    removed_variant_count: removed,
+                    added_variant_count: added,
+                    carry_earlier,
+                    carry_across_limit,
+                    inherit_failed,
+                    inherit_from,
+                    restored,
+                    replace_model,
+                } => {
+                    write!(f, "Variant edit: {removed} removed, {added} added.")?;
+                    for variant in restored {
+                        write!(
+                            f,
+                            " Restored variant {} of {}.",
+                            variant.variant_index, variant.plan_id
+                        )?;
                     }
+                    (
+                        *carry_earlier,
+                        *carry_across_limit,
+                        *inherit_failed,
+                        inherit_from.as_slice(),
+                        replace_model.as_slice(),
+                    )
                 }
-                match marked_job_count {
-                    0 => f.write_str(".")?,
-                    marked => write!(f, "; {marked} marked failed.")?,
+                Self::Document {
+                    carry_earlier,
+                    carry_across_limit,
+                    inherit_failed,
+                    inherit_from,
+                    replace_model,
+                } => {
+                    f.write_str("Document revised.")?;
+                    (
+                        *carry_earlier,
+                        *carry_across_limit,
+                        *inherit_failed,
+                        inherit_from.as_slice(),
+                        replace_model.as_slice(),
+                    )
                 }
-                return filed_by_group(f, group_id.as_ref(), policies);
-            }
-            Self::Recalculate {
-                all_evals: false,
-                job_count,
-            } => return write!(f, "Recalculation of {}.", counted(*job_count, "eval")),
-            Self::Recalculate {
-                all_evals: true,
-                job_count,
-            } => return write!(f, "Recalculation of all finished evals ({job_count})."),
-            Self::Revert { to_plan_id } => return write!(f, "Reverted to {to_plan_id}."),
-        };
+                Self::Rerun {
+                    answered: None,
+                    job_count: 0,
+                    marked_job_count,
+                    group_id,
+                    policies,
+                } if *marked_job_count > 0 => {
+                    write!(f, "Marked {} failed.", counted(*marked_job_count, "job"))?;
+                    return filed_by_group(f, group_id.as_ref(), policies);
+                }
+                Self::Rerun {
+                    answered,
+                    job_count,
+                    marked_job_count,
+                    group_id,
+                    policies,
+                } => {
+                    match answered {
+                        None => write!(f, "Re-run of {}", counted(*job_count, "job"))?,
+                        Some(Answered::Failed) => {
+                            write!(f, "Re-run of all failed jobs ({job_count})")?
+                        }
+                        Some(Answered::All) => {
+                            write!(f, "Re-run of all finished or failed jobs ({job_count})")?;
+                        }
+                    }
+                    match marked_job_count {
+                        0 => f.write_str(".")?,
+                        marked => write!(f, "; {marked} marked failed.")?,
+                    }
+                    return filed_by_group(f, group_id.as_ref(), policies);
+                }
+                Self::Recalculate {
+                    all_evals: false,
+                    job_count,
+                } => return write!(f, "Recalculation of {}.", counted(*job_count, "eval")),
+                Self::Recalculate {
+                    all_evals: true,
+                    job_count,
+                } => return write!(f, "Recalculation of all finished evals ({job_count})."),
+                Self::Revert { to_plan_id } => return write!(f, "Reverted to {to_plan_id}."),
+            };
         if carry_earlier {
             f.write_str(" Carries runs of earlier plans.")?;
         }
         if carry_across_limit {
             f.write_str(" Carries runs across a changed attempt limit.")?;
         }
+        if inherit_failed {
+            f.write_str(" Carries failed runs.")?;
+        }
         if !inherit_from.is_empty() {
             let ids: Vec<&str> = inherit_from.iter().map(PlanId::as_str).collect();
             write!(f, " Inherits runs of {}.", ids.join(", "))?;
         }
-        Ok(())
+        replace_model.iter().try_for_each(|replaced| {
+            write!(f, " Replaces model {} with {}", replaced.from, replaced.to)?;
+            if !replaced.verified {
+                f.write_str(" on the filer's word")?;
+            }
+            f.write_str(".")
+        })
     }
 }
 
@@ -1236,6 +1315,25 @@ mod tests {
 mod revision_change_tests {
     use super::*;
 
+    #[rstest::rstest]
+    #[case::vault_to_hub(
+        "/vault/resources/vault_1/content = org/repo@abc:m.gguf",
+        Some(("/vault/resources/vault_1/content", "org/repo@abc:m.gguf"))
+    )]
+    #[case::no_separator("org/repo@abc:m.gguf", None)]
+    #[case::two_separators("a=b=c", None)]
+    #[case::empty_side("a=", None)]
+    fn a_model_replacement_parses_one_pair(
+        #[case] text: &str,
+        #[case] parsed: Option<(&str, &str)>,
+    ) {
+        let got = text.parse::<ModelReplacement>().ok();
+        assert_eq!(
+            got.as_ref().map(|r| (r.from.as_str(), r.to.as_str())),
+            parsed
+        );
+    }
+
     enum SentenceCase {
         RerunOne,
         RerunFailed,
@@ -1247,6 +1345,7 @@ mod revision_change_tests {
         VariantsCarry,
         VariantsRestored,
         DocumentAcrossLimit,
+        DocumentReplaced,
         Revert,
     }
 
@@ -1279,6 +1378,12 @@ mod revision_change_tests {
         SentenceCase::DocumentAcrossLimit,
         "Document revised. Carries runs of earlier plans. \
          Carries runs across a changed attempt limit."
+    )]
+    #[case::document_replaced(
+        SentenceCase::DocumentReplaced,
+        "Document revised. Inherits runs of plan-a. \
+         Replaces model /vault/resources/vault_1/content with org/repo@abc:m.gguf. \
+         Replaces model org/repo@def:m.gguf with org/repo@abc:m.gguf on the filer's word."
     )]
     #[case::revert(SentenceCase::Revert, "Reverted to plan-a.")]
     fn a_revision_change_reads_as_a_sentence(
@@ -1337,14 +1442,17 @@ mod revision_change_tests {
                 added_variant_count: 0,
                 carry_earlier: true,
                 carry_across_limit: false,
+                inherit_failed: false,
                 inherit_from: vec![PlanId::try_new("plan-a")?, PlanId::try_new("plan-b")?],
                 restored: Vec::new(),
+                replace_model: Vec::new(),
             },
             SentenceCase::VariantsRestored => RevisionChange::Variants {
                 removed_variant_count: 1,
                 added_variant_count: 2,
                 carry_earlier: false,
                 carry_across_limit: false,
+                inherit_failed: false,
                 inherit_from: vec![PlanId::try_new("plan-a")?],
                 restored: vec![
                     RestoredVariant {
@@ -1356,11 +1464,32 @@ mod revision_change_tests {
                         variant_index: 0,
                     },
                 ],
+                replace_model: Vec::new(),
             },
             SentenceCase::DocumentAcrossLimit => RevisionChange::Document {
                 carry_earlier: true,
                 carry_across_limit: true,
+                inherit_failed: false,
                 inherit_from: Vec::new(),
+                replace_model: Vec::new(),
+            },
+            SentenceCase::DocumentReplaced => RevisionChange::Document {
+                carry_earlier: false,
+                carry_across_limit: false,
+                inherit_failed: false,
+                inherit_from: vec![PlanId::try_new("plan-a")?],
+                replace_model: vec![
+                    ReplacedModel {
+                        from: "/vault/resources/vault_1/content".into(),
+                        to: "org/repo@abc:m.gguf".into(),
+                        verified: true,
+                    },
+                    ReplacedModel {
+                        from: "org/repo@def:m.gguf".into(),
+                        to: "org/repo@abc:m.gguf".into(),
+                        verified: false,
+                    },
+                ],
             },
             SentenceCase::Revert => RevisionChange::Revert {
                 to_plan_id: PlanId::try_new("plan-a")?,
@@ -1377,7 +1506,9 @@ mod revision_change_tests {
         RevisionChange::Document {
             carry_earlier: false,
             carry_across_limit: false,
-            inherit_from: Vec::new()
+            inherit_failed: false,
+            inherit_from: Vec::new(),
+            replace_model: Vec::new()
         },
         serde_json::json!({"type": "document"})
     )]
@@ -1385,9 +1516,28 @@ mod revision_change_tests {
         RevisionChange::Document {
             carry_earlier: false,
             carry_across_limit: true,
-            inherit_from: Vec::new()
+            inherit_failed: false,
+            inherit_from: Vec::new(),
+            replace_model: Vec::new()
         },
         serde_json::json!({"type": "document", "carry_across_limit": true})
+    )]
+    #[case::document_replaced(
+        RevisionChange::Document {
+            carry_earlier: false,
+            carry_across_limit: false,
+            inherit_failed: false,
+            inherit_from: Vec::new(),
+            replace_model: vec![ReplacedModel {
+                from: "a".into(),
+                to: "b".into(),
+                verified: false
+            }]
+        },
+        serde_json::json!({
+            "type": "document",
+            "replace_model": [{"from": "a", "to": "b", "verified": false}]
+        })
     )]
     #[case::variants(
         RevisionChange::Variants {
@@ -1395,8 +1545,10 @@ mod revision_change_tests {
             added_variant_count: 2,
             carry_earlier: false,
             carry_across_limit: false,
+            inherit_failed: false,
             inherit_from: Vec::new(),
-            restored: Vec::new()
+            restored: Vec::new(),
+            replace_model: Vec::new()
         },
         serde_json::json!({
             "type": "variants", "removed_variant_count": 1, "added_variant_count": 2
@@ -1408,11 +1560,13 @@ mod revision_change_tests {
             added_variant_count: 1,
             carry_earlier: false,
             carry_across_limit: false,
+            inherit_failed: false,
             inherit_from: Vec::new(),
             restored: vec![RestoredVariant {
                 plan_id: PlanId::from_uuid(uuid::Uuid::from_u128(1)),
                 variant_index: 3
-            }]
+            }],
+            replace_model: Vec::new()
         },
         serde_json::json!({
             "type": "variants", "removed_variant_count": 0, "added_variant_count": 1,

@@ -5,8 +5,8 @@ and its display name `org_display_name`, all absent outside one), its expanded p
 `may`: how far each of its authorities reaches (`none`, `own` for its
 organization and itself, or `every`), with the names it may grant, and the ones
 among them a service account may hold, as its routes judge them, so a client
-draws from it rather than re-deriving the rules from names. A `pending` account
-reaches nothing. This is the user form of `GET /clients/me`.
+draws from it rather than re-deriving the rules from names. This is the user
+form of `GET /clients/me`.
 
 `may.edit_catalog` is `own` for a holder of `edit_catalog` in an organization.
 It is `every` for a holder of `edit_any_catalog`, and `none` for all other
@@ -19,11 +19,9 @@ which were registered before its owner signed in
 ([Users: Signing in through Clerk](../users.md#signing-in-through-clerk)). It
 is absent before that sign-in and on a server without `[clerk]`.
 
-It admits an account at any status but `disabled`, and its signature may name
-only its key. It is the one route a `pending` account reaches, so it can watch
-for its admission the way a pending client watches `GET /clients/me`, and the
-one that takes a signature without `X-Client-Id`, which is how a holder of
-nothing but the key learns its account.
+It refuses a `disabled` account, and its signature may name only its key. It is
+the one route that takes a signature without `X-Client-Id`, which is how a
+holder of nothing but the key learns its account.
 
 ## Statuses
 

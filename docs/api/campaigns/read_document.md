@@ -18,7 +18,5 @@ In that order: the caller's authority first, so a caller holding none reads
 | Status | When |
 |--------|------|
 | 200 | The plan the revision replaces, and its document |
-| 400 | `campaign_id` is not a campaign id |
 | 403 | The caller holds no campaign authority, the campaign is outside its scope, or it lacks the grants a [variant edit](edit_variants.md) names over the plan the campaign runs |
-| 404 | No such campaign |
 | 409 | The campaign runs no plan, or runs one with no stored document |

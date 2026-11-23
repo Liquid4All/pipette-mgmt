@@ -55,7 +55,8 @@
         <h2 id="{uid}-title">Preview</h2>
         <p class="muted">What the policies would do now with the answered jobs of each campaign's plan, its eval jobs
           left out: each check's policy alone, on or off, then the policies that are on together.</p>
-        <DataTable {spec} {rows} id={(row) => row.campaign_id} noun="campaigns" {empty} cells={{ name, deadline }} />
+        <DataTable {spec} {rows} id={(row) => row.campaign_id} noun="campaigns" name="preview" {empty}
+                   cells={{ name, deadline }} />
         {#if rows.some((row) => row.deadline_passed)}
           <p class="muted">The server refuses a re-run of a plan whose document sets a deadline that has passed.</p>
         {/if}
@@ -64,7 +65,7 @@
         <section aria-labelledby="{uid}-filings">
           <h2 id="{uid}-filings">Recent policy revisions</h2>
           <DataTable spec={filings} rows={recentFilings(rows)} id={(row) => row.campaign_id} noun="revisions"
-                     empty="The policies have revised none of these campaigns." cells={{ name }} />
+                     name="filings" empty="The policies have revised none of these campaigns." cells={{ name }} />
         </section>
         {#if params}<ModelParamsGaps {rows} policy={params} {names} {reader} {add} />{/if}
         {#if smaller}<SmallerFailures {rows} policy={smaller} {names} />{/if}

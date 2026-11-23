@@ -26,7 +26,7 @@ use pipette_web_testkit::{
     GATED_GGUF_FILE, GatedModel, ONE_CELL_PLAN, UserSigner, VISION_MMPROJ_FILE, VISION_MODEL_BYTES,
     VISION_MODEL_FILE, approved_client, assert_nothing_staged, authed_post, authed_user_get,
     body_json, file_job_bodies, filing_uri, gated_hub, gated_macos_document, job, json_str,
-    make_state_with_hf_endpoint, make_state_with_plan_max_jobs, own_campaign_plans_uri,
+    make_state_with_hf_endpoint, make_state_with_plan_max_jobs, org_of, own_campaign_plans_uri,
     post_plan_document, put_idle_campaign, put_idle_campaign_of, raw_request, register_and_approve,
     registered_user, registered_user_with_detail, run_qm, seed_org, seeded_object_state,
     seeded_queue_state, seeded_state, set_matching_input, set_user_org, setup_benchmarks,
@@ -1880,8 +1880,8 @@ async fn test_a_campaign_handed_off_during_an_import_refuses_the_plan() -> anyho
     };
     let campaign = put_idle_campaign_of(&state, owner, "Gated").await?;
     let handed = Campaign {
-        owner: CampaignOwner::User {
-            user_id: operator.1.clone(),
+        owner: CampaignOwner::Org {
+            org_id: org_of(&state, &operator.1).await?,
         },
         ..campaign.clone()
     };
@@ -1933,8 +1933,8 @@ async fn test_two_tokens_for_one_commit_merge_onto_one_job() -> anyhow::Result<(
     Ok(())
 }
 
-/// Two users who file one gated commit import it each for themselves, so
-/// their jobs stay apart: neither user can read the other's job source.
+/// Two organizations whose members file one gated commit import it each for
+/// themselves, so their jobs stay apart: neither can read the other's job source.
 #[tokio::test]
 async fn test_two_owners_of_one_gated_commit_do_not_merge() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1955,7 +1955,8 @@ async fn test_two_owners_of_one_gated_commit_do_not_merge() -> anyhow::Result<()
             assert_eq!(status, StatusCode::CREATED, "{report}");
             assert_eq!(report["merged_job_count"], 0, "{report}");
             let model = stored_model(state, &report).await?;
-            assert_eq!(model["principal_id"], signer.1.as_str(), "{model}");
+            let owner = org_of(state, &signer.1).await?;
+            assert_eq!(model["principal_id"], owner.as_str(), "{model}");
             anyhow::Ok(json_str(&report["job_ids"], "0")?.to_owned())
         })
         .try_collect()
@@ -2170,8 +2171,8 @@ async fn test_a_dropped_stream_files_no_plan_and_keeps_stored_blobs() -> anyhow:
 
     assert_nothing_staged(&state).await?;
     assert!(record_owners(&state).await?.is_empty());
-    let owner = VaultOwner::User {
-        user_id: signer.1.clone(),
+    let owner = VaultOwner::Org {
+        org_id: org_of(&state, &signer.1).await?,
     };
     let sha256 = Sha256::try_new(MockFile::lfs(VISION_MODEL_FILE, VISION_MODEL_BYTES).sha256())?;
     assert!(

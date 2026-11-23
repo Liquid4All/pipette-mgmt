@@ -26,6 +26,5 @@ The response is the updated entry view with its complete `members` list.
 | 200 | The API appended the member |
 | 400 | The body or member fails catalog validation, the member's kind differs from the entry's, or Hugging Face refuses a repository |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable, the entry is absent, or the server has no database catalog |
 | 409 | The entry is tombstoned or the member duplicates a current member |
 | 502 | Hugging Face failed or limited the rate of the requests |

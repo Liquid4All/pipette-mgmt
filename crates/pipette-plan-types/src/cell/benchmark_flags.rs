@@ -361,9 +361,8 @@ pub enum BenchmarkFlags {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
     },
-    // OpenVINO (uv venv): a rep is a one-shot driver subprocess, so the attempt
-    // limit and `readiness` are the whole surface. `max_memory_usage` does not
-    // gate; `eval` and `vl` are unimplemented.
+    // OpenVINO (uv venv): `max_memory_usage` does not gate; `eval` is
+    // unimplemented, and the VL cells follow TensorRT Edge-LLM's.
     PrefillThroughputUvOpenvinoOpenvino {
         attempt_timeout_seconds: Option<PositiveSeconds>,
         readiness: Option<ReadinessOverrides>,
@@ -428,6 +427,17 @@ pub enum BenchmarkFlags {
         readiness: Option<ReadinessOverrides>,
     },
     VlMaxMemoryTrtEdgellmGgufVision {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+    },
+    // OpenVINO (uv venv) VL cells: an HTTP server, with TensorRT Edge-LLM's VL flags.
+    // The pipeline compiles before the server listens, so neither timeout covers it.
+    VlThroughputUvOpenvinoOpenvino {
+        http_timeout_seconds: Option<PositiveSeconds>,
+        attempt_timeout_seconds: Option<PositiveSeconds>,
+        readiness: Option<ReadinessOverrides>,
+    },
+    VlMaxMemoryUvOpenvinoOpenvino {
         http_timeout_seconds: Option<PositiveSeconds>,
         attempt_timeout_seconds: Option<PositiveSeconds>,
     },
@@ -725,6 +735,12 @@ impl BenchmarkFlags {
             BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision { .. } => {
                 (B::VlMaxMemory, R::TrtEdgellm, M::GgufVision)
             }
+            BenchmarkFlags::VlThroughputUvOpenvinoOpenvino { .. } => {
+                (B::VlThroughput, R::UvOpenvino, M::Openvino)
+            }
+            BenchmarkFlags::VlMaxMemoryUvOpenvinoOpenvino { .. } => {
+                (B::VlMaxMemory, R::UvOpenvino, M::Openvino)
+            }
             BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx { .. } => {
                 (B::MaxMemoryUsage, R::MlxMacosPipette, M::Mlx)
             }
@@ -990,6 +1006,14 @@ impl BenchmarkFlags {
                 ..
             }
             | BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision {
+                http_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlThroughputUvOpenvinoOpenvino {
+                http_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlMaxMemoryUvOpenvinoOpenvino {
                 http_timeout_seconds,
                 ..
             } => *http_timeout_seconds,
@@ -1298,6 +1322,14 @@ impl BenchmarkFlags {
                 attempt_timeout_seconds,
                 ..
             }
+            | BenchmarkFlags::VlThroughputUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
+            | BenchmarkFlags::VlMaxMemoryUvOpenvinoOpenvino {
+                attempt_timeout_seconds,
+                ..
+            }
             | BenchmarkFlags::MaxMemoryUsageMlxMacosPipetteMlx {
                 attempt_timeout_seconds,
             }
@@ -1455,6 +1487,7 @@ impl BenchmarkFlags {
             | BenchmarkFlags::EndToEndLatencyLlamacppApkPipetteGgufText { readiness, .. }
             | BenchmarkFlags::VlThroughputLlamacppApkPipetteGgufVision { readiness, .. }
             | BenchmarkFlags::VlThroughputTrtEdgellmGgufVision { readiness, .. }
+            | BenchmarkFlags::VlThroughputUvOpenvinoOpenvino { readiness, .. }
             | BenchmarkFlags::PrefillThroughputAppleCoreAiMacosPipetteAppleCoreAi {
                 readiness,
                 ..
@@ -1475,6 +1508,7 @@ impl BenchmarkFlags {
             } => readiness.as_ref(),
             BenchmarkFlags::VlMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision { .. }
+            | BenchmarkFlags::VlMaxMemoryUvOpenvinoOpenvino { .. }
             | BenchmarkFlags::AsrMaxMemoryLlamacppCliStockToolsGgufVision { .. }
             | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufText { .. }
             | BenchmarkFlags::DecisionMaxMemoryLlamacppCliStockToolsGgufVision { .. }
@@ -2099,6 +2133,21 @@ impl TryFrom<BenchmarkFlagRef> for BenchmarkFlags {
             (B::VlMaxMemory, R::TrtEdgellm, M::GgufVision) => {
                 r.deny_readiness()?;
                 BenchmarkFlags::VlMaxMemoryTrtEdgellmGgufVision {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                }
+            }
+            // OpenVINO: as the TensorRT Edge-LLM VL cells above.
+            (B::VlThroughput, R::UvOpenvino, M::Openvino) => {
+                BenchmarkFlags::VlThroughputUvOpenvinoOpenvino {
+                    http_timeout_seconds: r.http_timeout_seconds,
+                    attempt_timeout_seconds: r.attempt_timeout_seconds,
+                    readiness: r.readiness,
+                }
+            }
+            (B::VlMaxMemory, R::UvOpenvino, M::Openvino) => {
+                r.deny_readiness()?;
+                BenchmarkFlags::VlMaxMemoryUvOpenvinoOpenvino {
                     http_timeout_seconds: r.http_timeout_seconds,
                     attempt_timeout_seconds: r.attempt_timeout_seconds,
                 }
@@ -2964,6 +3013,10 @@ mod tests {
          &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("vl_throughput", "trt_edgellm", "gguf_vision", &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
         ("vl_max_memory", "trt_edgellm", "gguf_vision",
+         &["http_timeout_seconds", "attempt_timeout_seconds"]),
+        ("vl_throughput", "uv_openvino", "openvino",
+         &["http_timeout_seconds", "attempt_timeout_seconds", "readiness"]),
+        ("vl_max_memory", "uv_openvino", "openvino",
          &["http_timeout_seconds", "attempt_timeout_seconds"]),
         ("asr_max_memory", "llamacpp_cli_stock_tools", "gguf_vision",
          &["http_timeout_seconds", "attempt_timeout_seconds"]),

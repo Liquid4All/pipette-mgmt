@@ -19,7 +19,7 @@
   import { auditAction } from "../lib/audit";
   import { catalogOrgOf } from "../lib/catalog-entry";
   import {
-    CAMPAIGN_PAGES, campaignPlan, deviceTimeText, headAddress, labelPairs, labelScope, labelVocabulary,
+    CAMPAIGN_PAGES, campaignPlan, deferralText, deviceTimeText, headAddress, labelPairs, labelScope, labelVocabulary,
     revertOffered, stateOf, unlessWithheld,
   } from "../lib/campaigns";
   import CampaignLabels from "../lib/components/CampaignLabels.svelte";
@@ -128,7 +128,7 @@
   const known = new Loader<Map<string, string[]>>();
   let knownFor = "";
   function suggest() {
-    const scope = view && session.account ? labelScope(session.account, view.owner) : null;
+    const scope = view ? labelScope(view.owner) : null;
     if (!scope || JSON.stringify(scope) === knownFor) return;
     knownFor = JSON.stringify(scope);
     const signer = session.signer;
@@ -136,7 +136,7 @@
       campaigns(signer, ownedQuery(scope, [], cursor, ROUTE_PAGE_MAX)))).items));
   }
   const vocabulary = $derived(known.data ?? new Map<string, string[]>());
-  const under = $derived(view && session.account ? ownerBranch(session.account, view.owner, session.known, CAMPAIGN_PAGES) : null);
+  const under = $derived(view ? ownerBranch(view.owner, session.known, CAMPAIGN_PAGES) : null);
   // Set again on each tab, as every step to another address clears it.
   $effect(() => {
     void here.path;
@@ -229,6 +229,9 @@
       <p>{#if detail.group}<a class="pill lead" href={campaignGroupLink(detail.group.group_id)}>group {detail.group.name}</a>{/if}
         <LabelsInline campaign={detail} listing={under?.href} {vocabulary} onopen={suggest} onchange={reread}
                       editable={detail.may_administer} /></p>
+    {/if}
+    {#if detail.policy_deferral}
+      <p class="notice"><time datetime={detail.policy_deferral.until} title={when(detail.policy_deferral.until)}>{deferralText(detail.policy_deferral, Date.now())}</time></p>
     {/if}
 
     <!-- Every plan the campaign ran has an address under it; the campaign's own opens what it runs now. -->

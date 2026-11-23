@@ -39,8 +39,12 @@ export function changeText(change: RevisionChange): string {
         : "Document revised.";
       const earlier = change.carry_earlier ? " Carries runs of earlier plans." : "";
       const acrossLimit = change.carry_across_limit ? " Carries runs across a changed attempt limit." : "";
+      const failed = change.inherit_failed ? " Carries failed runs." : "";
       const named = change.inherit_from?.length ? ` Inherits runs of ${change.inherit_from.join(", ")}.` : "";
-      return head + earlier + acrossLimit + named;
+      const replaced = (change.replace_model ?? [])
+        .map((pair) => ` Replaces model ${pair.from} with ${pair.to}${pair.verified ? "" : " on the filer's word"}.`)
+        .join("");
+      return head + earlier + acrossLimit + failed + named + replaced;
     }
   }
 }
@@ -292,6 +296,7 @@ export function planTable(names: Record<string, string>, submitters: boolean): T
   const submitter = (plan: PlanView) => (plan.submitted_by ? names[plan.submitted_by] ?? plan.submitted_by : "operator");
   const counts = (plan: PlanView) => plan.progress_snapshot?.counts;
   return {
+    sort: "-created_at",
     columns: [
       { key: "plan_id", label: "plan_id", raw: (plan) => plan.plan_id, href: (plan) => planLink(plan.plan_id) },
       { key: "note", label: "note", raw: (plan) => plan.note ?? null },

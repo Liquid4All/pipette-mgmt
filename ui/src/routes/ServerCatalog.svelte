@@ -6,6 +6,7 @@
     scopeLabel,
   } from "../lib/catalog";
   import DataTable from "../lib/components/DataTable.svelte";
+  import FamilyLogo from "../lib/components/FamilyLogo.svelte";
   import Loaded from "../lib/components/Loaded.svelte";
   import PageHead from "../lib/components/PageHead.svelte";
   import TabBar from "../lib/components/TabBar.svelte";
@@ -57,6 +58,7 @@
     <span class="flavors">{flavors(row)}</span>
   {/if}
 {/snippet}
+{#snippet logoCell(row: DescriptorEntryListRow)}<FamilyLogo sha256={row.family_logo_sha256} />{/snippet}
 {#snippet offerCell(row: DescriptorEntryListRow)}
   {@const warning = offerWarning(row)}
   {#if warning}<span class="err">{warning}</span>{:else}—{/if}
@@ -110,7 +112,7 @@
       <DataTable spec={tabs[kind].table} rows={listed.items} id={catalogRowId} noun="catalog entries"
                  {path} kept={[["kind", kind === "model" ? "model" : ""], ["hidden", showHidden ? "1" : ""]]}
                  columnsKey={tabs[kind].columnsKey} empty={`No ${kind} entries.`}
-                 cells={{ flavors: flavorsCell, offer_rule: offerCell }} />
+                 cells={{ flavors: flavorsCell, offer_rule: offerCell, family_logo: logoCell }} />
     {/key}
   {/snippet}
 </Loaded>

@@ -1,8 +1,6 @@
 //! HTTP handlers for the user routes: `POST /api/v1/users/register`, `GET /api/v1/users/me`,
 //! `POST /api/v1/users/me/keys` and `DELETE /api/v1/users/me/keys/{key_id}`.
 
-use std::net::IpAddr;
-
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -10,22 +8,20 @@ use axum::response::IntoResponse;
 use jiff::{SignedDuration, Timestamp};
 
 use pipette_core::key_index::{KeyClaim, KeyHolderPrincipalId, digest_of};
-use pipette_core::types::DeriveFromKey;
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_preauth::{UserPreauthConsumeOutcome, UserPreauthToken};
 use pipette_pipeline::org::{DeviceScope, RosterScope};
 use pipette_plan_types::{
-    AddUserKeyRequest, AuditActor, AuditTarget, ContactEmail, NonEmptyTrimmedString, OwnUserView,
-    PublicKeyHex, Reach, RegisterUserKeyRequest, UserAbilities, UserAccountType, UserId, UserKeyId,
+    AddUserKeyRequest, AuditActor, AuditTarget, NonEmptyTrimmedString, OwnUserView, PublicKeyHex,
+    Reach, RegisterUserKeyRequest, UserAbilities, UserAccountType, UserId, UserKeyId,
     UserKeyRegistered, UserPermission, UserPermissionSet, UserStatus,
 };
-use pipette_store::EmailClaim;
 
 use crate::audit::Audit;
 use crate::auth::{ActiveUser, AuthenticatedUser, Caller, KeyOnlyUser, UserRights, user_org};
 use crate::error::AppError;
 use crate::extract::{ApiJson, ApiPath, Parsed};
-use crate::registration_throttle::ClientIp;
+
 use crate::state::AppState;
 
 /// Ceiling on a submitted `key_details`, in characters: the authentication path
@@ -41,32 +37,14 @@ const KEY_LIFETIME_SKEW: SignedDuration = SignedDuration::from_mins(5);
 
 // POST /api/v1/users/register
 //
-// Unauthenticated: the pre-auth secret is the credential where there is one, and
-// without it the account created may do nothing until an operator admits it.
+// Unauthenticated: the pre-auth secret is the credential.
 pub async fn register_user_key(
     State(state): State<AppState>,
     audit: Audit,
-    ClientIp(client_ip): ClientIp,
     ApiJson(body): ApiJson<RegisterUserKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    match (body.user_preauth_key, body.contact_email) {
-        (Some(token), None) => {
-            let token = UserPreauthToken::new(token.expose());
-            register_against_invite(&state, &audit, token, body.public_key, body.key_details).await
-        }
-        (None, Some(email)) => {
-            let (key, details) = (body.public_key, body.key_details);
-            request_account(&state, &audit, client_ip, email, key, details).await
-        }
-        (Some(_), Some(_)) => Err(AppError::BadRequest(
-            "user_preauth_key and contact_email are exclusive: an invite already names the \
-             account this key joins"
-                .into(),
-        )),
-        (None, None) => Err(AppError::BadRequest(
-            "one of user_preauth_key or contact_email is required".into(),
-        )),
-    }
+    let token = UserPreauthToken::new(body.user_preauth_key.expose());
+    register_against_invite(&state, &audit, token, body.public_key, body.key_details).await
 }
 
 /// The invited path: the pre-auth key names an existing account, and the
@@ -150,186 +128,6 @@ async fn register_against_invite(
             user_id: user.user_id,
             status: user.status,
             key_id: registration.key_id,
-        }),
-    )
-        .into_response())
-}
-
-/// The request path: no invite, so this creates the account the address names and
-/// leaves it [`UserStatus::Pending`](pipette_plan_types::UserStatus::Pending) for
-/// an operator to admit. Claim, key, then record, so each failure is recoverable.
-async fn request_account(
-    state: &AppState,
-    audit: &Audit,
-    client_ip: Option<IpAddr>,
-    contact_email: ContactEmail,
-    public_key: PublicKeyHex,
-    key_details: NonEmptyTrimmedString,
-) -> Result<axum::response::Response, AppError> {
-    // As `POST /clients/register` refuses: a deployment that mints every identity
-    // by hand closes the keyless path for both kinds.
-    if state.config.require_user_preauth_key {
-        tracing::warn!("refused: registration requires a pre-auth key");
-        return Err(AppError::Forbidden(
-            "registration requires a pre-auth key".into(),
-        ));
-    }
-
-    // Mints the id and folds the address, which is what makes the record's
-    // `contact_email` the index key claimed just below.
-    let user = User::requested(contact_email, Timestamp::now())
-        .map_err(|e| AppError::BadRequest(format!("invalid contact_email: {e}")))?;
-
-    // An unverified claim here would hold the address against the Clerk sign-in
-    // that verifies it.
-    if let Some(rule) = state
-        .clerk
-        .as_deref()
-        .and_then(|clerk| clerk.provision_rule(&user.contact_email))
-    {
-        tracing::warn!("refused: the address is at a domain Clerk provisions");
-        return Err(AppError::Forbidden(format!(
-            "addresses at {} sign in to the console through Clerk, which creates the account",
-            rule.domain
-        )));
-    }
-    state.registration_throttle.admit(client_ip)?;
-
-    // First, and exclusively: an address names one account, so two machines
-    // asking for one address contend for this key and exactly one wins.
-    match state
-        .user_store
-        .claim_user_email(user.contact_email.as_str(), &user.user_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to claim the address: {e:#}")))?
-    {
-        EmailClaim::Claimed => {}
-        EmailClaim::Taken(holder) => {
-            return address_taken(state, audit, &holder, &public_key).await;
-        }
-    }
-
-    // A failure between the next two writes leaves an inert key registration and
-    // frees the address; the caller mints a fresh keypair per attempt to retry.
-    let created = create_requested_account(state, &user, public_key, key_details).await;
-    let registration = match created {
-        Ok(registration) => registration,
-        Err(error) => {
-            if let Err(release) = state
-                .user_store
-                .release_user_email(user.contact_email.as_str())
-                .await
-            {
-                tracing::warn!(
-                    user_id = %user.user_id,
-                    error = %release,
-                    "failed to release the address claim after a requested registration failed; \
-                     `users release-claim <email>` will clear it"
-                );
-            }
-            return Err(error);
-        }
-    };
-    audit.acted_as(AuditActor::User {
-        user_id: user.user_id.clone(),
-        key_id: registration.key_id.clone(),
-    });
-
-    tracing::info!(
-        user_id = %user.user_id,
-        key_id = %registration.key_id,
-        status = %user.status,
-        "user account requested"
-    );
-
-    Ok((
-        StatusCode::CREATED,
-        Json(UserKeyRegistered {
-            user_id: user.user_id,
-            status: user.status,
-            key_id: registration.key_id,
-        }),
-    )
-        .into_response())
-}
-
-/// The two writes that make a requested account. No permissions object: an
-/// absent one is the empty set, and the operator grants at `users approve`.
-async fn create_requested_account(
-    state: &AppState,
-    user: &User,
-    public_key: PublicKeyHex,
-    key_details: NonEmptyTrimmedString,
-) -> Result<UserKey, AppError> {
-    let registration = register_key(state, user, public_key, key_details, None).await?;
-    state
-        .user_store
-        .put_user(user)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to write the user record: {e:#}")))?;
-    Ok(registration)
-}
-
-/// What to answer a request for an address some account already holds: idempotent
-/// only when this keypair is registered there, a retried `201`. Anything else would
-/// let a stranger have an operator approve their key.
-async fn address_taken(
-    state: &AppState,
-    audit: &Audit,
-    holder: &UserId,
-    public_key: &PublicKeyHex,
-) -> Result<axum::response::Response, AppError> {
-    let existing = state
-        .user_store
-        .get_user(holder)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to load the user: {e:#}")))?;
-    let Some(existing) = existing else {
-        // A claim whose record is missing: a failed create or one in flight, which
-        // look identical from here, so only an operator resolves it.
-        tracing::warn!(%holder, "a registration asked for an address held by a stranded claim");
-        return Err(AppError::Conflict(
-            "that address is claimed by an account that does not exist yet; retry, or ask an \
-             operator to clear the claim"
-                .into(),
-        ));
-    };
-
-    let key_id = UserKeyId::derive(public_key);
-    if state
-        .user_store
-        .get_user_key(&existing.user_id, &key_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to load the user key: {e:#}")))?
-        .is_none()
-    {
-        tracing::warn!(
-            user_id = %existing.user_id,
-            %key_id,
-            "refused an account request for an address another account holds"
-        );
-        return Err(AppError::Conflict(
-            "an account already holds that address".into(),
-        ));
-    }
-
-    tracing::info!(
-        user_id = %existing.user_id,
-        %key_id,
-        status = %existing.status,
-        "idempotent account request; the key is already registered to the account"
-    );
-    audit.acted_as(AuditActor::User {
-        user_id: existing.user_id.clone(),
-        key_id: key_id.clone(),
-    });
-    audit.unchanged();
-    Ok((
-        StatusCode::OK,
-        Json(UserKeyRegistered {
-            user_id: existing.user_id,
-            status: existing.status,
-            key_id,
         }),
     )
         .into_response())

@@ -7,6 +7,7 @@
   import PageHead from "../lib/components/PageHead.svelte";
   import { Busy } from "../lib/components/work.svelte";
   import { SERVER } from "../lib/crumbs";
+  import { deviceLabel } from "../lib/fleet";
   import { byName, choiceName } from "../lib/orgs";
   import { pathOf, type RouteOf } from "../lib/routes";
   import { session } from "../lib/session.svelte";
@@ -35,22 +36,22 @@
     return claiming.attempt(async () => {
       await setClientOwner(session.signer, row.client_id, { owner: { type: "org", org_id } });
       await listing?.reload();
-    }, row.device_name ?? row.client_id);
+    }, deviceLabel(row));
   };
 </script>
 
 {#snippet claimCell(row: ClientListRow)}
   {#if choices.length === 1}
     <button type="button" aria-disabled={claiming.busy}
-            aria-label="Claim {row.device_name ?? row.client_id} for {choices[0]?.display_name}"
+            aria-label="Claim {deviceLabel(row)} for {choices[0]?.display_name}"
             onclick={() => claim(row, choices[0]?.org_id)}>Claim for {choices[0]?.display_name}</button>
   {:else}
-    <select bind:value={picked[row.client_id]} aria-label="claim {row.device_name ?? row.client_id} for">
+    <select bind:value={picked[row.client_id]} aria-label="claim {deviceLabel(row)} for">
       <option value="">organization…</option>
       {#each choices as org (org.org_id)}<option value={org.org_id}>{choiceName(org, choices)}</option>{/each}
     </select>
     <button type="button" disabled={!picked[row.client_id]} aria-disabled={claiming.busy}
-            aria-label="Claim {row.device_name ?? row.client_id}"
+            aria-label="Claim {deviceLabel(row)}"
             onclick={() => claim(row, picked[row.client_id])}>Claim</button>
   {/if}
 {/snippet}

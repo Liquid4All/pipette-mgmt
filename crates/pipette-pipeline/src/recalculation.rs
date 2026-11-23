@@ -86,8 +86,41 @@ pub(crate) async fn answer_from(
         .find_job(source)
         .await?
         .with_context(|| format!("job {source} has no recorded result to recalculate"))?;
-    let mut success = eval_success(&record.body)
+    let success = eval_success(&record.body)
         .with_context(|| format!("job {source} recorded no eval completions to recalculate"))?;
+    write_copy(submissions, source, job_id, now, success).await
+}
+
+/// [`answer_from`] for any success, the copy naming `model` and keeping the
+/// reported one in `replaced_model_descriptor`.
+pub(crate) async fn answer_replacing(
+    submissions: &dyn SubmissionStore,
+    source: &JobId,
+    job_id: &JobId,
+    now: Timestamp,
+    model: &Value,
+) -> anyhow::Result<()> {
+    let record = submissions
+        .find_job(source)
+        .await?
+        .with_context(|| format!("job {source} has no recorded result to copy"))?;
+    let Submission::Success(mut success) = parse_stored_submission(&record.body)
+        .map_err(|e| anyhow::anyhow!("the record of job {source}: {e}"))?
+    else {
+        anyhow::bail!("job {source} recorded no success to copy");
+    };
+    success.replaced_model_descriptor = success.wire.model_descriptor.take();
+    success.wire.model_descriptor = Some(serde_json::to_string(model)?);
+    write_copy(submissions, source, job_id, now, success).await
+}
+
+async fn write_copy(
+    submissions: &dyn SubmissionStore,
+    source: &JobId,
+    job_id: &JobId,
+    now: Timestamp,
+    mut success: Box<SuccessSubmission>,
+) -> anyhow::Result<()> {
     success.run_submitted_at = run_submitted_at(submissions, &success).await?;
     // Typed, so a key the scorer added to the record is not copied.
     success.job_id = job_id.clone();
@@ -202,6 +235,48 @@ mod tests {
         let copy = submissions.find_job(&second).await?.context("no copy")?;
         assert_eq!(copy.body["rescored_from"], "job-b");
         assert_eq!(copy.body["run_submitted_at"], "2026-05-29T14:49:43Z");
+        Ok(())
+    }
+
+    /// Any success, not only an eval's.
+    #[tokio::test]
+    async fn a_replacing_copy_names_the_new_model() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stores = stores(dir.path())?;
+        let (source, job_id) = (JobId::try_new("job-a")?, JobId::try_new("job-b")?);
+        let mut recorded = success_record(&source, "decode_throughput");
+        recorded["model_descriptor"] = serde_json::json!(r#"{"type":"gguf_text","old":1}"#);
+        stores
+            .submissions
+            .write_processed(&source, &recorded)
+            .await?;
+        let model = serde_json::json!({"type": "gguf_text", "new": 1});
+
+        answer_replacing(
+            stores.submissions.as_ref(),
+            &source,
+            &job_id,
+            Timestamp::now(),
+            &model,
+        )
+        .await?;
+
+        let copy = stores
+            .submissions
+            .find_job(&job_id)
+            .await?
+            .context("no copy")?
+            .body;
+        assert_eq!(
+            serde_json::from_str::<Value>(copy["model_descriptor"].as_str().context("none")?)?,
+            model
+        );
+        assert_eq!(
+            copy["replaced_model_descriptor"],
+            r#"{"type":"gguf_text","old":1}"#
+        );
+        assert_eq!(copy["rescored_from"], "job-a");
+        assert_eq!(copy["run_submitted_at"], "2026-05-29T14:49:43Z");
         Ok(())
     }
 

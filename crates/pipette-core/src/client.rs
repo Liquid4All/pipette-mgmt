@@ -259,6 +259,10 @@ pub struct Client {
     pub organization: NonEmptyTrimmedString,
     #[tabled(rename = "Details", display = "truncate_details")]
     pub client_details: NonEmptyTrimmedString,
+    /// Only an operator can set the name. The record omits it when the device has no name.
+    #[tabled(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<NonEmptyTrimmedString>,
     #[tabled(rename = "Contact")]
     pub contact_email: ContactEmail,
     #[tabled(rename = "Status")]
@@ -287,6 +291,7 @@ impl Client {
             public_key: self.public_key,
             organization: self.organization,
             client_details: self.client_details,
+            name: self.name,
             contact_email: administered.then_some(self.contact_email),
             status: self.status.into(),
             registered_at: self.registered_at,
@@ -304,6 +309,8 @@ struct RepairableClient {
     organization: Option<String>,
     #[serde(default)]
     client_details: Option<String>,
+    #[serde(default)]
+    name: Option<NonEmptyTrimmedString>,
     #[serde(default)]
     contact_email: Option<String>,
     status: ClientStatus,
@@ -329,6 +336,7 @@ impl RepairableClient {
             public_key: self.public_key,
             organization,
             client_details,
+            name: self.name,
             contact_email,
             status: self.status,
             registered_at: self.registered_at,
@@ -450,6 +458,7 @@ mod tests {
             )?,
             organization: NonEmptyTrimmedString::try_new("org")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
             registered_at: "2026-01-01T00:00:00Z".parse()?,

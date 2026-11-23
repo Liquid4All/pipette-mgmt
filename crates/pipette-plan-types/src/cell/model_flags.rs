@@ -243,7 +243,8 @@ impl ModelFlags {
             | BenchmarkType::AsrThroughput
             | BenchmarkType::AsrMaxMemory
             | BenchmarkType::DecisionLatency
-            | BenchmarkType::DecisionMaxMemory => None,
+            | BenchmarkType::DecisionMaxMemory
+            | BenchmarkType::Session => None,
         }
     }
 }

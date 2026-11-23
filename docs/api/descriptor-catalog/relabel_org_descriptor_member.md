@@ -30,7 +30,5 @@ The response is the updated entry view with its complete `members` list.
 | 200 | The API changed the label |
 | 400 | The body is invalid, a label fails the label grammar, or the entry holds runtimes |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable. |
-| 404 | The entry or matching member does not exist. |
-| 404 | The server has no database catalog. |
-| 409 | The entry is tombstoned. The new label equals the old label. A member with the same format holds the new label. |
+| 404 | The entry or matching member does not exist |
+| 409 | The entry is tombstoned, the new label equals the old label, or a member with the same format holds the new label |

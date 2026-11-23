@@ -6,6 +6,7 @@ import { handle } from "./format";
 
 /** Each page's address; `:name` is a parameter, one whole path segment. */
 const PATTERNS = {
+  home: "/app",
   account: "/app/account",
   "account-keys": "/app/account/keys",
   "login-cli": "/app/login/cli",
@@ -20,13 +21,10 @@ const PATTERNS = {
   vault: "/app/vault",
   "vault-runtimes": "/app/vault/runtimes",
   "vault-resource": "/app/vault/:resource_id",
-  "me-vault": "/app/me/vault",
-  "me-vault-runtimes": "/app/me/vault/runtimes",
   "org-vault": "/app/orgs/:org/vault",
   "org-vault-runtimes": "/app/orgs/:org/vault/runtimes",
   clients: "/app/clients",
   client: "/app/clients/:client_id",
-  "me-devices": "/app/me/devices",
   "org-devices": "/app/orgs/:org/devices",
   users: "/app/users",
   "user-new": "/app/users/new",
@@ -66,8 +64,6 @@ const PATTERNS = {
   "campaign-plan-revisions": "/app/campaigns/:campaign_id/plans/:plan_id/revisions",
   "campaign-plan-settings": "/app/campaigns/:campaign_id/plans/:plan_id/settings",
   "campaign-document": "/app/campaigns/:campaign_id/document",
-  "me-campaigns": "/app/me/campaigns",
-  "me-campaign-groups": "/app/me/campaigns/groups",
   "org-campaigns": "/app/orgs/:org/campaigns",
   "org-campaign-groups": "/app/orgs/:org/campaigns/groups",
   "campaign-group": "/app/campaign-groups/:group_id",
@@ -75,11 +71,6 @@ const PATTERNS = {
   "campaign-group-activity": "/app/campaign-groups/:group_id/activity",
   "campaign-group-settings": "/app/campaign-groups/:group_id/settings",
 } as const;
-
-/** Addresses that draw another's page in place rather than redirect, so a query like `?clerk=1` survives. */
-const ALIASES: Record<string, Page> = {
-  "/app": "me-campaigns",
-};
 
 type Patterns = typeof PATTERNS;
 export type Page = keyof Patterns;
@@ -145,8 +136,6 @@ export function matchIn(entries: Entry[], path: string): Record<string, string> 
 
 /** The route `path` names; the query and hash are not part of it. */
 export function match(path: string): Route {
-  const alias = ALIASES[normalized(path)];
-  if (alias) return { page: alias } as Route;
   return (matchIn(TABLE, path) as Route | null) ?? { page: "missing", path };
 }
 
@@ -207,32 +196,38 @@ export function legacyOrgFilter(query: URLSearchParams, page: OrgPage, kept: str
 /** A page with no parameter. */
 type PlainPage = { [P in Page]: [ParamNames<Patterns[P]>] extends [never] ? P : never }[Page];
 
-/** An owned listing's three branches: the reader's, an organization's, every record's. */
+/** An owned listing's two branches: an organization's, every record's. */
 export interface OwnedPages {
-  mine: PlainPage;
   org: OrgPage;
   all: PlainPage;
 }
 
+type Reader = { org_id?: string | null; org_slug?: string | null };
+
+/** The reader's organization by handle, `null` for none. */
+function ownHandle(reader: Reader): string | null {
+  if (!reader.org_id) return null;
+  // `GET /api/v1/users/me` may name the reader's organization without its slug; its id is an address too.
+  return reader.org_slug ? handle({ slug: reader.org_slug, org_id: reader.org_id }) : reader.org_id;
+}
+
+/** Where `/app` lands: the reader's organization's campaigns. */
+export function homePath(reader: Reader): string {
+  const own = ownHandle(reader);
+  return pathOf(own ? { page: "org-campaigns", org: own } : { page: "campaigns" });
+}
+
 /**
  * Where a link carrying a classic owned listing's old `owner` or `org_id`
- * filter lands, as the classic console redirected it: the reader's own branch, the
- * organization's, or for `owner=org` alone the reader's organization, else
- * every record's. `limit` is kept; `null` without a filter.
+ * filter lands: the organization's, or for `owner=org` alone the reader's
+ * organization, else every record's. `limit` is kept; `null` without a filter.
  */
-export function legacyOwnerFilter(query: URLSearchParams, pages: OwnedPages,
-                                  reader: { org_id?: string | null; org_slug?: string | null }): string | null {
+export function legacyOwnerFilter(query: URLSearchParams, pages: OwnedPages, reader: Reader): string | null {
   const owner = query.get("owner") || null;
   const org_id = query.get("org_id") || null;
-  if (owner !== "mine" && owner !== "org" && !org_id) return null;
-  // `GET /api/v1/users/me` may name the reader's organization without its slug; its id is an address too.
-  const own = reader.org_id
-    ? (reader.org_slug ? handle({ slug: reader.org_slug, org_id: reader.org_id }) : reader.org_id)
-    : null;
-  const org = owner === "mine" ? null : org_id ?? own;
-  const route = owner === "mine" ? { page: pages.mine }
-    : org ? { page: pages.org, org }
-    : { page: pages.all };
+  if (owner !== "org" && !org_id) return null;
+  const org = org_id ?? ownHandle(reader);
+  const route = org ? { page: pages.org, org } : { page: pages.all };
   const path = pathOf(route as Route);
   const limit = query.get("limit");
   return limit ? `${path}?${new URLSearchParams({ limit })}` : path;

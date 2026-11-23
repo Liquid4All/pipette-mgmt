@@ -6,6 +6,7 @@ import type { TableSpec } from "./table";
 import type { ModelParams } from "./api-types";
 
 export const MODEL_PARAMS_TABLE: TableSpec<ModelParams> = {
+  sort: "model_key",
   columns: [
     { key: "model_key", label: "model_key", raw: (row) => row.model_key, as: "id" },
     { key: "total_millions", label: "total_millions", raw: (row) => row.total_millions, num: true },

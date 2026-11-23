@@ -144,27 +144,16 @@ async fn a_private_entry_is_absent_from_the_public_catalog(
     Ok(())
 }
 
-/// A device the organization holds, directly or through a member who owns
-/// it, is served the organization's private entries beside the public ones,
-/// and each private entry names the organization it is private to.
-#[rstest]
-#[case::org_owned(true)]
-#[case::user_owned(false)]
+/// A device the organization holds is served the organization's private
+/// entries beside the public ones, and each private entry names the
+/// organization it is private to.
 #[tokio::test]
-async fn an_owned_device_reads_its_organizations_private_entries(
-    #[case] org_owned: bool,
-) -> anyhow::Result<()> {
+async fn an_owned_device_reads_its_organizations_private_entries() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, acme) = state_with_a_private_entry(dir.path()).await?;
     let (key, client_id) = register_and_approve(&state).await?;
-    let owner = if org_owned {
-        ClientOwner::Org {
-            org_id: acme.org_id.clone(),
-        }
-    } else {
-        let (_, member, _) = registered_user(&state, &[]).await?;
-        set_user_org(&state, &member, Some(acme.org_id.clone())).await?;
-        ClientOwner::User { user_id: member }
+    let owner = ClientOwner::Org {
+        org_id: acme.org_id.clone(),
     };
     own_client(&state, &client_id, owner).await?;
 
@@ -221,16 +210,13 @@ async fn a_device_outside_the_organization_reads_the_public_catalog(
 }
 
 /// An account is served its organization's private entries through its
-/// membership, once active; one belonging to no organization, and one still
-/// pending, read the public catalog.
+/// membership; one belonging to no organization reads the public catalog.
 #[rstest]
-#[case::member(true, UserStatus::Active, true)]
-#[case::no_org(false, UserStatus::Active, false)]
-#[case::pending_member(true, UserStatus::Pending, false)]
+#[case::member(true, true)]
+#[case::no_org(false, false)]
 #[tokio::test]
 async fn an_account_reads_through_its_membership(
     #[case] member: bool,
-    #[case] status: UserStatus,
     #[case] sees_private: bool,
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -239,7 +225,6 @@ async fn an_account_reads_through_its_membership(
     if member {
         set_user_org(&state, &user_id, Some(acme.org_id.clone())).await?;
     }
-    set_user_status(&state, &user_id, status).await?;
 
     let ids =
         listed(authed_user_get(&state, &key, &user_id, &key_id, "/benchmarks").await?).await?;

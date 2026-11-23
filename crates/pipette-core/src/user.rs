@@ -70,18 +70,6 @@ impl User {
             campaign_scope: None,
         })
     }
-
-    /// An account that asked for itself — [`UserStatus::Pending`] until an
-    /// operator admits it (`users approve`). Otherwise as [`Self::try_new`].
-    pub fn requested(
-        contact_email: ContactEmail,
-        created_at: Timestamp,
-    ) -> Result<Self, ContactEmailError> {
-        Ok(Self {
-            status: UserStatus::Pending,
-            ..Self::try_new(contact_email, created_at)?
-        })
-    }
 }
 
 /// One public key registered to a user — the body of

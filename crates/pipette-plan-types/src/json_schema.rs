@@ -14,7 +14,7 @@ use crate::{
     AbsolutePath, AuditEventId, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId,
     CapabilityFlag, CatalogName, ClientId, ClientPreauthKeyId, ContactEmail, DockerShmSize,
     ElapsedMillis, EnvForward, FileName, HfOrg, HfRepoName, HfRevision, JobId, Labels,
-    LlamaCppFlavor, ModelKey, ModelType, NonEmptyString, NonEmptyTrimmedString,
+    LlamaCppFlavor, LogoUri, ModelKey, ModelType, NonEmptyString, NonEmptyTrimmedString,
     OnnxExecutionProvider, OpenvinoDevice, OrgId, OrgSlug, OvmsFlavor, PlanId, PositiveCount,
     PositiveSeconds, PublicKeyHex, RelativePath, RemoteArchiveUrl, RepoSubpath, RepositoryUrl,
     ResourceUrl, RuntimeType, SemverWithBuild, Sha256, SkinCelsius, Tag, TrtEdgellmFlavor, UserId,
@@ -43,7 +43,8 @@ primitive_schema!({ "type": "string" }:
 );
 // The type also refuses non-ASCII uppercase, which the pattern does not check.
 primitive_schema!({ "type": "string", "pattern": "^[^\\sA-Z]+$" }: CapabilityFlag);
-primitive_schema!({ "type": "string", "pattern": "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$", "maxLength": 200 }: CatalogName);
+primitive_schema!({ "type": "string", "pattern": CatalogName::SCHEMA_PATTERN, "maxLength": CatalogName::MAX_LEN }: CatalogName);
+primitive_schema!({ "type": "string", "pattern": LogoUri::SCHEMA_PATTERN, "maxLength": LogoUri::MAX_LEN }: LogoUri);
 primitive_schema!({ "type": "integer", "minimum": 0 }: ElapsedMillis);
 primitive_schema!({ "type": "integer", "minimum": 1 }: PositiveCount, PositiveSeconds);
 primitive_schema!({ "type": "integer", "minimum": 1, "maximum": 110 }: SkinCelsius);
@@ -112,8 +113,14 @@ fn axis<T: Debug + Serialize>(key: &'static str, values: impl IntoIterator<Item 
     Axis { key, values }
 }
 
+/// The benchmark axis excludes `session` because plans cannot name sessions.
 fn benchmark_axis() -> Axis {
-    axis("benchmark_type", BenchmarkType::ALL.iter())
+    axis(
+        "benchmark_type",
+        BenchmarkType::ALL
+            .iter()
+            .filter(|&&t| t != BenchmarkType::Session),
+    )
 }
 
 fn runtime_axis() -> Axis {
@@ -422,7 +429,12 @@ mod tests {
     fn a_cell_name_reads_as_that_cell_alone() -> anyhow::Result<()> {
         let triple = [benchmark_axis(), runtime_axis(), model_axis()];
         let pair = [benchmark_axis(), model_axis()];
-        for &b in BenchmarkType::ALL {
+        let session = serde_json::to_value(BenchmarkType::Session)?;
+        anyhow::ensure!(pair[0].values.iter().all(|(_, wire)| *wire != session));
+        for &b in BenchmarkType::ALL
+            .iter()
+            .filter(|&&b| b != BenchmarkType::Session)
+        {
             for m in ModelType::iter() {
                 let cell = |runtime: Option<RuntimeType>| -> anyhow::Result<Map<String, Value>> {
                     let mut cell = Map::new();

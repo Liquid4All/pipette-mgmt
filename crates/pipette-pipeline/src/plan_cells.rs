@@ -57,7 +57,7 @@ pub type JobCells = Arc<[(JobId, Option<PlanCell>)]>;
 
 /// The types a plan's cells were filed under: `recorded`, its manifest's
 /// `benchmark_types`. A plan filed before the manifest recorded them has none,
-/// and was typed by each id's prefix, so that is how it still reads.
+/// and reads each id by the prefixes available at the time.
 pub fn filed_types<'a>(
     recorded: &BTreeMap<BenchmarkId, BenchmarkType>,
     ids: impl IntoIterator<Item = &'a BenchmarkId>,
@@ -66,7 +66,11 @@ pub fn filed_types<'a>(
         return recorded.clone();
     }
     ids.into_iter()
-        .filter_map(|id| Some((id.clone(), benchmark_type_of(id)?)))
+        .filter_map(|id| {
+            benchmark_type_of(id)
+                .filter(|&kind| kind != BenchmarkType::Session)
+                .map(|kind| (id.clone(), kind))
+        })
         .collect()
 }
 
@@ -235,6 +239,18 @@ mod tests {
     /// `spec`'s cell as a plan filed before `benchmark_types` reads it.
     fn prefixed(spec: &ClientRunSpec) -> PlanCell {
         PlanCell::of(spec, &filed_types(&BTreeMap::new(), [&spec.benchmark]))
+    }
+
+    #[test]
+    fn legacy_manifest_does_not_infer_the_session_prefix() -> anyhow::Result<()> {
+        let session_prefixed = BenchmarkId::try_new("session_lab")?;
+        let prefill = BenchmarkId::try_new("prefill_throughput_512")?;
+        let types = filed_types(&BTreeMap::new(), [&session_prefixed, &prefill]);
+        assert_eq!(
+            types,
+            BTreeMap::from([(prefill, BenchmarkType::PrefillThroughput)])
+        );
+        Ok(())
     }
 
     fn job(n: u128) -> JobId {

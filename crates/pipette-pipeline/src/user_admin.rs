@@ -6,8 +6,10 @@ use anyhow::Context;
 use jiff::Timestamp;
 
 use pipette_core::user::User;
-use pipette_core::user_permission::UserPermissionSet;
-use pipette_plan_types::{ContactEmail, OrgId, UserId, UserKeyId, UserPermission};
+use pipette_core::user_permission::{UserPermissionGroup, UserPermissionSet};
+use pipette_plan_types::{
+    ContactEmail, NonEmptyTrimmedString, OrgId, UserId, UserKeyId, UserPermission,
+};
 use pipette_store::{EmailClaim, KeyIndexStore, OrgStore, UserStore};
 
 /// What a delete found and freed, for the caller's report.
@@ -127,16 +129,15 @@ pub enum Provisioned {
     Taken(UserId),
 }
 
-/// Create an active account for `email` in `org_id`, for a Clerk sign-in. The
-/// record is written last, so an existing account is complete.
+/// Write `user`, a fresh active account, into `org_id`, for a Clerk sign-in.
+/// The record is written last, so an existing account is complete.
 pub async fn provision(
     users: &dyn UserStore,
     orgs: &dyn OrgStore,
-    email: ContactEmail,
+    user: User,
     org_id: &OrgId,
     permissions: &[UserPermission],
 ) -> anyhow::Result<Provisioned> {
-    let user = User::try_new(email, Timestamp::now())?;
     if let EmailClaim::Taken(holder) = users
         .claim_user_email(user.contact_email.as_str(), &user.user_id)
         .await?
@@ -165,6 +166,32 @@ pub async fn provision(
     Ok(Provisioned::Created(user))
 }
 
+/// [`provision`] into a new [`crate::org::create_personal`] organization, as its
+/// administrator, for a sign-in no provision rule places. The organization goes
+/// again when the address turns out taken; after a failed write it stays, since
+/// the account may have landed in it.
+pub async fn provision_personal(
+    users: &dyn UserStore,
+    orgs: &dyn OrgStore,
+    email: ContactEmail,
+    org_name: Option<NonEmptyTrimmedString>,
+) -> anyhow::Result<Provisioned> {
+    let user = User::try_new(email, Timestamp::now())?;
+    let org = crate::org::create_personal(orgs, &user, org_name).await?;
+    let provisioned = provision(
+        users,
+        orgs,
+        user,
+        &org.org_id,
+        UserPermissionGroup::OrgAdmin.permissions(),
+    )
+    .await?;
+    if let Provisioned::Taken(_) = provisioned {
+        crate::org::discard_personal(orgs, &org).await;
+    }
+    Ok(provisioned)
+}
+
 /// Best-effort, so one failure does not strand the rest.
 async fn undo_provision(users: &dyn UserStore, orgs: &dyn OrgStore, user: &User) {
     let user_id = &user.user_id;
@@ -186,7 +213,6 @@ mod tests {
     use jiff::Timestamp;
 
     use pipette_core::types::Mint;
-    use pipette_core::user_permission::UserPermissionGroup;
     use pipette_plan_types::{FirstClerkSignIn, UserStatus};
     use pipette_store::Stores;
     use pipette_store_fs::build_local_fs_stores;
@@ -332,7 +358,7 @@ mod tests {
         let Provisioned::Created(user) = provision(
             &*stores.users,
             &*stores.orgs,
-            ContactEmail::try_new("Op@Example.test")?,
+            User::try_new(ContactEmail::try_new("Op@Example.test")?, Timestamp::now())?,
             &org_id,
             member,
         )
@@ -362,6 +388,90 @@ mod tests {
         Ok(())
     }
 
+    /// The account administers an organization slugged by its id and named as
+    /// asked, or for its address.
+    #[rstest::rstest]
+    #[case::named_for_the_address(None, "kyle.wheeler@example.test's personal org")]
+    #[case::named_as_asked(Some("Kyle's lab"), "Kyle's lab")]
+    #[tokio::test]
+    async fn a_personal_account_administers_its_own_organization(
+        #[case] asked: Option<&str>,
+        #[case] named: &str,
+    ) -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let Provisioned::Created(user) = provision_personal(
+            &*stores.users,
+            &*stores.orgs,
+            ContactEmail::try_new("Kyle.Wheeler@example.test")?,
+            asked.map(NonEmptyTrimmedString::try_new).transpose()?,
+        )
+        .await?
+        else {
+            anyhow::bail!("the address was free");
+        };
+        let org_id = stores
+            .orgs
+            .get_membership(&user.user_id)
+            .await?
+            .context("a personal account belongs to its organization")?;
+        let org = stores
+            .orgs
+            .get_org(&org_id)
+            .await?
+            .context("the organization exists")?;
+        assert_eq!(
+            org.slug,
+            pipette_plan_types::OrgSlug::personal(&user.user_id)?
+        );
+        assert_eq!(org.display_name.as_str(), named);
+        assert_eq!(
+            stores.users.get_user_permissions(&user.user_id).await?,
+            Some(
+                UserPermissionSet::from_iter(
+                    UserPermissionGroup::OrgAdmin.permissions().iter().copied()
+                )
+                .normalized()
+            )
+        );
+        Ok(())
+    }
+
+    /// The slug is the account's, so a second run finds the first run's
+    /// organization rather than making another.
+    #[tokio::test]
+    async fn a_personal_organization_is_made_once_per_account() -> anyhow::Result<()> {
+        let (_dir, stores) = stores()?;
+        let user = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
+        let first = crate::org::create_personal(&*stores.orgs, &user, None).await?;
+        let again = crate::org::create_personal(&*stores.orgs, &user, None).await?;
+        assert_eq!(again, first);
+        assert_eq!(stores.orgs.list_orgs().await?.len(), 1);
+        Ok(())
+    }
+
+    /// The organization made for a sign-in that lost the address goes again.
+    #[tokio::test]
+    async fn a_personal_provision_on_a_claimed_address_leaves_no_organization() -> anyhow::Result<()>
+    {
+        let (_dir, stores) = stores()?;
+        let holder = UserId::mint();
+        stores
+            .users
+            .claim_user_email("op@example.test", &holder)
+            .await?;
+
+        let provisioned = provision_personal(
+            &*stores.users,
+            &*stores.orgs,
+            ContactEmail::try_new("op@example.test")?,
+            None,
+        )
+        .await?;
+        assert!(matches!(provisioned, Provisioned::Taken(id) if id == holder));
+        assert!(stores.orgs.list_orgs().await?.is_empty());
+        Ok(())
+    }
+
     /// A claimed address is somebody's account, whatever state it is in.
     #[tokio::test]
     async fn provisioning_a_claimed_address_writes_nothing() -> anyhow::Result<()> {
@@ -375,7 +485,7 @@ mod tests {
         let provisioned = provision(
             &*stores.users,
             &*stores.orgs,
-            ContactEmail::try_new("op@example.test")?,
+            User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?,
             &OrgId::mint(),
             UserPermissionGroup::OrgMember.permissions(),
         )

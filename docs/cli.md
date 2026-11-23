@@ -109,7 +109,7 @@ Credentials stay out of the file, with one exception:
 | [`campaigns`](#pipette-mgmt-campaigns-createingestvariantsrevisererunrevertlistshowrenameownerdelete) | File and revise plans through campaigns |
 | [`catalog`](#pipette-mgmt-catalog) | Manage readable names for runtime and model descriptors |
 | [`clients`](#pipette-mgmt-clients-list---tag-tag) | Devices: lifecycle, tags, permissions, owners, pre-auth keys |
-| [`users`](#pipette-mgmt-users-createlistshowapproveset-typeset-campaignsdisableenabledeleterelease-claimset-org) | Accounts: lifecycle, permissions, keys, pre-auth keys |
+| [`users`](#pipette-mgmt-users-createlistshowset-typeset-campaignsdisableenabledeleterelease-claimset-org) | Accounts: lifecycle, permissions, keys, pre-auth keys |
 | [`orgs`](#pipette-mgmt-orgs-createlistshowupdatedisableenabledeleterelease-claimmembersclientsbenchmarks) | Organizations, their rosters and private benchmarks |
 | [`vault`](#pipette-mgmt-vault-listshowdeleteprune) | Read and delete vault records and files |
 | [`models`](#pipette-mgmt-models-resolveunresolvedimport) | Coverage of the model parameter table, and rows from a file |
@@ -527,7 +527,7 @@ needing a grant are a listing rather than a guess
 did not take the grant, carries on with the rest, and exits non-zero with a
 count, so a re-run converges.
 
-### `pipette-mgmt users create|list|show|approve|set-type|set-campaigns|disable|enable|delete|release-claim|set-org`
+### `pipette-mgmt users create|list|show|set-type|set-campaigns|disable|enable|delete|release-claim|set-org`
 
 The operator principal, which authors work where a client does it
 ([storage.md §3.1](storage.md#31-the-user-principal)). Accounts are a separate
@@ -539,9 +539,15 @@ other.
 
 A service account (`--type service`, [authentication.md §5.11](authentication.md#511-users))
 belongs to an organization and holds no admin name (`manage_orgs`,
-`manage_clients`, any `_any_` name): `create`, `approve` and `permission add` /
-`set` refuse one for it, `set-type service` refuses an account holding one, and
-`set-org --none` will not leave one in no organization.
+`manage_clients`, any `_any_` name): `create` and `permission add` / `set`
+refuse one for it, and `set-type service` refuses an account holding one.
+
+Every account belongs to an organization. `create` without `--org` gives a
+person's account a new one of its own, named `--org-name` or `<email>'s personal
+org`, with the slug `u-<id>` from the account's id, and grants it `org_admin`
+besides the named set. `orgs create` refuses a `u-` slug, so nobody else takes
+one. `set-org` moves an
+account and never clears one: `disable` takes it out of service.
 
 A campaign reader is a service account that reads the campaigns it names and
 their plans alone, and holds `read_plans` alone
@@ -559,19 +565,16 @@ key carries no template. The grant is written after the record, so a failure
 there leaves a real account holding nothing, and the error names the
 `users permission set` that finishes it.
 
-`approve` admits an account a machine asked for at `POST /api/v1/users/register`
-([`POST /api/v1/users/register`](api/users/register_user_key.md)). `users list` is
-where a `pending` one is noticed. `require_user_preauth_key = true` closes that
-path, so every account is minted with `create`.
+Nothing asks for an account and waits for approval: an account is minted with
+`create`, `POST /api/v1/users`, or a first Clerk sign-in.
 
 **Prefer `disable` to `delete`.** Disabling refuses every request and keeps the
 record, so the plans it filed stay attributed to a principal that resolves.
 Over HTTP it is the only offboarding. `delete` is for an account created in
 error: it removes the record, the address claim and the permission set in that
-order, so a failure part-way leaves state that grants nobody anything. A delete
-is refused while the account owns a device (`--detach` unowns them, and
-`clients owner set` reassigns one instead), a campaign (hand it over with
-`campaigns owner`) or a vault resource (`vault delete` it).
+order, so a failure part-way leaves state that grants nobody anything. An
+account owns nothing, so a delete leaves every campaign, device and vault
+resource with its organization.
 
 `delete` is idempotent: a teardown that stopped half-way is finished by running
 it again. With the record already gone it clears the permissions and points at
@@ -594,7 +597,7 @@ when it names the account being deleted.
 permission but bounds the account's bare roster grants and `manage_clients`,
 and decides which organization's campaigns, vault resources and private
 benchmarks it reaches. Moving an organization admin therefore makes it the new
-organization's admin, and the devices the account owns move with it. See
+organization's admin; no record moves with it. See
 [`pipette-mgmt orgs`](#pipette-mgmt-orgs-createlistshowupdatedisableenabledeleterelease-claimmembersclientsbenchmarks).
 
 ### `pipette-mgmt users permission add|remove|set|list`
@@ -612,7 +615,7 @@ groups**, one word for a set:
 
 | Group | Grants |
 |---|---|
-| `--org-member` | `submit_plans`, `read_plans`, `cancel_plans`, `read_clients`, `edit_catalog`; it files and cancels in its own campaigns, `read_plans` also reads its organization's, `read_clients` reads the fleet, and `edit_catalog` changes the org entries of the descriptor catalog |
+| `--org-member` | `submit_plans`, `read_plans`, `cancel_plans`, `read_clients`, `edit_catalog`; it files into and cancels in its organization's campaigns, `read_plans` reads them, `read_clients` reads the fleet, and `edit_catalog` changes the org entries of the descriptor catalog |
 | `--org-admin` | everything inside its **own** organization: the member's permission names, its devices (`manage_clients`) and its roster (`manage_orgs`: the organization, its people, and what they hold) |
 | `--server-admin` | the `_any_` verbs, including `edit_any_catalog`: every plan, device, roster, and org entry of the descriptor catalog on this server |
 
@@ -701,13 +704,12 @@ hold nothing. `list` shows no template as `-` and an empty one as `(none)`,
 because the two grant different things
 ([authentication.md §5.3](authentication.md#53-defaults)).
 
-`--owner-org` or `--owner-user` is the operator vouching for a device ahead of
-time, so it arrives already owned rather than unowned. The owner is resolved
-when the key is minted and stored by id, so a handle that names nothing mints no
-key. If the owner is deleted first, registration refuses the key with `401`
-rather than registering the device outside the organization it promised.
-`orgs delete` refuses while an unexpired key names the organization; `users
-delete` does not count keys, so revoke one naming an account you delete.
+`--owner-org` is the operator vouching for a device ahead of time, so it
+arrives already owned rather than unowned. The owner is resolved when the key
+is minted and stored by id, so a handle that names nothing mints no key. If the
+owner is deleted first, registration refuses the key with `401` rather than
+registering the device outside the organization it promised. `orgs delete`
+refuses while an unexpired key names the organization.
 
 An organization's administrator mints an owner-only key for its own
 organization over HTTP
@@ -747,19 +749,13 @@ nobody approved.
 
 ### `pipette-mgmt clients owner show|set|clear`
 
-Who a device belongs to: an organization directly, or a user account whose own
-membership then says which organization
-([storage.md §3.2.4](storage.md#324-ownership-client-ownersclient_idjson)). The
-two kinds exist because a rack machine and somebody's laptop differ: collapsing
-a shared device onto whoever racked it makes their offboarding delete it.
-
-A user-owned device rolls up to whichever organization its owner belongs to
-*now*, so `users set-org` moves an account's devices with it. `show` prints the
-owner and the organization it resolves to; an owner in no organization rolls up
-to none, which is a state, not an error. `clear` leaves the device unowned,
-which is also where a fresh self-registration starts: an operator vouches for a
-device, the device does not name itself. Both targets are resolved before the
-write, so an ownership only ever names a record that exists.
+Which organization a device belongs to
+([storage.md §3.2.4](storage.md#324-ownership-client-ownersclient_idjson)).
+`set` takes `--org`. `show` prints the owner. `clear` leaves the device
+unowned, which is also where a fresh self-registration starts: an operator
+vouches for a device, the device does not name itself. The organization is
+resolved before the write, so an ownership only ever names a record that
+exists.
 
 ### `pipette-mgmt orgs create|list|show|update|disable|enable|delete|release-claim|members|clients|benchmarks`
 
@@ -776,10 +772,19 @@ devices may do.
 
 `<org>` is **either spelling**: an `org_`-prefixed value is read as an id,
 anything else as a handle. A handle may therefore not begin `org_`. `create`
+also refuses the handle `global` in any letter case: the descriptor catalog
+writes `global/<name>` for a global entry. It refuses a handle starting `u-`
+too, the slug an account's own organization gets. `create`
 claims the handle the way `users create` claims an address, and
 `--adopt-stranded-claim` and `release-claim` work as they do there.
 
-`delete --detach` clears memberships and direct ownerships only. A private
+`orgs list` reports any existing organization with the handle `global` on
+stderr. Use this check before enabling qualified descriptor names. The
+organization still appears in the roster on stdout.
+
+`delete --detach` clears device ownerships only. A member is moved with
+`users set-org` or deleted with `users delete`, since an account always belongs
+to an organization. A private
 benchmark, a campaign and a vault resource are the organization's own data, so
 each goes through `orgs benchmarks delete`, `campaigns owner` or `campaigns
 delete`, or `vault delete`, and a pre-auth key through `clients preauth revoke`.
@@ -1133,11 +1138,9 @@ row's value names the pass that declared it when the warehouse records one, as
 
 **`cancel`** records a cancellation and returns; `queue-maintenance` retires the
 jobs and settles the plan
-([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)). From the
-cancel on, the plan makes none of its jobs claimable: a job that only this plan
-holds gets no new lease. A lease that a client already holds stays valid until
-that run retires it. Until that run, `status` reads as before, with the pending
-cancel shown. A plan that stays `cancelling` across runs means teardown keeps
+([plan-ingestion.md §9](plan-ingestion.md#cancellation-and-teardown)). Until
+that run the jobs stay claimable, a held lease stays valid, and `status` reads
+as before with the pending cancel shown. A plan that stays `cancelling` across runs means teardown keeps
 failing, and each run exits non-zero. Cancelling is refused for a plan with no
 manifest and for a `complete` one; a plan already `cancelling` or `cancelled`
 reports a no-op.
@@ -1166,8 +1169,8 @@ pointer, and refuses while one of its plans runs with no cancel requested.
 
 What differs from HTTP:
 
-- **No permission check.** `create` and `owner` take exactly one of `--user` /
-  `--org`, resolved against the roster before anything is written, and can hand
+- **No permission check.** `create` and `owner` take `--org`, resolved against
+  the roster before anything is written, and can hand
   a campaign anywhere; the bound in
   [`PUT /api/v1/campaigns/{campaign_id}/owner`](api/campaigns/set_campaign_owner.md) is on the
   signed routes. A job may name any organization's private benchmark. `owner`
@@ -1210,8 +1213,9 @@ What differs from HTTP:
   `hf_import_endpoint`. `variants`, `revise`, `rerun` and `revert` add the
   revised document and the carry-over counts (`carried_job_count`,
   `new_job_count`, `requirements_rerun_job_count`, `satisfied_job_count`,
-  `restored_job_count`, `inherited_job_count`, `rerun_job_ids`,
-  `marked_job_ids`, `dropped_job_ids`, `held_jobs`, `repeated_variants`).
+  `restored_job_count`, `inherited_job_count`, `inherited_failed_job_count`,
+  `rerun_job_ids`, `marked_job_ids`, `dropped_job_ids`, `held_jobs`,
+  `repeated_variants`).
   The counts include the cells that an earlier finished run answers
   ([plan-ingestion.md §7](plan-ingestion.md#satisfying-a-cell-from-an-earlier-run)). A `revise` of the
   unchanged document files nothing, and its dry run runs no import, so `imports`
@@ -1272,6 +1276,14 @@ neither of the two covers. Alone, the flag does not file the unchanged
 document. Run the command with `--dry-run` first:
 `requirements_rerun_job_count` counts the cells that would run again, failed
 ones included, and `dropped_job_ids` lists their jobs.
+
+`--inherit-failed`, on the same two commands, lets a cell that no finished run
+answers take a failed run of the replaced plan or of an inherited plan, as
+`inherit_failed` does on the two routes
+([carrying jobs into a revision](api/campaigns.md#carrying-jobs-into-a-revision)).
+The dry run counts those from inherited plans in `inherited_failed_job_count`
+and marks each in `held_jobs` with `"failed": true`. Alone, the flag does not
+file the unchanged document.
 
 `campaigns show` walks the chain back from the head, one read per revision, and
 stops after 50. The id is the handle: there is no slug index, and a value
@@ -1359,6 +1371,9 @@ optional `--org <org>` selects an existing organization. The file has a
 `runtimes` list or a `models` list, not both. `release_time` is a quoted
 RFC 3339 string or a native TOML datetime, and it cannot be in the future. If
 the file omits `release_time`, the command uses the creation time.
+A model file can also give a `family`, such as `family = "LFM2.5"`. Without
+it, the family is the text of the name before its first hyphen. With
+`--name`, use `--family`.
 
 The `runtimes` list is in order of precedence. Each runtime uses the inline
 runtime table from a plan. A runtime of an organization entry can come from a
@@ -1486,10 +1501,11 @@ because the importer finds its entries by name.
 If another live hand-made entry in the scope holds the new name, the command
 merges the entry into that entry. The members must pass the checks of
 `add-member`: one kind of descriptor, and for runtimes one runtime type and one
-build. A member with the digest and the key of a member of the target entry is
-already there, so the merge skips it. The other members go to the end of the
-target entry, in their order. The command then deletes the entry, and prints
-the moved and the skipped member keys. Nothing undoes a merge.
+build. If the target has a member with the same digest and key, the merge
+skips the source member and copies its download size if the target has no
+recorded size. The other members go to the end of the target entry in their
+original order. The command then deletes the source entry and prints the
+moved and skipped member keys. Nothing undoes a merge.
 
 The old name is free at once. In an organization, a bare old name then selects
 the global entry of that name, if one exists. A stored plan holds descriptors,
@@ -1507,6 +1523,60 @@ changes the quantization label of one model member. The optional
 with the same format can hold the new label. The old label is free at once.
 The label is not part of the digest, so the member keeps its digest, its
 position and its descriptor.
+
+`catalog set-family NAME FAMILY [--dry-run]` sets the family of a model
+entry. The model pickers of the clients group entries by family. Use
+`--org <org>` to select an organization. The family follows the catalog name
+grammar.
+
+`catalog set-family NAME --default` clears the family
+that an operator set. The entry then has its default family: the text of its
+name before the first hyphen, or the whole name if it has no hyphen. A rename
+changes the default family.
+
+A runtime entry has no family, so the command refuses it. The command records
+a `catalog_set_family` audit event for the change. It also records its usual
+command audit event.
+
+`catalog set-family-logo FAMILY URI [--dry-run]` sets the logo of a model
+family, such as `LFM2.5`. The model pickers of the clients show the logo with
+the family. Use `--org <org>` to select an organization. The command ignores
+the case of the family. It refuses a family unless a model entry in the
+selected catalog has that family and is not tombstoned. The entry can use its
+default family or a family that an operator set.
+
+A logo Uniform Resource Identifier (URI) has one of two forms:
+
+- a URI under `https://pipette.liquid.ai/logos/`. After that prefix, it has
+  path segments of `[A-Za-z0-9._-]` with `/` between them. A segment cannot
+  be empty or start with `.`.
+- a data URI that holds the image. Start with `data:`. Add `image/png`,
+  `image/svg+xml`, or `image/webp`. Add `;base64,` and the image in padded
+  base64 using the standard alphabet.
+
+A logo URI has at most 65,536 characters. The web console loads remote images from
+the logo folder only.
+
+To make a data URI from an image file, encode the file in base64 on one line:
+
+```sh
+pipette-mgmt catalog set-family-logo LFM2.5 "data:image/png;base64,$(base64 -w0 lfm.png)"
+```
+
+For a URI under the logo folder, the command prints the URI. For a data URI,
+it prints the SHA-256 of the URI in its place. Catalog reads give the same
+digest in `family_logo_sha256`.
+
+`catalog set-family-logo FAMILY --clear` removes the logo of the family. A
+removal does not need an entry with the family. An organization entry whose
+family has no organization logo shows the global logo for that family. A logo
+stays after the last entry of its family is renamed or tombstoned.
+
+The command records a `catalog_set_family_logo` audit event for the change. The
+event holds the whole logo URI. A `--clear` that finds no logo changes nothing
+and records no such event. The command also records its usual command audit
+event. The `catalog family logo set` log event gives the digest of the logo in
+`logo_sha256`.
 
 `catalog remove-member NAME --member <key> [--dry-run]` removes one member
 from a hand-made entry. The optional `--org <org>` selects an organization
@@ -1555,10 +1625,24 @@ entry with the same name. That organization keeps its entry, and inside it the
 bare name selects its own entry. A stored plan holds descriptors, so a move
 does not change it.
 
+A model entry keeps its family logo after the move. If global has no logo for
+the family, the move copies the organization's logo for the family to global.
+If global has a logo for the family, the entry shows the global logo. The
+organization keeps its own logo.
+
 No command moves a global entry into an organization.
 
-A dry run of `rename`, `relabel`, `remove-member`, or `move-to-global` makes
-every check and prints the change. It writes nothing and makes no audit event.
+These catalog commands support a dry run:
+
+- `rename`
+- `relabel`
+- `set-family`
+- `set-family-logo`
+- `remove-member`
+- `move-to-global`
+
+A dry run checks whether the change can succeed and prints the proposed change.
+It writes nothing and makes no audit event.
 
 `catalog tombstone NAME` permanently removes a name from reads and resolution.
 The name stays unavailable for reuse. A tombstone is for a wrong descriptor.
@@ -1586,15 +1670,24 @@ these fields:
 - the release time
 - the member keys: a runtime member's flavor, or a model member's
   `format::quantization`
+- the family of a model entry, or `-` for a runtime entry
 
 `--json` prints each entry as one line of JSON, with the fields of
 `catalog show`. The command then writes the `next_cursor` line to stderr, so
 stdout holds only entries.
 
 `catalog show NAME` prints the full entry and its members in order as JSON.
-The JSON includes its scope. `--org <org>` selects an organization entry.
+The JSON includes the entry's scope and, for a model, its effective `family`.
+If the family has a logo, the JSON also gives the digest of the logo in
+`family_logo_sha256`.
+Use `--org <org>` to select an organization entry.
 `catalog list` and `catalog show` do not return tombstoned entries. `catalog list`
 refuses `--state tombstoned`.
+
+`catalog show-family-logo SHA256` looks up a `family_logo_sha256` value in
+the configured database across all catalog scopes. It prints the full logo
+URI on one line, including the complete data URI for an embedded logo.
+The command exits with an error if no logo has that digest.
 
 `catalog coverage [--days N] [--top N]` reports how many recent results the
 catalog names. It reads the warehouse and the catalog, and it writes nothing.
@@ -1656,6 +1749,19 @@ The command does not read Hugging Face.
 Each row prints the digest, the scope, the name, the kind, the state and the
 member key. `--json` prints each row as one line of JSON. If no live entry
 holds the digest, the command writes a line to stderr and prints nothing.
+
+`catalog fix-sizes [--dry-run]` records the download size of each Hugging Face
+model member that has no size. It reads every live model entry in every
+scope. The command reads each size from Hugging Face at the member's pinned
+commit. On later runs, it skips members that already have a size. Vault model
+members stay without a size. Use `--dry-run` to print download sizes without
+saving them. If a catalog edit invalidates the page cursor, the command
+restarts the scan once and keeps any sizes it already saved.
+
+The command prints the entry, member key, and size in bytes on each row. If
+Hugging Face cannot list a member or its size exceeds the catalog storage
+limit, the command logs a warning that names the member and continues. The
+command then exits nonzero after the summary.
 
 ### `pipette-mgmt vault list|show|delete|prune`
 

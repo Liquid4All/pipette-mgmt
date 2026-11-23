@@ -20,4 +20,3 @@ nothing.
 | 200 | The account, and whether it changed |
 | 400 | The caller removing its own `manage_orgs` or `manage_any_orgs`; or a service account granted `manage_orgs`, `manage_clients` or an `_any_` name |
 | 403 | The set names a name the caller does not hold, and the refusal names every one; or, for a scoped caller, the account holds a server-wide name it lacks; or the caller is a service account |
-| 404 | The account is outside the caller's scope or does not exist |

@@ -4,7 +4,7 @@ The **vault** is how a plan names a private artifact: a customer's own
 checkpoint, an internal build. A **vault resource** is one uploaded file of a
 model or a prebuilt runtime: it says whose it is, what it hashes to, and which
 plan variant it was uploaded as. A device fetches the bytes through mgmt and
-gets them only if the device's own owner is the resource's owner.
+gets them only if the organization that owns the device owns the resource.
 
 **Files first, then what they are.** A client uploads each file by its digest
 ([`PUT /api/v1/vault/blobs/{principal_id}/{sha256}`](vault/put_blob.md)), then
@@ -46,40 +46,31 @@ import of the same commit and files by the same owner reuses the records.
 
 ## Who may do what
 
-**There are no new permission names.** Owning private artifacts is something
-every operator does for itself, so an account's own resources need no grant at
-all, the way its own keys do not. A team's are read and uploaded by its
-members and deleted by its `manage_orgs` holders, the line a campaign draws.
+**There are no new permission names.** Only an organization owns a resource.
+Its resources are read, uploaded and deleted by its members; setting a model's
+parameter counts takes `manage_orgs`.
 
 Uploading a file, asking whether one is uploaded, and naming the variant
-uploaded files make up take the same scope: any active account for its own and
-its organization's, `manage_orgs` for a member's. Reading one resource, or its
-bytes, takes `perform_work` (device) or any active account, **and** the owner
-match. Deleting one takes the owner, or `manage_orgs` for an organization's.
+uploaded files make up take the same scope: any active account for its
+organization's. Reading one resource, or its bytes, takes `perform_work`
+(device) or any active account, **and** the owner match. Deleting one takes
+membership of the owning organization.
 
 The **ownership rule** is the whole of the model, and it is read twice: once for
 operators, once for devices.
 
-- A **user-owned** resource is its owner's, and its owner's **devices'**. A
-  colleague on the same organization reaches neither the record nor the bytes,
-  and neither does the administrator who uploaded it for that member: it leaves
-  the administrator's reach as a personal campaign does
-  ([`PUT /api/v1/campaigns/{campaign_id}/owner`](campaigns/set_campaign_owner.md)),
-  but a vault record has no owner change, so it cannot be handed back. The
-  member, or `manage_any_orgs`, deletes it.
-- An **org-owned** resource is **read** and **uploaded** by every account on
-  the organization. Deleting one takes `manage_orgs` **and** membership, the
-  rule [Campaigns' "Who may do what"](campaigns.md#who-may-do-what) states for
-  a campaign. Uploading runs nothing, and a worker fetches a record when a job
+- A resource is **read**, **uploaded** and **deleted** by every account on
+  its organization, as it did the ones it once owned itself
+  ([Campaigns' "Who may do what"](campaigns.md#who-may-do-what) states the
+  campaign rule). Uploading runs nothing, and a worker fetches a record when a job
   it claimed names it; the server checks the owner, not the job, so the bytes
-  are fetchable by every working device the organization owns, directly or
-  through an account on it.
+  are fetchable by every working device the organization owns.
 - `manage_any_orgs` reaches every resource, read and write. **`read_any_orgs`
   does not**: that name is the roster read, documented as who exists and who
   belongs where rather than what anything holds, and private weights are not
   roster data.
 
-For either owner, any other device is not granted a job naming the resource:
+Any other device is not granted a job naming the resource:
 a claim puts it back in the queue and denies it to the device, and a heartbeat
 or reclaim on a lease it already holds is refused with `403` and puts that
 lease back the same way
@@ -97,19 +88,13 @@ An **unowned device reaches nothing.** Registration is open, so a machine that
 registered itself and was never claimed is exactly the identity the vault must
 not serve.
 
-Ownership on the record is read as it stands, **not** derived through the
-owner's membership, the rule [Campaigns' "Who may do what"](campaigns.md#who-may-do-what)
-states for a campaign. A device's ownership *is* derived, so moving an account
-between organizations moves what its devices can fetch.
-
 A resource outside the caller's scope is a **`403`**, for the reason a campaign
 outside one is: the id is a minted UUIDv7 under a `vault_` prefix, so a caller
-that can name one was given it. A member deleting its organization's resource is
-told it needs `manage_orgs`; any other resource outside the caller's scope is
+that can name one was given it. A resource outside the caller's scope is
 refused as belonging to another owner.
 
 **Naming a resource in a plan takes reach, not a grant.** A plan may name the
-filer's own resources and its organization's; `submit_any_plans` names any,
+filer's organization's resources; `submit_any_plans` names any,
 and `manage_any_orgs` does not widen it. This holds on every door that files a
 plan, `POST /api/v1/campaigns` and every revision of
 [Campaigns](campaigns.md), dry runs included. Ingestion refuses a resource

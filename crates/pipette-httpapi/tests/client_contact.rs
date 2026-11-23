@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use pipette_plan_types::{ClientId, ClientOwner, OrgId, UserPermission};
+use pipette_plan_types::{ClientId, OrgId, UserPermission};
 
 use pipette_httpapi::state::AppState;
 
@@ -20,13 +20,9 @@ struct Fleet {
     state: AppState,
     acme: OrgId,
     rival: OrgId,
-    /// acme's directly.
+    /// acme's.
     ours: ClientId,
-    /// An acme member's, so acme's through the membership.
-    members: ClientId,
     unowned: ClientId,
-    /// An account's in no organization, so no organization's.
-    stray: ClientId,
     /// rival's.
     theirs: ClientId,
     /// Every read grant over clients and organizations, no device administration.
@@ -46,28 +42,7 @@ async fn fleet() -> anyhow::Result<Fleet> {
 
     let (_, ours) = register_pending(&state).await?;
     own_client_by_org(&state, &ours, &acme).await?;
-    let member = registered_user(&state, &[]).await?;
-    set_user_org(&state, &member.1, Some(acme.clone())).await?;
-    let (_, members) = register_pending(&state).await?;
-    own_client(
-        &state,
-        &members,
-        ClientOwner::User {
-            user_id: member.1.clone(),
-        },
-    )
-    .await?;
     let (_, unowned) = register_pending(&state).await?;
-    let loner = registered_user(&state, &[]).await?;
-    let (_, stray) = register_pending(&state).await?;
-    own_client(
-        &state,
-        &stray,
-        ClientOwner::User {
-            user_id: loner.1.clone(),
-        },
-    )
-    .await?;
     let (_, theirs) = register_pending(&state).await?;
     own_client_by_org(&state, &theirs, &rival).await?;
 
@@ -97,9 +72,7 @@ async fn fleet() -> anyhow::Result<Fleet> {
         acme,
         rival,
         ours,
-        members,
         unowned,
-        stray,
         theirs,
         reader,
         org_admin,
@@ -132,28 +105,18 @@ fn shown(rows: Option<&Value>) -> anyhow::Result<Vec<(String, bool)>> {
 }
 
 /// `GET /api/v1/clients` and `GET /api/v1/clients/{client_id}` carry the
-/// address for the devices the reader administers: an organization's own,
-/// through a member too, for `manage_clients`, every one for
+/// address for the devices the reader administers: an organization's own
+/// for `manage_clients`, every one for
 /// `manage_any_clients`. The fleet grants alone read none.
 #[tokio::test]
 async fn test_the_fleet_reads_serve_contact_email_to_administrators_only() -> anyhow::Result<()> {
     let fleet = fleet().await?;
     let read_clients = registered_user(&fleet.state, &[UserPermission::ReadClients]).await?;
-    let all = [
-        &fleet.ours,
-        &fleet.members,
-        &fleet.unowned,
-        &fleet.stray,
-        &fleet.theirs,
-    ];
+    let all = [&fleet.ours, &fleet.unowned, &fleet.theirs];
     let cases = [
         ("read_clients", &read_clients, vec![]),
         ("read_any_clients", &fleet.reader, vec![]),
-        (
-            "manage_clients",
-            &fleet.org_admin,
-            vec![&fleet.ours, &fleet.members],
-        ),
+        ("manage_clients", &fleet.org_admin, vec![&fleet.ours]),
         ("manage_any_clients", &fleet.fleet_admin, all.to_vec()),
     ];
     for (who, signer, administered) in cases {
@@ -204,7 +167,7 @@ async fn test_the_org_reads_serve_contact_email_to_administrators_only() -> anyh
     ];
     for (who, signer, administered) in cases {
         for (org_id, devices) in [
-            (&fleet.acme, vec![&fleet.ours, &fleet.members]),
+            (&fleet.acme, vec![&fleet.ours]),
             (&fleet.rival, vec![&fleet.theirs]),
         ] {
             let administers = administered.contains(&org_id);

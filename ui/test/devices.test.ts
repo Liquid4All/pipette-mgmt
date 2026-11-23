@@ -22,26 +22,22 @@ const device = (fields: Partial<ClientDetail>): ClientDetail => ({
 const acme = { org_id: "org_acme", slug: "acme" };
 
 describe("the branch a device's page sits under", () => {
-  test("nobody's is the server's, and the reader's own is its", () => {
+  test("nobody's is the server's", () => {
     expect(deviceBranch(device({}), reader(["read_orgs"]), null)).toEqual({ kind: "server" });
-    const mine = device({ owner: { type: "user", user_id: "user_me" }, owning_org_id: "org_acme" });
-    expect(deviceBranch(mine, reader(["read_orgs"], "org_acme"), acme)).toEqual({ kind: "me" });
   });
 
   test("an organization's for a reader of its roster the tree holds it for, else the fleet", () => {
-    const held = device({ owner: { type: "user", user_id: "user_member" }, owning_org_id: "org_acme" });
+    const held = device({ owner: { type: "org", org_id: "org_acme" } });
     expect(deviceBranch(held, reader(["read_orgs"], "org_acme"), acme))
       .toEqual({ kind: "org", org_id: "org_acme", slug: "acme", count: null });
-    // `owning_org_id` without the roster read: a scoped device administrator's.
+    // A scoped device administrator, who reads no roster.
     expect(deviceBranch(held, reader(["manage_clients"], "org_acme"), acme)).toEqual({ kind: "all" });
     expect(deviceBranch(held, reader(["read_orgs"]), null)).toEqual({ kind: "all" });
-    const unnamed = device({ owner: { type: "org", org_id: "org_acme" } });
-    expect(deviceBranch(unnamed, reader(["read_orgs"]), acme)).toEqual({ kind: "all" });
+    expect(deviceBranch(held, reader(["read_orgs"], "org_globex"), acme)).toEqual({ kind: "all" });
   });
 
   test("each branch goes back to its listing", () => {
     expect([listingPath({ kind: "all" }), listingName({ kind: "all" })]).toEqual(["/app/clients", "Fleet"]);
-    expect([listingPath({ kind: "me" }), listingName({ kind: "me" })]).toEqual(["/app/me/devices", "Devices"]);
     expect([listingPath({ kind: "server" }), listingName({ kind: "server" })])
       .toEqual(["/app/server/devices", "Unclaimed devices"]);
     expect(listingPath({ kind: "org", ...acme, count: null })).toBe("/app/orgs/acme/devices");
@@ -50,7 +46,6 @@ describe("the branch a device's page sits under", () => {
 
   test("a device's trail is its branch's section, then its listing", () => {
     expect(deviceTrail({ kind: "all" })).toEqual([{ label: "Fleet", href: "/app/clients" }]);
-    expect(deviceTrail({ kind: "me" })).toEqual([{ label: "Me" }, { label: "Devices", href: "/app/me/devices" }]);
     expect(deviceTrail({ kind: "server" }))
       .toEqual([{ label: "Server" }, { label: "Unclaimed devices", href: "/app/server/devices" }]);
     expect(deviceTrail({ kind: "org", ...acme, count: null }))
@@ -64,22 +59,20 @@ describe("the branch a device's page sits under", () => {
 });
 
 describe("the owner's name", () => {
-  const held = device({ owner: { type: "user", user_id: "user_member" }, owning_org_id: "org_acme" });
+  const held = device({ owner: { type: "org", org_id: "org_acme" } });
+  const loner = device({ owner: { type: "org", org_id: "org_loner" } });
 
   test("is asked for by a reader whose roster read covers the device's organization", () => {
     expect(namesOwner(held, reader(["read_orgs"], "org_acme"))).toBe(true);
-    expect(namesOwner(device({ owner: { type: "user", user_id: "user_loner" } }), reader(["read_any_orgs"]))).toBe(true);
+    expect(namesOwner(loner, reader(["read_any_orgs"]))).toBe(true);
   });
 
   test("is not asked for past that roster, or without it", () => {
     expect(namesOwner(held, reader(["read_orgs"], "org_globex"))).toBe(false);
-    expect(namesOwner(device({ owner: { type: "user", user_id: "user_loner" } }), reader(["read_orgs"], "org_acme")))
-      .toBe(false);
-    // `owning_org_id` sent to a scoped device administrator, who reads no roster.
+    expect(namesOwner(loner, reader(["read_orgs"], "org_acme"))).toBe(false);
+    // A scoped device administrator, who reads no roster.
     expect(namesOwner(held, reader(["manage_clients"], "org_acme"))).toBe(false);
-    expect(namesOwner(device({ owner: { type: "org", org_id: "org_acme" } }), reader(["read_clients"], "org_acme")))
-      .toBe(false);
-  });
+    expect(namesOwner(held, reader(["read_clients"], "org_acme"))).toBe(false);  });
 });
 
 describe("the permission form", () => {
@@ -106,21 +99,21 @@ describe("the permission form", () => {
 describe("the owner field", () => {
   const choices: OwnerMatch[] = [
     { value: "org_acme", name: "acme", label: "acme", type: "org" },
-    { value: "user_m", name: "member@acme.example", label: "member@acme.example (acme)", type: "user" },
+    { value: "org_globex", name: "globex", label: "Globex Corp", type: "org" },
   ];
 
-  test("typed text names a choice by its id, handle or address, case aside", () => {
+  test("typed text names a choice by its id, handle or label, case aside", () => {
     expect(exactChoice(choices, " ACME ")?.value).toBe("org_acme");
-    expect(exactChoice(choices, "Member@Acme.example")?.value).toBe("user_m");
-    expect(exactChoice(choices, "member@acme.example (acme)")?.value).toBe("user_m");
-    expect(exactChoice(choices, "user_m")?.value).toBe("user_m");
+    expect(exactChoice(choices, "GLOBEX")?.value).toBe("org_globex");
+    expect(exactChoice(choices, "globex corp")?.value).toBe("org_globex");
+    expect(exactChoice(choices, "org_globex")?.value).toBe("org_globex");
     expect(exactChoice(choices, "acm")).toBeNull();
     expect(exactChoice(choices, "  ")).toBeNull();
   });
 
   test("a pick posts the owner its id names", () => {
     expect(choices.map(ownerOf)).toEqual([
-      { type: "org", org_id: "org_acme" }, { type: "user", user_id: "user_m" },
+      { type: "org", org_id: "org_acme" }, { type: "org", org_id: "org_globex" },
     ]);
   });
 });

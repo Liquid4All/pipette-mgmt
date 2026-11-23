@@ -131,7 +131,8 @@ pub fn stated_samples(benchmark: &pipette_core::benchmark::Benchmark) -> Option<
         | Def::AsrMaxMemory(_)
         | Def::VlSpecDecode(_)
         | Def::DecisionLatency(_)
-        | Def::DecisionMaxMemory(_) => None,
+        | Def::DecisionMaxMemory(_)
+        | Def::Session(_) => None,
     }
 }
 

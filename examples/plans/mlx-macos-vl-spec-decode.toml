@@ -1,35 +1,24 @@
-# Example plan: unified pipette client, the VL spec-decode benchmark on MLX.
+# Example plan: the VL spec-decode benchmark on MLX.
 #
-# The MLX twin of llamacpp-macos-vl-spec-decode.toml: `vl_spec_decode` over the
-# same six MMSpec datasets, measured through `mlx_vlm.server` instead of
-# `llama-server`. Twice: once with the regular model (speculation off) and once
-# with the spec-decoding pair (speculation on), over the same benchmark ids.
-# Each run is its own job, server and row; the comparison between a pair is
-# computed outside the management server from its stored rows, never by a
+# The MLX twin of llamacpp-macos-vl-spec-decode.toml: the same six MMSpec
+# datasets through `mlx_vlm.server`, once with the regular model (speculation
+# off) and once with the spec-decoding pair (speculation on). The speedup is
+# computed outside the management server from the stored rows, never by a
 # client.
 #
-# `speculative_enabled` is the one MLX runtime flag, and only on this benchmark:
-# the launch is `mlx_vlm.server` with fixed arguments, and whether the drafter
-# bundle loads is the only choice a plan makes. Unset, it follows the model; it
-# is written out below so the plan says what each variant measures.
+# `speculative_enabled` is the only MLX runtime flag, and only on this
+# benchmark: `mlx_vlm.server` runs with fixed arguments, so whether the drafter
+# loads is the plan's one choice. Unset, it follows the model.
 #
-# The `mlx_speculative` type names **two repositories**: an MLX drafter is a
-# bundle of its own with its own `config.json`, which `mlx_vlm`'s `load_drafter`
-# reads to decide which drafter it is holding. The drafter repo is **gated**:
-# export `PIPETTE_HF_TOKEN` on the client, or the fetch 404s on the drafter half.
+# `mlx_speculative` names two repositories because an MLX drafter is a bundle
+# with its own `config.json`, which `mlx_vlm`'s `load_drafter` reads. The
+# drafter repo is gated: export `PIPETTE_HF_TOKEN` on the client, or its fetch
+# 404s.
 #
-# The benchmark ids are the management server's: its catalog pins the corpus and
-# serves it, and there is no local form of this benchmark. `pipette sync` first.
-#
-# An id's `_k8` suffix is its `parameter_draft_length`; the catalog publishes
-# each subset at k7, k8 and k9. This plan runs the reference condition; listing
-# the siblings sweeps the draft length, both variants together.
-#
-# The runtime is the `0.7.4` catalog row, which ships `mlx-vlm` beside `mlx-lm`.
-# See crates/pipette-artifacts-catalog/bundled-catalog/mlx/catalog.toml.
-#
-# State written to
-# .pipette-ctl/plans/mlx-macos-vl-spec-decode-example/state.jsonl.
+# The benchmark ids are the management server's: its catalog serves the corpus
+# and there is no local form of this benchmark, so run `pipette sync` first. The
+# `_k8` suffix is `parameter_draft_length`; the catalog also publishes k7 and
+# k9, and listing those in both variants sweeps the draft length.
 
 plan_id = "mlx-macos-vl-spec-decode-example"
 benchmarks = [
@@ -62,11 +51,11 @@ runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", speculative_enabled = false },
 ]
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", http_timeout_seconds = 600 },
 ]
-# The runtime is spelled out rather than referenced by catalog key, because a
-# plan carries the environment it measured: `version` selects nothing here, it
-# only labels what `source.contents` pins. This body is the `0.7.4` row of
+# Spelled out rather than referenced by catalog key so the plan carries the
+# environment it measured; `version` only labels what `source.contents` pins.
+# The body is the `0.7.4` row of
 # crates/pipette-artifacts-catalog/bundled-catalog/mlx/catalog.toml verbatim.
 [[variants.runtimes]]
 type = "mlx_macos_pipette"
@@ -146,12 +135,9 @@ runtime_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", speculative_enabled = true },
 ]
 benchmark_flags = [
-  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", http_timeout_seconds = 600, bench_timeout_seconds = 10800 },
+  { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", http_timeout_seconds = 600 },
 ]
-# The runtime is spelled out rather than referenced by catalog key, because a
-# plan carries the environment it measured: `version` selects nothing here, it
-# only labels what `source.contents` pins. This body is the `0.7.4` row of
-# crates/pipette-artifacts-catalog/bundled-catalog/mlx/catalog.toml verbatim.
+# The same `0.7.4` runtime as above.
 [[variants.runtimes]]
 type = "mlx_macos_pipette"
 version = "0.7.4"

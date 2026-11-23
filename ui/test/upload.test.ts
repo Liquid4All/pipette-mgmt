@@ -29,7 +29,7 @@ const VISION = vaultType("gguf_vision", ["model", "mmproj"]);
 const OVMS = vaultType("ovms", ["archive"], ["windows-x64"]);
 
 const form = (overrides: Partial<UploadForm> = {}): UploadForm =>
-  ({ name: " acme LFM2-VL-3B q4 ", vaultType: VISION, runtime: false, owner: USER, me: USER, flavor: "", ...overrides });
+  ({ name: " acme LFM2-VL-3B q4 ", vaultType: VISION, runtime: false, owner: ORG, flavor: "", ...overrides });
 
 const digestOf = (text: string) => {
   const hash = new Sha256();
@@ -62,24 +62,21 @@ function fake(heads: Answer[], puts: (Answer | null)[], signal = new AbortContro
 
 describe("uploadOwners", () => {
   test("offers the organization to every member of it, as VaultAuthority's gives_to", () => {
-    expect(uploadOwners(account(["manage_orgs"]))).toEqual([{ value: USER, label: "me" }]);
-    expect(uploadOwners(account([], ORG))).toEqual([
-      { value: USER, label: "me" },
-      { value: ORG, label: `my organization (${ORG})` },
-    ]);
+    expect(uploadOwners(account(["manage_orgs"]))).toEqual([]);
+    expect(uploadOwners(account([], ORG))).toEqual([{ value: ORG, label: `my organization (${ORG})` }]);
   });
 });
 
 describe("uploadBody", () => {
   const files = [{ role: "model" as const, filename: "m.gguf", sha256: "a".repeat(64) }];
 
-  test("leaves the reader unnamed and trims the name", () => {
+  test("names the owner and trims the name", () => {
     expect(uploadBody(form(), files)).toEqual(
-      { name: "acme LFM2-VL-3B q4", type: "gguf_vision", model: { filename: "m.gguf", sha256: "a".repeat(64) } });
+      { name: "acme LFM2-VL-3B q4", type: "gguf_vision", owner: ORG, model: { filename: "m.gguf", sha256: "a".repeat(64) } });
   });
 
-  test("names another owner, and a runtime's trimmed flavor", () => {
-    const body = uploadBody(form({ owner: ORG, vaultType: OVMS, runtime: true, flavor: " windows-x64 " }),
+  test("names a runtime's trimmed flavor", () => {
+    const body = uploadBody(form({ vaultType: OVMS, runtime: true, flavor: " windows-x64 " }),
       [{ role: "archive", filename: "ovms.zip", sha256: "b".repeat(64) }]);
     expect(body).toEqual({
       name: "acme LFM2-VL-3B q4", type: "ovms", owner: ORG, flavor: "windows-x64",
@@ -111,7 +108,7 @@ describe("upload", () => {
   const model = new File(["GGUF model"], "model.gguf");
   const mmproj = new File(["GGUF projector"], "mmproj.gguf");
   const chosen: Chosen[] = [{ role: "model", file: model }, { role: "mmproj", file: mmproj }];
-  const blob = (text: string, principal = USER) => `/api/v1/vault/blobs/${principal}/${digestOf(text)}`;
+  const blob = (text: string, principal = ORG) => `/api/v1/vault/blobs/${principal}/${digestOf(text)}`;
 
   test("skips a file already uploaded, sends the rest in turn, then describes them", async () => {
     const { transport, calls, described } = fake([answered(200), answered(404)], []);
@@ -125,7 +122,7 @@ describe("upload", () => {
     ]);
     expect(lines).toEqual(["model.gguf: already uploaded", "mmproj.gguf: uploaded"]);
     expect(described).toEqual([{
-      name: "acme LFM2-VL-3B q4", type: "gguf_vision",
+      name: "acme LFM2-VL-3B q4", type: "gguf_vision", owner: ORG,
       model: { filename: "model.gguf", sha256: digestOf("GGUF model") },
       mmproj: { filename: "mmproj.gguf", sha256: digestOf("GGUF projector") },
     }]);
@@ -133,9 +130,9 @@ describe("upload", () => {
 
   test("uploads under the owner chosen", async () => {
     const { transport, calls, described } = fake([], []);
-    await upload(transport, form({ owner: ORG }), chosen.slice(0, 1), () => {});
-    expect(calls).toEqual([`HEAD ${blob("GGUF model", ORG)}`, `PUT ${blob("GGUF model", ORG)}`]);
-    expect(described[0]?.owner).toBe(ORG);
+    await upload(transport, form({ owner: "org_0199cccc" }), chosen.slice(0, 1), () => {});
+    expect(calls).toEqual([`HEAD ${blob("GGUF model", "org_0199cccc")}`, `PUT ${blob("GGUF model", "org_0199cccc")}`]);
+    expect(described[0]?.owner).toBe("org_0199cccc");
   });
 
   test("waits and retries while mgmt is busy or the connection drops", async () => {

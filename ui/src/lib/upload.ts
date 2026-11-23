@@ -23,17 +23,9 @@ export interface Owner {
   label: string;
 }
 
-/**
- * The owners the form offers: the reader, and the organization it belongs to,
- * which is `VaultAuthority`'s `gives_to`: membership alone.
- */
-export function uploadOwners(account: OwnUserView): Owner[] {
-  const owners = [{ value: account.user_id, label: "me" }];
-  if (account.org_id) {
-    owners.push({ value: account.org_id, label: `my organization (${account.org_id})` });
-  }
-  return owners;
-}
+/** The owners the form offers: the organization the reader belongs to, which is `VaultAuthority`'s `gives_to`. */
+export const uploadOwners = (account: OwnUserView): Owner[] =>
+  (account.org_id ? [{ value: account.org_id, label: `my organization (${account.org_id})` }] : []);
 
 /** What a file field takes, as its caption says it. */
 export const takes = (format: VaultFileFormat) => (format === "gguf" ? "a .gguf" : "a .tar, .tar.gz or .zip");
@@ -69,10 +61,8 @@ export function offered(types: VaultTypes, type: string): Offered | null {
 /** The fields of the form, as typed. */
 export interface UploadForm extends Offered {
   name: string;
-  /** The owner chosen, an account or organization id. */
+  /** The owner chosen, an organization id. */
   owner: string;
-  /** The reader, whom the body leaves unnamed. */
-  me: string;
   flavor: string;
 }
 
@@ -82,11 +72,10 @@ export interface Chosen {
   file: File;
 }
 
-/** The description: `owner` left out for the reader, `flavor` for a model. */
+/** The description: `flavor` left out for a model. */
 export function uploadBody(form: UploadForm,
                            files: { role: VaultFileRole; filename: string; sha256: string }[]): UploadVaultResourcesRequest {
-  const body: UploadVaultResourcesRequest = { name: form.name.trim(), type: form.vaultType.type };
-  if (form.owner !== form.me) body.owner = form.owner;
+  const body: UploadVaultResourcesRequest = { name: form.name.trim(), type: form.vaultType.type, owner: form.owner };
   if (form.runtime) body.flavor = form.flavor.trim();
   for (const { role, filename, sha256 } of files) body[role] = { filename, sha256 };
   return body;

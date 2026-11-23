@@ -1,7 +1,7 @@
 <script lang="ts">
   // The classic console's devices under an organization
   // (`static/templates/clients.html` under its branch): `GET /api/v1/clients?org_id=`,
-  // what it owns directly or through a member, on its roster read, and its
+  // what it owns, on its roster read, and its
   // device pre-auth keys for a reader who may mint one.
   import DeviceKeys from "../lib/components/DeviceKeys.svelte";
   import DeviceListing from "../lib/components/DeviceListing.svelte";

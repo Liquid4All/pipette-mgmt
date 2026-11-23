@@ -206,7 +206,7 @@ mod tests {
 
     use pipette_core::campaign::{CampaignOwner, NewCampaign};
     use pipette_core::types::Mint;
-    use pipette_plan_types::{NonEmptyTrimmedString, PlanId, UserId};
+    use pipette_plan_types::{NonEmptyTrimmedString, OrgId, PlanId};
     use pipette_store::drain_campaigns;
 
     use super::*;
@@ -214,8 +214,8 @@ mod tests {
     fn a_campaign(name: &str) -> anyhow::Result<Campaign> {
         Ok(NewCampaign::new(
             NonEmptyTrimmedString::try_new(name)?,
-            CampaignOwner::User {
-                user_id: UserId::mint(),
+            CampaignOwner::Org {
+                org_id: OrgId::mint(),
             },
         )
         .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now()))

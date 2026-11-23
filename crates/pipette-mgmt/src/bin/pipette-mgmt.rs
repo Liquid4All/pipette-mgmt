@@ -30,7 +30,7 @@ use pipette_core::user_permission::{
 };
 use pipette_core::user_preauth;
 use pipette_core::user_preauth::{UserPreauthKey, UserPreauthParams};
-use pipette_core::vault::{VaultOwner, VaultResource};
+use pipette_core::vault::VaultResource;
 use pipette_httpapi::api_schema::openapi::OpenApi;
 use pipette_httpapi::state::AppState;
 use pipette_pipeline::audit::CommandAudit;
@@ -40,6 +40,7 @@ use pipette_pipeline::client_cli;
 use pipette_pipeline::client_cli::{CapabilityQuery, CapabilitySource};
 use pipette_pipeline::descriptor_alias;
 use pipette_pipeline::descriptor_catalog_admin::{self, CatalogTransition, Document};
+use pipette_pipeline::descriptor_names::CatalogReadScope;
 use pipette_pipeline::hf_import::{HfImports, HubClient, Progress};
 use pipette_pipeline::model_params::{self, ModelParamTable};
 use pipette_pipeline::org;
@@ -58,18 +59,19 @@ use pipette_plan_types::{
     AddDescriptorMemberRequest, AuditAction, AuditOutcome, AuditTarget, BenchmarkId,
     CampaignGroupId, CampaignId, CampaignState, CatalogName, CatalogScope, ClientId, ClientOwner,
     ClientPermission, ClientPreauthKeyId, ClientPreauthUsage, ContactEmail, Counts,
-    CreateDescriptorEntryRequest, CreatePlanTagRequest, DescriptorEntryKind, DescriptorEntryState,
-    DescriptorMember, DescriptorMemberKey, ExpiresAt, FleetDetail, JobCensus, JobId, Labels,
-    ModelFormat, ModelKey, ModelMemberRequest, NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug,
-    OrgStatus, PlanId, PlanStatus, PlanTag, PrincipalOwner, QuantizationLabel, RestoredVariant,
-    Runtime, RuntimeType, SchedulingState, Tag, UserAccountType, UserId, UserKeyId, UserPermission,
+    CreateDescriptorEntryRequest, CreatePlanTagRequest, DescriptorEntry, DescriptorEntryKind,
+    DescriptorEntryState, DescriptorMember, DescriptorMemberKey, ExpiresAt, FamilyLogos,
+    FleetDetail, JobCensus, JobId, Labels, LogoUri, ModelFormat, ModelKey, ModelMemberRequest,
+    NonEmptyTrimmedString, NonEmptyVec, OrgId, OrgSlug, OrgStatus, PlanId, PlanStatus, PlanTag,
+    QuantizationLabel, ReservedOrgSlugError, RestoredVariant, Runtime, RuntimeType,
+    SchedulingState, Sha256, Tag, UserAccountType, UserId, UserKeyId, UserPermission,
     UserPreauthKeyId, UserPreauthUsage, UserStatus, VaultResourceId, Warning,
 };
 use pipette_store::{
     AuditStore, AuditStores, CatalogEntryKey, CatalogImportRunStore, ClientStore, CreateOutcome,
     DescriptorCatalogStore, DescriptorEntryFilter, EmailClaim, OrgStore, STORAGE_CONCURRENCY,
-    SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore, drain_campaigns,
-    drain_clients, drain_vault_resources, warn_unreadable_clients,
+    SetFamilyLogoOutcome, SlugClaim, Stores, SubmissionStore, TagStore, TodoStore, UserStore,
+    drain_campaigns, drain_clients, drain_vault_resources, warn_unreadable_clients,
 };
 use pipette_store_init::storage_lock;
 use pipette_store_init::storage_lock::StorageLock;
@@ -479,14 +481,10 @@ enum CampaignAction {
         /// What to print for a human, e.g. `"Nightly LFM2 regression"`.
         /// Free-text: nothing keys on it, and two campaigns may share one.
         name: String,
-        /// The account that owns it, and is therefore the only one that may
-        /// repoint it over HTTP. Exactly one of `--user` / `--org`.
-        #[arg(long, value_parser = parse_user_id, conflicts_with = "org")]
-        user: Option<UserId>,
         /// The organization that owns it: its `manage_orgs` holders repoint it,
         /// and it outlives any one of them. Either spelling of the handle.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
-        org: Option<OrgRef>,
+        org: OrgRef,
         /// The TOML document for the first plan, as `campaigns ingest --plan`
         /// reads it.
         #[arg(long, value_name = "FILE")]
@@ -610,6 +608,11 @@ enum CampaignAction {
         /// offer lists its job for the cell's very body.
         #[arg(long, requires = "edit")]
         carry_across_limit: bool,
+        /// Let a cell that no finished run answers take a failed run of the
+        /// replaced plan or of a plan on offer, where the failure says the
+        /// cell would fail again (`inherit_failed`).
+        #[arg(long, requires = "edit")]
+        inherit_failed: bool,
         /// A plan of any campaign whose finished runs a cell the replaced
         /// plan has not answered may take, as it takes one of that plan's.
         /// Repeatable. Files the plan's own document too.
@@ -662,6 +665,9 @@ enum CampaignAction {
         /// file the plan's own document.
         #[arg(long, requires = "plan")]
         carry_across_limit: bool,
+        /// As on `variants`. Alone, it does not file the plan's own document.
+        #[arg(long, requires = "plan")]
+        inherit_failed: bool,
         /// A plan of any campaign whose finished runs a cell the replaced
         /// plan has not answered may take, as it takes one of that plan's.
         /// Repeatable. Files the plan's own document too.
@@ -730,9 +736,6 @@ enum CampaignAction {
     },
     /// List campaigns, newest first, with what each one currently points at.
     List {
-        /// Only the campaigns this account owns.
-        #[arg(long, value_parser = parse_user_id, conflicts_with = "org")]
-        user: Option<UserId>,
         /// Only this organization's.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
         org: Option<OrgRef>,
@@ -802,12 +805,9 @@ enum CampaignAction {
     Owner {
         #[arg(value_name = "CAMPAIGN_ID", value_parser = parse_campaign_id)]
         campaign_id: CampaignId,
-        /// The account to hand it to. Exactly one of `--user` / `--org`.
-        #[arg(long, value_parser = parse_user_id, conflicts_with = "org")]
-        user: Option<UserId>,
         /// The organization to hand it to.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
-        org: Option<OrgRef>,
+        org: OrgRef,
     },
     /// Delete a campaign. **The pointer only** — every plan that it filed keeps
     /// its manifest, its jobs and its lifecycle. The command refuses while one of
@@ -825,9 +825,6 @@ enum CampaignAction {
 enum VaultAction {
     /// List vault resources, newest first.
     List {
-        /// Only the resources this account owns.
-        #[arg(long, value_parser = parse_user_id, conflicts_with = "org")]
-        user: Option<UserId>,
         /// Only this organization's.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
         org: Option<OrgRef>,
@@ -915,6 +912,10 @@ enum CatalogAction {
             value_parser = parse_model_member
         )]
         models: Vec<ModelMemberRequest>,
+        /// The family of a model entry, such as `LFM2.5`. Without it, the
+        /// family is the text of the name before its first hyphen.
+        #[arg(long, value_parser = parse_catalog_name, requires = "models")]
+        family: Option<CatalogName>,
         #[arg(long, value_parser = parse_org_ref)]
         org: Option<OrgRef>,
         #[arg(long)]
@@ -927,6 +928,9 @@ enum CatalogAction {
             .args(["file", "runtime", "model"])
             .required(true)
     ))]
+    #[command(
+        override_usage = "pipette-mgmt catalog add-member [OPTIONS] <NAME> <FILE|--runtime <JSON>|--model <QUANTIZATION=JSON>>"
+    )]
     AddMember {
         #[arg(value_parser = parse_catalog_name)]
         name: CatalogName,
@@ -1004,6 +1008,61 @@ enum CatalogAction {
         org: Option<OrgRef>,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Set the family of a model entry, such as `LFM2.5`. The model pickers
+    /// group entries by family. With --default, the family is the text of the
+    /// name before its first hyphen.
+    #[command(group(
+        clap::ArgGroup::new("value")
+            .args(["family", "default"])
+            .required(true)
+    ))]
+    #[command(
+        override_usage = "pipette-mgmt catalog set-family [OPTIONS] <NAME> <FAMILY|--default>"
+    )]
+    SetFamily {
+        #[arg(value_parser = parse_catalog_name)]
+        name: CatalogName,
+        #[arg(value_parser = parse_catalog_name)]
+        family: Option<CatalogName>,
+        /// Clear the family that an operator set.
+        #[arg(long)]
+        default: bool,
+        #[arg(long, value_parser = parse_org_ref)]
+        org: Option<OrgRef>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set the logo of a model family, such as `LFM2.5`. The model pickers
+    /// show the logo with the family. Use a Uniform Resource Identifier (URI)
+    /// under `https://pipette.liquid.ai/logos/` or a base64 data URI with media
+    /// type `image/png`, `image/svg+xml`, or `image/webp`. Use `--clear` to
+    /// remove the family logo.
+    #[command(group(
+        clap::ArgGroup::new("value")
+            .args(["logo_uri", "clear"])
+            .required(true)
+    ))]
+    #[command(
+        override_usage = "pipette-mgmt catalog set-family-logo [OPTIONS] <FAMILY> <LOGO_URI|--clear>"
+    )]
+    SetFamilyLogo {
+        #[arg(value_parser = parse_catalog_name)]
+        family: CatalogName,
+        #[arg(value_parser = parse_logo_uri)]
+        logo_uri: Option<LogoUri>,
+        /// Remove the logo of the family.
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, value_parser = parse_org_ref)]
+        org: Option<OrgRef>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the full URI of a family logo from its catalog digest.
+    ShowFamilyLogo {
+        /// The family_logo_sha256 value from catalog show or catalog list --json.
+        sha256: Sha256,
     },
     /// Remove one member from a hand-made entry. The other members keep their
     /// positions. The command refuses to remove the last member.
@@ -1105,6 +1164,13 @@ enum CatalogAction {
         /// Print each hit as one line of JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Record missing download sizes for Hugging Face model members in all
+    /// scopes. Read each size from the Hub at the member's pinned commit.
+    FixSizes {
+        /// Print the download sizes from Hugging Face without saving them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1594,9 +1660,7 @@ enum ClientAction {
         #[arg(value_parser = parse_client_id)]
         client_id: ClientId,
     },
-    /// Show or set who owns a device: an organization directly, or a user
-    /// account whose own membership then says which organization
-    /// (`pipette-mgmt orgs`).
+    /// Show or set the organization that owns a device (`pipette-mgmt orgs`).
     ///
     /// Distinct from `--organization` on `clients update`, which is free text
     /// the device sent about itself with no record behind it. This points at a
@@ -1605,8 +1669,8 @@ enum ClientAction {
         #[command(subcommand)]
         action: ClientOwnerAction,
     },
-    /// Update mutable client details (organization, details, contact email).
-    /// Pass at least one flag; the command prints each field it changed.
+    /// Update a device's record. Pass at least one update flag.
+    /// The command prints each field it changes.
     Update {
         /// Client ID to update
         #[arg(value_parser = parse_client_id)]
@@ -1620,30 +1684,27 @@ enum ClientAction {
         /// New contact email
         #[arg(long = "email")]
         contact_email: Option<String>,
+        /// New name for the device. An empty value clears the name.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum ClientOwnerAction {
-    /// Show a device's owner, and the organization it rolls up to
+    /// Show a device's owner
     Show {
         #[arg(value_parser = parse_client_id)]
         client_id: ClientId,
     },
-    /// Give a device an owner. Exactly one of `--org` / `--user`: a device
-    /// belongs to one or the other, and naming both would be two answers to one
-    /// question.
+    /// Give a device an owner: an organization.
     Set {
         #[arg(value_parser = parse_client_id)]
         client_id: ClientId,
-        /// The organization that owns this device directly — a rack machine, a
-        /// lab phone, anything that outlives whoever set it up.
-        #[arg(long, value_name = "ORG", value_parser = parse_org_ref, required_unless_present = "user")]
-        org: Option<OrgRef>,
-        /// The account that owns this device. Its organization follows that
-        /// account's membership, so moving the account moves the device.
-        #[arg(long, value_name = "USER_ID", value_parser = parse_user_id, conflicts_with = "org")]
-        user: Option<UserId>,
+        /// The organization that owns this device: a rack machine, a lab phone,
+        /// anything that outlives whoever set it up.
+        #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
+        org: OrgRef,
     },
     /// Clear a device's owner, leaving it in no organization
     Clear {
@@ -1733,9 +1794,10 @@ enum OrgAction {
     /// case and must be unique — a second organization for one handle is
     /// refused, naming the one that already holds it.
     Create {
-        /// The handle the organization is addressed by: `[a-z0-9_-]`, at most
-        /// 64 characters, folded to lower case, never beginning `org_`. Stable — `orgs update` never changes it, because it
-        /// is the index key every command can name the organization by.
+        /// Use at most 64 characters from `[a-zA-Z0-9_-]`. The command converts
+        /// uppercase letters to lowercase. Do not start the handle with `org_`.
+        /// The descriptor catalog reserves the handle `global` for its global
+        /// scope. Commands use the handle as an index key. `orgs update` keeps it.
         #[arg(value_parser = parse_org_slug)]
         slug: OrgSlug,
         /// What to print for a human, e.g. `"Acme Corp., Inc."`. Defaults to
@@ -1789,16 +1851,15 @@ enum OrgAction {
     /// still names it, any device is owned by it directly, or it keeps a
     /// private benchmark, a campaign, a vault resource or an unexpired client
     /// pre-auth key. An org id is minted, so a stranded reference never
-    /// resolves again and would go unnoticed. Clear those one by one, then use
-    /// `--detach` to clear the accounts and devices.
+    /// resolves again and would go unnoticed. Clear those one by one, moving
+    /// or deleting each member, then use `--detach` to clear the devices.
     Delete {
         #[arg(value_name = "ORG", value_parser = parse_org_ref)]
         org: OrgRef,
-        /// Clear every membership and direct ownership naming this
-        /// organization, then delete it. A device owned by a *member* is
-        /// released by clearing that member's organization, so it keeps its
-        /// owner and simply stops rolling up here. Clears nothing else: any
-        /// other dependent refuses the command before anything is detached.
+        /// Clear every direct device ownership naming this organization, then
+        /// delete it. Clears nothing else: a member, which always belongs to
+        /// an organization, or any other dependent refuses the command before
+        /// anything is detached.
         #[arg(long)]
         detach: bool,
     },
@@ -1906,9 +1967,15 @@ enum UserAction {
         /// holds no admin name.
         #[arg(long = "type", value_name = "TYPE", default_value_t = UserAccountType::Human)]
         account_type: UserAccountType,
-        /// The organization the account joins, by handle or id.
+        /// The organization the account joins, by handle or id. Omitted, a
+        /// person's account gets an organization of its own, which it
+        /// administers, with a slug made from its id.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
         org: Option<OrgRef>,
+        /// The name of the organization a person's account gets without
+        /// `--org`; `<email>'s personal org` when omitted.
+        #[arg(long, value_name = "NAME", conflicts_with = "org")]
+        org_name: Option<NonEmptyTrimmedString>,
         /// Make the service account a campaign reader of this campaign.
         /// Repeatable. A campaign reader reads these campaigns and their plans
         /// alone, and holds `read_plans` alone.
@@ -1922,27 +1989,6 @@ enum UserAction {
         /// User ID whose account to show
         #[arg(value_parser = parse_user_id)]
         user_id: UserId,
-    },
-    /// Admit an account that asked for itself. A keyless `POST /api/v1/users/register`
-    /// creates the account `pending` and registers the key that asked, so this
-    /// is the whole of the decision: the machine re-runs nothing once it lands.
-    ///
-    /// Its own verb rather than a second spelling of `enable`, because it names
-    /// a different transition. `enable` returns an offboarded account to
-    /// service, and confusing "never admitted" with "admitted and withdrawn" is
-    /// exactly the mistake a status column exists to prevent.
-    Approve {
-        /// User ID to approve
-        #[arg(value_parser = parse_user_id)]
-        user_id: UserId,
-        /// Permission to grant alongside the approval. Repeatable, and
-        /// additive: it never removes one the account already holds. Approving
-        /// is when an operator decides what the account is for, which is why
-        /// the grant is on this command rather than a second one.
-        #[arg(long = "permission", value_name = "PERMISSION", value_parser = parse_user_permission)]
-        permissions: Vec<UserPermission>,
-        #[command(flatten)]
-        group: PermissionGroupFlags,
     },
     /// Mark an account as a person's (`human`) or a job's (`service`).
     SetType {
@@ -1976,8 +2022,7 @@ enum UserAction {
         #[arg(value_parser = parse_user_id)]
         user_id: UserId,
     },
-    /// Return a disabled account to service. An account that has never been
-    /// admitted is `users approve`, not this.
+    /// Return a disabled account to service.
     Enable {
         /// User ID to enable
         #[arg(value_parser = parse_user_id)]
@@ -1985,20 +2030,10 @@ enum UserAction {
     },
     /// Delete an account, its address claim and its permissions. For an account
     /// created in error — offboarding is a `disable`.
-    ///
-    /// Refused while the account still owns a device, a campaign or a vault
-    /// resource: each would be left naming a principal that no longer exists,
-    /// and because a user id is minted that reference never resolves again.
-    /// `--detach` clears the devices; hand over or delete the rest first.
     Delete {
         /// User ID to delete
         #[arg(value_parser = parse_user_id)]
         user_id: UserId,
-        /// Clear the ownership of every device this account owns, then delete
-        /// it. The devices stay registered and become unowned, which is where a
-        /// fresh self-registration sits until an operator vouches for it.
-        #[arg(long)]
-        detach: bool,
     },
     /// Release an address claim whose account record is gone — the residue of a
     /// create that failed between its two writes, or of a `delete` that stopped
@@ -2030,13 +2065,11 @@ enum UserAction {
         /// The account to assign
         #[arg(value_parser = parse_user_id)]
         user_id: UserId,
-        /// The organization's handle or id. Omit it and pass `--none` to clear
-        /// the membership.
-        #[arg(value_name = "ORG", value_parser = parse_org_ref, required_unless_present = "none")]
-        org: Option<OrgRef>,
-        /// Clear the membership, leaving the account in no organization.
-        #[arg(long, conflicts_with = "org")]
-        none: bool,
+        /// The organization's handle or id. Nothing clears a membership: an
+        /// account always belongs to one, and `users disable` takes it out of
+        /// service.
+        #[arg(value_name = "ORG", value_parser = parse_org_ref)]
+        org: OrgRef,
     },
     /// Manage an account's permissions. The user half of the vocabulary: plan
     /// and fleet verbs an operator holds, never the work verbs a device does
@@ -2059,15 +2092,14 @@ enum UserAction {
 /// The permission groups, as flags.
 ///
 /// Flattened into every command that assigns a user permission rather than
-/// repeated in each, so `users create`, `users approve` and
-/// `users permission add|set` carry one spelling of a group and one set of
+/// repeated in each, so `users create` and `users permission add|set` carry one
+/// spelling of a group and one set of
 /// refusals. The conflicts name `permissions`, the id each of those commands
 /// gives its list of names, and each other.
 #[derive(Args, Clone, Copy, Default)]
 struct PermissionGroupFlags {
-    /// Assign the organization-member group: submit and cancel the plans of
-    /// the account's own campaigns, read its organization's too, and read the
-    /// fleet.
+    /// Assign the organization-member group: submit, cancel and read the
+    /// plans of its organization's campaigns, and read the fleet.
     #[arg(long, conflicts_with_all = ["permissions", "org_admin", "server_admin"])]
     org_member: bool,
     /// Assign the organization-administrator group: everything inside the
@@ -2253,10 +2285,6 @@ enum ClientPreauthAction {
         /// as `clients owner set --org` would set it.
         #[arg(long, value_name = "ORG", value_parser = parse_org_ref)]
         owner_org: Option<OrgRef>,
-        /// The account that owns every client registering with this key, as
-        /// `clients owner set --user` would set it.
-        #[arg(long, value_name = "USER_ID", value_parser = parse_user_id, conflicts_with = "owner_org")]
-        owner_user: Option<UserId>,
         /// Free-form note stored with the key (shown in `clients preauth
         /// list`).
         #[arg(long)]
@@ -2676,7 +2704,6 @@ fn writes(command: &Command) -> bool {
                 UserPreauthAction::Create { .. } | UserPreauthAction::Revoke { .. } => true,
             },
             UserAction::Create { .. }
-            | UserAction::Approve { .. }
             | UserAction::SetType { .. }
             | UserAction::SetCampaigns { .. }
             | UserAction::Disable { .. }
@@ -2745,6 +2772,7 @@ fn writes(command: &Command) -> bool {
         Command::Catalog { action } => match action {
             CatalogAction::List { .. }
             | CatalogAction::Show { .. }
+            | CatalogAction::ShowFamilyLogo { .. }
             | CatalogAction::Coverage { .. }
             | CatalogAction::Find { .. } => false,
             CatalogAction::Import { .. } | CatalogAction::Refresh { .. } => true,
@@ -2752,8 +2780,11 @@ fn writes(command: &Command) -> bool {
             | CatalogAction::AddMember { dry_run, .. }
             | CatalogAction::Rename { dry_run, .. }
             | CatalogAction::Relabel { dry_run, .. }
+            | CatalogAction::SetFamily { dry_run, .. }
+            | CatalogAction::SetFamilyLogo { dry_run, .. }
             | CatalogAction::RemoveMember { dry_run, .. }
-            | CatalogAction::MoveToGlobal { dry_run, .. } => !dry_run,
+            | CatalogAction::MoveToGlobal { dry_run, .. }
+            | CatalogAction::FixSizes { dry_run } => !dry_run,
             CatalogAction::Pin { .. }
             | CatalogAction::Unpin { .. }
             | CatalogAction::Hide { .. }
@@ -3238,6 +3269,7 @@ async fn handle_catalog_action(
             release_time,
             runtimes,
             models,
+            family,
             org,
             dry_run,
         } => {
@@ -3250,6 +3282,7 @@ async fn handle_catalog_action(
                     release_time,
                     runtimes: NonEmptyVec::try_new(runtimes).ok(),
                     models: NonEmptyVec::try_new(models).ok(),
+                    family,
                 }),
                 (None, None) => anyhow::bail!("catalog create needs FILE or --name"),
             };
@@ -3359,6 +3392,93 @@ async fn handle_catalog_action(
                 println!("Relabeled {name}::{format}::{from} to {name}::{format}::{to}");
             }
         }
+        CatalogAction::SetFamily {
+            name,
+            family,
+            default: _,
+            org,
+            dry_run,
+        } => {
+            let scope = catalog_scope(stores, org.as_ref()).await?;
+            let entry = descriptor_catalog_admin::set_entry_family(
+                catalog,
+                &scope,
+                &name,
+                Some(family.as_ref()),
+                None,
+                dry_run,
+            )
+            .await?;
+            let shown = entry.family().unwrap_or_default();
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+                println!("Would set the family of {} to {shown}", entry.name);
+            } else {
+                record_catalog_change(
+                    stores.audit.as_deref(),
+                    &scope,
+                    descriptor_catalog_admin::set_family_audit_action(&scope, &entry),
+                )
+                .await;
+                println!("Set the family of {} to {shown}", entry.name);
+            }
+        }
+        CatalogAction::SetFamilyLogo {
+            family,
+            logo_uri,
+            clear: _,
+            org,
+            dry_run,
+        } => {
+            let scope = catalog_scope(stores, org.as_ref()).await?;
+            let outcome = descriptor_catalog_admin::set_family_logo(
+                catalog,
+                &scope,
+                &family,
+                logo_uri.as_ref(),
+                None,
+                dry_run,
+            )
+            .await?;
+            let changed = !matches!(
+                outcome,
+                SetFamilyLogoOutcome::Cleared(None) | SetFamilyLogoOutcome::NoSuchFamily
+            );
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+            } else if changed {
+                record_catalog_change(
+                    stores.audit.as_deref(),
+                    &scope,
+                    descriptor_catalog_admin::set_family_logo_audit_action(
+                        &scope,
+                        &family,
+                        logo_uri.as_ref(),
+                    ),
+                )
+                .await;
+            }
+            let verb = |would: &'static str, did: &'static str| if dry_run { would } else { did };
+            match outcome {
+                SetFamilyLogoOutcome::Set(logo) => println!(
+                    "{} the logo of family {family} to {}",
+                    verb("Would set", "Set"),
+                    // A data URI holds a whole image, too long to print.
+                    if logo.logo_uri.as_str().starts_with("data:") {
+                        format!("an embedded image with SHA-256 {}", logo.logo_uri.sha256())
+                    } else {
+                        logo.logo_uri.to_string()
+                    }
+                ),
+                SetFamilyLogoOutcome::Cleared(Some(_)) => println!(
+                    "{} the logo of family {family}",
+                    verb("Would remove", "Removed")
+                ),
+                SetFamilyLogoOutcome::Cleared(None) | SetFamilyLogoOutcome::NoSuchFamily => {
+                    println!("Family {family} has no logo");
+                }
+            }
+        }
         CatalogAction::RemoveMember {
             name,
             member,
@@ -3451,21 +3571,27 @@ async fn handle_catalog_action(
             });
             let page =
                 descriptor_catalog_admin::list(catalog, filter, after.as_ref(), limit).await?;
+            let logos = if json {
+                descriptor_catalog_admin::family_logos(catalog, [scope.clone()]).await?
+            } else {
+                FamilyLogos::default()
+            };
             for entry in page.items {
                 if json {
-                    println!("{}", serde_json::to_string(&entry)?);
+                    println!("{}", catalog_entry_json(&entry, &logos)?);
                     continue;
                 }
                 let keys = descriptor_catalog_admin::member_keys(&entry.members);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     entry.scope,
                     entry.name,
                     entry.kind,
                     entry.state,
                     entry.descriptor_types().join(","),
                     entry.release_time,
-                    keys
+                    keys,
+                    entry.family().unwrap_or("-")
                 );
             }
             for unreadable in page.unreadable {
@@ -3482,7 +3608,18 @@ async fn handle_catalog_action(
             let entry = descriptor_catalog_admin::show(catalog, &scope, &name)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("no catalog entry {name}"))?;
-            println!("{}", serde_json::to_string_pretty(&entry)?);
+            let logos = descriptor_catalog_admin::family_logos(catalog, [scope.clone()]).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&catalog_entry_json(&entry, &logos)?)?
+            );
+        }
+        CatalogAction::ShowFamilyLogo { sha256 } => {
+            let logo_uri = catalog
+                .family_logo_uri_by_digest(&sha256, None)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no catalog family logo with SHA-256 {sha256}"))?;
+            println!("{logo_uri}");
         }
         CatalogAction::Coverage { days, top, json } => {
             let since = jiff::SignedDuration::try_from_hours(i64::from(days) * 24)
@@ -3545,6 +3682,38 @@ async fn handle_catalog_action(
                 }
             });
         }
+        CatalogAction::FixSizes { dry_run } => {
+            let scopes = CatalogReadScope {
+                own_org: None,
+                every_org: true,
+            }
+            .readable_scopes(stores.orgs.as_ref())
+            .await?;
+            let fill = descriptor_catalog_admin::fill_member_sizes(
+                catalog,
+                &catalog_hub(config)?,
+                scopes,
+                dry_run,
+            )
+            .await?;
+            if dry_run {
+                println!("Dry run: the command writes nothing.");
+            }
+            fill.sized.iter().for_each(|sized| {
+                println!("{}\t{}\t{}", sized.entry, sized.member, sized.size_bytes);
+            });
+            let verb = if dry_run { "Would size" } else { "Sized" };
+            println!(
+                "{verb} {} members; {} failed.",
+                fill.sized.len(),
+                fill.failed
+            );
+            anyhow::ensure!(
+                fill.failed == 0,
+                "Could not determine the download size for {} members. See the log for the member names.",
+                fill.failed
+            );
+        }
     }
     Ok(())
 }
@@ -3589,8 +3758,26 @@ fn rename_report(
     }
 }
 
+fn catalog_entry_json(
+    entry: &DescriptorEntry,
+    logos: &FamilyLogos,
+) -> anyhow::Result<serde_json::Value> {
+    let mut json = serde_json::to_value(entry)?;
+    let object = json
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("a serialized catalog entry must be an object"))?;
+    if let Some(family) = entry.family() {
+        object.insert("family".to_owned(), family.into());
+    }
+    if let Some(sha256) = logos.of(entry) {
+        object.insert("family_logo_sha256".to_owned(), sha256.as_ref().into());
+    }
+    Ok(json)
+}
+
 /// Record a completed catalog change: `action` is a `CatalogRename`, a
-/// `CatalogMerge`, or a `CatalogRemoveMember`.
+/// `CatalogMerge`, a `CatalogRemoveMember`, a `CatalogSetFamily`, or a
+/// `CatalogSetFamilyLogo`.
 async fn record_catalog_change(
     log: Option<&dyn AuditStore>,
     scope: &CatalogScope,
@@ -3827,59 +4014,6 @@ fn print_org_line(org: &Organization, members: usize, clients: usize) {
     );
 }
 
-/// [`campaign_admin::owner`] decides; this adds only the CLI's words for naming
-/// neither `--user` nor `--org`, flags the route does not have.
-async fn campaign_owner(
-    stores: &Stores,
-    user: Option<UserId>,
-    org: Option<OrgRef>,
-) -> anyhow::Result<CampaignOwner> {
-    campaign_admin::owner(stores, user, org)
-        .await
-        .map_err(|e| match e {
-            campaign_admin::CampaignAdminError::NoOwnerNamed => {
-                anyhow::anyhow!("name an owner: --user <USER_ID> or --org <ORG>")
-            }
-            other @ (campaign_admin::CampaignAdminError::NotFound(_)
-            | campaign_admin::CampaignAdminError::NoSuchUser(_)
-            | campaign_admin::CampaignAdminError::NoSuchOrg(_)
-            | campaign_admin::CampaignAdminError::NoSuchPlan(_)
-            | campaign_admin::CampaignAdminError::NotAdvanced { .. }
-            | campaign_admin::CampaignAdminError::CommitUnknown { .. }
-            | campaign_admin::CampaignAdminError::NoPlan(_)
-            | campaign_admin::CampaignAdminError::Archived(_)
-            | campaign_admin::CampaignAdminError::Locked { .. }
-            | campaign_admin::CampaignAdminError::TextTooLong(_)
-            | campaign_admin::CampaignAdminError::TextHasNul(_)
-            | campaign_admin::CampaignAdminError::LockNeedsNote
-            | campaign_admin::CampaignAdminError::NoteWithoutLock
-            | campaign_admin::CampaignAdminError::LockedArchive(_)
-            | campaign_admin::CampaignAdminError::BadTagName(_)
-            | campaign_admin::CampaignAdminError::TagTaken { .. }
-            | campaign_admin::CampaignAdminError::NoTagStore
-            | campaign_admin::CampaignAdminError::NotOnPlan { .. }
-            | campaign_admin::CampaignAdminError::NoDocument(_)
-            | campaign_admin::CampaignAdminError::SourceMismatch(_)
-            | campaign_admin::CampaignAdminError::NotInCampaign { .. }
-            | campaign_admin::CampaignAdminError::NoSuchSourceVariant { .. }
-            | campaign_admin::CampaignAdminError::Edit(_)
-            | campaign_admin::CampaignAdminError::NothingToRerun
-            | campaign_admin::CampaignAdminError::RerunAndFail(_)
-            | campaign_admin::CampaignAdminError::NotInPlan { .. }
-            | campaign_admin::CampaignAdminError::Unanswered(_)
-            | campaign_admin::CampaignAdminError::NoneAnswered { .. }
-            | campaign_admin::CampaignAdminError::NotRescorable(_)
-            | campaign_admin::CampaignAdminError::NoneRescorable(_)
-            | campaign_admin::CampaignAdminError::Overtaken { .. }
-            | campaign_admin::CampaignAdminError::NotCancelled { .. }
-            | campaign_admin::CampaignAdminError::StillRunning { .. }
-            | campaign_admin::CampaignAdminError::DeletedDuringFiling { .. }
-            | campaign_admin::CampaignAdminError::AdvanceContended { .. }
-            | campaign_admin::CampaignAdminError::Contended(_)
-            | campaign_admin::CampaignAdminError::Store(_)) => anyhow::Error::new(other),
-        })
-}
-
 /// `KEY=VALUE` pairs, comma-separated; `-` for none.
 fn labels_text(labels: &Labels) -> String {
     if labels.is_empty() {
@@ -3945,10 +4079,8 @@ async fn ingest_into_campaign(
                     "{e}; preserve live jobs in {plan_id} with a successful filing before cancelling it: {source:#}"
                 ),
                 other @ (campaign_admin::CampaignAdminError::NotFound(_)
-                | campaign_admin::CampaignAdminError::NoSuchUser(_)
                 | campaign_admin::CampaignAdminError::NoSuchOrg(_)
                 | campaign_admin::CampaignAdminError::NoSuchPlan(_)
-                | campaign_admin::CampaignAdminError::NoOwnerNamed
                 | campaign_admin::CampaignAdminError::CommitUnknown { .. }
                 | campaign_admin::CampaignAdminError::NoPlan(_)
                 | campaign_admin::CampaignAdminError::Archived(_)
@@ -4098,10 +4230,8 @@ fn revision_error(e: campaign_admin::CampaignAdminError, retry: &str) -> anyhow:
             ..
         } => anyhow::anyhow!("{e}; stop it with `plans cancel {superseded}`: {source:#}"),
         other @ (campaign_admin::CampaignAdminError::NotFound(_)
-        | campaign_admin::CampaignAdminError::NoSuchUser(_)
         | campaign_admin::CampaignAdminError::NoSuchOrg(_)
         | campaign_admin::CampaignAdminError::NoSuchPlan(_)
-        | campaign_admin::CampaignAdminError::NoOwnerNamed
         | campaign_admin::CampaignAdminError::CommitUnknown { .. }
         | campaign_admin::CampaignAdminError::NoPlan(_)
         | campaign_admin::CampaignAdminError::Archived(_)
@@ -4193,7 +4323,6 @@ async fn handle_campaign_action(
     match action {
         CampaignAction::Create {
             name,
-            user,
             org,
             plan,
             note,
@@ -4203,7 +4332,7 @@ async fn handle_campaign_action(
             let name =
                 NonEmptyTrimmedString::try_new(name).map_err(|e| anyhow::anyhow!("name: {e}"))?;
             // Before the dry run too, so it refuses an owner the create would.
-            let owner = campaign_owner(stores, user, org).await?;
+            let owner = campaign_admin::owner(stores, org).await?;
             if dry_run {
                 let report =
                     campaign_admin::dry_run_document(stores, settings, &owner, &plan, note).await?;
@@ -4239,6 +4368,7 @@ async fn handle_campaign_action(
             dry_run,
             carry_earlier,
             carry_across_limit,
+            inherit_failed,
             inherit_from,
             add_from,
             restore,
@@ -4267,7 +4397,8 @@ async fn handle_campaign_action(
                 &campaign_admin::inheriting(&inherit_from, &add_from, &restore),
             )
             .await?
-            .across_limit(carry_across_limit);
+            .across_limit(carry_across_limit)
+            .inherit_failed(inherit_failed);
             let added = offer.variants_of(&*stores.plans, &add_from).await?;
             let restored = offer.restored_variants(&*stores.plans, &restore).await?;
             let edit = edit.adding(added).restoring(restored, restore);
@@ -4296,6 +4427,7 @@ async fn handle_campaign_action(
             dry_run,
             carry_earlier,
             carry_across_limit,
+            inherit_failed,
             inherit_from,
         } => {
             let Some(plan) = plan else {
@@ -4319,7 +4451,8 @@ async fn handle_campaign_action(
                 &inherit_from,
             )
             .await?
-            .across_limit(carry_across_limit);
+            .across_limit(carry_across_limit)
+            .inherit_failed(inherit_failed);
             if dry_run {
                 let report = campaign_admin::dry_run_revise_document(
                     stores,
@@ -4388,11 +4521,11 @@ async fn handle_campaign_action(
             }
             revert_campaign(stores, settings, campaign_id, base, to, note).await
         }
-        CampaignAction::List { user, org } => {
+        CampaignAction::List { org } => {
             // An unknown owner errors, rather than listing nothing.
-            let filter = match (user, org) {
-                (None, None) => None,
-                (user, org) => Some(campaign_owner(stores, user, org).await?),
+            let filter = match org {
+                None => None,
+                Some(org) => Some(campaign_admin::owner(stores, org).await?),
             };
             let listing = drain_campaigns(&*campaigns).await?;
             listing.unreadable.iter().for_each(|entry| {
@@ -4567,12 +4700,8 @@ async fn handle_campaign_action(
             tags.iter().for_each(print_tag_line);
             Ok(())
         }
-        CampaignAction::Owner {
-            campaign_id,
-            user,
-            org,
-        } => {
-            let owner = campaign_owner(stores, user, org).await?;
+        CampaignAction::Owner { campaign_id, org } => {
+            let owner = campaign_admin::owner(stores, org).await?;
             let mut campaign = campaign_admin::require(&*stores.campaigns, &campaign_id).await?;
             let read = campaign.clone();
             let before = campaign.owner.label();
@@ -4608,29 +4737,6 @@ async fn handle_campaign_action(
             Ok(())
         }
     }
-}
-
-/// `campaign_owner`'s rule for vault owners.
-async fn vault_owner(
-    stores: &Stores,
-    user: Option<UserId>,
-    org: Option<OrgRef>,
-) -> anyhow::Result<VaultOwner> {
-    vault_admin::owner(stores, user, org)
-        .await
-        .map_err(|e| match e {
-            vault_admin::VaultAdminError::NoOwnerNamed => {
-                anyhow::anyhow!("name an owner: --user <USER_ID> or --org <ORG>")
-            }
-            other @ (vault_admin::VaultAdminError::NotFound(_)
-            | vault_admin::VaultAdminError::NoSuchUser(_)
-            | vault_admin::VaultAdminError::NoSuchOrg(_)
-            | vault_admin::VaultAdminError::DigestMismatch { .. }
-            | vault_admin::VaultAdminError::NoBlob { .. }
-            | vault_admin::VaultAdminError::NotA { .. }
-            | vault_admin::VaultAdminError::TooLarge { .. }
-            | vault_admin::VaultAdminError::Store(_)) => anyhow::Error::new(other),
-        })
 }
 
 fn print_vault_line(resource: &VaultResource) {
@@ -4684,11 +4790,11 @@ fn vault_show_lines(resource: &VaultResource, stored: Option<u64>) -> anyhow::Re
 async fn handle_vault_action(action: VaultAction, stores: Stores) -> anyhow::Result<()> {
     let vault = stores.vault.clone();
     match action {
-        VaultAction::List { user, org } => {
+        VaultAction::List { org } => {
             // An unknown owner errors, rather than listing nothing.
-            let filter = match (user, org) {
-                (None, None) => None,
-                (user, org) => Some(vault_owner(&stores, user, org).await?),
+            let filter = match org {
+                None => None,
+                Some(org) => Some(vault_admin::owner(&stores, org).await?),
             };
             let listing = drain_vault_resources(&*vault).await?;
             listing.unreadable.iter().for_each(|entry| {
@@ -4779,6 +4885,7 @@ async fn handle_org_action(action: OrgAction, stores: Stores) -> anyhow::Result<
             name,
             adopt_stranded_claim,
         } => {
+            slug.refuse_reserved()?;
             let display_name = match name {
                 Some(name) => NonEmptyTrimmedString::try_new(name)
                     .map_err(|e| anyhow::anyhow!("--name: {e}"))?,
@@ -4871,6 +4978,9 @@ async fn handle_org_action(action: OrgAction, stores: Stores) -> anyhow::Result<
             orgs.iter().for_each(|org| {
                 let tallied = counts.get(&org.org_id).copied().unwrap_or_default();
                 print_org_line(org, tallied.members, tallied.clients);
+                if let Err(error @ ReservedOrgSlugError::Global) = org.slug.refuse_reserved() {
+                    eprintln!("Warning: organization {}: {error}.", org.org_id);
+                }
             });
             Ok(())
         }
@@ -4953,24 +5063,9 @@ async fn handle_org_action(action: OrgAction, stores: Stores) -> anyhow::Result<
                 if !found.only_detachable() {
                     return Err(org_delete_refusal(&org, &found));
                 }
-                // A service account is never left in no organization.
-                let services = service_accounts(&*stores.users, &found.members).await?;
-                anyhow::ensure!(
-                    services.is_empty(),
-                    "organization {} still holds {} service account(s), which `--detach` does \
-                     not release: {}. Move each with `users set-org <user_id> <org>`, or delete \
-                     it with `users delete <user_id>`",
-                    org.slug,
-                    services.len(),
-                    joined(&services, UserId::as_str)
-                );
-                let cleared = org::detach_all(&*org_store, &org.org_id).await?;
+                let cleared = org::detach_devices(&*org_store, &org.org_id).await?;
                 if !cleared.is_empty() {
-                    println!(
-                        "Detached {} member(s) and {} directly-owned device(s).",
-                        cleared.members.len(),
-                        cleared.clients.len()
-                    );
+                    println!("Detached {} device(s).", cleared.len());
                 }
             }
             // Re-read after any detach: a membership written in between would
@@ -5050,21 +5145,6 @@ async fn handle_org_action(action: OrgAction, stores: Stores) -> anyhow::Result<
     }
 }
 
-async fn service_accounts(
-    users: &dyn UserStore,
-    members: &[UserId],
-) -> anyhow::Result<Vec<UserId>> {
-    stream::iter(members)
-        .then(|user_id| users.get_user(user_id))
-        .try_filter_map(|user| async move {
-            Ok(user
-                .filter(|user| user.account_type == UserAccountType::Service)
-                .map(|user| user.user_id))
-        })
-        .try_collect()
-        .await
-}
-
 /// Steps listed in the order that works: `--detach` refuses while anything else
 /// is left.
 fn org_delete_refusal(org: &Organization, found: &org::Dependents) -> anyhow::Error {
@@ -5090,14 +5170,21 @@ fn org_delete_refusal(org: &Organization, found: &org::Dependents) -> anyhow::Er
             joined(&found.preauth_keys, ClientPreauthKeyId::as_str)
         ));
     }
-    if !found.members.is_empty() || !found.clients.is_empty() {
+    if !found.members.is_empty() {
+        steps.push(format!(
+            "Move each member with `users set-org <user_id> <org>`, or delete it with `users \
+             delete <user_id>`: {}",
+            joined(&found.members, UserId::as_str)
+        ));
+    }
+    if !found.clients.is_empty() {
         let verb = if steps.is_empty() {
             "Clear"
         } else {
             "Then clear"
         };
         steps.push(format!(
-            "{verb} the members and devices with `orgs delete {} --detach`, or reassign them",
+            "{verb} the devices with `orgs delete {} --detach`, or reassign them",
             org.slug
         ));
     }
@@ -5127,20 +5214,6 @@ fn holdings_steps(held: &org::Holdings) -> Vec<String> {
         ));
     }
     steps
-}
-
-/// Refuse `users delete` while the account owns a campaign or vault record.
-async fn refuse_holdings(stores: &Stores, user_id: &UserId) -> anyhow::Result<()> {
-    let owner = PrincipalOwner::User {
-        user_id: user_id.clone(),
-    };
-    let held = org::holdings_of(&*stores.campaigns, &*stores.vault, &owner).await?;
-    anyhow::ensure!(
-        held.is_empty(),
-        "user {user_id} still owns campaigns or vault resources. {}",
-        holdings_steps(&held).join(". ")
-    );
-    Ok(())
 }
 
 fn joined<T>(ids: &[T], as_str: fn(&T) -> &str) -> String {
@@ -5326,11 +5399,7 @@ async fn handle_client_owner_action(
             return Ok(());
         }
         ClientOwnerAction::Clear { .. } => None,
-        ClientOwnerAction::Set { org, user, .. } => {
-            // Clap refuses neither; restated rather than assumed.
-            let owner = require_client_owner(stores, org, user).await?;
-            Some(owner.ok_or_else(|| anyhow::anyhow!("pass exactly one of --org or --user"))?)
-        }
+        ClientOwnerAction::Set { org, .. } => Some(require_client_owner(stores, &org).await?),
     };
 
     if current == owner {
@@ -5355,21 +5424,9 @@ async fn handle_client_owner_action(
 }
 
 /// Resolved against its roster, so no stored owner names a missing record.
-async fn require_client_owner(
-    stores: &Stores,
-    org: Option<OrgRef>,
-    user: Option<UserId>,
-) -> anyhow::Result<Option<ClientOwner>> {
-    Ok(match (org, user) {
-        (None, None) => None,
-        (Some(reference), None) => Some(ClientOwner::Org {
-            org_id: org::require(&*stores.orgs, &reference).await?.org_id,
-        }),
-        (None, Some(user_id)) => Some(ClientOwner::User {
-            user_id: require_user(&stores.users, &user_id).await?.user_id,
-        }),
-        // Clap refuses both; restated rather than assumed.
-        (Some(_), Some(_)) => anyhow::bail!("an owner is an organization or an account, not both"),
+async fn require_client_owner(stores: &Stores, org: &OrgRef) -> anyhow::Result<ClientOwner> {
+    Ok(ClientOwner::Org {
+        org_id: org::require(&*stores.orgs, org).await?.org_id,
     })
 }
 
@@ -5383,6 +5440,7 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
             group,
             account_type,
             org,
+            org_name,
             campaigns,
         } => {
             let permissions = group.resolve(permissions);
@@ -5529,21 +5587,40 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
                 user.contact_email.as_str()
             );
             // Only once the record exists, so no membership names a missing id.
-            if let Some(org) = &org {
-                if let Err(write) = stores
-                    .orgs
-                    .set_membership(&user.user_id, Some(org.org_id.clone()))
-                    .await
-                {
-                    return Err(write.context(format!(
-                        "user {} was created but belongs to no organization and holds nothing; \
-                         place it with `users set-org {} {}`, then grant it with `users \
-                         permission set`",
-                        user.user_id, user.user_id, org.slug
-                    )));
+            let (org, permissions) = match org {
+                Some(org) => (org, permissions),
+                None => {
+                    let org = org::create_personal(&*stores.orgs, &user, org_name)
+                        .await
+                        .map_err(|e| {
+                            e.context(format!(
+                                "user {} was created but belongs to no organization and holds \
+                                 nothing; place it with `users set-org {} <org>`, then grant it \
+                                 with `users permission set`",
+                                user.user_id, user.user_id
+                            ))
+                        })?;
+                    println!("Created organization {} ({}).", org.slug, org.display_name);
+                    let permissions = permissions
+                        .into_iter()
+                        .chain(UserPermissionGroup::OrgAdmin.permissions().iter().copied())
+                        .collect();
+                    (org, permissions)
                 }
-                println!("User {} belongs to {}.", user.user_id, org.slug);
+            };
+            if let Err(write) = stores
+                .orgs
+                .set_membership(&user.user_id, Some(org.org_id.clone()))
+                .await
+            {
+                return Err(write.context(format!(
+                    "user {} was created but belongs to no organization and holds nothing; \
+                     place it with `users set-org {} {}`, then grant it with `users \
+                     permission set`",
+                    user.user_id, user.user_id, org.slug
+                )));
             }
+            println!("User {} belongs to {}.", user.user_id, org.slug);
             // Only once the record exists: a grant for a missing id is one
             // `delete` would never reach.
             if !permissions.is_empty() {
@@ -5635,55 +5712,6 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
             }
             Ok(())
         }
-        UserAction::Approve {
-            user_id,
-            permissions,
-            group,
-        } => {
-            let permissions = group.resolve(permissions);
-            let user = require_user(&user_store, &user_id).await?;
-            ensure_holdable(Holder::of(&user), &permissions)?;
-            match user.status {
-                UserStatus::Pending => {
-                    user_store
-                        .put_user(&pipette_core::user::User {
-                            status: UserStatus::Active,
-                            ..user
-                        })
-                        .await?;
-                    tracing::info!(user_id = %user_id, "user approved");
-                    println!("Approved user {user_id} (pending -> active).");
-                }
-                // Not an error: the `--permission` grant below still applies.
-                UserStatus::Active => eprintln!("User {user_id} is already active."),
-                UserStatus::Disabled => anyhow::bail!(
-                    "user {user_id} is disabled, not pending: it was admitted and then \
-                     offboarded. Return it to service with `users enable {user_id}`"
-                ),
-            }
-            if !permissions.is_empty() {
-                let given = permissions.clone();
-                let mutation = user_store
-                    .mutate_user_permissions(&user_id, &move |set| {
-                        let before = set.clone();
-                        set.insert_all(permissions.iter().copied());
-                        *set = set.normalized();
-                        *set != before
-                    })
-                    .await?;
-                if mutation.changed {
-                    tracing::info!(
-                        %user_id,
-                        added = ?log_names(given.iter()),
-                        resulting = ?mutation.resulting.names(),
-                        "user permissions granted"
-                    );
-                }
-                report_user_permissions(&user_id, mutation.changed, &mutation.resulting);
-                report_implied_names(&given, &mutation.resulting);
-            }
-            Ok(())
-        }
         UserAction::SetType {
             user_id,
             account_type,
@@ -5768,44 +5796,9 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
             set_user_status(&user_store, &user_id, UserStatus::Disabled).await
         }
         UserAction::Enable { user_id } => {
-            // Admitting a pending account is `approve`'s decision, not this one.
-            let user = require_user(&user_store, &user_id).await?;
-            if user.status == UserStatus::Pending {
-                anyhow::bail!(
-                    "user {user_id} has never been admitted, so there is nothing to return \
-                     it to. Admit it with `users approve {user_id}`"
-                );
-            }
             set_user_status(&user_store, &user_id, UserStatus::Active).await
         }
-        UserAction::Delete { user_id, detach } => {
-            // Before any detach: a campaign or vault record naming a gone
-            // account reaches only `_any_` holders.
-            refuse_holdings(&stores, &user_id).await?;
-
-            // A device left pointing at a deleted account never resolves again,
-            // and drops out of every organization listing silently.
-            if detach {
-                let cleared = org::detach_devices_of(&*stores.orgs, &user_id).await?;
-                if !cleared.is_empty() {
-                    println!("Detached {} device(s) from {user_id}.", cleared.len());
-                }
-            } else {
-                let owned = org::devices_owned_by(&*stores.orgs, &user_id).await?;
-                if !owned.is_empty() {
-                    anyhow::bail!(
-                        "user {user_id} still owns {} device(s): {}. Clear them with \
-                         `users delete {user_id} --detach`, or reassign each with \
-                         `clients owner set <client_id> --org <org>`",
-                        owned.len(),
-                        joined(&owned, ClientId::as_str)
-                    );
-                }
-            }
-            // Read again: the account is still active, and may have filed or
-            // uploaded since the first read.
-            refuse_holdings(&stores, &user_id).await?;
-
+        UserAction::Delete { user_id } => {
             // Idempotent so a re-run converges; the "no record" line is the only
             // sign of a mistyped id.
             let deleted =
@@ -5849,42 +5842,21 @@ async fn handle_user_action(action: UserAction, stores: Stores) -> anyhow::Resul
             }
             Ok(())
         }
-        UserAction::SetOrg { user_id, org, none } => {
-            let user = require_user(&user_store, &user_id).await?;
-            if none && user.account_type == UserAccountType::Service {
-                anyhow::bail!(
-                    "{user_id} is a service account, which belongs to an organization; move it to another instead"
-                );
-            }
+        UserAction::SetOrg { user_id, org } => {
+            require_user(&user_store, &user_id).await?;
             // Resolved before the write, so a membership names an existing org.
-            let org_id = match (org, none) {
-                (Some(reference), _) => Some(org::require(&*stores.orgs, &reference).await?),
-                (None, true) => None,
-                // Clap refuses this; restated rather than assumed.
-                (None, false) => anyhow::bail!("pass an organization, or --none to clear"),
-            };
-            let before = stores.orgs.get_membership(&user_id).await?;
-            if before == org_id.as_ref().map(|org| org.org_id.clone()) {
+            let org = org::require(&*stores.orgs, &org).await?;
+            if stores.orgs.get_membership(&user_id).await?.as_ref() == Some(&org.org_id) {
                 println!("User {user_id}: no change.");
                 return Ok(());
             }
-            let org_id = org_id.map(refuse_disabled).transpose()?;
+            let org = refuse_disabled(org)?;
             stores
                 .orgs
-                .set_membership(&user_id, org_id.as_ref().map(|org| org.org_id.clone()))
+                .set_membership(&user_id, Some(org.org_id.clone()))
                 .await?;
-            tracing::info!(
-                %user_id,
-                org_id = org_id.as_ref().map(|org| tracing::field::display(&org.org_id)),
-                "user organization set"
-            );
-            match (before, org_id) {
-                (_, Some(org)) => println!("User {user_id} now belongs to {}.", org.slug),
-                (Some(before), None) => {
-                    println!("User {user_id} no longer belongs to {before}.")
-                }
-                (None, None) => println!("User {user_id} belongs to no organization."),
-            }
+            tracing::info!(%user_id, org_id = %org.org_id, "user organization set");
+            println!("User {user_id} now belongs to {}.", org.slug);
             Ok(())
         }
         UserAction::Permission { action } => {
@@ -5918,13 +5890,12 @@ fn render_optional_permissions<S: AsRef<str>>(set: Option<impl IntoIterator<Item
 fn render_user_status(status: &UserStatus) -> &'static str {
     match status {
         UserStatus::Active => "active",
-        UserStatus::Pending => "pending",
         UserStatus::Disabled => "disabled",
     }
 }
 
 /// A whole-record write, sound because every writer of an existing record sets
-/// `status` alone: this, `users approve` and `PATCH /api/v1/users/{user_id}`.
+/// `status` alone: this and `PATCH /api/v1/users/{user_id}`.
 async fn set_user_status(
     user_store: &Arc<dyn UserStore>,
     user_id: &UserId,
@@ -6437,10 +6408,12 @@ async fn handle_client_preauth_action(
             no_permissions,
             org,
             owner_org,
-            owner_user,
             note,
         } => {
-            let default_owner = require_client_owner(stores, owner_org, owner_user).await?;
+            let default_owner = match owner_org {
+                Some(org) => Some(require_client_owner(stores, &org).await?),
+                None => None,
+            };
             let usage = if multi_use {
                 ClientPreauthUsage::MultiUse
             } else {
@@ -7411,6 +7384,10 @@ fn parse_catalog_name(s: &str) -> Result<CatalogName, String> {
     CatalogName::try_new(s.to_owned()).map_err(|error| error.to_string())
 }
 
+fn parse_logo_uri(s: &str) -> Result<LogoUri, String> {
+    LogoUri::try_new(s.to_owned()).map_err(|error| error.to_string())
+}
+
 fn parse_model_format(s: &str) -> Result<ModelFormat, String> {
     s.parse()
         .map_err(|error: strum::ParseError| error.to_string())
@@ -8207,6 +8184,7 @@ async fn handle_client_action(action: ClientAction, stores: Stores) -> anyhow::R
             organization,
             client_details,
             contact_email,
+            name,
         } => {
             let update = client_admin::ClientUpdate {
                 organization: organization
@@ -8221,10 +8199,11 @@ async fn handle_client_action(action: ClientAction, stores: Stores) -> anyhow::R
                     .map(pipette_plan_types::ContactEmail::try_new)
                     .transpose()
                     .map_err(|e| anyhow::anyhow!("--email: {e}"))?,
+                name,
             };
             if update.is_empty() {
                 anyhow::bail!(
-                    "nothing to update: pass at least one of --organization, --details, --email"
+                    "nothing to update: pass at least one of --organization, --details, --email, --name"
                 );
             }
             match client_admin::update(&*client_store, &client_id, update).await? {
@@ -8953,6 +8932,48 @@ mod tests {
             anyhow::bail!("dry run attempted to relabel a member")
         }
 
+        async fn set_family(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _family: Option<&CatalogName>,
+            _actor: Option<&pipette_plan_types::AuditActor>,
+        ) -> anyhow::Result<pipette_store::SetFamilyOutcome> {
+            anyhow::bail!("dry run attempted to set a family")
+        }
+
+        async fn set_family_logo(
+            &self,
+            _scope: &CatalogScope,
+            _family: &CatalogName,
+            _logo_uri: Option<&pipette_plan_types::LogoUri>,
+            _actor: Option<&pipette_plan_types::AuditActor>,
+        ) -> anyhow::Result<pipette_store::SetFamilyLogoOutcome> {
+            anyhow::bail!("dry run attempted to set a family logo")
+        }
+
+        async fn family_logos(
+            &self,
+            _scopes: &[CatalogScope],
+        ) -> anyhow::Result<Vec<pipette_plan_types::FamilyLogoDigest>> {
+            Ok(Vec::new())
+        }
+
+        async fn family_logos_with_digest(
+            &self,
+            _sha256: &pipette_plan_types::Sha256,
+        ) -> anyhow::Result<Vec<pipette_plan_types::FamilyLogo>> {
+            Ok(Vec::new())
+        }
+
+        async fn family_logo_uri_by_digest(
+            &self,
+            _sha256: &Sha256,
+            _scopes: Option<&[CatalogScope]>,
+        ) -> anyhow::Result<Option<LogoUri>> {
+            Ok(None)
+        }
+
         async fn remove_member(
             &self,
             _scope: &CatalogScope,
@@ -9021,6 +9042,15 @@ mod tests {
 
         async fn delete_tombstones_in_org(&self, _org_id: &OrgId) -> anyhow::Result<()> {
             anyhow::bail!("dry run attempted to delete tombstones")
+        }
+        async fn fill_member_size(
+            &self,
+            _scope: &CatalogScope,
+            _name: &CatalogName,
+            _digest: &str,
+            _size_bytes: u64,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("dry run attempted to record a member size")
         }
     }
 
@@ -9531,7 +9561,7 @@ mod tests {
     )]
     // A campaign is created with its first plan, from a document only.
     #[case::campaign_create(
-        &["pipette-mgmt", "campaigns", "create", "Nightly", "--user", NIL_USER_ID, "--plan", "p.toml"],
+        &["pipette-mgmt", "campaigns", "create", "Nightly", "--org", "acme", "--plan", "p.toml"],
         true
     )]
     #[case::campaign_create_dry_run(
@@ -9540,11 +9570,14 @@ mod tests {
         true
     )]
     #[case::campaign_create_without_a_plan(
-        &["pipette-mgmt", "campaigns", "create", "Nightly", "--user", NIL_USER_ID], false
+        &["pipette-mgmt", "campaigns", "create", "Nightly", "--org", "acme"], false
     )]
-    #[case::campaign_create_with_both_owners(
+    #[case::campaign_create_without_an_org(
+        &["pipette-mgmt", "campaigns", "create", "Nightly", "--plan", "p.toml"], false
+    )]
+    #[case::campaign_create_refuses_a_user_owner(
         &["pipette-mgmt", "campaigns", "create", "Nightly", "--user", NIL_USER_ID,
-          "--org", NIL_ORG_ID, "--plan", "p.toml"],
+          "--plan", "p.toml"],
         false
     )]
     // `campaigns variants` lists with no edit, and an edit names its base.
@@ -9600,6 +9633,20 @@ mod tests {
     )]
     #[case::campaign_revise_read_across_limit(
         &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--carry-across-limit"], false
+    )]
+    // `--inherit-failed` goes where `--carry-across-limit` goes.
+    #[case::campaign_variants_edit_inherit_failed(
+        &["pipette-mgmt", "campaigns", "variants", NIL_CAMPAIGN_ID, "--remove", "0",
+          "--base", NIL_PLAN_ID, "--inherit-from", NIL_PLAN_ID, "--inherit-failed"],
+        true
+    )]
+    #[case::campaign_revise_inherit_failed(
+        &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--plan", "p.toml",
+          "--base", NIL_PLAN_ID, "--inherit-from", NIL_PLAN_ID, "--inherit-failed"],
+        true
+    )]
+    #[case::campaign_revise_read_inherit_failed(
+        &["pipette-mgmt", "campaigns", "revise", NIL_CAMPAIGN_ID, "--inherit-failed"], false
     )]
     #[case::campaign_rerun_across_limit(
         &["pipette-mgmt", "campaigns", "rerun", NIL_CAMPAIGN_ID, "--job", NIL_JOB_ID,
@@ -9852,12 +9899,11 @@ mod tests {
     #[case::orgs_benchmarks_list_every(&["pipette-mgmt", "orgs", "benchmarks", "list"], true)]
     #[case::orgs_benchmarks_list_one(&["pipette-mgmt", "orgs", "benchmarks", "list", "acme"], true)]
     #[case::users_set_org(&["pipette-mgmt", "users", "set-org", NIL_USER_ID, "acme"], true)]
-    #[case::users_set_org_none(&["pipette-mgmt", "users", "set-org", NIL_USER_ID, "--none"], true)]
     #[case::users_set_org_needs_a_target(
         &["pipette-mgmt", "users", "set-org", NIL_USER_ID], false
     )]
-    #[case::users_set_org_refuses_both(
-        &["pipette-mgmt", "users", "set-org", NIL_USER_ID, "acme", "--none"], false
+    #[case::users_set_org_never_clears(
+        &["pipette-mgmt", "users", "set-org", NIL_USER_ID, "--none"], false
     )]
     #[case::users_key_list(&["pipette-mgmt", "users", "key", "list", NIL_USER_ID], true)]
     #[case::users_key_revoke(
@@ -9875,34 +9921,17 @@ mod tests {
     #[case::clients_owner_org(
         &["pipette-mgmt", "clients", "owner", "set", "c-one", "--org", "acme"], true
     )]
-    #[case::clients_owner_user(
-        &["pipette-mgmt", "clients", "owner", "set", "c-one", "--user", NIL_USER_ID], true
-    )]
-    #[case::clients_owner_refuses_both(
-        &[
-            "pipette-mgmt", "clients", "owner", "set", "c-one",
-            "--org", "acme", "--user", NIL_USER_ID,
-        ],
-        false
+    #[case::clients_owner_refuses_a_user(
+        &["pipette-mgmt", "clients", "owner", "set", "c-one", "--user", NIL_USER_ID], false
     )]
     #[case::clients_owner_needs_one(
         &["pipette-mgmt", "clients", "owner", "set", "c-one"], false
     )]
-    #[case::clients_owner_user_refuses_an_org_id(
-        &["pipette-mgmt", "clients", "owner", "set", "c-one", "--user", NIL_ORG_ID], false
-    )]
     #[case::clients_preauth_owner_org(
         &["pipette-mgmt", "clients", "preauth", "create", "--owner-org", "acme"], true
     )]
-    #[case::clients_preauth_owner_user(
-        &["pipette-mgmt", "clients", "preauth", "create", "--owner-user", NIL_USER_ID], true
-    )]
-    #[case::clients_preauth_owner_refuses_both(
-        &[
-            "pipette-mgmt", "clients", "preauth", "create",
-            "--owner-org", "acme", "--owner-user", NIL_USER_ID,
-        ],
-        false
+    #[case::clients_preauth_refuses_a_user_owner(
+        &["pipette-mgmt", "clients", "preauth", "create", "--owner-user", NIL_USER_ID], false
     )]
     #[case::clients_preauth_note(
         &["pipette-mgmt", "clients", "preauth", "create", "--note", " laptop "], true
@@ -10161,10 +10190,9 @@ mod tests {
         Ok(ContactEmail::try_new(s)?)
     }
 
-    /// An account owning one resource, uploaded as `POST /api/v1/vault/resources`
-    /// does.
-    async fn vault_stores() -> anyhow::Result<(tempfile::TempDir, Stores, UserId, VaultResourceId)>
-    {
+    /// An account's organization owning one resource, uploaded as `POST
+    /// /api/v1/vault/resources` does.
+    async fn vault_stores() -> anyhow::Result<(tempfile::TempDir, Stores, OrgId, VaultResourceId)> {
         let (dir, stores) = user_stores()?;
         handle_user_action(
             UserAction::Create {
@@ -10174,6 +10202,7 @@ mod tests {
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -10186,14 +10215,22 @@ mod tests {
             .pop()
             .context("the account must exist")?
             .user_id;
-        let owner = VaultOwner::User {
-            user_id: user_id.clone(),
+        let org_id = stores
+            .orgs
+            .get_membership(&user_id)
+            .await?
+            .context("the account must have its personal organization")?;
+        let owner = pipette_core::vault::VaultOwner::Org {
+            org_id: org_id.clone(),
         };
         let resource_id = uploaded_for(&stores, owner).await?;
-        Ok((dir, stores, user_id, resource_id))
+        Ok((dir, stores, org_id, resource_id))
     }
 
-    async fn uploaded_for(stores: &Stores, owner: VaultOwner) -> anyhow::Result<VaultResourceId> {
+    async fn uploaded_for(
+        stores: &Stores,
+        owner: pipette_core::vault::VaultOwner,
+    ) -> anyhow::Result<VaultResourceId> {
         const BLOB: &[u8] = b"GGUF private weights";
         let mut digest = pipette_core::vault::BlobDigest::default();
         digest.update(BLOB);
@@ -10219,15 +10256,14 @@ mod tests {
         Ok(resource.resource_id)
     }
 
-    /// `list --user` narrows to one owner, and an unknown owner is an error.
+    /// `list --org` narrows to one owner, and an unknown owner is an error.
     #[tokio::test]
     async fn vault_list_filters_by_owner() -> anyhow::Result<()> {
-        let (_dir, stores, user_id, _) = vault_stores().await?;
+        let (_dir, stores, org_id, _) = vault_stores().await?;
 
         let refused = handle_vault_action(
             VaultAction::List {
-                user: Some(UserId::mint()),
-                org: None,
+                org: Some(OrgRef::Id(OrgId::mint())),
             },
             stores.clone(),
         )
@@ -10239,8 +10275,7 @@ mod tests {
 
         handle_vault_action(
             VaultAction::List {
-                user: Some(user_id),
-                org: None,
+                org: Some(OrgRef::Id(org_id)),
             },
             stores.clone(),
         )
@@ -10308,99 +10343,6 @@ mod tests {
         let gone = vault_show_lines(&resource, None)?.join("\n");
         assert!(gone.contains("Object state MISSING"), "{gone}");
         handle_vault_action(VaultAction::Show { resource_id }, stores.clone()).await
-    }
-
-    /// A campaign or vault resource each refuse `users delete`, before `--detach`
-    /// clears anything.
-    #[rstest]
-    #[case::the_campaign_last(true)]
-    #[case::the_vault_resource_last(false)]
-    #[tokio::test]
-    async fn deleting_an_account_refuses_its_campaigns_and_vault_resources(
-        #[case] campaign_last: bool,
-    ) -> anyhow::Result<()> {
-        let (_dir, stores, user_id, resource_id) = vault_stores().await?;
-        let campaign = NewCampaign::new(
-            NonEmptyTrimmedString::try_new("nightly")?,
-            CampaignOwner::User {
-                user_id: user_id.clone(),
-            },
-        )
-        .around(
-            PlanId::from_uuid(uuid::Uuid::now_v7()),
-            jiff::Timestamp::now(),
-        );
-        stores.campaigns.put_campaign(&campaign).await?;
-        let device = ClientId::try_new("ev1_laptop")?;
-        stores
-            .orgs
-            .put_ownership(&pipette_core::organization::Ownership {
-                client_id: device.clone(),
-                owner: ClientOwner::User {
-                    user_id: user_id.clone(),
-                },
-            })
-            .await?;
-        let delete = || {
-            handle_user_action(
-                UserAction::Delete {
-                    user_id: user_id.clone(),
-                    detach: true,
-                },
-                stores.clone(),
-            )
-        };
-
-        let refused = delete()
-            .await
-            .err()
-            .context("a campaign and a vault resource must refuse the delete")?
-            .to_string();
-        [
-            campaign.campaign_id.as_str(),
-            resource_id.as_str(),
-            "campaigns owner",
-            "vault delete",
-        ]
-        .into_iter()
-        .for_each(|named| assert!(refused.contains(named), "{named} missing from: {refused}"));
-
-        let drop_campaign = || stores.campaigns.delete_campaign(&campaign.campaign_id);
-        let drop_resource = || {
-            let resource_id = resource_id.clone();
-            handle_vault_action(VaultAction::Delete { resource_id }, stores.clone())
-        };
-        let (left, gone) = if campaign_last {
-            drop_resource().await?;
-            ("campaigns owner", "vault delete")
-        } else {
-            drop_campaign().await?;
-            ("vault delete", "campaigns owner")
-        };
-        let refused = delete()
-            .await
-            .err()
-            .context("either alone must refuse the delete")?
-            .to_string();
-        assert!(
-            refused.contains(left) && !refused.contains(gone),
-            "{refused}"
-        );
-        assert!(stores.users.get_user(&user_id).await?.is_some());
-        assert!(
-            stores.orgs.get_ownership(&device).await?.is_some(),
-            "refused before anything was detached"
-        );
-
-        if campaign_last {
-            drop_campaign().await?;
-        } else {
-            drop_resource().await?;
-        }
-        delete().await?;
-        assert!(stores.users.get_user(&user_id).await?.is_none());
-        assert!(stores.orgs.get_ownership(&device).await?.is_none());
-        Ok(())
     }
 
     #[tokio::test]
@@ -10582,6 +10524,22 @@ mod tests {
         Ok(member)
     }
 
+    /// A device `org` owns directly: what `orgs delete --detach` clears.
+    async fn device_of(stores: &Stores, org: &Organization) -> anyhow::Result<ClientId> {
+        let client = flag_reindex_client("ev1_rack", "aa")?;
+        stores.clients.put_client(&client).await?;
+        stores
+            .orgs
+            .set_ownership(
+                &client.client_id,
+                Some(ClientOwner::Org {
+                    org_id: org.org_id.clone(),
+                }),
+            )
+            .await?;
+        Ok(client.client_id)
+    }
+
     /// The second create of a handle is refused and names its holder.
     #[tokio::test]
     async fn a_second_organization_cannot_take_a_handle() -> anyhow::Result<()> {
@@ -10650,8 +10608,8 @@ mod tests {
             .put_campaign(&Campaign {
                 campaign_id: campaign_id.clone(),
                 name: NonEmptyTrimmedString::try_new("Nightly")?,
-                owner: CampaignOwner::User {
-                    user_id: UserId::mint(),
+                owner: CampaignOwner::Org {
+                    org_id: OrgId::mint(),
                 },
                 current_plan_id: Some(plan_id.clone()),
                 labels: Labels::default(),
@@ -10738,17 +10696,40 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_reserved_handle_is_refused_before_its_claim() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let refused = handle_org_action(
+            OrgAction::Create {
+                slug: slug("GLOBAL")?,
+                name: None,
+                adopt_stranded_claim: false,
+            },
+            reopen(&dir)?,
+        )
+        .await;
+        let message = refused
+            .err()
+            .context("a reserved handle must be refused")?
+            .to_string();
+        assert!(message.contains("is reserved"), "{message}");
+        let stores = reopen(&dir)?;
+        assert!(stores.orgs.lookup_org_by_slug("global").await?.is_none());
+        assert!(stores.orgs.list_orgs().await?.is_empty());
+        Ok(())
+    }
+
     /// The path names no file, so the refusal comes before the document is read.
     #[tokio::test]
     async fn a_dry_run_create_refuses_an_unknown_owner() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let ghost = UserId::try_new(NIL_USER_ID)?;
+        let ghost = OrgId::try_new(NIL_ORG_ID)?;
 
         let refused = handle_campaign_action(
             CampaignAction::Create {
                 name: "Nightly".into(),
-                user: Some(ghost.clone()),
-                org: None,
+                org: OrgRef::Id(ghost.clone()),
                 plan: dir.path().join("absent.toml"),
                 note: None,
                 strict_models: false,
@@ -10815,8 +10796,9 @@ mod tests {
         Ok(())
     }
 
-    /// A delete is refused while anything names the organization; `--detach`
-    /// clears those references and then deletes.
+    /// A delete is refused while anything names the organization. `--detach`
+    /// clears the devices it owns, never a member: an account always belongs
+    /// to an organization.
     #[tokio::test]
     async fn deleting_an_organization_refuses_live_references() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -10824,32 +10806,49 @@ mod tests {
 
         let stores = reopen(&dir)?;
         let member = member_of(&stores, &org).await?;
-
-        let refused = handle_org_action(
-            OrgAction::Delete {
+        let device = device_of(&stores, &org).await?;
+        let delete = |detach| -> anyhow::Result<OrgAction> {
+            Ok(OrgAction::Delete {
                 org: OrgRef::Slug(slug("acme")?),
-                detach: false,
-            },
-            reopen(&dir)?,
-        )
-        .await;
+                detach,
+            })
+        };
+
+        let (delete, tree) = (&delete, &dir);
+        let refusals: Vec<String> = stream::iter([false, true])
+            .then(|detach| async move {
+                let delete = delete(detach)?;
+                anyhow::Ok(
+                    handle_org_action(delete, reopen(tree)?)
+                        .await
+                        .err()
+                        .context("a member must refuse the delete")?
+                        .to_string(),
+                )
+            })
+            .try_collect()
+            .await?;
         assert!(
-            refused
-                .err()
-                .context("a live reference must refuse the delete")?
-                .to_string()
-                .contains("1 member(s)"),
+            refusals
+                .iter()
+                .all(|refused| refused.contains("1 member(s)") && refused.contains("users set-org")),
+            "{refusals:?}"
         );
-        assert!(reopen(&dir)?.orgs.get_org(&org.org_id).await?.is_some());
+        let stores = reopen(&dir)?;
+        assert!(stores.orgs.get_org(&org.org_id).await?.is_some());
+        assert!(
+            stores.orgs.get_ownership(&device).await?.is_some(),
+            "refused before anything was detached"
+        );
 
-        handle_org_action(
-            OrgAction::Delete {
-                org: OrgRef::Slug(slug("acme")?),
-                detach: true,
+        handle_user_action(
+            UserAction::Delete {
+                user_id: member.user_id.clone(),
             },
             reopen(&dir)?,
         )
         .await?;
+        handle_org_action(delete(true)?, reopen(&dir)?).await?;
         let stores = reopen(&dir)?;
         assert!(stores.orgs.get_org(&org.org_id).await?.is_none());
         assert!(
@@ -10857,9 +10856,9 @@ mod tests {
             "the handle is released, so it can be taken again"
         );
         assert_eq!(
-            stores.orgs.get_membership(&member.user_id).await?,
+            stores.orgs.get_ownership(&device).await?,
             None,
-            "the detached member belongs to nothing rather than to a ghost"
+            "the detached device belongs to nothing rather than to a ghost"
         );
         Ok(())
     }
@@ -11134,7 +11133,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             )
             .await
         };
-        let member = member_of(&reopen(&dir)?, &org).await?;
+        let device = device_of(&reopen(&dir)?, &org).await?;
         let id = BenchmarkId::try_new("eval_acme_internal_v3")?;
         if unreadable {
             // A field the current definition no longer takes.
@@ -11171,9 +11170,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         );
         let stores = reopen(&dir)?;
         assert!(stores.orgs.get_org(&org.org_id).await?.is_some());
-        assert_eq!(
-            stores.orgs.get_membership(&member.user_id).await?,
-            Some(org.org_id.clone()),
+        assert!(
+            stores.orgs.get_ownership(&device).await?.is_some(),
             "refused before anything was detached"
         );
 
@@ -11211,7 +11209,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         let dir = tempfile::tempdir()?;
         let org = create_org(&dir, "acme").await?;
         let stores = reopen(&dir)?;
-        let member = member_of(&stores, &org).await?;
+        let device = device_of(&stores, &org).await?;
         let org_id = org.org_id.clone();
         let id = match kept {
             Kept::Campaign => {
@@ -11226,11 +11224,13 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 stores.campaigns.put_campaign(&campaign).await?;
                 campaign.campaign_id.to_string()
             }
-            Kept::VaultResource => uploaded_for(&stores, VaultOwner::Org { org_id })
-                .await?
-                .to_string(),
+            Kept::VaultResource => {
+                uploaded_for(&stores, pipette_core::vault::VaultOwner::Org { org_id })
+                    .await?
+                    .to_string()
+            }
             Kept::PreauthKey => {
-                let minted = preauth_create(Some(OrgRef::Slug(slug("acme")?)), None);
+                let minted = preauth_create(Some(OrgRef::Slug(slug("acme")?)));
                 handle_client_preauth_action(minted, &stores).await?;
                 let keys = stores.clients.list_client_preauth_keys().await?;
                 keys.first().context("the key")?.key_id.to_string()
@@ -11252,9 +11252,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             matches!(order, [Some(first), Some(then)] if first < then),
             "{refused}"
         );
-        assert_eq!(
-            stores.orgs.get_membership(&member.user_id).await?,
-            Some(org.org_id),
+        assert!(
+            stores.orgs.get_ownership(&device).await?.is_some(),
             "refused before anything was detached"
         );
         Ok(())
@@ -11409,7 +11408,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         Ok(())
     }
 
-    /// Clearing takes `--none`, not an absent argument.
     #[tokio::test]
     async fn a_membership_names_an_organization_that_exists() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -11423,8 +11421,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             handle_user_action(
                 UserAction::SetOrg {
                     user_id: user.user_id.clone(),
-                    org: Some(OrgRef::Slug(slug("nobody")?)),
-                    none: false,
+                    org: OrgRef::Slug(slug("nobody")?),
                 },
                 reopen(&dir)?,
             )
@@ -11436,8 +11433,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         handle_user_action(
             UserAction::SetOrg {
                 user_id: user.user_id.clone(),
-                org: Some(OrgRef::Slug(slug("acme")?)),
-                none: false,
+                org: OrgRef::Slug(slug("acme")?),
             },
             reopen(&dir)?,
         )
@@ -11446,47 +11442,22 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             reopen(&dir)?.orgs.get_membership(&user.user_id).await?,
             Some(org.org_id)
         );
-
-        handle_user_action(
-            UserAction::SetOrg {
-                user_id: user.user_id.clone(),
-                org: None,
-                none: true,
-            },
-            reopen(&dir)?,
-        )
-        .await?;
-        assert_eq!(
-            reopen(&dir)?.orgs.get_membership(&user.user_id).await?,
-            None
-        );
         Ok(())
     }
 
     /// An ownership names a record that exists, and clearing leaves the device
     /// owned by nobody: what `org::owning_org` relies on.
-    #[rstest]
-    #[case::missing_org("org")]
-    #[case::missing_user("user")]
     #[tokio::test]
-    async fn an_ownership_names_a_record_that_exists(#[case] kind: &str) -> anyhow::Result<()> {
+    async fn an_ownership_names_a_record_that_exists() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let org = create_org(&dir, "acme").await?;
         let stores = reopen(&dir)?;
         let client = flag_reindex_client("ev1_rack", "aa")?;
         stores.clients.put_client(&client).await?;
 
-        let missing = match kind {
-            "org" => ClientOwnerAction::Set {
-                client_id: client.client_id.clone(),
-                org: Some(OrgRef::Slug(slug("nobody")?)),
-                user: None,
-            },
-            _ => ClientOwnerAction::Set {
-                client_id: client.client_id.clone(),
-                org: None,
-                user: Some(UserId::mint()),
-            },
+        let missing = ClientOwnerAction::Set {
+            client_id: client.client_id.clone(),
+            org: OrgRef::Slug(slug("nobody")?),
         };
         assert!(
             handle_client_owner_action(missing, &reopen(&dir)?)
@@ -11498,8 +11469,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         handle_client_owner_action(
             ClientOwnerAction::Set {
                 client_id: client.client_id.clone(),
-                org: Some(OrgRef::Slug(slug("acme")?)),
-                user: None,
+                org: OrgRef::Slug(slug("acme")?),
             },
             &reopen(&dir)?,
         )
@@ -11525,10 +11495,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         Ok(())
     }
 
-    fn preauth_create(
-        owner_org: Option<OrgRef>,
-        owner_user: Option<UserId>,
-    ) -> ClientPreauthAction {
+    fn preauth_create(owner_org: Option<OrgRef>) -> ClientPreauthAction {
         ClientPreauthAction::Create {
             multi_use: false,
             expires_in: None,
@@ -11538,24 +11505,15 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             no_permissions: false,
             org: None,
             owner_org,
-            owner_user,
             note: None,
         }
     }
 
-    #[rstest]
-    #[case::missing_org("org")]
-    #[case::missing_user("user")]
     #[tokio::test]
-    async fn a_preauth_key_refuses_an_owner_that_does_not_exist(
-        #[case] kind: &str,
-    ) -> anyhow::Result<()> {
+    async fn a_preauth_key_refuses_an_owner_that_does_not_exist() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         create_org(&dir, "acme").await?;
-        let missing = match kind {
-            "org" => preauth_create(Some(OrgRef::Slug(slug("nobody")?)), None),
-            _ => preauth_create(None, Some(UserId::mint())),
-        };
+        let missing = preauth_create(Some(OrgRef::Slug(slug("nobody")?)));
         assert!(
             handle_client_preauth_action(missing, &reopen(&dir)?)
                 .await
@@ -11576,7 +11534,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     #[rstest]
     #[case::org_handle("org_handle")]
     #[case::org_id("org_id")]
-    #[case::user("user")]
     #[tokio::test]
     async fn an_owner_flag_stores_the_record_it_names(
         #[case] spelling: &str,
@@ -11584,41 +11541,16 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         let dir = tempfile::tempdir()?;
         let org = create_org(&dir, "acme").await?;
         let stores = reopen(&dir)?;
-        handle_user_action(
-            UserAction::Create {
-                adopt_stranded_claim: false,
-                email: email("owner@example.test")?,
-                permissions: Vec::new(),
-                group: PermissionGroupFlags::default(),
-                account_type: UserAccountType::Human,
-                org: None,
-                campaigns: Vec::new(),
-            },
-            stores.clone(),
-        )
-        .await?;
-        let user_id = stores
-            .users
-            .list_users()
-            .await?
-            .pop()
-            .context("the account must exist")?
-            .user_id;
 
-        let org_owner = ClientOwner::Org {
+        let expected = ClientOwner::Org {
             org_id: org.org_id.clone(),
         };
-        let (owner_org, owner_user, expected) = match spelling {
-            "org_handle" => (Some(OrgRef::Slug(slug("acme")?)), None, org_owner),
-            "org_id" => (Some(OrgRef::Id(org.org_id.clone())), None, org_owner),
-            _ => (None, Some(user_id.clone()), ClientOwner::User { user_id }),
+        let owner_org = match spelling {
+            "org_handle" => OrgRef::Slug(slug("acme")?),
+            _ => OrgRef::Id(org.org_id.clone()),
         };
 
-        handle_client_preauth_action(
-            preauth_create(owner_org.clone(), owner_user.clone()),
-            &stores,
-        )
-        .await?;
+        handle_client_preauth_action(preauth_create(Some(owner_org.clone())), &stores).await?;
         let keys = stores.clients.list_client_preauth_keys().await?;
         let [key] = keys.as_slice() else {
             anyhow::bail!("one minted key must list as one record, got {}", keys.len());
@@ -11636,7 +11568,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             ClientOwnerAction::Set {
                 client_id: client.client_id.clone(),
                 org: owner_org,
-                user: owner_user,
             },
             &stores,
         )
@@ -11669,7 +11600,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         #[case] permissions: Vec<UserPermission>,
         #[case] expected: Option<serde_json::Value>,
     ) -> anyhow::Result<()> {
-        let (_dir, stores) = user_stores()?;
+        let (dir, stores) = user_stores()?;
+        create_org(&dir, "acme").await?;
         let auth = stores.users.clone();
 
         handle_user_action(
@@ -11679,7 +11611,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 permissions,
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
-                org: None,
+                org: Some(OrgRef::Slug(slug("acme")?)),
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -11699,39 +11632,42 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         Ok(())
     }
 
+    /// With no `--org`, a person's account administers an organization of its own.
     #[tokio::test]
-    async fn approve_admits_a_requested_account_and_grants_with_it() -> anyhow::Result<()> {
+    async fn create_without_an_org_gives_one_of_its_own() -> anyhow::Result<()> {
         let (_dir, stores) = user_stores()?;
         let auth = stores.users.clone();
 
-        // What the keyless `POST /api/v1/users/register` leaves.
-        let requested = pipette_core::user::User::requested(
-            email("asker@example.com")?,
-            jiff::Timestamp::now(),
-        )?;
-        auth.claim_user_email(requested.contact_email.as_str(), &requested.user_id)
-            .await?;
-        auth.put_user(&requested).await?;
-
         handle_user_action(
-            UserAction::Approve {
-                user_id: requested.user_id.clone(),
-                permissions: vec![UserPermission::SubmitPlans],
+            UserAction::Create {
+                adopt_stranded_claim: false,
+                email: email("Op.Lead@example.com")?,
+                permissions: vec![UserPermission::SubmitAnyPlans],
                 group: PermissionGroupFlags::default(),
+                account_type: UserAccountType::Human,
+                org: None,
+                org_name: Some(NonEmptyTrimmedString::try_new("Lead's lab")?),
+                campaigns: Vec::new(),
             },
-            stores,
+            stores.clone(),
         )
         .await?;
 
-        let admitted = auth
-            .get_user(&requested.user_id)
+        let user = auth.list_users().await?.pop().context("the account")?;
+        let org_id = stores
+            .orgs
+            .get_membership(&user.user_id)
             .await?
-            .context("the account must still exist")?;
-        assert_eq!(admitted.status, UserStatus::Active);
-        assert_eq!(
-            auth.get_user_permissions(&requested.user_id).await?,
-            Some(UserPermissionSet::from_iter([UserPermission::SubmitPlans]))
-        );
+            .context("a membership")?;
+        let org = stores.orgs.get_org(&org_id).await?.context("the org")?;
+        assert_eq!(org.slug, OrgSlug::personal(&user.user_id)?);
+        assert_eq!(org.display_name.as_str(), "Lead's lab");
+        let held = auth
+            .get_user_permissions(&user.user_id)
+            .await?
+            .context("a grant")?;
+        assert!(held.holds(UserPermission::ManageOrgs), "{held:?}");
+        assert!(held.holds(UserPermission::SubmitAnyPlans), "{held:?}");
         Ok(())
     }
 
@@ -11750,6 +11686,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             group: PermissionGroupFlags::default(),
             account_type: UserAccountType::Service,
             org,
+            org_name: None,
             campaigns: Vec::new(),
         };
         let refused = handle_user_action(create(None), stores.clone())
@@ -11797,7 +11734,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     enum RefusedMembership {
         CreateIntoDisabled,
         MoveIntoDisabled,
-        ReleaseService,
         RetypeUnaffiliated,
         DetachService,
     }
@@ -11807,9 +11743,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     #[rstest]
     #[case::create_into_disabled(RefusedMembership::CreateIntoDisabled, "is disabled")]
     #[case::move_into_disabled(RefusedMembership::MoveIntoDisabled, "is disabled")]
-    #[case::release_a_service(RefusedMembership::ReleaseService, "move it to another")]
     #[case::retype_the_unaffiliated(RefusedMembership::RetypeUnaffiliated, "`users set-org` first")]
-    #[case::detach_a_service(RefusedMembership::DetachService, "does not release")]
+    #[case::detach_a_service(RefusedMembership::DetachService, "users set-org")]
     #[tokio::test]
     async fn the_host_refuses_a_membership_it_would_not_keep(
         #[case] write: RefusedMembership,
@@ -11829,6 +11764,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type,
                 org,
+                org_name: None,
                 campaigns: Vec::new(),
             })
         };
@@ -11848,18 +11784,9 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             RefusedMembership::MoveIntoDisabled => {
                 let moved = UserAction::SetOrg {
                     user_id: robot.user_id.clone(),
-                    org: Some(closed()?),
-                    none: false,
+                    org: closed()?,
                 };
                 handle_user_action(moved, stores.clone()).await
-            }
-            RefusedMembership::ReleaseService => {
-                let released = UserAction::SetOrg {
-                    user_id: robot.user_id.clone(),
-                    org: None,
-                    none: true,
-                };
-                handle_user_action(released, stores.clone()).await
             }
             RefusedMembership::RetypeUnaffiliated => {
                 let retyped = UserAction::SetType {
@@ -11956,6 +11883,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                     group: PermissionGroupFlags::default(),
                     account_type,
                     org: Some(OrgRef::Slug(slug("acme")?)),
+                    org_name: None,
                     campaigns,
                 })
             };
@@ -12028,6 +11956,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             group: PermissionGroupFlags::default(),
             account_type: UserAccountType::Service,
             org: Some(acme.clone()),
+            org_name: None,
             campaigns: Vec::new(),
         };
         let refused = handle_user_action(create(vec![UserPermission::ManageOrgs]), stores.clone())
@@ -12059,16 +11988,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         )
         .await;
         assert!(set.is_err());
-        let approve = handle_user_action(
-            UserAction::Approve {
-                user_id: robot.user_id.clone(),
-                permissions: vec![UserPermission::ManageClients],
-                group: PermissionGroupFlags::default(),
-            },
-            stores.clone(),
-        )
-        .await;
-        assert!(approve.is_err());
         assert_eq!(auth.get_user_permissions(&robot.user_id).await?, None);
 
         handle_user_action(
@@ -12106,71 +12025,12 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
         Ok(())
     }
 
-    /// `approve` and `enable` each refuse the other's account by name.
-    #[rstest]
-    #[case::approve_refuses_a_disabled_account(
-        UserStatus::Disabled,
-        true,
-        "admitted and then offboarded. Return it to service with `users enable"
-    )]
-    #[case::enable_refuses_a_pending_account(
-        UserStatus::Pending,
-        false,
-        "nothing to return it to. Admit it with `users approve"
-    )]
-    #[tokio::test]
-    async fn the_admission_verbs_do_not_stand_in_for_each_other(
-        #[case] status: UserStatus,
-        #[case] approve: bool,
-        #[case] expected: &str,
-    ) -> anyhow::Result<()> {
-        let (_dir, stores) = user_stores()?;
-        let auth = stores.users.clone();
-
-        let user = pipette_core::user::User {
-            status,
-            ..pipette_core::user::User::try_new(email("op@example.com")?, jiff::Timestamp::now())?
-        };
-        auth.claim_user_email(user.contact_email.as_str(), &user.user_id)
-            .await?;
-        auth.put_user(&user).await?;
-
-        let action = if approve {
-            UserAction::Approve {
-                user_id: user.user_id.clone(),
-                permissions: Vec::new(),
-                group: PermissionGroupFlags::default(),
-            }
-        } else {
-            UserAction::Enable {
-                user_id: user.user_id.clone(),
-            }
-        };
-        let refused = handle_user_action(action, stores)
-            .await
-            .err()
-            .context("the wrong verb must be refused")?;
-
-        assert!(
-            refused.to_string().contains(expected),
-            "the refusal must name the verb that makes this decision: {refused}"
-        );
-        assert_eq!(
-            auth.get_user(&user.user_id)
-                .await?
-                .context("the account must still exist")?
-                .status,
-            status,
-            "a refused verb must not write the status anyway"
-        );
-        Ok(())
-    }
-
     /// Adopting a claim a stopped `delete` left must not hand the new account
     /// anything of the dead one.
     #[tokio::test]
     async fn adopting_a_claim_inherits_nothing_of_the_stranded_account() -> anyhow::Result<()> {
-        let (_dir, stores) = user_stores()?;
+        let (dir, stores) = user_stores()?;
+        let acme = create_org(&dir, "acme").await?;
         let auth = stores.users.clone();
 
         let stranded = UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?;
@@ -12215,7 +12075,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 permissions: Vec::new(),
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
-                org: None,
+                org: Some(OrgRef::Slug(slug("acme")?)),
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12240,7 +12101,11 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             .map(|key| key.key_id)
             .collect();
         assert_eq!(left, vec![other.key.key_id]);
-        assert_eq!(stores.orgs.get_membership(&stranded).await?, None);
+        assert_eq!(
+            stores.orgs.get_membership(&stranded).await?,
+            Some(acme.org_id),
+            "the stranded membership gave way to the one this create names"
+        );
         assert_eq!(auth.get_user_first_clerk_sign_in(&stranded).await?, None);
         Ok(())
     }
@@ -12280,6 +12145,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: Some(OrgRef::Slug(slug("acme")?)),
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12317,6 +12183,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12333,6 +12200,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -12367,6 +12235,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12386,6 +12255,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -12420,6 +12290,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12434,7 +12305,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
         handle_user_action(
             UserAction::Delete {
-                detach: false,
                 user_id: user_id.clone(),
             },
             stores,
@@ -12462,6 +12332,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12507,6 +12378,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12522,7 +12394,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
         handle_user_action(
             UserAction::Delete {
-                detach: false,
                 user_id: user_id.clone(),
             },
             stores.clone(),
@@ -12737,6 +12608,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 public_key,
                 organization: pipette_plan_types::NonEmptyTrimmedString::try_new("org")?,
                 client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("d")?,
+                name: None,
                 contact_email: ContactEmail::try_new("d@example.com")?,
                 status: pipette_core::client::ClientStatus::Approved,
                 registered_at: jiff::Timestamp::now(),
@@ -12786,6 +12658,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12819,7 +12692,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
         handle_user_action(
             UserAction::Delete {
-                detach: false,
                 user_id: UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
             },
             stores.clone(),
@@ -12851,6 +12723,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -12879,6 +12752,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores.clone(),
@@ -12892,7 +12766,6 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
 
         handle_user_action(
             UserAction::Delete {
-                detach: false,
                 user_id: user_id.clone(),
             },
             stores,
@@ -12965,6 +12838,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             ))?,
             organization: NonEmptyTrimmedString::try_new("org")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
             registered_at: jiff::Timestamp::now(),
@@ -13649,6 +13523,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -13755,6 +13630,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
                 group: PermissionGroupFlags::default(),
                 account_type: UserAccountType::Human,
                 org: None,
+                org_name: None,
                 campaigns: Vec::new(),
             },
             stores,
@@ -14061,5 +13937,40 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Each usage line lists the positional arguments in the order that the
+    /// command parses them. Clap puts a required group first, so a command
+    /// whose group holds a positional argument needs `override_usage`.
+    #[test]
+    fn usage_lists_positional_arguments_in_order() {
+        fn misordered(command: &mut clap::Command, path: &str, found: &mut Vec<String>) {
+            let path = format!("{path} {}", command.get_name());
+            let usage = command.render_usage().to_string();
+            let places: Vec<Option<usize>> = command
+                .get_positionals()
+                .map(|arg| {
+                    let name = arg
+                        .get_value_names()
+                        .and_then(|names| names.first())
+                        .map_or_else(|| arg.get_id().as_str().to_uppercase(), ToString::to_string);
+                    ["<", "[", "|"]
+                        .iter()
+                        .filter_map(|open| usage.find(&format!("{open}{name}")))
+                        .min()
+                })
+                .collect();
+            if places.iter().any(Option::is_none) || !places.is_sorted() {
+                found.push(format!("{path}: {usage}"));
+            }
+            for sub in command.get_subcommands_mut() {
+                misordered(sub, &path, found);
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut found = Vec::new();
+        misordered(&mut command, "", &mut found);
+        assert!(found.is_empty(), "{found:#?}");
     }
 }

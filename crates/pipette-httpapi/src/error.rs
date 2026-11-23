@@ -175,6 +175,7 @@ bad_request_from!(
     pipette_plan_types::PublicKeyHexError,
     pipette_plan_types::TagError,
     pipette_plan_types::PrincipalIdError,
+    pipette_plan_types::ReservedOrgSlugError,
 );
 
 /// An ingest failure splits by audience. A HuggingFace failure's body is the
@@ -190,6 +191,31 @@ impl From<pipette_pipeline::plan_ingestion::IngestError> for AppError {
             IngestError::Upstream { .. } => AppError::BadGateway(e.to_string()),
             // The log keeps the whole `anyhow` chain; `message()` withholds it.
             IngestError::Other(e) => AppError::internal(e),
+        }
+    }
+}
+
+impl From<pipette_pipeline::model_replacement::ReplaceModelError> for AppError {
+    fn from(e: pipette_pipeline::model_replacement::ReplaceModelError) -> Self {
+        use pipette_pipeline::hf_import::HubError;
+        use pipette_pipeline::model_replacement::ReplaceModelError;
+        match e {
+            ReplaceModelError::Hub(HubError::RateLimited { .. }) => {
+                AppError::TooManyRequests(e.to_string())
+            }
+            ReplaceModelError::Hub(_) => AppError::BadGateway(e.to_string()),
+            ReplaceModelError::Store(e) => {
+                AppError::internal(e.context("reading a vault record for replace_model"))
+            }
+            e @ (ReplaceModelError::Repeated(_)
+            | ReplaceModelError::Same(_)
+            | ReplaceModelError::NoOld(_)
+            | ReplaceModelError::NoNew(_)
+            | ReplaceModelError::Ambiguous(_)
+            | ReplaceModelError::Token(_)
+            | ReplaceModelError::OtherType { .. }
+            | ReplaceModelError::OtherFiles { .. }
+            | ReplaceModelError::Differ { .. }) => AppError::BadRequest(e.to_string()),
         }
     }
 }
@@ -243,9 +269,7 @@ impl From<pipette_pipeline::campaign_admin::CampaignAdminError> for AppError {
             | CampaignAdminError::NoSuchPlan(_)
             | CampaignAdminError::NotInCampaign { .. }
             | CampaignAdminError::NoTagStore => AppError::NotFound(message),
-            CampaignAdminError::NoSuchUser(_)
-            | CampaignAdminError::NoSuchOrg(_)
-            | CampaignAdminError::NoOwnerNamed
+            CampaignAdminError::NoSuchOrg(_)
             | CampaignAdminError::NothingToRerun
             | CampaignAdminError::RerunAndFail(_)
             | CampaignAdminError::NoSuchSourceVariant { .. }
@@ -295,9 +319,9 @@ impl From<pipette_pipeline::org_catalog::OrgCatalogError> for AppError {
         let message = error.to_string();
         match error {
             OrgCatalogError::NotFound { .. } => AppError::NotFound(message),
-            OrgCatalogError::MisleadingPrefix { .. } | OrgCatalogError::UnsafeSampleName(_) => {
-                AppError::BadRequest(message)
-            }
+            OrgCatalogError::MisleadingPrefix { .. }
+            | OrgCatalogError::UnsafeSampleName(_)
+            | OrgCatalogError::PrivateSession(_) => AppError::BadRequest(message),
             OrgCatalogError::ShadowsPublic(_)
             | OrgCatalogError::HeldElsewhere(_)
             | OrgCatalogError::DatasetHeldElsewhere(_)
@@ -316,9 +340,7 @@ impl From<pipette_pipeline::vault_admin::VaultAdminError> for AppError {
         let message = error.to_string();
         match error {
             VaultAdminError::NotFound(_) => AppError::NotFound(message),
-            VaultAdminError::NoSuchUser(_)
-            | VaultAdminError::NoSuchOrg(_)
-            | VaultAdminError::NoOwnerNamed
+            VaultAdminError::NoSuchOrg(_)
             | VaultAdminError::DigestMismatch { .. }
             | VaultAdminError::NoBlob { .. }
             | VaultAdminError::NotA { .. } => AppError::BadRequest(message),

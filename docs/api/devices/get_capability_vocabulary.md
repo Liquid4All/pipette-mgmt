@@ -26,7 +26,7 @@ set a job's clauses test.
 |-----------|------|-------------|
 | `status` | string | Report over the clients of one status alone: `approved` or `pending`. Absent or empty means every status. An unknown value is a `400` |
 
-## Response `200 OK`
+## Response
 
 The body is `CapabilityVocabulary`: flags grouped by namespace, the token
 before a flag's first `:`, each with how many clients carry it, and the flags

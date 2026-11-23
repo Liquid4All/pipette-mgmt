@@ -71,6 +71,13 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
                 )?
             };
             state.plan_store.clone().put_plan(&manifest).await?;
+            // The run can skip a closed plan that no queued job names.
+            let closed = sample_manifest(
+                PlanId::from_uuid(uuid::Uuid::from_u128(1)),
+                PlanStatus::Complete,
+                false,
+            )?;
+            state.plan_store.clone().put_plan(&closed).await?;
             run_qm(state).await?;
             run_qm(state).await?;
             anyhow::Ok(true)
@@ -94,7 +101,9 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
             "queue_passes_ms=",
             "reconcile_plans_ms=",
             "plan_index_gc_ms=",
-            "plans=1",
+            "plans_full=1",
+            "plans_summary=0",
+            "peak_rss_kib=",
             "plans_reconciled=1",
             probes,
             "count_jobs_ms=",
@@ -146,6 +155,7 @@ fn a_run_logs_its_summary() -> anyhow::Result<()> {
                     "wait_ms=0",
                     "bodies_decoded=0",
                     "cpu_ms=",
+                    "peak_rss_kib=",
                 ],
             );
         });

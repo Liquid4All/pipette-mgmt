@@ -1,10 +1,7 @@
 # `GET /api/v1/plans`
 
 List the plans the caller may read in ascending plan-key order, or newest first
-under `order=newest`. A **user** route: it gates on
-`read_plans`, which is grantable to a user alone
-([the vocabulary](../users.md#permissions)), so a client
-presenting an `ev1_…` is refused at the header rather than at the permission.
+under `order=newest`.
 
 ## Query parameters
 
@@ -19,7 +16,7 @@ presenting an `ev1_…` is refused at the header rather than at the permission.
 | `names` | `true` adds `names`, each submitter of the plans served by its address ([names](../../httpapi.md#14-names)). A `submitted_by` filter outside the scope names nobody |
 
 Under `scope=mine` a plan filed into a campaign is the caller's when the caller
-reads that campaign: one the caller owns, or one its organization owns. Whoever
+reads that campaign: one its organization owns. Whoever
 filed the plan does not matter, and a deleted campaign's plans are nobody's. A
 plan filed outside every campaign is the caller's when its `submitted_by`
 equals the caller's `user_id`. One that names **no** submitter (one a client

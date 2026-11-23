@@ -18,8 +18,8 @@ use pipette_pipeline::org::OrgLookupError;
 use pipette_pipeline::user_admin;
 use pipette_pipeline::user_admin::Provisioned;
 use pipette_plan_types::{
-    AuditAction, AuditActor, AuditTarget, ContactEmail, FirstClerkSignIn, OrgStatus,
-    RegisterClerkUserKeyRequest, UserAccountType, UserId, UserKeyId, UserKeyRegistered,
+    AuditAction, AuditActor, AuditTarget, ContactEmail, FirstClerkSignIn, NonEmptyTrimmedString,
+    OrgStatus, RegisterClerkUserKeyRequest, UserAccountType, UserId, UserKeyId, UserKeyRegistered,
 };
 
 use crate::api_v1::users::own::register_key;
@@ -43,7 +43,7 @@ pub async fn register_clerk_key(
     headers: HeaderMap,
     ApiJson(body): ApiJson<RegisterClerkUserKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = clerk_account(&state, &audit, &headers).await?;
+    let user = clerk_account(&state, &audit, &headers, body.org_name).await?;
     let expires_at = Timestamp::now() + CLERK_KEY_LIFETIME;
     let key = register_key(
         &state,
@@ -120,12 +120,13 @@ async fn record_first_sign_in(
     Ok(())
 }
 
-/// The active account the request's Clerk token names, created first when a
-/// provision rule covers the address. Spends the token.
+/// The active account the request's Clerk token names, created first on its
+/// first sign-in from an allowed domain. Spends the token.
 async fn clerk_account(
     state: &AppState,
     audit: &Audit,
     headers: &HeaderMap,
+    org_name: Option<NonEmptyTrimmedString>,
 ) -> Result<User, AppError> {
     let clerk = state
         .clerk
@@ -150,7 +151,7 @@ async fn clerk_account(
         )));
     }
 
-    let user = account(state, audit, clerk, email).await?;
+    let user = account(state, audit, clerk, email, org_name).await?;
     // Named now: the writes below, and provisioning before them, stand.
     audit
         .involve(
@@ -178,12 +179,15 @@ async fn clerk_account(
     Ok(user)
 }
 
-/// The account holding `email`, or the one its provision rule creates.
+/// The account holding `email`, or the one sign-in creates: a member of its
+/// provision rule's organization, else, at a listed domain, the administrator
+/// of an organization of its own, named `org_name` when given.
 async fn account(
     state: &AppState,
     audit: &Audit,
     clerk: &ClerkSignIn,
     email: ContactEmail,
+    org_name: Option<NonEmptyTrimmedString>,
 ) -> Result<User, AppError> {
     if let Some(holder) = state
         .user_store
@@ -195,11 +199,27 @@ async fn account(
     }
 
     let Some(rule) = clerk.provision_rule(&email) else {
-        tracing::warn!("refused: no account holds the address a Clerk token names");
-        return Err(AppError::Forbidden(format!(
-            "no account holds {}; ask an operator to create one",
-            email.as_str()
-        )));
+        if !clerk.creates_personal(&email) {
+            tracing::warn!("refused: no account holds the address a Clerk token names");
+            return Err(AppError::Forbidden(format!(
+                "no account holds {}; ask an operator to create one",
+                email.as_str()
+            )));
+        }
+        let provisioned =
+            user_admin::provision_personal(&*state.user_store, &*state.org_store, email, org_name)
+                .await
+                .map_err(AppError::internal)?;
+        if let Provisioned::Created(user) = &provisioned
+            && let Some(org_id) = state
+                .org_store
+                .get_membership(&user.user_id)
+                .await
+                .map_err(AppError::internal)?
+        {
+            audit.involve(state, [AuditTarget::Org { org_id }]).await;
+        }
+        return created_or_holder(state, provisioned).await;
     };
     let org = org::require(&*state.org_store, &rule.org)
         .await
@@ -227,16 +247,22 @@ async fn account(
             }],
         )
         .await;
-    match user_admin::provision(
+    let user = User::try_new(email, Timestamp::now())
+        .map_err(|e| AppError::Internal(format!("a verified address made no account: {e}")))?;
+    let provisioned = user_admin::provision(
         &*state.user_store,
         &*state.org_store,
-        email,
+        user,
         &org.org_id,
         UserPermissionGroup::OrgMember.permissions(),
     )
     .await
-    .map_err(AppError::internal)?
-    {
+    .map_err(AppError::internal)?;
+    created_or_holder(state, provisioned).await
+}
+
+async fn created_or_holder(state: &AppState, provisioned: Provisioned) -> Result<User, AppError> {
+    match provisioned {
         Provisioned::Created(user) => Ok(user),
         // A sign-in racing this one claimed the address first.
         Provisioned::Taken(holder) => holder_record(state, &holder).await,

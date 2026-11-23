@@ -58,5 +58,4 @@ the token is shown**: only its `sha256` is stored, and the answer carries
 | 201 | `UserPreauthKeyMinted`, the key and its token, shown this once |
 | 400 | An unknown field, `expires_in_days` outside 1 to 90, or a `note` longer than 4096 characters |
 | 403 | The caller does not hold `manage_orgs`; or the account holds a name the caller does not, or one this build does not know; or the account is a campaign reader reading a campaign whose plans the caller does not; or, for a scoped caller, the account holds a server-wide name it lacks ([the rules that make delegation safe](../users.md#the-rules-that-make-delegation-safe)) |
-| 404 | The account is outside the caller's scope or does not exist |
 | 409 | A person's account that somebody has signed in as, that predates the record of first sign-ins, or that already holds a key |

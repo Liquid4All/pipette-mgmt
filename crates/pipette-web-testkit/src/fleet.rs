@@ -61,6 +61,7 @@ async fn seed_filter_fleet(state: &AppState) -> anyhow::Result<()> {
             public_key: PublicKeyHex::try_new(format!("{index:064x}"))?,
             organization: NonEmptyTrimmedString::try_new("test-org")?,
             client_details: NonEmptyTrimmedString::try_new("test")?,
+            name: None,
             contact_email: ContactEmail::try_new("operator@example.com")?,
             status,
             registered_at: jiff::Timestamp::now(),

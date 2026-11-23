@@ -92,9 +92,9 @@ export async function agentSigner(match = "", socket = process.env.SSH_AUTH_SOCK
   };
 }
 
-/** The signer PIPETTE_KEY names (see the header); `fallback` when it is unset. */
-export async function signerFromEnv(fallback?: string): Promise<Signer> {
-  const source = process.env.PIPETTE_KEY || fallback;
+/** The signer PIPETTE_KEY names (see the header). */
+export async function signerFromEnv(): Promise<Signer> {
+  const source = process.env.PIPETTE_KEY;
   if (!source) throw new Error("set PIPETTE_KEY to an op:// reference, agent[:<match>], or a key file");
   if (source.startsWith("op://")) return onePasswordSigner(source);
   if (source === "agent" || source.startsWith("agent:")) return agentSigner(source.slice("agent:".length));

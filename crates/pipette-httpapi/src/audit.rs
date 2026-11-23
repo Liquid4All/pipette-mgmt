@@ -556,6 +556,8 @@ mod tests {
                 | AuditAction::CatalogRename { .. }
                 | AuditAction::CatalogMerge { .. }
                 | AuditAction::CatalogRemoveMember { .. }
+                | AuditAction::CatalogSetFamily { .. }
+                | AuditAction::CatalogSetFamilyLogo { .. }
                 | AuditAction::CatalogMoveToGlobal { .. }
                 | AuditAction::GroupPolicy { .. } => (event.outcome, 0),
             })

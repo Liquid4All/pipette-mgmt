@@ -3,13 +3,13 @@
   // text box per text filter, applied once the typing rests, the server's
   // filters, applied on change, and a multi-select per select, applied at once,
   // each from the first row, then how many rows they keep and the way back to all.
-  // They live in the address, or where `onchange` is given, in the page.
+  // They live in the address.
   import { redirect } from "../route.svelte";
   import { cleared, filtering, rowCount, toggledIn, type Choice, type TableSpec, type TableState } from "../table";
   import { Typing } from "../typing";
   import MultiSelect from "./MultiSelect.svelte";
 
-  let { spec, state, choices, kept, total, noun, link, onchange }: {
+  let { spec, state, choices, kept, total, noun, link }: {
     spec: TableSpec<R>;
     state: TableState;
     choices: Record<string, Choice[]>;
@@ -18,12 +18,10 @@
     /** What a row is, plural: "campaigns". */
     noun: string;
     /** The listing's address under a state, from its first row. */
-    link?: (state: TableState) => string;
-    /** A state the page keeps, for a table that shares its address with another. */
-    onchange?: (state: TableState) => void;
+    link: (state: TableState) => string;
   } = $props();
 
-  const apply = (to: TableState) => (onchange ? onchange(to) : redirect(link!(to)));
+  const apply = (to: TableState) => redirect(link(to));
   // Read when it applies, so two boxes typed in turn both hold.
   const typed = (key: string, value: string) => apply({ ...state, texts: { ...state.texts, [key]: value } });
   const typing = new Typing();
@@ -52,14 +50,13 @@
       {/if}</label>
   {/each}
   {#each spec.choices ?? [] as { key, label } (key)}
-    <!-- A select with nothing to offer is left out; a choice the address holds is always offered. -->
-    {#if choices[key]?.length}
+    <!-- Drawn even when the other filters empty its list. -->
+    {#if choices[key]}
       <MultiSelect {label} options={choices[key] ?? []} chosen={state.choices[key] ?? []} toggle={toggle(key)} />
     {/if}
   {/each}
   <span class="muted count">{rowCount(kept, total, noun)}
-    {#if filtering(state)}{#if link}<a href={link(cleared(state))}>Clear filters</a>{:else}<button type="button"
-      class="again" onclick={() => apply(cleared(state))}>Clear filters</button>{/if}{/if}</span>
+    {#if filtering(state)}<a href={link(cleared(state))}>Clear filters</a>{/if}</span>
 </div>
 
 <style>
@@ -67,5 +64,5 @@
   /* Not `wide`: that global class is a table wrapper's, with margins of its own. */
   .filters input.long { width: 26em; }
   .count { margin-left: auto; align-self: center; }
-  .count a, .count button { margin-left: 8px; }
+  .count a { margin-left: 8px; }
 </style>

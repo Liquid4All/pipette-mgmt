@@ -128,4 +128,3 @@ rows of a vault run, but not on its planned cell.
 | 400 | `plan_id` in the path contains characters outside `[A-Za-z0-9-]`; a `limit` or `offset` that is not a non-negative integer; or a `results` or `all` that is not a boolean |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | Caller holds neither `read_plans` nor `read_any_plans` |
-| 404 | No such plan, **or** a plan the caller's scope does not admit ([one `404` for both](get_plan.md#one-404-for-both)) |

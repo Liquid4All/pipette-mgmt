@@ -37,12 +37,7 @@ export function orgBranches<O extends { org_id: string }>(own: O | null, others:
 }
 
 /** The reader's own leaves under **Me**. */
-export const meLeaves = (reads: Reads): Leaf[] => [
-  { label: "Campaigns", href: "/app/me/campaigns" },
-  { label: "Vault", href: "/app/me/vault" },
-  ...(reads.fleet ? [{ label: "Devices", href: "/app/me/devices" }] : []),
-  { label: "Account", href: "/app/account" },
-];
+export const ME_LEAVES: Leaf[] = [{ label: "Account", href: "/app/account" }];
 
 /** An open organization's leaves, each its own address. */
 export function orgLeaves(org: { slug: string; org_id: string }, reads: Reads): Leaf[] {

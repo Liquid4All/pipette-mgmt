@@ -51,8 +51,7 @@ async fn onboarding_org(
 }
 
 /// The store keys pre-auth keys by id alone, so this reads the operator-sized
-/// keyspace. A key naming a member rather than the organization is that
-/// member's, and is not here.
+/// keyspace.
 async fn naming(state: &AppState, org_id: &OrgId) -> Result<Vec<ClientPreauthKey>, AppError> {
     Ok(state
         .client_store
@@ -60,7 +59,7 @@ async fn naming(state: &AppState, org_id: &OrgId) -> Result<Vec<ClientPreauthKey
         .await
         .map_err(|e| AppError::internal(e.context("failed to list the pre-auth keys")))?
         .into_iter()
-        .filter(|key| key.default_owner.as_ref().and_then(ClientOwner::org_id) == Some(org_id))
+        .filter(|key| key.default_owner.as_ref().map(ClientOwner::org_id) == Some(org_id))
         .collect())
 }
 
@@ -181,7 +180,7 @@ pub async fn admit_delegated(
     };
     // Every key minted here names an organization, so one that does not was
     // not minted here.
-    let Some(org_id) = owner.and_then(ClientOwner::org_id) else {
+    let Some(org_id) = owner.map(ClientOwner::org_id) else {
         return Err(refused("the key names no organization"));
     };
     if !scope.may_assign_to(Some(org_id)) {

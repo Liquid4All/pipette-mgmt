@@ -21,15 +21,12 @@
   const uid = $props.id();
   const reader = $derived(session.account!);
   const refusal = $derived(newCampaignRefusal(reader));
-  const owners = $derived(newCampaignOwners(reader));
-  // The listing the page was opened from, which its crumbs lead back to.
-  const opened = chosenOwner(newCampaignOwners(session.account!), here.query.get("owner"));
-  const under = $derived(ownerBranch(reader, opened ? { type: "org", org_id: opened }
-    : { type: "user", user_id: reader.user_id }, session.known, CAMPAIGN_PAGES));
+  // The organization the page was opened from, else the reader's own: the owner, whose listing the crumbs lead back to.
+  const owner = chosenOwner(newCampaignOwners(session.account!), here.query.get("owner"));
+  const under = $derived(ownerBranch({ type: "org", org_id: owner }, session.known, CAMPAIGN_PAGES));
   $effect(() => { here.under = refusal ? null : under.href; });
 
   let name = $state("");
-  let owner = $state(opened);
   let note = $state("");
   let text = $state("");
   /** Whether the name's problem shows: once something typed there is left, or a create is refused for it. */
@@ -87,13 +84,6 @@
              aria-invalid={!!nameIssue || undefined} aria-describedby="{uid}-name">
     </label>
     <div id="{uid}-name" class="hint err" role="status" hidden={!nameIssue}>{nameIssue}</div>
-    {#if owners.length > 1}
-      <label><span>owner</span>
-        <select bind:value={owner}>
-          {#each owners as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
-        </select>
-      </label>
-    {/if}
     <PlanEditor bind:text confirm={(asked) => confirm?.ask(asked)} verb="create"
                 examples={PLAN_EXAMPLES} required={submitted} locked={work.busy} bind:this={editor} />
     <label><span>note (optional)</span>

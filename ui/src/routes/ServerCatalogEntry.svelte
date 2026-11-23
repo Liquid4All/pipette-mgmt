@@ -2,7 +2,8 @@
   // Read the entry selected by the address and show controls for a live, editable org entry.
   import { catalogEntry, descriptorNamesByDigest } from "../lib/api";
   import type { DescriptorDigestNames, DescriptorEntryListRow } from "../lib/api-types";
-  import { digestBatches } from "../lib/catalog-entry";
+  import { LOGO_URI_PREFIX, digestBatches } from "../lib/catalog-entry";
+  import { familyLogo } from "../lib/family-logos";
   import {
     ANY_DEVICE_LABEL, anyDeviceText, catalogPath, catalogSynonyms, mayEdit, memberLabel, modelMemberRows,
     parameterText, scopeLabel, sharedParameters, type CatalogSynonym,
@@ -20,7 +21,11 @@
   import { session } from "../lib/session.svelte";
 
   let { route }: { route: RouteOf<"server-catalog-entry"> } = $props();
-  interface Detail { entry: DescriptorEntryListRow | null; synonyms: CatalogSynonym[] | null }
+  interface Detail {
+    entry: DescriptorEntryListRow | null;
+    synonyms: CatalogSynonym[] | null;
+    logo: Promise<string | null> | null;
+  }
   const read = new Loader<Detail>();
   let controls = $state<ReturnType<typeof CatalogEntryControls>>();
   $effect(() => { here.under = catalogPath; });
@@ -28,16 +33,17 @@
   const load = (keep = false) => read.run(async () => {
     const found = await catalogEntry(session.signer, route.name, session.account?.may.read_fleet ?? false);
     const entry = found.entries[0] ?? null;
-    if (!entry) return { entry: null, synonyms: [] };
+    if (!entry) return { entry: null, synonyms: [], logo: null };
+    const logo = entry.family_logo_sha256 ? familyLogo(entry.family_logo_sha256) : null;
     const batches = digestBatches((entry.members ?? []).map((member) => member.digest));
     let answers: DescriptorDigestNames[];
     try {
       answers = await Promise.all(batches.map((digests) => descriptorNamesByDigest(session.signer, digests)));
     } catch {
-      return { entry, synonyms: null };
+      return { entry, synonyms: null, logo };
     }
     const names: DescriptorDigestNames = { names: Object.assign({}, ...answers.map((answer) => answer.names)) };
-    return { entry, synonyms: catalogSynonyms(entry, names, (hit) => scopeLabel(hit, session.account)) };
+    return { entry, synonyms: catalogSynonyms(entry, names, (hit) => scopeLabel(hit, session.account)), logo };
   }, keep);
   void load();
   const listPath = $derived(read.data?.entry?.descriptor_kind === "model" ? `${catalogPath}?kind=model` : catalogPath);
@@ -60,6 +66,23 @@
         <div><dt>release time</dt><dd>{when(entry.release_time)}</dd></div>
         <div><dt>created</dt><dd>{when(entry.created_at)} by {entry.created_by}</dd></div>
         <div><dt>{model ? "model type" : "runtime type"}</dt><dd>{entry.descriptor_types.join(", ")}</dd></div>
+        {#if model}
+          <div><dt>family</dt><dd>{entry.family ?? "—"}</dd></div>
+          <div><dt>family logo</dt><dd>
+            {#if detail.logo}
+              {#await detail.logo}
+                <span class="muted">Loading…</span>
+              {:then logo}
+                {#if logo}
+                  <img class="logo" src={logo} alt="" />
+                  {#if logo.startsWith(LOGO_URI_PREFIX)}
+                    <a href={logo}><code>{logo}</code></a>
+                  {:else}<span class="muted">embedded image</span>{/if}
+                {:else}<span class="muted">unreadable</span>{/if}
+              {/await}
+            {:else}—{/if}
+          </dd></div>
+        {/if}
         {#if shared}
           <div><dt>parameters</dt><dd>{parameterText(shared.parameters)}
             <span class="muted">(<code>{shared.model_key}</code>)</span></dd></div>
@@ -159,4 +182,5 @@
   .models pre { max-width: 48em; }
   .synonyms { list-style: none; padding: 0; }
   .synonyms li { display: flex; align-items: baseline; gap: 10px; margin: 6px 0; }
+  .logo { height: 24px; width: auto; vertical-align: middle; margin-right: 8px; }
 </style>

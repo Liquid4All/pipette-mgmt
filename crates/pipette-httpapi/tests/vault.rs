@@ -11,7 +11,6 @@ use futures::{StreamExt, TryStreamExt};
 use rstest::rstest;
 use serde_json::{Value, json};
 
-use pipette_core::types::Mint;
 use pipette_core::vault::{VaultObjectKey, VaultResource};
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
@@ -68,10 +67,10 @@ async fn server_admin(state: &AppState) -> anyhow::Result<UserSigner> {
     .await
 }
 
-/// An account holding **nothing**. It still owns its own vault, which is the
-/// point: the surface needs no grant of its own.
+/// An administrator of its own organization and nothing more: the surface
+/// needs no grant of its own.
 async fn operator(state: &AppState) -> anyhow::Result<UserSigner> {
-    registered_user(state, &[]).await
+    registered_user(state, &[UserPermission::ManageOrgs]).await
 }
 
 /// An `org_admin`, placed on `org_id`: administering a team's artifacts is the
@@ -112,8 +111,9 @@ fn org_owner(org_id: &str) -> Value {
     json!({ "type": "org", "org_id": org_id })
 }
 
-fn user_owner(user_id: &UserId) -> Value {
-    json!({ "type": "user", "user_id": user_id })
+/// The organization `user_id` belongs to, as an owner.
+async fn org_owner_of(state: &AppState, user_id: &UserId) -> anyhow::Result<Value> {
+    Ok(org_owner(org_of(state, user_id).await?.as_str()))
 }
 
 /// `owner` defaults to the signer. The raw response, since several tests are
@@ -133,9 +133,9 @@ async fn vision_upload(
     state: &AppState,
     signer: &UserSigner,
 ) -> anyhow::Result<(Value, String, String)> {
-    let principal = signer.1.as_str();
-    let model = upload_vault_blob(state, signer, principal, BLOB).await?;
-    let mmproj = upload_vault_blob(state, signer, principal, PROJECTOR).await?;
+    let principal = org_of(state, &signer.1).await?;
+    let model = upload_vault_blob(state, signer, principal.as_str(), BLOB).await?;
+    let mmproj = upload_vault_blob(state, signer, principal.as_str(), PROJECTOR).await?;
     let upload = json!({
         "name": "acme LFM2-VL-3B q4",
         "type": "gguf_vision",
@@ -166,7 +166,8 @@ async fn vision_upload(
 /// The whole arrangement one test in three needs: an account, its uploaded
 /// file, and the record over it. Returns the record's id and the file's digest.
 async fn own_resource(state: &AppState, signer: &UserSigner) -> anyhow::Result<(String, String)> {
-    let sha256 = upload_vault_blob(state, signer, signer.1.as_str(), BLOB).await?;
+    let principal = org_of(state, &signer.1).await?;
+    let sha256 = upload_vault_blob(state, signer, principal.as_str(), BLOB).await?;
     let resource_id = describe_gguf_text_ok(state, signer, None, &sha256).await?;
     Ok((resource_id, sha256))
 }
@@ -200,19 +201,15 @@ fn fields(value: &Value) -> anyhow::Result<Vec<&str>> {
 /// organization, and nothing else does. This is the whole feature in one test.
 #[rstest]
 // The device the organization owns outright.
-#[case::org_owned_device(true, false, None, StatusCode::OK)]
-// A device belonging to an account on the organization: ownership follows the
-// account's membership.
-#[case::member_owned_device(false, true, None, StatusCode::OK)]
+#[case::org_owned_device(true, None, StatusCode::OK)]
 // A device nobody claimed reaches nothing, which is what keeps a
 // self-registered machine away from customer bytes.
-#[case::unowned_device(false, false, None, StatusCode::FORBIDDEN)]
+#[case::unowned_device(false, None, StatusCode::FORBIDDEN)]
 // A range changes which bytes come back, not who gets them.
-#[case::unowned_device_with_a_range(false, false, Some("bytes=4-"), StatusCode::FORBIDDEN)]
+#[case::unowned_device_with_a_range(false, Some("bytes=4-"), StatusCode::FORBIDDEN)]
 #[tokio::test]
 async fn an_org_artifact_reaches_the_organization_s_devices(
     #[case] org_owned: bool,
-    #[case] member_owned: bool,
     #[case] range: Option<&str>,
     #[case] expected: StatusCode,
 ) -> anyhow::Result<()> {
@@ -222,15 +219,7 @@ async fn an_org_artifact_reaches_the_organization_s_devices(
     let owner = org_admin(&state, &org_id).await?;
     let resource_id = upload_gguf_text(&state, &owner, Some(&org_id), BLOB).await?;
 
-    let device_owner = if org_owned {
-        Some(org_owner(&org_id))
-    } else if member_owned {
-        let member = registered_user(&state, &[]).await?;
-        set_user_org(&state, &member.1, Some(org_id.parse()?)).await?;
-        Some(user_owner(&member.1))
-    } else {
-        None
-    };
+    let device_owner = org_owned.then(|| org_owner(&org_id));
     let (device_key, device_id) = owned_device(&state, &admin, device_owner).await?;
 
     let uri = content_uri(&resource_id);
@@ -238,39 +227,6 @@ async fn an_org_artifact_reaches_the_organization_s_devices(
     headers.extend(range.map(|range| ("range", range.to_string())));
     let resp = authed_get_with_headers(&state, &uri, &headers).await?;
     assert_eq!(resp.status(), expected);
-    Ok(())
-}
-
-/// A colleague on the same organization does not reach it: a personal artifact
-/// stays personal.
-#[tokio::test]
-async fn a_personal_artifact_does_not_follow_its_owner_s_organization() -> anyhow::Result<()> {
-    let (_dir, state) = vault_state().await?;
-    let admin = server_admin(&state).await?;
-    let org_id = create_org(&state, &admin, "acme").await?;
-    let me = operator(&state).await?;
-    set_user_org(&state, &me.1, Some(org_id.parse()?)).await?;
-    let (resource_id, _) = own_resource(&state, &me).await?;
-
-    let (mine_key, mine_id) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
-    assert_eq!(
-        authed_get(&state, &mine_key, &mine_id, &content_uri(&resource_id))
-            .await?
-            .status(),
-        StatusCode::OK
-    );
-
-    let colleague = registered_user(&state, &[]).await?;
-    set_user_org(&state, &colleague.1, Some(org_id.parse()?)).await?;
-    let (theirs_key, theirs_id) =
-        owned_device(&state, &admin, Some(user_owner(&colleague.1))).await?;
-    assert_eq!(
-        authed_get(&state, &theirs_key, &theirs_id, &content_uri(&resource_id))
-            .await?
-            .status(),
-        StatusCode::FORBIDDEN,
-        "a colleague's device must not reach a personal artifact"
-    );
     Ok(())
 }
 
@@ -765,7 +721,8 @@ async fn a_device_reads_the_record_it_may_fetch() -> anyhow::Result<()> {
     let (resource_id, _) = own_resource(&state, &me).await?;
     let uri = format!("/vault/resources/{resource_id}");
 
-    let (mine_key, mine_id) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
+    let (mine_key, mine_id) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &me.1).await?)).await?;
     let resp = authed_get(&state, &mine_key, &mine_id, &uri).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
@@ -844,7 +801,7 @@ async fn a_device_without_perform_work_fetches_nothing() -> anyhow::Result<()> {
         &admin,
         "PUT",
         &format!("/api/v1/clients/{device_id}/owner"),
-        &json!({ "owner": user_owner(&me.1) }),
+        &json!({ "owner": org_owner_of(&state, &me.1).await? }),
     )
     .await?;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -858,19 +815,18 @@ async fn a_device_without_perform_work_fetches_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An ordinary member of the organization reads its artifacts and does not
-/// administer them, the asymmetry `read_orgs` and `manage_orgs` draw over the
-/// roster. Its *devices* fetch them too, which is a relation rather than a
-/// grant.
+/// An ordinary member of the organization reads its artifacts, its devices
+/// fetch them, and it deletes them, as it did the ones it owned itself; only
+/// their parameter counts stay an administrator's.
 #[tokio::test]
-async fn a_member_reads_its_organization_s_artifacts_and_deletes_none() -> anyhow::Result<()> {
+async fn a_member_reads_and_deletes_its_organization_s_artifacts() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
     let team_admin = org_admin(&state, &org_id).await?;
     let resource_id = upload_gguf_text(&state, &team_admin, Some(&org_id), BLOB).await?;
 
-    let member = operator(&state).await?;
+    let member = registered_user(&state, &[]).await?;
     set_user_org(&state, &member.1, Some(org_id.parse()?)).await?;
     assert_eq!(
         signed_empty(&state, &member, "GET", &content_uri(&resource_id))
@@ -878,23 +834,8 @@ async fn a_member_reads_its_organization_s_artifacts_and_deletes_none() -> anyho
             .status(),
         StatusCode::OK
     );
-    let record = format!("/api/v1/vault/resources/{resource_id}");
-    let read = body_json(signed_empty(&state, &member, "GET", &record).await?).await?;
-    assert_eq!(read["may_administer"], json!(false), "{read}");
-    let resp = signed_empty(&state, &member, "DELETE", &record).await?;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "reading the team's record is not administering it"
-    );
-    let error = body_json(resp).await?;
-    let error = json_str(&error, "error")?;
-    assert!(
-        error.contains("needs manage_orgs"),
-        "the refusal names the grant, not another owner: {error}"
-    );
-
-    let (device_key, device_id) = owned_device(&state, &admin, Some(user_owner(&member.1))).await?;
+    let (device_key, device_id) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &member.1).await?)).await?;
     assert_eq!(
         authed_get(&state, &device_key, &device_id, &content_uri(&resource_id))
             .await?
@@ -902,54 +843,13 @@ async fn a_member_reads_its_organization_s_artifacts_and_deletes_none() -> anyho
         StatusCode::OK,
         "the member's device runs the work as well"
     );
-    Ok(())
-}
 
-/// An organization's device administrator cannot make a device its colleague's,
-/// which would let a device it holds the key of fetch the colleague's weights.
-#[tokio::test]
-async fn an_org_device_admin_cannot_hand_a_device_to_a_colleague() -> anyhow::Result<()> {
-    let (_dir, state) = vault_state().await?;
-    let admin = server_admin(&state).await?;
-    let org_id = create_org(&state, &admin, "acme").await?;
-    let device_admin = registered_user(&state, &[UserPermission::ManageClients]).await?;
-    set_user_org(&state, &device_admin.1, Some(org_id.parse()?)).await?;
-    let colleague = operator(&state).await?;
-    set_user_org(&state, &colleague.1, Some(org_id.parse()?)).await?;
-    let (resource_id, _) = own_resource(&state, &colleague).await?;
-    let (device_key, device_id) = owned_device(&state, &admin, Some(org_owner(&org_id))).await?;
-
-    let owner_uri = format!("/api/v1/clients/{device_id}/owner");
-    let resp = signed_json(
-        &state,
-        &device_admin,
-        "PUT",
-        &owner_uri,
-        &json!({ "owner": user_owner(&colleague.1) }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        authed_get(&state, &device_key, &device_id, &content_uri(&resource_id))
-            .await?
-            .status(),
-        StatusCode::FORBIDDEN,
-        "the device never became the colleague's"
-    );
-
-    let resp = signed_json(
-        &state,
-        &device_admin,
-        "PUT",
-        &owner_uri,
-        &json!({ "owner": user_owner(&device_admin.1) }),
-    )
-    .await?;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "its own device is still its to keep"
-    );
+    let record = format!("/api/v1/vault/resources/{resource_id}");
+    let read = body_json(signed_empty(&state, &member, "GET", &record).await?).await?;
+    assert_eq!(read["may_administer"], json!(true), "{read}");
+    assert_eq!(read["model_params"]["may_set"], json!(false), "{read}");
+    let resp = signed_empty(&state, &member, "DELETE", &record).await?;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     Ok(())
 }
 
@@ -962,7 +862,7 @@ async fn an_org_device_admin_cannot_hand_a_device_to_a_colleague() -> anyhow::Re
 async fn a_file_is_kept_only_as_its_digest_says() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let principal = me.1.to_string();
+    let principal = org_of(&state, &me.1).await?.to_string();
     let sha256 = sha256_hex(BLOB);
 
     let wrong = "b".repeat(64);
@@ -1013,9 +913,17 @@ async fn a_file_sent_again_is_kept_as_first_uploaded() -> anyhow::Result<()> {
     const OTHER: &[u8] = b"GGUF other bytes, another length";
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
 
-    let resp = put_vault_blob(&state, &me, me.1.as_str(), &sha256, OTHER).await?;
+    let resp = put_vault_blob(
+        &state,
+        &me,
+        org_of(&state, &me.1).await?.as_str(),
+        &sha256,
+        OTHER,
+    )
+    .await?;
     assert_eq!(resp.status(), StatusCode::OK, "already uploaded");
     assert_eq!(
         body_json(resp).await?,
@@ -1041,16 +949,28 @@ async fn an_upload_past_the_limit_is_told_to_retry() -> anyhow::Result<()> {
     let all = u32::try_from(state.vault_uploads.available_permits())?;
     let busy = state.vault_uploads.try_acquire_many(all)?;
     assert_eq!(
-        put_vault_blob(&state, &me, me.1.as_str(), &sha256, BLOB)
-            .await?
-            .status(),
+        put_vault_blob(
+            &state,
+            &me,
+            org_of(&state, &me.1).await?.as_str(),
+            &sha256,
+            BLOB
+        )
+        .await?
+        .status(),
         StatusCode::TOO_MANY_REQUESTS
     );
     drop(busy);
     assert_eq!(
-        put_vault_blob(&state, &me, me.1.as_str(), &sha256, BLOB)
-            .await?
-            .status(),
+        put_vault_blob(
+            &state,
+            &me,
+            org_of(&state, &me.1).await?.as_str(),
+            &sha256,
+            BLOB
+        )
+        .await?
+        .status(),
         StatusCode::CREATED
     );
     Ok(())
@@ -1102,7 +1022,7 @@ async fn describing_names_uploaded_files_of_the_right_format(
         "{error}"
     );
 
-    upload_vault_blob(&state, &me, me.1.as_str(), bytes).await?;
+    upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), bytes).await?;
     let resp = describe_vault_upload(&state, &me, &body).await?;
     match refused {
         None => assert_eq!(resp.status(), StatusCode::CREATED),
@@ -1138,10 +1058,10 @@ async fn a_multi_file_description_is_refused_whole(
 ) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let model = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let model = upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let mmproj_sha256 = sha256_hex(mmproj);
     if uploaded {
-        upload_vault_blob(&state, &me, me.1.as_str(), mmproj).await?;
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), mmproj).await?;
     }
     let body = json!({
         "name": "acme LFM2-VL-3B q4",
@@ -1188,6 +1108,7 @@ async fn an_upload_answers_with_the_plan_entry() -> anyhow::Result<()> {
     assert_eq!(fields, ["entry", "resources", "toml"]);
     crate::api_schema::assert_conforms("VaultResourcesUploaded", &answer)?;
 
+    let own = org_of(&state, &me.1).await?;
     assert_eq!(
         answer["entry"],
         json!({"model": {
@@ -1197,7 +1118,7 @@ async fn an_upload_answers_with_the_plan_entry() -> anyhow::Result<()> {
             "model_sha256": sha256_hex(BLOB),
             "mmproj": content_uri(&mmproj_id),
             "mmproj_sha256": sha256_hex(PROJECTOR),
-            "principal_id": me.1,
+            "principal_id": own,
             "custom_label": "acme LFM2-VL-3B q4",
         }})
     );
@@ -1332,7 +1253,7 @@ async fn each_file_of_an_upload_is_its_own_record() -> anyhow::Result<()> {
 async fn no_answer_names_where_a_file_is_stored() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let principal = me.1.to_string();
+    let principal = org_of(&state, &me.1).await?.to_string();
     let sha256 = sha256_hex(BLOB);
 
     let mut answers = vec![
@@ -1382,7 +1303,7 @@ async fn a_file_route_is_checked_at_the_boundary(
 ) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let principal = principal.replace("{me}", me.1.as_str());
+    let principal = principal.replace("{me}", org_of(&state, &me.1).await?.as_str());
     let resp = match method {
         "PUT" => put_vault_blob(&state, &me, &principal, sha256, BLOB).await?,
         _ => head_vault_blob(&state, &me, &principal, sha256).await?,
@@ -1441,17 +1362,16 @@ async fn uploading_for_an_organization_takes_membership(
     Ok(())
 }
 
-/// A member's upload for the team is the team's: the member cannot delete it,
-/// and membership names no colleague as an owner.
+/// A member's upload for the team is the team's, which the member deletes, and
+/// membership names no other organization as an owner.
 #[tokio::test]
-async fn a_member_uploads_for_its_organization_and_for_no_colleague() -> anyhow::Result<()> {
+async fn a_member_uploads_for_its_organization_and_for_no_other() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
-    let member = operator(&state).await?;
+    let rival = create_org(&state, &admin, "rival").await?;
+    let member = registered_user(&state, &[]).await?;
     set_user_org(&state, &member.1, Some(org_id.parse()?)).await?;
-    let colleague = operator(&state).await?;
-    set_user_org(&state, &colleague.1, Some(org_id.parse()?)).await?;
 
     let resource_id = upload_gguf_text(&state, &member, Some(&org_id), BLOB).await?;
     let resp = signed_empty(
@@ -1461,19 +1381,17 @@ async fn a_member_uploads_for_its_organization_and_for_no_colleague() -> anyhow:
         &format!("/api/v1/vault/resources/{resource_id}"),
     )
     .await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let error = body_json(resp).await?;
-    assert!(json_str(&error, "error")?.contains("needs manage_orgs"));
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let sha256 = sha256_hex(BLOB);
     assert_eq!(
-        put_vault_blob(&state, &member, colleague.1.as_str(), &sha256, BLOB)
+        put_vault_blob(&state, &member, &rival, &sha256, BLOB)
             .await?
             .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        describe(&state, &member, Some(colleague.1.as_str()), &sha256)
+        describe(&state, &member, Some(&rival), &sha256)
             .await?
             .status(),
         StatusCode::FORBIDDEN
@@ -1491,8 +1409,7 @@ async fn a_member_uploads_for_its_organization_and_for_no_colleague() -> anyhow:
 async fn manage_orgs_off_the_roster_uploads_nothing_for_the_organization(
     #[case] on_a_rival: bool,
 ) -> anyhow::Result<()> {
-    const OUT_OF_SCOPE: &str = "you may only upload to the vault for yourself, \
-        your organization, or a member of an organization you administer";
+    const OUT_OF_SCOPE: &str = "you may only upload to the vault for your organization";
     let (_dir, state) = vault_state().await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
@@ -1559,20 +1476,17 @@ async fn a_listing_shows_only_what_the_caller_reaches() -> anyhow::Result<()> {
     };
 
     let all = body_json(signed_empty(&state, &me, "GET", "/api/v1/vault/resources").await?).await?;
-    assert_eq!(ids(&all)?, vec![mine.clone()], "only the caller's own");
+    assert_eq!(
+        ids(&all)?,
+        vec![mine.clone()],
+        "only the caller's organization's"
+    );
 
-    // The filter narrows inside that reach: `mine` keeps it, `org` empties it.
-    let filtered =
-        body_json(signed_empty(&state, &me, "GET", "/api/v1/vault/resources?owner=mine").await?)
-            .await?;
-    assert_eq!(ids(&filtered)?, vec![mine]);
+    // The filter never widens that reach.
     let org_only =
         body_json(signed_empty(&state, &me, "GET", "/api/v1/vault/resources?owner=org").await?)
             .await?;
-    assert!(
-        ids(&org_only)?.is_empty(),
-        "the caller owns nothing as an org"
-    );
+    assert_eq!(ids(&org_only)?, vec![mine]);
     Ok(())
 }
 
@@ -1586,7 +1500,8 @@ async fn a_listing_pages_through_a_mixed_keyspace() -> anyhow::Result<()> {
     own_resource(&state, &stranger).await?;
 
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let first = describe_gguf_text_ok(&state, &me, None, &sha256).await?;
     let second = describe_gguf_text_ok(&state, &me, None, &sha256).await?;
 
@@ -1661,34 +1576,23 @@ enum Deleter {
     Server,
 }
 
-/// A delete by somebody other than the owner: acme's administrator takes acme's
-/// record and the server takes anybody's, so the owner and its devices find it
-/// gone. A `manage_orgs` holder off acme's roster is refused and the record stays,
-/// and so is acme's administrator on a member's own record: deleting is not the
-/// upload hand-off.
+/// A delete: acme's administrator takes acme's record and the server takes
+/// anybody's, so acme and its devices find it gone. A `manage_orgs` holder off
+/// acme's roster is refused and the record stays.
 #[rstest]
-#[case::acme_admin_on_acme(Deleter::AcmeAdmin, false, None)]
-#[case::acme_admin_on_a_member_s(
-    Deleter::AcmeAdmin,
-    true,
-    Some("this vault resource belongs to another owner")
-)]
-#[case::server_on_acme(Deleter::Server, false, None)]
-#[case::server_on_a_member_s(Deleter::Server, true, None)]
+#[case::acme_admin_on_acme(Deleter::AcmeAdmin, None)]
+#[case::server_on_acme(Deleter::Server, None)]
 #[case::rival_admin_on_acme(
     Deleter::RivalAdmin,
-    false,
     Some("this vault resource belongs to another owner")
 )]
 #[case::manage_orgs_on_no_org_on_acme(
     Deleter::ManageOrgsOnNoOrg,
-    false,
     Some("this vault resource belongs to another owner")
 )]
 #[tokio::test]
 async fn an_administrator_deletes_only_within_its_reach(
     #[case] deleter: Deleter,
-    #[case] personal: bool,
     #[case] refused: Option<&str>,
 ) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
@@ -1697,17 +1601,15 @@ async fn an_administrator_deletes_only_within_its_reach(
         Deleter::AcmeAdmin => w.acme_admin.clone(),
         Deleter::RivalAdmin => w.rival_admin.clone(),
         Deleter::ManageOrgsOnNoOrg => {
-            registered_user(&state, &[UserPermission::ManageOrgs]).await?
+            let caller = registered_user(&state, &[UserPermission::ManageOrgs]).await?;
+            set_user_org(&state, &caller.1, None).await?;
+            caller
         }
         Deleter::Server => w.server.clone(),
     };
     // The resource, an account that reads it, and the owner of a device that
     // fetches it.
-    let (resource_id, reader, device_owner) = if personal {
-        (&w.member_res, &w.member, user_owner(&w.member.1))
-    } else {
-        (&w.acme_res, &w.acme_admin, org_owner(&w.acme))
-    };
+    let (resource_id, reader, device_owner) = (&w.acme_res, &w.acme_admin, org_owner(&w.acme));
     let (device_key, device_id) = owned_device(&state, &w.server, Some(device_owner)).await?;
     let uri = format!("/api/v1/vault/resources/{resource_id}");
 
@@ -1759,8 +1661,6 @@ enum Setter {
 #[derive(Debug, Clone, Copy)]
 enum Row {
     AcmeFile,
-    /// A personal file of an acme member's.
-    MemberFile,
     /// A model name, which is every organization's.
     Name,
 }
@@ -1782,7 +1682,6 @@ async fn resource_read(
 /// owns and of nothing else; the server sets any. The record says so first.
 #[rstest]
 #[case::acme_admin_on_acme(Setter::AcmeAdmin, Row::AcmeFile, None)]
-#[case::acme_admin_on_a_member_s(Setter::AcmeAdmin, Row::MemberFile, Some(NOT_YOURS))]
 #[case::acme_admin_on_a_name(Setter::AcmeAdmin, Row::Name, Some(NOT_YOURS))]
 #[case::rival_admin_on_acme(Setter::RivalAdmin, Row::AcmeFile, Some(NOT_YOURS))]
 #[case::acme_member_on_acme(
@@ -1791,7 +1690,6 @@ async fn resource_read(
     Some("user lacks the manage_orgs permission")
 )]
 #[case::server_on_acme(Setter::Server, Row::AcmeFile, None)]
-#[case::server_on_a_member_s(Setter::Server, Row::MemberFile, None)]
 #[case::server_on_a_name(Setter::Server, Row::Name, None)]
 #[tokio::test]
 async fn an_administrator_sets_model_params_only_within_its_reach(
@@ -1809,7 +1707,6 @@ async fn an_administrator_sets_model_params_only_within_its_reach(
     };
     let resource_id = match row {
         Row::AcmeFile => Some(&w.acme_res),
-        Row::MemberFile => Some(&w.member_res),
         Row::Name => None,
     };
     let key = resource_id.map_or("acmelm-4.5b-text", String::as_str);
@@ -1871,7 +1768,8 @@ async fn a_delete_revokes_access_and_takes_an_unshared_file() -> anyhow::Result<
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (resource_id, sha256) = own_resource(&state, &me).await?;
-    let (device_key, device_id) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
+    let (device_key, device_id) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &me.1).await?)).await?;
 
     assert_eq!(
         signed_empty(
@@ -1895,7 +1793,7 @@ async fn a_delete_revokes_access_and_takes_an_unshared_file() -> anyhow::Result<
     let resp = describe(&state, &me, None, &sha256).await?;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "the file is gone");
     assert!(json_str(&body_json(resp).await?, "error")?.contains("upload it first"));
-    upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     assert_eq!(
         describe(&state, &me, None, &sha256).await?.status(),
         StatusCode::CREATED
@@ -1939,14 +1837,15 @@ async fn device_and_artifact(
 ) -> anyhow::Result<(ed25519_dalek::SigningKey, ClientId, String, PathBuf)> {
     let admin = server_admin(state).await?;
     let me = operator(state).await?;
-    let sha256 = upload_vault_blob(state, &me, me.1.as_str(), bytes).await?;
+    let sha256 = upload_vault_blob(state, &me, org_of(state, &me.1).await?.as_str(), bytes).await?;
     let resource_id = describe_gguf_text_ok(state, &me, None, &sha256).await?;
-    let (device_key, device) = owned_device(state, &admin, Some(user_owner(&me.1))).await?;
+    let (device_key, device) =
+        owned_device(state, &admin, Some(org_owner_of(state, &me.1).await?)).await?;
     Ok((
         device_key,
         device,
         resource_id,
-        blob_path(dir, me.1.as_str(), &sha256),
+        blob_path(dir, org_of(state, &me.1).await?.as_str(), &sha256),
     ))
 }
 
@@ -2106,7 +2005,8 @@ async fn a_signature_for_one_resource_does_not_fetch_another() -> anyhow::Result
     // A second artifact under the same device's owner.
     let me = registered_user(&state, &[]).await?;
     let second = {
-        let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+        let sha256 =
+            upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
         describe_gguf_text_ok(&state, &me, None, &sha256).await?
     };
 
@@ -2240,11 +2140,12 @@ async fn a_device_reaches_no_index_route(
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (resource_id, sha256) = own_resource(&state, &me).await?;
-    let (device_key, device) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
+    let (device_key, device) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &me.1).await?)).await?;
 
     let uri = path
         .replace("{id}", &resource_id)
-        .replace("{me}", me.1.as_str())
+        .replace("{me}", org_of(&state, &me.1).await?.as_str())
         .replace("{sha256}", &sha256);
     let headers = auth_headers(&device_key, &device, method, &uri)?;
     let resp = match method {
@@ -2268,7 +2169,8 @@ async fn an_unknown_id_is_a_404_everywhere() -> anyhow::Result<()> {
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (_, _) = own_resource(&state, &me).await?;
-    let (device_key, device) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
+    let (device_key, device) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &me.1).await?)).await?;
     let absent = "vault_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e";
 
     for uri in [format!("/vault/resources/{absent}"), content_uri(absent)] {
@@ -2518,7 +2420,7 @@ async fn the_record_wire_shape_is_pinned() -> anyhow::Result<()> {
         ]
     );
     assert_eq!(body["resource_id"], resource_id);
-    assert_eq!(body["owner"], json!({ "type": "user", "user_id": me.1 }));
+    assert_eq!(body["owner"], org_owner_of(&state, &me.1).await?);
     assert_eq!(body["sha256"], sha256);
     assert_eq!(body["bytes"], BLOB.len());
     assert_eq!(
@@ -2664,7 +2566,8 @@ async fn a_record_from_before_uploads_is_served_without_an_entry() -> anyhow::Re
 async fn an_oversized_description_is_a_413() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let mut body = gguf_text_upload(None, &sha256);
     body["name"] = json!("n".repeat(65 * 1024));
     assert_eq!(
@@ -2692,7 +2595,8 @@ async fn a_name_is_trimmed_and_held_to_its_ceiling(
 ) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let mut body = gguf_text_upload(None, &sha256);
     body["name"] = json!(name);
 
@@ -2741,7 +2645,14 @@ async fn a_file_is_not_held_to_the_body_ceiling() -> anyhow::Result<()> {
         .chain(std::iter::repeat_n(7, 256 * 1024))
         .collect();
     let sha256 = sha256_hex(&big);
-    let resp = put_vault_blob(&state, &me, me.1.as_str(), &sha256, &big).await?;
+    let resp = put_vault_blob(
+        &state,
+        &me,
+        org_of(&state, &me.1).await?.as_str(),
+        &sha256,
+        &big,
+    )
+    .await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     assert_eq!(body_json(resp).await?["bytes"], big.len());
     Ok(())
@@ -2756,7 +2667,7 @@ async fn a_file_past_the_vault_limit_is_a_413() -> anyhow::Result<()> {
     setup_benchmarks(dir.path())?;
     let state = make_state_with_vault_blob_limit(dir.path(), limit).await?;
     let me = operator(&state).await?;
-    let principal = me.1.to_string();
+    let principal = org_of(&state, &me.1).await?.to_string();
 
     let over: Vec<u8> = BLOB.iter().copied().chain([0]).collect();
     let resp = put_vault_blob(&state, &me, &principal, &sha256_hex(&over), &over).await?;
@@ -2819,7 +2730,7 @@ async fn a_streamed_file_past_the_vault_limit_is_a_413() -> anyhow::Result<()> {
     setup_benchmarks(dir.path())?;
     let state = make_state_with_vault_blob_limit(dir.path(), limit).await?;
     let me = operator(&state).await?;
-    let principal = me.1.to_string();
+    let principal = org_of(&state, &me.1).await?.to_string();
 
     // The whole limit in the first chunk, the byte past it in the second.
     let over: Vec<u8> = BLOB.iter().copied().chain([0]).collect();
@@ -2915,7 +2826,7 @@ async fn a_file_cut_short_is_the_caller_s_and_a_store_fault_a_500(
 ) -> anyhow::Result<()> {
     let (dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let principal = me.1.to_string();
+    let principal = org_of(&state, &me.1).await?.to_string();
     let sha256 = sha256_hex(BLOB);
 
     let got = put_cut_short(&state, &me, &principal, hang).await?;
@@ -2985,24 +2896,19 @@ async fn a_campaign_revision_naming_the_vault_is_checked_too() -> anyhow::Result
 // These pin the whole model in one place each, so a change to the reach or to
 // the device relation has to rewrite a table.
 
-/// Two organizations, a personal and an organizational artifact on each, and
-/// every kind of principal that could ask for them.
+/// Two organizations, an artifact on each, and every kind of principal that
+/// could ask for them.
 struct World {
     acme: String,
     rival: String,
-    /// A member of acme, holding nothing, and its artifact.
+    /// A member of acme, holding nothing.
     member: UserSigner,
-    member_res: String,
-    /// Another member of acme, and its artifact: the one a colleague and an
-    /// administrator must **not** reach.
-    colleague_res: String,
     acme_admin: UserSigner,
     acme_res: String,
     rival_admin: UserSigner,
     rival_res: String,
-    /// A member of rival, and its artifact.
+    /// A member of rival, holding nothing.
     rival_member: UserSigner,
-    rival_member_res: String,
     server: UserSigner,
 }
 
@@ -3011,13 +2917,8 @@ async fn world(state: &AppState) -> anyhow::Result<World> {
     let acme = create_org(state, &server, "acme").await?;
     let rival = create_org(state, &server, "rival").await?;
 
-    let member = operator(state).await?;
+    let member = registered_user(state, &[]).await?;
     set_user_org(state, &member.1, Some(acme.parse()?)).await?;
-    let (member_res, _) = own_resource(state, &member).await?;
-
-    let colleague = operator(state).await?;
-    set_user_org(state, &colleague.1, Some(acme.parse()?)).await?;
-    let (colleague_res, _) = own_resource(state, &colleague).await?;
 
     let acme_admin = org_admin(state, &acme).await?;
     let acme_res = upload_gguf_text(state, &acme_admin, Some(&acme), BLOB).await?;
@@ -3025,22 +2926,18 @@ async fn world(state: &AppState) -> anyhow::Result<World> {
     let rival_admin = org_admin(state, &rival).await?;
     let rival_res = upload_gguf_text(state, &rival_admin, Some(&rival), BLOB).await?;
 
-    let rival_member = operator(state).await?;
+    let rival_member = registered_user(state, &[]).await?;
     set_user_org(state, &rival_member.1, Some(rival.parse()?)).await?;
-    let (rival_member_res, _) = own_resource(state, &rival_member).await?;
 
     Ok(World {
         acme,
         rival,
         member,
-        member_res,
-        colleague_res,
         acme_admin,
         acme_res,
         rival_admin,
         rival_res,
         rival_member,
-        rival_member_res,
         server,
     })
 }
@@ -3084,54 +2981,38 @@ async fn account_sees(
     Ok(listed)
 }
 
-/// **The operator model.** An account sees its own and its organization's,
-/// grant or no grant; nobody sees a colleague's personal artifact or another
-/// organization's. A server admin sees everything.
+/// **The operator model.** An account sees its organization's, grant or no
+/// grant; nobody sees another organization's. A server admin sees everything.
 #[tokio::test]
 async fn the_operator_matrix() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let w = world(&state).await?;
 
     // Rows are callers; columns are the artifacts, in this order.
-    let columns = [
-        &w.member_res,
-        &w.colleague_res,
-        &w.acme_res,
-        &w.rival_res,
-        &w.rival_member_res,
-    ];
-    let expected: [(&str, &UserSigner, [bool; 5]); 5] = [
-        //                                    own     colleague acme   rival  rival-member
-        (
-            "member of acme",
-            &w.member,
-            [true, false, true, false, false],
-        ),
-        (
-            "acme admin",
-            &w.acme_admin,
-            [false, false, true, false, false],
-        ),
-        (
-            "rival admin",
-            &w.rival_admin,
-            [false, false, false, true, false],
-        ),
-        (
-            "member of rival",
-            &w.rival_member,
-            [false, false, false, true, true],
-        ),
-        ("server admin", &w.server, [true, true, true, true, true]),
+    let columns = [&w.acme_res, &w.rival_res];
+    let expected: [(&str, &UserSigner, [bool; 2]); 5] = [
+        //                                acme   rival
+        ("member of acme", &w.member, [true, false]),
+        ("acme admin", &w.acme_admin, [true, false]),
+        ("rival admin", &w.rival_admin, [false, true]),
+        ("member of rival", &w.rival_member, [false, true]),
+        ("server admin", &w.server, [true, true]),
     ];
 
-    for (who, signer, row) in expected {
-        for (resource_id, want) in columns.iter().zip(row) {
-            let got = account_sees(&state, signer, resource_id).await?;
-            assert_eq!(got, want, "{who} on {resource_id}");
-        }
-    }
-    Ok(())
+    futures::stream::iter(expected.map(anyhow::Ok))
+        .try_for_each(|(who, signer, row)| {
+            let state = &state;
+            async move {
+                futures::stream::iter(columns.into_iter().zip(row).map(anyhow::Ok))
+                    .try_for_each(|(resource_id, want)| async move {
+                        let got = account_sees(state, signer, resource_id).await?;
+                        assert_eq!(got, want, "{who} on {resource_id}");
+                        Ok(())
+                    })
+                    .await
+            }
+        })
+        .await
 }
 
 /// `read_any_orgs` is the roster read and opens no vault resource. If the reach
@@ -3150,13 +3031,7 @@ async fn read_any_orgs_reaches_no_vault_resource() -> anyhow::Result<()> {
         "the grant is held: the reader reads a roster it is not on"
     );
 
-    for resource_id in [
-        &w.member_res,
-        &w.colleague_res,
-        &w.acme_res,
-        &w.rival_res,
-        &w.rival_member_res,
-    ] {
+    for resource_id in [&w.acme_res, &w.rival_res] {
         assert!(
             !account_sees(&state, &reader, resource_id).await?,
             "read_any_orgs on {resource_id}"
@@ -3176,45 +3051,20 @@ async fn read_any_orgs_reaches_no_vault_resource() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **The device model.** A device reaches what its owner owns. An
-/// organization's device reaches its artifacts and no member's personal ones;
-/// an account's device also reaches its account's organization's, as
-/// `owning_org` rolls devices up everywhere. An unowned device reaches nothing.
+/// **The device model.** A device reaches what its owner owns: an
+/// organization's device reaches its artifacts. An unowned device reaches
+/// nothing.
 #[tokio::test]
 async fn the_device_matrix() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let w = world(&state).await?;
 
-    let columns = [
-        &w.member_res,
-        &w.colleague_res,
-        &w.acme_res,
-        &w.rival_res,
-        &w.rival_member_res,
-    ];
-    let devices: [(&str, Option<Value>, [bool; 5]); 5] = [
-        //                                                  member  colleague acme   rival  rival-member
-        ("unowned", None, [false, false, false, false, false]),
-        (
-            "owned by the member",
-            Some(user_owner(&w.member.1)),
-            [true, false, true, false, false],
-        ),
-        (
-            "owned by acme",
-            Some(org_owner(&w.acme)),
-            [false, false, true, false, false],
-        ),
-        (
-            "owned by rival",
-            Some(org_owner(&w.rival)),
-            [false, false, false, true, false],
-        ),
-        (
-            "owned by rival's member",
-            Some(user_owner(&w.rival_member.1)),
-            [false, false, false, true, true],
-        ),
+    let columns = [&w.acme_res, &w.rival_res];
+    let devices: [(&str, Option<Value>, [bool; 2]); 3] = [
+        //                                        acme   rival
+        ("unowned", None, [false, false]),
+        ("owned by acme", Some(org_owner(&w.acme)), [true, false]),
+        ("owned by rival", Some(org_owner(&w.rival)), [false, true]),
     ];
 
     for (who, owner, row) in devices {
@@ -3242,45 +3092,6 @@ async fn the_device_matrix() -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
-}
-
-// ── the edges of the gate ───────────────────────────────────────────────────
-
-/// A device belongs to whichever organization its **account** is on now, so
-/// moving the account moves what the device may fetch: the old team's artifact
-/// closes and the new team's opens, with nothing written to the device.
-#[tokio::test]
-async fn a_device_follows_its_account_between_organizations() -> anyhow::Result<()> {
-    let (_dir, state) = vault_state().await?;
-    let admin = server_admin(&state).await?;
-    let acme = create_org(&state, &admin, "acme").await?;
-    let rival = create_org(&state, &admin, "rival").await?;
-
-    let acme_admin = org_admin(&state, &acme).await?;
-    let acme_res = upload_gguf_text(&state, &acme_admin, Some(&acme), BLOB).await?;
-    let rival_admin = org_admin(&state, &rival).await?;
-    let rival_res = upload_gguf_text(&state, &rival_admin, Some(&rival), BLOB).await?;
-
-    let member = registered_user(&state, &[]).await?;
-    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
-    let (key, device) = owned_device(&state, &admin, Some(user_owner(&member.1))).await?;
-    let fetch = async |res: &str| -> anyhow::Result<StatusCode> {
-        Ok(authed_get(&state, &key, &device, &content_uri(res))
-            .await?
-            .status())
-    };
-
-    assert_eq!(fetch(&acme_res).await?, StatusCode::OK);
-    assert_eq!(fetch(&rival_res).await?, StatusCode::FORBIDDEN);
-
-    set_user_org(&state, &member.1, Some(rival.parse()?)).await?;
-    assert_eq!(
-        fetch(&acme_res).await?,
-        StatusCode::FORBIDDEN,
-        "the old team's artifact closes the moment the account leaves"
-    );
-    assert_eq!(fetch(&rival_res).await?, StatusCode::OK);
     Ok(())
 }
 
@@ -3333,9 +3144,9 @@ async fn an_unvetted_caller_reaches_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An account that is pending or disabled reaches no vault route, its own
-/// resource included, and nothing is stored or deleted. Swapping the active-user
-/// gate for a bare signature check on any route would fail here.
+/// A disabled account reaches no vault route, its own resource included, and
+/// nothing is stored or deleted. Swapping the active-user gate for a bare
+/// signature check on any route would fail here.
 #[rstest]
 #[case::read("GET", "/vault/resources/{id}")]
 #[case::fetch("GET", "/vault/resources/{id}/content")]
@@ -3349,13 +3160,7 @@ async fn an_unvetted_caller_reaches_nothing() -> anyhow::Result<()> {
 async fn an_account_out_of_standing_reaches_none_of_its_vault(
     #[case] method: &str,
     #[case] path: &str,
-    #[values(UserStatus::Pending, UserStatus::Disabled)] status: UserStatus,
 ) -> anyhow::Result<()> {
-    let reason = match status {
-        UserStatus::Pending => "user is pending an operator's approval",
-        UserStatus::Disabled => "user is disabled",
-        UserStatus::Active => anyhow::bail!("only the statuses that refuse belong here"),
-    };
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
     let (resource_id, sha256) = own_resource(&state, &me).await?;
@@ -3363,9 +3168,9 @@ async fn an_account_out_of_standing_reaches_none_of_its_vault(
     let projector = sha256_hex(PROJECTOR);
     let uri = path
         .replace("{id}", &resource_id)
-        .replace("{me}", me.1.as_str())
+        .replace("{me}", org_of(&state, &me.1).await?.as_str())
         .replace("{sha256}", &projector);
-    set_user_status(&state, &me.1, status).await?;
+    set_user_status(&state, &me.1, UserStatus::Disabled).await?;
 
     let headers = user_auth_headers(&me.0, &me.1, &me.2, method, &uri)?;
     let resp = match method {
@@ -3382,7 +3187,10 @@ async fn an_account_out_of_standing_reaches_none_of_its_vault(
         "no pin for bytes that are not served"
     );
     if method != "HEAD" {
-        assert_eq!(json_str(&body_json(resp).await?, "error")?, reason);
+        assert_eq!(
+            json_str(&body_json(resp).await?, "error")?,
+            "user is disabled"
+        );
     }
 
     set_user_status(&state, &me.1, UserStatus::Active).await?;
@@ -3396,9 +3204,14 @@ async fn an_account_out_of_standing_reaches_none_of_its_vault(
         .collect();
     assert_eq!(ids, [resource_id.as_str()], "nothing written or deleted");
     assert_eq!(
-        head_vault_blob(&state, &me, me.1.as_str(), &projector)
-            .await?
-            .status(),
+        head_vault_blob(
+            &state,
+            &me,
+            org_of(&state, &me.1).await?.as_str(),
+            &projector
+        )
+        .await?
+        .status(),
         StatusCode::NOT_FOUND,
         "no file kept"
     );
@@ -3412,7 +3225,11 @@ async fn a_record_whose_object_was_removed_is_a_404() -> anyhow::Result<()> {
     let (dir, state) = vault_state().await?;
     let me = operator(&state).await?;
     let (resource_id, sha256) = own_resource(&state, &me).await?;
-    std::fs::remove_file(blob_path(dir.path(), me.1.as_str(), &sha256))?;
+    std::fs::remove_file(blob_path(
+        dir.path(),
+        org_of(&state, &me.1).await?.as_str(),
+        &sha256,
+    ))?;
 
     assert_eq!(
         signed_empty(&state, &me, "GET", &content_uri(&resource_id))
@@ -3435,77 +3252,14 @@ async fn a_record_whose_object_was_removed_is_a_404() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── the edges of the index ──────────────────────────────────────────────────
-
-/// Who may upload **for whom**: an organization's administrator may put a
-/// file and a record down on a member of it, a plain operator may not put one
-/// down on anybody else, and a destination that does not exist is a `400` only
-/// for a caller that could otherwise have reached it. The file and the
-/// description answer alike.
-#[rstest]
-// An org admin hands down inside the roster it administers.
-#[case::admin_for_member(true, true, true, StatusCode::CREATED)]
-// A plain operator registers for nobody but itself.
-#[case::operator_for_stranger(false, true, true, StatusCode::FORBIDDEN)]
-// An org admin may not reach an account outside its roster.
-#[case::admin_for_outsider(true, false, true, StatusCode::FORBIDDEN)]
-// A server admin learns the account does not exist; scope passed first.
-#[case::server_for_absent(true, true, false, StatusCode::BAD_REQUEST)]
-#[tokio::test]
-async fn uploading_for_another_account(
-    #[case] caller_is_admin: bool,
-    #[case] target_on_roster: bool,
-    #[case] target_exists: bool,
-    #[case] expected: StatusCode,
-) -> anyhow::Result<()> {
-    let (_dir, state) = vault_state().await?;
-    let admin = server_admin(&state).await?;
-    let org_id = create_org(&state, &admin, "acme").await?;
-
-    let caller = if caller_is_admin {
-        org_admin(&state, &org_id).await?
-    } else {
-        operator(&state).await?
-    };
-    let target = if target_exists {
-        let target = registered_user(&state, &[]).await?;
-        if target_on_roster {
-            set_user_org(&state, &target.1, Some(org_id.parse()?)).await?;
-        }
-        target.1
-    } else {
-        UserId::mint()
-    };
-    // The absent-account case is the server admin's, because a caller that may
-    // not hand there is refused before existence is consulted.
-    let caller = if target_exists { caller } else { admin };
-
-    let sha256 = sha256_hex(BLOB);
-    let put = put_vault_blob(&state, &caller, target.as_str(), &sha256, BLOB).await?;
-    assert_eq!(
-        put.status(),
-        if expected == StatusCode::CREATED {
-            StatusCode::CREATED
-        } else {
-            expected
-        }
-    );
-    assert_eq!(
-        describe(&state, &caller, Some(target.as_str()), &sha256)
-            .await?
-            .status(),
-        expected
-    );
-    Ok(())
-}
-
 /// A delete takes a file only with the last record naming it: two uploads of
 /// one file share its bytes, and the first delete leaves them for the second.
 #[tokio::test]
 async fn a_file_goes_with_the_last_record_naming_it() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let mut ids = Vec::new();
     for _ in 0..2 {
         let resp = describe(&state, &me, None, &sha256).await?;
@@ -3518,63 +3272,10 @@ async fn a_file_goes_with_the_last_record_naming_it() -> anyhow::Result<()> {
         let uri = format!("/api/v1/vault/resources/{resource_id}");
         let resp = signed_empty(&state, &me, "DELETE", &uri).await?;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        let probe = head_vault_blob(&state, &me, me.1.as_str(), &sha256).await?;
+        let probe =
+            head_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), &sha256).await?;
         assert_eq!(probe.status(), stored, "after deleting {resource_id}");
     }
-    Ok(())
-}
-
-/// An upload an administrator makes for a member of its organization is the
-/// member's: its owner and its plan entry's principal name the member, the
-/// member reads and deletes it, and the administrator neither reads nor deletes it.
-#[tokio::test]
-async fn an_upload_for_a_member_belongs_to_the_member() -> anyhow::Result<()> {
-    let (_dir, state) = vault_state().await?;
-    let admin = server_admin(&state).await?;
-    let org_id = create_org(&state, &admin, "acme").await?;
-    let team_admin = org_admin(&state, &org_id).await?;
-    let member = operator(&state).await?;
-    set_user_org(&state, &member.1, Some(org_id.parse()?)).await?;
-
-    let sha256 = upload_vault_blob(&state, &team_admin, member.1.as_str(), BLOB).await?;
-    let resp = describe(&state, &team_admin, Some(member.1.as_str()), &sha256).await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let answer = body_json(resp).await?;
-    assert_eq!(answer["resources"][0]["owner"], user_owner(&member.1));
-    assert_eq!(answer["entry"]["model"]["principal_id"], json!(member.1));
-    let resource_id = json_str(&answer["resources"][0], "resource_id")?.to_string();
-    let uri = format!("/api/v1/vault/resources/{resource_id}");
-
-    for read in [uri.clone(), content_uri(&resource_id)] {
-        let resp = signed_empty(&state, &team_admin, "GET", &read).await?;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{read}");
-        assert_eq!(
-            json_str(&body_json(resp).await?, "error")?,
-            "this vault resource belongs to another owner"
-        );
-    }
-
-    // Uploading it for the member does not let the administrator delete it.
-    let resp = signed_empty(&state, &team_admin, "DELETE", &uri).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        json_str(&body_json(resp).await?, "error")?,
-        "this vault resource belongs to another owner"
-    );
-
-    let resp = signed_empty(&state, &member, "GET", &uri).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await?["owner"], user_owner(&member.1));
-    assert_eq!(
-        signed_empty(&state, &member, "DELETE", &uri)
-            .await?
-            .status(),
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        signed_empty(&state, &member, "GET", &uri).await?.status(),
-        StatusCode::NOT_FOUND
-    );
     Ok(())
 }
 
@@ -3592,7 +3293,11 @@ async fn an_upload_for_a_member_belongs_to_the_member() -> anyhow::Result<()> {
 async fn a_malformed_description_is_a_400(#[case] body: Value) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let body: Value = serde_json::from_str(&body.to_string().replace("{me}", me.1.as_str()))?;
+    let body: Value = serde_json::from_str(
+        &body
+            .to_string()
+            .replace("{me}", org_of(&state, &me.1).await?.as_str()),
+    )?;
     assert_eq!(
         describe_vault_upload(&state, &me, &body).await?.status(),
         StatusCode::BAD_REQUEST
@@ -3616,7 +3321,8 @@ async fn a_description_not_sent_as_json_is_a_400_in_the_envelope(
 ) -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let body = body.map_or_else(
         || gguf_text_upload(None, &sha256).to_string(),
         str::to_string,
@@ -3989,8 +3695,8 @@ async fn a_plan_labels_a_vault_model_as_its_record_names_it() -> anyhow::Result<
 
 /// A campaign that ran an organization's vault resource stays inside it, as
 /// one that ran its private benchmark does. The job names the owner, so the
-/// record's delete changes nothing; a filer who moves away cannot hand the
-/// campaign to the new organization, and can hand it back inside.
+/// record's delete changes nothing: even the server cannot hand the campaign
+/// to another organization.
 #[tokio::test]
 async fn a_campaign_that_ran_an_organization_s_resource_stays_in_it() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
@@ -4017,16 +3723,14 @@ async fn a_campaign_that_ran_an_organization_s_resource_stays_in_it() -> anyhow:
     assert!(resp.status().is_success(), "{}", resp.status());
 
     let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-    set_user_org(&state, &filer.1, Some(labs.parse()?)).await?;
     let to_labs = json!({ "owner": org_owner(&labs) });
-    let resp = signed_json(&state, &filer, "PUT", &uri, &to_labs).await?;
+    let resp = signed_json(&state, &admin, "PUT", &uri, &to_labs).await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let error = json_str(&body_json(resp).await?, "error")?.to_string();
     assert!(error.contains(&resource_id), "{error}");
 
-    set_user_org(&state, &filer.1, Some(acme.parse()?)).await?;
     let to_acme = json!({ "owner": org_owner(&acme) });
-    let resp = signed_json(&state, &filer, "PUT", &uri, &to_acme).await?;
+    let resp = signed_json(&state, &admin, "PUT", &uri, &to_acme).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     Ok(())
 }
@@ -4101,8 +3805,8 @@ async fn head_of(state: &AppState, campaign_id: &str) -> anyhow::Result<Option<P
         .current_plan_id)
 }
 
-/// **The filer model.** A plan names the filer's own resources and its
-/// organization's, and `submit_any_plans` names every one. `manage_any_orgs`
+/// **The filer model.** A plan names the filer's organization's resources,
+/// and `submit_any_plans` names every one. `manage_any_orgs`
 /// reads every resource and names none it does not own. A resource outside the
 /// reach is refused exactly as an absent one, so the refusal names no owner.
 #[tokio::test]
@@ -4148,33 +3852,15 @@ async fn the_filer_matrix() -> anyhow::Result<()> {
     .await?;
 
     // Rows are filers; columns are the artifacts, in this order.
-    let columns = [
-        &w.member_res,
-        &w.colleague_res,
-        &w.acme_res,
-        &w.rival_res,
-        &w.rival_member_res,
-    ];
-    let expected: [(&str, &UserSigner, [bool; 5]); 6] = [
-        //                                    member  colleague acme   rival  rival-member
-        (
-            "member of acme",
-            &w.member,
-            [true, false, true, false, false],
-        ),
-        (
-            "acme admin",
-            &w.acme_admin,
-            [false, false, true, false, false],
-        ),
-        (
-            "member of rival",
-            &w.rival_member,
-            [false, false, false, true, true],
-        ),
-        ("in no org", &unaffiliated, [false; 5]),
-        ("manage_any_orgs in no org", &reader, [false; 5]),
-        ("server admin", &w.server, [true; 5]),
+    let columns = [&w.acme_res, &w.rival_res];
+    let expected: [(&str, &UserSigner, [bool; 2]); 6] = [
+        //                                         acme   rival
+        ("member of acme", &w.member, [true, false]),
+        ("acme admin", &w.acme_admin, [true, false]),
+        ("member of rival", &w.rival_member, [false, true]),
+        ("on its own org", &unaffiliated, [false; 2]),
+        ("manage_any_orgs on its own org", &reader, [false; 2]),
+        ("server admin", &w.server, [true; 2]),
     ];
 
     for (who, signer, row) in expected {
@@ -4211,7 +3897,6 @@ async fn the_filer_matrix() -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum Named {
     Owner,
-    Filer,
     FilerOrg,
 }
 
@@ -4219,7 +3904,6 @@ enum Named {
 /// reach answers as an absent one: never `belongs to`, and never its owner.
 #[rstest]
 #[case::its_owner(Named::Owner)]
-#[case::the_filer(Named::Filer)]
 #[case::the_filer_s_organization(Named::FilerOrg)]
 #[tokio::test]
 async fn a_refusal_outside_the_reach_names_no_owner(#[case] named: Named) -> anyhow::Result<()> {
@@ -4229,7 +3913,6 @@ async fn a_refusal_outside_the_reach_names_no_owner(#[case] named: Named) -> any
     grant_user(&state, &w.member.1, &[UserPermission::SubmitPlans]).await?;
     let principal = match named {
         Named::Owner => w.rival.clone(),
-        Named::Filer => w.member.1.to_string(),
         Named::FilerOrg => w.acme.clone(),
     };
 
@@ -4530,8 +4213,15 @@ async fn a_store_fault_during_an_upload_is_a_redacted_500() -> anyhow::Result<()
     let sha256 = sha256_hex(BLOB);
 
     let answers = [
-        put_vault_blob(&state, &me, me.1.as_str(), &sha256, BLOB).await?,
-        head_vault_blob(&state, &me, me.1.as_str(), &sha256).await?,
+        put_vault_blob(
+            &state,
+            &me,
+            org_of(&state, &me.1).await?.as_str(),
+            &sha256,
+            BLOB,
+        )
+        .await?,
+        head_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), &sha256).await?,
         describe(&state, &me, None, &sha256).await?,
     ];
     let bodies: Vec<(StatusCode, String)> = futures::stream::iter(answers)
@@ -4576,7 +4266,8 @@ async fn the_newest_come_first_when_asked() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let me = operator(&state).await?;
     let stranger = operator(&state).await?;
-    let sha256 = upload_vault_blob(&state, &me, me.1.as_str(), BLOB).await?;
+    let sha256 =
+        upload_vault_blob(&state, &me, org_of(&state, &me.1).await?.as_str(), BLOB).await?;
     let first = describe_gguf_text_ok(&state, &me, None, &sha256).await?;
     own_resource(&state, &stranger).await?;
     let second = describe_gguf_text_ok(&state, &me, None, &sha256).await?;
@@ -4667,18 +4358,12 @@ async fn the_newest_first_count_the_unreadable_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `names=true` names the owner of every row served, and no other: an
-/// account by its address, an organization by its handle. Unasked, the body
-/// carries no `names`.
+/// `names=true` names the owner of every row served, and no other, an
+/// organization by its display name. Unasked, the body carries no `names`.
 #[tokio::test]
 async fn names_are_the_served_rows_owners() -> anyhow::Result<()> {
     let (_dir, state) = vault_state().await?;
     let w = world(&state).await?;
-    let member = state
-        .user_store
-        .get_user(&w.member.1)
-        .await?
-        .context("the member exists")?;
     let read = async |signer: &UserSigner, query: &str| {
         body_json(
             signed_empty(
@@ -4697,12 +4382,9 @@ async fn names_are_the_served_rows_owners() -> anyhow::Result<()> {
     assert_eq!(page["names"], json!({ w.acme.as_str(): "acme" }));
     crate::api_schema::assert_conforms("NamedVaultResourceDetailPage", &page)?;
 
-    let page = read(&w.member, "names=true&owner=mine").await?;
-    assert_eq!(listed(&page)?, std::slice::from_ref(&w.member_res));
-    assert_eq!(
-        page["names"],
-        json!({ w.member.1.as_str(): member.contact_email.to_string() })
-    );
+    let page = read(&w.member, "names=true&owner=org").await?;
+    assert_eq!(listed(&page)?, std::slice::from_ref(&w.acme_res));
+    assert_eq!(page["names"], json!({ w.acme.as_str(): "acme" }));
 
     // A filter naming an owner outside the reach serves no row, so names nobody.
     let page = read(&w.member, &format!("names=true&org_id={}", w.rival)).await?;
@@ -4749,7 +4431,7 @@ async fn the_file_state_follows_the_store() -> anyhow::Result<()> {
     let present = json!({ "state": "present" });
     assert_eq!(states().await?, (present.clone(), present));
 
-    let stored = blob_path(dir.path(), me.1.as_str(), &sha256);
+    let stored = blob_path(dir.path(), org_of(&state, &me.1).await?.as_str(), &sha256);
     std::fs::write(&stored, b"GGUF but longer than it was")?;
     let resized = json!({ "state": "resized", "bytes": 27 });
     assert_eq!(states().await?, (resized.clone(), resized));
@@ -4845,10 +4527,11 @@ async fn a_store_fault_costs_the_listing_a_cell() -> anyhow::Result<()> {
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (resource_id, _) = own_resource(&state, &me).await?;
-    // The owner's record no longer parses, so its address does not read.
+    // The owner's record no longer parses, so its name does not read.
+    let own = org_of(&state, &me.1).await?;
     std::fs::write(
-        dir.path().join("users").join(format!("{}.json", me.1)),
-        b"{ not a user",
+        dir.path().join("orgs").join(format!("{own}.json")),
+        b"{ not an org",
     )?;
     state.vault_store = std::sync::Arc::new(StatFailing(state.vault_store.clone()));
 
@@ -4903,7 +4586,8 @@ async fn a_device_read_takes_neither_names_nor_the_file_state() -> anyhow::Resul
     let admin = server_admin(&state).await?;
     let me = operator(&state).await?;
     let (resource_id, _) = own_resource(&state, &me).await?;
-    let (key, client_id) = owned_device(&state, &admin, Some(user_owner(&me.1))).await?;
+    let (key, client_id) =
+        owned_device(&state, &admin, Some(org_owner_of(&state, &me.1).await?)).await?;
 
     let resp = authed_get(
         &state,

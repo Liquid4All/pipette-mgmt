@@ -19,14 +19,7 @@ const ORGS: Keyspace = Keyspace {
     report_prefix: "orgs/",
 };
 
-fn owner_columns(owner: &ClientOwner) -> (&'static str, &str) {
-    match owner {
-        ClientOwner::Org { org_id } => ("org", org_id.as_str()),
-        ClientOwner::User { user_id } => ("user", user_id.as_str()),
-    }
-}
-
-/// An ownership row that does not name an owner.
+/// An ownership row that does not name an owner; a `user` row is one.
 #[derive(Debug, thiserror::Error)]
 enum OwnerError {
     #[error(transparent)]
@@ -39,9 +32,6 @@ fn owner_of(client_id: &str, owner_type: &str, owner_id: &str) -> anyhow::Result
     let owner: Result<ClientOwner, OwnerError> = match owner_type {
         "org" => OrgId::try_new(owner_id)
             .map(|org_id| ClientOwner::Org { org_id })
-            .map_err(Into::into),
-        "user" => UserId::try_new(owner_id)
-            .map(|user_id| ClientOwner::User { user_id })
             .map_err(Into::into),
         other => Err(OwnerError::UnknownType(other.to_owned())),
     };
@@ -269,18 +259,16 @@ impl OrgStore for SqlOrgStore {
     }
 
     async fn put_ownership(&self, ownership: &Ownership) -> anyhow::Result<()> {
-        let (owner_type, owner_id) = owner_columns(&ownership.owner);
         self.db
             .execute("put_ownership", || {
                 sqlx::query(
-                    "INSERT INTO client_owners (client_id, owner_type, owner_id) VALUES ($1, $2, $3)
+                    "INSERT INTO client_owners (client_id, owner_type, owner_id) VALUES ($1, 'org', $2)
                      ON CONFLICT (client_id) DO UPDATE SET
                          owner_type = EXCLUDED.owner_type,
                          owner_id = EXCLUDED.owner_id",
                 )
                 .bind(ownership.client_id.as_str())
-                .bind(owner_type)
-                .bind(owner_id)
+                .bind(ownership.owner.org_id().as_str())
             })
             .await?;
         Ok(())
@@ -473,12 +461,21 @@ mod tests {
             "not-an-org",
         )
         .await?;
+        let user_owned = ClientId::try_new("ev1_user_owned")?;
+        insert_raw(
+            db,
+            "INSERT INTO client_owners (client_id, owner_type, owner_id) VALUES ($1, 'user', $2)",
+            user_owned.as_str(),
+            UserId::mint().as_str(),
+        )
+        .await?;
 
         assert!(store.get_org(&broken_org).await.is_err());
         assert!(store.list_orgs().await?.is_empty());
         assert!(store.get_membership(&broken_user).await.is_err());
         assert!(store.list_memberships().await?.is_empty());
         assert!(store.get_ownership(&broken_client).await.is_err());
+        assert!(store.get_ownership(&user_owned).await.is_err());
         assert!(store.list_ownerships().await?.is_empty());
         Ok(())
     }
@@ -487,8 +484,8 @@ mod tests {
     async fn sql_ownerships_list_in_key_order() -> anyhow::Result<()> {
         let test_db = crate::testing::test_db_or_skip!();
         let store = SqlOrgStore::new(test_db.db().clone());
-        let owner = ClientOwner::User {
-            user_id: UserId::mint(),
+        let owner = ClientOwner::Org {
+            org_id: OrgId::mint(),
         };
         for id in ["ev1_a", "ev1_a-1", "ev1_b"] {
             store

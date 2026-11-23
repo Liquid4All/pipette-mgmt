@@ -149,6 +149,18 @@ export function actionShown(event: Pick<AuditEvent, "action" | "outcome" | "summ
     return { text: `Removed catalog member ${action.member} from ${action.name}`,
              title: `${action.scope}: ${action.name}\n${action.member}: ${action.digest}`, status: null };
   }
+  if (action.type === "catalog_set_family") {
+    return { text: action.family ? `Set the family of catalog entry ${action.name} to ${action.family}`
+                                 : `Set catalog entry ${action.name} to its default family`,
+             title: `${action.scope}: ${action.name}`, status: null };
+  }
+  if (action.type === "catalog_set_family_logo") {
+    // A data URI holds a whole image, too long to show.
+    const logo = action.logo_uri?.startsWith("data:") ? "an embedded image" : action.logo_uri;
+    return { text: logo ? `Set the logo of catalog family ${action.family} to ${logo}`
+                                   : `Removed the logo of catalog family ${action.family}`,
+             title: `${action.scope}: ${action.family}`, status: null };
+  }
   if (action.type === "catalog_move_to_global") {
     return { text: `Moved catalog entry ${action.name} from ${action.org_id} to global scope`,
              title: `${action.org_id}: ${action.name}\ncreated by ${action.original_created_by}`, status: null };

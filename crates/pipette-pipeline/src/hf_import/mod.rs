@@ -378,6 +378,17 @@ impl Source {
             SourceFiles::Dir { entries, .. } => archive::archive_size(entries),
         }
     }
+
+    /// The bytes of the files that a client downloads from the Hub, without
+    /// the archive framing of [`Source::bytes`].
+    fn file_bytes(&self) -> u64 {
+        match &self.files {
+            SourceFiles::Gguf { size, .. } => *size,
+            SourceFiles::Dir { entries, .. } => entries
+                .iter()
+                .fold(0, |total: u64, entry| total.saturating_add(entry.size)),
+        }
+    }
 }
 
 impl ImportPlan {
@@ -539,13 +550,22 @@ async fn plan_one(
     })
 }
 
+/// The Hugging Face listings of one model, and the bytes that a client
+/// downloads for it.
+pub(crate) struct ModelListings {
+    pub(crate) listings: HashMap<HfRepo, ResolvedRepo>,
+    /// The sum of the file sizes of each distinct source. A source that two
+    /// roles share counts once.
+    pub(crate) download_bytes: u64,
+}
+
 /// Each Hugging Face repository of `model` at its resolved commit. Each file
 /// that `model` names must be at that commit, in the form that an import
 /// needs.
 pub(crate) async fn listings_for(
     hub: &HubClient,
     model: &Model,
-) -> Result<HashMap<HfRepo, ResolvedRepo>, HfImportError> {
+) -> Result<ModelListings, HfImportError> {
     let wanted = wanted(model).ok_or_else(|| HfImportError::NotAllHuggingFace {
         model: model.to_string(),
     })?;
@@ -556,13 +576,23 @@ pub(crate) async fn listings_for(
             listings.insert(repo.clone(), hub.resolve(repo).await?);
         }
     }
-    wanted.try_map(|_, want| {
+    let sources = wanted.try_map(|_, want| {
         let listing = listings
             .get(want.repo())
             .ok_or_else(|| anyhow::anyhow!("{} has no listing", want.repo().reference()))?;
         select(want, listing)
     })?;
-    Ok(listings)
+    let mut counted = HashSet::new();
+    let mut download_bytes: u64 = 0;
+    for (_, source) in sources.files() {
+        if counted.insert(source_id(source)?) {
+            download_bytes = download_bytes.saturating_add(source.file_bytes());
+        }
+    }
+    Ok(ModelListings {
+        listings,
+        download_bytes,
+    })
 }
 
 /// The bytes that a fetch of `sources` downloads. The function counts no bytes

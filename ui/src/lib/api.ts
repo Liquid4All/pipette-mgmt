@@ -14,8 +14,8 @@ import type {
   ModelParams, ModelParamsPage,
   NamedAuditEventPage, NamedCampaignOverview, NamedCampaignView, NamedCampaignViewPage, NamedPlanJobs, NamedPlanView, NamedPlanViewPage, NamedVaultResourceDetail, NamedVaultResourceDetailPage, OrgBenchmarks,
   OrgOverview, OrgView, OrgViewPage, OwnUserView, OwnerMatches, OwnerType, PlanCancelRequested, PlanJob,
-  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RelabelDescriptorMemberRequest, RenameDescriptorEntryRequest, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest, CreatePlanTagRequest, PlanTag,
-  SetClientOwnerRequest, SetUserOrgRequest, UpdateCampaignRequest, UpdateModelParamsRequest, UpdateOrgRequest, UpdatePlanRequest, UpdateUserRequest,
+  PlanValidation, PlanVariants, RecalculateJobsRequest, RegisterClerkUserKeyRequest, RegisterUserKeyRequest, RelabelDescriptorMemberRequest, RenameDescriptorEntryRequest, SetDescriptorEntryFamilyRequest, SetDescriptorFamilyLogoRequest, DescriptorFamilyLogo, DescriptorFamilyLogoView, RerunJobsRequest, RevertCampaignRequest, RevisionDryRun, SetCampaignOwnerRequest, CreatePlanTagRequest, PlanTag,
+  SetClientOwnerRequest, SetUserOrgRequest, UpdateCampaignRequest, UpdateClientRequest, UpdateModelParamsRequest, UpdateOrgRequest, UpdatePlanRequest, UpdateUserRequest,
   UploadVaultResourcesRequest, UserDetail, UserKeyPage, UserKeyRegistered, UserPreauthKeyMinted, UserPreauthKeyViewPage, UserView, UserViewPage, VaultResourcesUploaded,
   VaultTypes,
 } from "./api-types";
@@ -201,6 +201,10 @@ export const updateOrg = (signer: Signer, org_id: string, body: UpdateOrgRequest
 export const descriptorNamesByDigest = (signer: Signer, digests: readonly string[]) =>
   signed<DescriptorDigestNames>(signer, "GET", `/api/v1/descriptor-catalog/by-digest?digests=${digests.join(",")}`);
 
+/** The family logo with the digest `sha256` that a catalog read gives. */
+export const descriptorFamilyLogo = (signer: Signer, sha256: string) =>
+  signed<DescriptorFamilyLogo>(signer, "GET", `/api/v1/descriptor-catalog/family-logos/${encodeURIComponent(sha256)}`);
+
 /** One page of the entries of every scope that the reader can read, with compact member summaries. */
 export const catalogEntries = (signer: Signer, query: string) =>
   signed<DescriptorEntryListRowPage>(signer, "GET", `/api/v1/descriptor-catalog?${query}`);
@@ -257,6 +261,19 @@ export const relabelOrgDescriptorMember = (signer: Signer, org_id: string, name:
                                            body: RelabelDescriptorMemberRequest) =>
   signed<DescriptorEntryListRow>(signer, "POST",
     orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/members/relabel`), body);
+
+/** Sets the family of the model entry `name` of the organization `org_id`, or clears it with `null`. The answer is the
+ * entry with its members. */
+export const setOrgDescriptorEntryFamily = (signer: Signer, org_id: string, name: string,
+                                            body: SetDescriptorEntryFamilyRequest) =>
+  signed<DescriptorEntryListRow>(signer, "POST",
+    orgPath(org_id, `/descriptor-catalog/${encodeURIComponent(name)}/family`), body);
+
+/** Sets the logo of the model family `family` of the organization `org_id`, or removes it with `null`. */
+export const setOrgDescriptorFamilyLogo = (signer: Signer, org_id: string, family: string,
+                                           body: SetDescriptorFamilyLogoRequest) =>
+  signed<DescriptorFamilyLogoView>(signer, "POST",
+    orgPath(org_id, `/descriptor-families/${encodeURIComponent(family)}/logo`), body);
 
 /** Every live entry of the organization `org_id`, read page by page. With `members`, each row has the descriptors of
  * its members. */
@@ -363,6 +380,9 @@ export const rejectClient = (signer: Signer, client_id: string) =>
 
 export const deleteClient = (signer: Signer, client_id: string) =>
   signed<unknown>(signer, "DELETE", device(client_id));
+
+export const updateClient = (signer: Signer, client_id: string, body: UpdateClientRequest) =>
+  signed<unknown>(signer, "PATCH", device(client_id), body);
 
 export const amendClientPermissions = (signer: Signer, client_id: string, body: AmendClientPermissionsRequest) =>
   signed<unknown>(signer, "PATCH", device(client_id, "/permissions"), body);

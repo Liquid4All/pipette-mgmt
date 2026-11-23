@@ -1,23 +1,26 @@
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::http::{Method, Request, StatusCode};
-use axum::middleware::Next;
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+use axum::middleware::{Next, map_response};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use tracing::Instrument;
 
-use pipette_plan_types::ErrorBody;
 use pipette_plan_types::UserPermission::{
     CancelPlans, EditAnyCatalog, EditCatalog, ManageAnyOrgs, ManageClients, ManageOrgs,
     ReadAnyPlans, ReadClients, ReadOrgs, ReadPlans, SubmitPlans,
 };
+use pipette_plan_types::{ErrorBody, LogoUri};
 
 use crate::error::AppError;
 use crate::gate::Gate::{self, Active, AllOf, AnyOf, Needs};
 use crate::gate::gate;
 use crate::state::AppState;
 use crate::{api_schema, api_v1, client, health, ui};
+
+/// A full-length logo URI plus room for the JSON envelope.
+pub(crate) const FAMILY_LOGO_BODY_LIMIT_BYTES: usize = LogoUri::MAX_LEN + 1024;
 
 pub(crate) const READ_CAMPAIGN: Gate = AnyOf(
     &[ReadPlans, ManageOrgs],
@@ -48,6 +51,14 @@ pub(crate) const EDIT_ORG_CATALOG: Gate = AnyOf(
 /// encoder flushes on each wait, so a progress line still arrives at once.
 pub(crate) fn compression() -> tower_http::compression::CompressionLayer {
     tower_http::compression::CompressionLayer::new()
+}
+
+async fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 /// The served route table, built by `serve` and the integration tests alike.
@@ -120,6 +131,15 @@ fn client_protocol(router: Router<AppState>, submission_body_limit: usize) -> Ro
         .route(
             "/clients/me",
             get(client::clients::get_own_client).patch(client::clients::update_own_client),
+        )
+        .route(
+            "/clients/me/descriptor-catalog",
+            get(client::descriptor_catalog::list_own_descriptor_catalog),
+        )
+        .route(
+            "/clients/me/descriptor-catalog/family-logos/{sha256}",
+            get(client::descriptor_catalog::get_own_descriptor_family_logo)
+                .layer(map_response(no_store)),
         )
         .route(
             "/benchmarks",
@@ -399,6 +419,14 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
             )),
         )
         .route(
+            "/api/v1/descriptor-catalog/family-logos/{sha256}",
+            get(gate(
+                Active,
+                api_v1::descriptor_catalog::get_descriptor_family_logo,
+            ))
+            .layer(map_response(no_store)),
+        )
+        .route(
             "/api/v1/descriptor-catalog/by-digest",
             get(gate(
                 Active,
@@ -439,6 +467,21 @@ fn operator_api(router: Router<AppState>, plan_body_limit: usize) -> Router<AppS
                 EDIT_ORG_CATALOG,
                 api_v1::descriptor_catalog::remove_org_descriptor_member,
             )),
+        )
+        .route(
+            "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/family",
+            post(gate(
+                EDIT_ORG_CATALOG,
+                api_v1::descriptor_catalog::set_org_descriptor_entry_family,
+            )),
+        )
+        .route(
+            "/api/v1/orgs/{org_id}/descriptor-families/{family}/logo",
+            post(gate(
+                EDIT_ORG_CATALOG,
+                api_v1::descriptor_catalog::set_org_descriptor_family_logo,
+            ))
+            .layer(DefaultBodyLimit::max(FAMILY_LOGO_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/v1/orgs/{org_id}/descriptor-catalog/{name}/state",

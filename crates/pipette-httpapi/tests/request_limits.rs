@@ -463,17 +463,17 @@ enum Caller {
     Anonymous,
     /// A user account holding `submit_plans`: the ordinary plan filer.
     Submitter,
-    /// An account that holds `submit_plans` but still waits for an operator.
-    PendingUser,
+    /// An account that holds `submit_plans` but is disabled.
+    DisabledUser,
     /// An active account that an operator has granted nothing.
     UngrantedUser,
 }
 
 /// Every gate runs before the plan body is read, so only a caller the route
-/// admits can make the server read one. Registration and asking for an account
-/// are both self-service, so without this ordering either could exhaust memory
-/// through the raised ceiling. The pending user holds `submit_plans`, so its
-/// `403` can only come from the status gate.
+/// admits can make the server read one. Device registration is self-service, so
+/// without this ordering it could exhaust memory through the raised ceiling. The
+/// disabled user holds `submit_plans`, so its `403` can only come from the
+/// status gate.
 #[rstest]
 #[case::approved_client_is_refused_first(
     Caller::Approved,
@@ -486,10 +486,10 @@ enum Caller {
     "request body is too large"
 )]
 #[case::pending_is_refused_first(Caller::Pending, StatusCode::UNAUTHORIZED, DEVICE_REFUSAL)]
-#[case::pending_user_is_refused_first(
-    Caller::PendingUser,
+#[case::disabled_user_is_refused_first(
+    Caller::DisabledUser,
     StatusCode::FORBIDDEN,
-    "user is pending an operator's approval"
+    "user is disabled"
 )]
 #[case::ungranted_user_is_refused_first(
     Caller::UngrantedUser,
@@ -520,7 +520,7 @@ async fn test_only_an_admitted_caller_can_send_a_plan_sized_body(
             device_request(&state, &owner.1, register_pending(&state).await?).await?
         }
         Caller::Submitter => user_request(&state, &[UserPermission::SubmitPlans], false).await?,
-        Caller::PendingUser => user_request(&state, &[UserPermission::SubmitPlans], true).await?,
+        Caller::DisabledUser => user_request(&state, &[UserPermission::SubmitPlans], true).await?,
         Caller::UngrantedUser => user_request(&state, &[], false).await?,
     };
     let resp = raw_request(
@@ -555,16 +555,16 @@ async fn device_request(
 }
 
 /// A new account's own campaign's plans route, and that account's signed `POST`
-/// headers. `pending` resets it after the grant, so a refusal is the status
+/// headers. `disabled` disables it after the grant, so a refusal is the status
 /// gate's.
 async fn user_request(
     state: &AppState,
     grants: &[UserPermission],
-    pending: bool,
+    disabled: bool,
 ) -> anyhow::Result<(String, Vec<(&'static str, String)>)> {
     let (key, user_id, key_id) = registered_user(state, grants).await?;
-    if pending {
-        set_user_status(state, &user_id, UserStatus::Pending).await?;
+    if disabled {
+        set_user_status(state, &user_id, UserStatus::Disabled).await?;
     }
     let uri = own_campaign_plans_uri(state, &user_id).await?;
     let headers = user_auth_headers(&key, &user_id, &key_id, "POST", &uri)?;

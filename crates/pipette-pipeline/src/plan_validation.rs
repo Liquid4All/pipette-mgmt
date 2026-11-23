@@ -19,7 +19,7 @@ use crate::plan_document::{DocumentError, chain, index_labels};
 use crate::plan_ingestion::{
     IngestContext, IngestError, JobRejectionError, RejectionError, validate_submission,
 };
-use crate::plan_names::{NamedDocument, OffsetMap};
+use crate::plan_names::{NamedDocument, OffsetMap, ResolvedName};
 use crate::submission::without_auth_tokens;
 use crate::variant_edit::VARIANTS;
 
@@ -102,6 +102,8 @@ pub struct Submission {
     pub offsets: OffsetMap,
     /// The warnings of resolving the catalog names, placed as the planner's are.
     pub warnings: Vec<PlanWarning>,
+    /// The catalog names that the rewrite replaced.
+    pub resolved: Vec<ResolvedName>,
 }
 
 impl Submission {
@@ -112,6 +114,7 @@ impl Submission {
             text: named.text,
             offsets: named.offsets,
             warnings: named.warnings,
+            resolved: named.resolved,
         }
     }
 
@@ -123,6 +126,7 @@ impl Submission {
             text: text.to_owned(),
             offsets: OffsetMap::default(),
             warnings: Vec::new(),
+            resolved: Vec::new(),
         }
     }
 }
@@ -160,6 +164,7 @@ fn stage(
             expansion,
         }),
         Err(e) => {
+            let e = e.with_model_selector(&submission.resolved);
             let mut verdict = refusal_in(&submission.submitted, &submission.offsets, e)?;
             verdict
                 .issues
@@ -296,7 +301,8 @@ fn issue_for(text: &str, offsets: &OffsetMap, error: &DocumentError) -> PlanIssu
         DocumentError::Parse(PlanParseError::HfTokenEnv { variant, .. }) => Some(*variant),
         DocumentError::Count(e) | DocumentError::Expand(e) => e.variant(),
         // A fault of the whole document, or of the server, names no variant.
-        DocumentError::TooManyJobs { .. }
+        DocumentError::Parse(PlanParseError::RootSession { .. })
+        | DocumentError::TooManyJobs { .. }
         | DocumentError::TokenOutsideAModel
         | DocumentError::Stored(_)
         | DocumentError::Digest(_)

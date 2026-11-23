@@ -57,9 +57,9 @@ describe("the re-run controls", () => {
   });
 
   test("open a re-run's or a recalculation's parent on its plan's Jobs tab, searched for its id", () => {
-    expect(parentLink(null, "plan-1", "job-a")).toBe("/app/plans/plan-1/cells?q=job-a");
+    expect(parentLink(null, "plan-1", "job-a")).toBe("/app/plans/plan-1/cells?q=job-a&sort=job");
     expect(parentLink("cmp_1", "plan/1", "job b"))
-      .toBe("/app/campaigns/cmp_1/plans/plan%2F1/cells?q=job+b");
+      .toBe("/app/campaigns/cmp_1/plans/plan%2F1/cells?q=job+b&sort=job");
   });
 });
 

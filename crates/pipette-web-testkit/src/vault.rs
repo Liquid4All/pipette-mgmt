@@ -100,7 +100,7 @@ pub async fn upload_vault_blob(
 }
 
 /// Describe the file under `sha256` as a `gguf_text` model for `owner` (the
-/// signer when `None`), failing the test on a refusal. Returns the minted id.
+/// signer's organization when `None`), failing the test on a refusal. Returns the minted id.
 pub async fn describe_gguf_text_ok(
     state: &AppState,
     signer: &UserSigner,
@@ -122,15 +122,19 @@ pub async fn describe_gguf_text_ok(
         .ok_or_else(|| anyhow::anyhow!("the answer names no resource: {answer}"))
 }
 
-/// Upload `bytes` for `owner` (the signer when `None`) and describe them as a
-/// `gguf_text` model, failing the test on any refusal. Returns the minted id.
+/// Upload `bytes` for `owner` (the signer's organization when `None`) and
+/// describe them as a `gguf_text` model, failing the test on any refusal.
+/// Returns the minted id.
 pub async fn upload_gguf_text(
     state: &AppState,
     signer: &UserSigner,
     owner: Option<&str>,
     bytes: &[u8],
 ) -> anyhow::Result<String> {
-    let principal = owner.map_or_else(|| signer.1.to_string(), str::to_string);
+    let principal = match owner {
+        Some(owner) => owner.to_string(),
+        None => crate::org_of(state, &signer.1).await?.to_string(),
+    };
     let sha256 = upload_vault_blob(state, signer, &principal, bytes).await?;
     describe_gguf_text_ok(state, signer, owner, &sha256).await
 }

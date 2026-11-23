@@ -15,8 +15,9 @@ device already has (`null` for none) is the no-op.
 
 **One owner shape everywhere.** The same object names who owns a device, a
 campaign ([campaigns](../campaigns.md)) and a vault resource ([the vault](../vault.md)), and is
-answered in the same shape on every read. `type` is the tag. A `null` value
-clears the relation.
+answered in the same shape on every read. `type` is the tag, and `org` is its
+only value: only an organization owns things. A `null` value clears the
+relation.
 
 The route checks the device first, as every device write does
 ([device administration](../devices.md)), and the destination's scope before its
@@ -30,5 +31,5 @@ outside its reach from one that does not exist.
 |--------|------|
 | 200 | The ownership is written, or already held; the body is the updated record plus `changed` |
 | 400 | The body is not JSON, omits `owner`, or holds a key other than `owner`. Nothing is written: only an explicit `null` clears |
-| 403 | The caller does not hold `manage_clients`, or the move leaves its scope: without `manage_any_clients`, a user owner other than the caller is outside it |
-| 404 | The device named in the path does not exist; or, only for a caller whose scope admits the move, the organization or the account named in the *body* does not exist, a scoped caller getting the `403` |
+| 403 | The caller does not hold `manage_clients`, or the move leaves its scope: without `manage_any_clients`, an organization other than the caller's is outside it |
+| 404 | The device named in the path does not exist; or, only for a caller whose scope admits the move, the organization named in the *body* does not exist, a scoped caller getting the `403` |

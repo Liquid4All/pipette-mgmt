@@ -34,7 +34,7 @@ describe("the vocabulary", () => {
 describe("the roster", () => {
   const rows = [
     account({ user_id: "u3", contact_email: "zed@acme.example", org_id: "org_acme" }),
-    account({ user_id: "u1", contact_email: "Bob@example.test", account_type: "human", status: "pending" }),
+    account({ user_id: "u1", contact_email: "Bob@example.test", account_type: "human", status: "disabled" }),
     account({ user_id: "u2", contact_email: "amy@acme.example", org_id: "org_acme", status: "disabled" }),
     account({ user_id: "u4", contact_email: "eve@globex.example", org_id: "org_globex", account_type: "service" }),
   ];
@@ -51,7 +51,7 @@ describe("the roster", () => {
     const view = (query: string) =>
       ids(tableView(spec, tableState(spec, new URLSearchParams(query)), rosterRows(rows, { kind: "all" })));
     expect(view("type=service")).toEqual(["u4"]);
-    expect(view("status=pending&status=disabled")).toEqual(["u1", "u2"]);
+    expect(view("status=disabled")).toEqual(["u1", "u2"]);
     expect(view("organization=org_acme")).toEqual(["u2", "u3"]);
     expect(view("organization=none")).toEqual(["u1"]);
     expect(view("q=ACME")).toEqual(["u2", "u3"]);
@@ -68,9 +68,9 @@ describe("the roster", () => {
   });
 
   test("sends a link carrying the old org filter to that organization's members", () => {
-    expect(legacyRosterFilter(new URLSearchParams("org=acme&status=pending&offset=50&cursor=x")))
-      .toBe("/app/orgs/acme/members?status=pending&offset=50");
-    expect(legacyRosterFilter(new URLSearchParams("status=pending"))).toBeNull();
+    expect(legacyRosterFilter(new URLSearchParams("org=acme&status=disabled&offset=50&cursor=x")))
+      .toBe("/app/orgs/acme/members?status=disabled&offset=50");
+    expect(legacyRosterFilter(new URLSearchParams("status=disabled"))).toBeNull();
   });
 });
 
@@ -140,7 +140,6 @@ describe("what an account's page offers", () => {
   });
 
   test("each standing its one step, and never the reader's own disable", () => {
-    expect(standing("pending", false)).toMatchObject({ to: "active", label: "Admit this account" });
     expect(standing("disabled", true)).toMatchObject({ to: "active", label: "Enable this account" });
     expect(standing("active", false)).toMatchObject({ to: "disabled", danger: true });
     expect(standing("active", true)).toMatchObject({ to: null, note: "Active. You cannot disable your own account." });

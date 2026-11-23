@@ -10,6 +10,4 @@ rename's rights
 | Status | When |
 |--------|------|
 | 204 | The group is deleted; its campaigns are kept |
-| 400 | `group_id` is not a group id |
 | 403 | The caller may not administer the group ([who may do what](../campaign-groups.md#who-may-do-what)) |
-| 404 | No such group, or the server has no `[database]` |

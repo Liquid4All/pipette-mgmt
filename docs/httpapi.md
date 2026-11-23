@@ -119,6 +119,7 @@ unread, and neither its size nor its content is refused.
 | `POST /benchmarks`, `POST /benchmarks/batch` | `submission_body_limit_bytes` (default 500 MB) |
 | `POST /api/v1/plans`, `POST /api/v1/plans/validate`, `POST /api/v1/campaigns`, `POST /api/v1/campaigns/{campaign_id}/plans`, `POST /api/v1/campaigns/{campaign_id}/variants`, `PUT /api/v1/campaigns/{campaign_id}/document` | `plan_body_limit_bytes` (default 128 MB) |
 | `PUT /api/v1/vault/blobs/{principal_id}/{sha256}` | `vault_blob_limit_bytes` (default 128 GiB), streamed rather than read in full ([`PUT /api/v1/vault/blobs/{principal_id}/{sha256}`](api/vault/put_blob.md)) |
+| `POST /api/v1/orgs/{org_id}/descriptor-families/{family}/logo` | 65 KiB, including the JSON envelope |
 | Every other route | `default_body_limit_bytes` (default 64 KB) |
 
 The routes above carry a body that scales with the workload, and each kind
@@ -126,11 +127,10 @@ scales on a different thing. A `POST /benchmarks` submission carries one
 `completions` entry per eval sample. A `POST /benchmarks/batch` request carries
 up to 1000 submissions. A plan request carries the source document
 ([Campaigns: Request body](api/campaigns.md#request-body)), and
-`plan_max_jobs` separately limits its server-side expansion. Each ceiling is a
-key in [`config.rs`](../crates/pipette-core/src/config.rs), so an operator can
-raise or lower it. Everything else carries a fixed
-set of identity and device fields, for which 64 KB is far beyond any legitimate
-request.
+`plan_max_jobs` separately limits its server-side expansion. An operator can
+set the named ceilings in [`config.rs`](../crates/pipette-core/src/config.rs).
+The fixed logo upload cap leaves room for a 65,536-character URI and its JSON
+envelope.
 
 A submission body is also costed before it is parsed, since its parsed form can
 take far more memory than its text: a `0` takes a 32-byte value, and a
@@ -583,7 +583,7 @@ hold is served as the public entry. The signature
 is checked the way every authenticated route checks it, so a request that
 carries `X-Client-Id` and fails to verify is a `401`, not the public view.
 Standing decides what is added, not whether the route answers: a pending client
-or a pending user is served the public catalog, an approved client or an active
+is served the public catalog, an approved client or an active
 user its organization's private entries as well. A disabled user is refused
 with `403` as it is everywhere.
 
@@ -783,7 +783,7 @@ yet, and a grant is what an operator makes after vetting one.
 client's organization keeps to itself
 ([benchmarks.md §1.1](benchmarks.md#11-private-benchmarks)): the rule
 [§2.6](#26-get-benchmarksbenchmark_id) serves a definition by, so an approved
-client its organization holds, directly or through a member owner. Any other
+client its organization owns. Any other
 private id is `404 benchmark not found`, the answer an unknown id gets. The
 exception is a `"failure"` reporting the client's own live claim on a job that
 runs the id, accepted from any client. A device outside the organization
@@ -1886,3 +1886,47 @@ and only then is the file opened. A `Range` does not change a refusal.
 A missing file is a `404` with a logged `vault_object_missing` event: the record
 outlives its bytes only if the file went missing from the store, which is an
 operator's problem rather than the caller's.
+
+### 2.19. `GET /clients/me/descriptor-catalog`
+
+Get the catalog short list for the device that signs the request. The response
+is the same `DescriptorCatalogShortList` that an operator reads at
+[`GET /api/v1/descriptor-catalog/devices/{client_id}`](api/descriptor-catalog/list_descriptor_catalog_for_device.md).
+That page tells how the list selects the members and what `withheld` reports.
+
+The list always includes global entries. If an organization owns the approved
+device, the list also includes that organization's entries. The device needs
+no permission to read its short list.
+
+A model entry whose family has a logo gives the digest of the logo in
+`family_logo_sha256`. Get the logo with
+[§2.20](#220-get-clientsmedescriptor-catalogfamily-logossha256).
+
+#### 2.19.1. Errors
+
+| Status | Condition |
+|--------|-----------|
+| 401 | Missing or invalid authentication headers |
+
+### 2.20. `GET /clients/me/descriptor-catalog/family-logos/{sha256}`
+
+Get the logo of a model family by the `family_logo_sha256` digest that the
+short list gives. The response is the same `DescriptorFamilyLogo` that an
+operator reads at
+[`GET /api/v1/descriptor-catalog/family-logos/{sha256}`](api/descriptor-catalog/get_descriptor_family_logo.md).
+That page describes the forms of the logo Uniform Resource Identifier (URI).
+
+Get a logo by its digest when the device needs it. The response has the header
+`Cache-Control: private, no-store`. Show the URI as an image only because an
+SVG image can hold a script.
+
+The device gets a global logo, or a logo of the organization that owns the
+approved device. The device needs no permission to read a logo.
+
+#### 2.20.1. Errors
+
+| Status | Condition |
+|--------|-----------|
+| 400 | The digest is not 64 lowercase hexadecimal characters |
+| 401 | Missing or invalid authentication headers |
+| 404 | No logo that the device can read has the digest |

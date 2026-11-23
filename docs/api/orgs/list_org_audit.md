@@ -21,4 +21,3 @@ and `names=true` names the ids the reader may see
 | 200 | A page of the organization's events, newest first |
 | 400 | An outcome or an actor kind that is not in the vocabulary, a `target` that cannot be an id, or, for a reader with `manage_orgs`, a `target` that names another organization |
 | 403 | The caller does not hold `manage_orgs`, or is a service account |
-| 404 | The organization is outside the caller's scope or does not exist; or the server has no `[database]`, so keeps no audit log |

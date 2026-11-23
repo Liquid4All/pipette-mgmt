@@ -15,8 +15,7 @@ The body is `CreatePlanTagRequest` ([the OpenAPI document](../../httpapi.md#15-t
 
 The server adds the caller as `tagger` and the time as `created_at`. A tag made
 by `pipette-mgmt campaigns tag` has no `tagger`. No route changes, moves or
-deletes a tag. The campaign's delete removes its tags. Tags are kept only on a
-`[database]`.
+deletes a tag. The campaign's delete removes its tags.
 
 Answers `201` with the `PlanTag`. The tags show in
 [`GET …/tags`](list_plan_tags.md), in [`GET …/plans`](list_campaign_plans.md),
@@ -30,5 +29,5 @@ on each row of the [overview](get_campaign_overview.md)'s `history`, and as
 | 201 | The tag |
 | 400 | The body is not JSON, names another field, or carries a bad `name`, an overlong `message` or a malformed `plan_id` |
 | 403 | The caller may not file into the campaign |
-| 404 | No such campaign, the campaign filed no such plan, or the server has no `[database]` |
+| 404 | No such campaign, or the campaign filed no such plan |
 | 409 | The campaign already has a tag of that name |

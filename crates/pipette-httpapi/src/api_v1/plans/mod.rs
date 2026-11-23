@@ -48,8 +48,14 @@ pub(crate) struct FilingScope {
     vault: VaultScope,
 }
 
-/// The [`FilingScope`] of a user: everyone's under `submit_any_plans`, else the
-/// user's own and its organization's. Every door has already required it active.
+impl FilingScope {
+    pub(crate) fn vault(&self) -> &VaultScope {
+        &self.vault
+    }
+}
+
+/// The [`FilingScope`] of a user: everyone's under `submit_any_plans`, else
+/// its organization's. Every door has already required it active.
 pub(crate) async fn plan_scope(
     state: &AppState,
     user: &User,
@@ -64,10 +70,7 @@ pub(crate) async fn plan_scope(
     let org = user_org(state, &user.user_id).await?;
     Ok(FilingScope {
         catalog: CatalogScope::Org(org.clone()),
-        vault: VaultScope::Own {
-            user: user.user_id.clone(),
-            org,
-        },
+        vault: VaultScope::Own { org },
     })
 }
 
@@ -85,11 +88,10 @@ pub async fn validate_plan(
     let scope = plan_scope(&state, &user, &rights).await?;
     let catalogs = IngestCatalogs::load_without_models(&state, &scope).await?;
     let types = plan_document::benchmark_types(&catalogs.benchmarks);
+    let own_org = user_org(&state, &user.user_id).await?;
     let named = match pipette_pipeline::plan_names::resolve_names(
         &catalogs.context(&state, &state.hf_imports),
-        &VaultOwner::User {
-            user_id: user.user_id.clone(),
-        },
+        own_org.as_ref(),
         text.clone(),
     )
     .await
@@ -491,6 +493,7 @@ mod tests {
             merged_job_count: 0,
             job_ids: vec![],
             merges: vec![],
+            replaced: vec![],
             warnings: vec![
                 Warning {
                     kind: WarningKind::Fleet,

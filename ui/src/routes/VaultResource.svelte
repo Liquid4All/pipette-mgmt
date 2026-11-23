@@ -36,7 +36,7 @@
   record.run(read);
 
   const view = $derived(record.data);
-  const under = $derived(view && session.account ? ownerBranch(session.account, view.owner, session.known, VAULT_PAGES) : null);
+  const under = $derived(view ? ownerBranch(view.owner, session.known, VAULT_PAGES) : null);
   // The tab that lists it, where its delete lands: a runtime's is under the vault's own address.
   const runtimes = $derived(under && view && listedUnder(view) === "runtime"
     ? { label: "Runtimes", href: runtimesPath(under.href) } : null);

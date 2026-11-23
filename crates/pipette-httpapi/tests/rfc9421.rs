@@ -100,10 +100,7 @@ async fn a_write_is_held_to_its_body() -> anyhow::Result<()> {
             .await?
             .contains("not the signed Content-Digest")
     );
-    assert!(
-        state.org_store.list_orgs().await?.is_empty(),
-        "nothing was written"
-    );
+    assert!(team_orgs(&state).await?.is_empty(), "nothing was written");
 
     let resp = rfc9421_request(
         &state,
@@ -156,7 +153,7 @@ async fn a_body_without_a_signed_digest_is_refused() -> anyhow::Result<()> {
             .await?
             .contains("not the signed Content-Digest")
     );
-    assert!(state.org_store.list_orgs().await?.is_empty());
+    assert!(team_orgs(&state).await?.is_empty());
     Ok(())
 }
 
@@ -226,18 +223,11 @@ async fn a_device_key_names_no_account() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Standing is read as for `v2`: a disabled account reaches nothing, and a
-/// pending one reaches only its own record.
+/// Standing is read as for `v2`: a disabled account reaches nothing.
 #[tokio::test]
 async fn standing_is_read_as_for_v2() -> anyhow::Result<()> {
     let (_dir, state) = empty_state().await?;
     let signer = registered_user(&state, &[UserPermission::ReadPlans]).await?;
-
-    set_user_status(&state, &signer.1, UserStatus::Pending).await?;
-    let resp = rfc9421_request(&state, &signer, "GET", "/api/v1/users/me", None).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let resp = rfc9421_request(&state, &signer, "GET", "/api/v1/plans", None).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     set_user_status(&state, &signer.1, UserStatus::Disabled).await?;
     let resp = rfc9421_request(&state, &signer, "GET", "/api/v1/users/me", None).await?;
@@ -285,7 +275,8 @@ async fn the_kind_dispatching_gates_admit_it() -> anyhow::Result<()> {
 
     let file = b"weights".as_slice();
     let digest = sha256_hex(file);
-    let uri = format!("/api/v1/vault/blobs/{user_id}/{digest}");
+    let principal = org_of(&state, user_id).await?;
+    let uri = format!("/api/v1/vault/blobs/{principal}/{digest}");
     let headers = rfc9421_headers(key, key_id, "PUT", &uri, Some(file))?;
     let resp = raw_request(
         &state,
@@ -303,7 +294,7 @@ async fn the_kind_dispatching_gates_admit_it() -> anyhow::Result<()> {
         error_of(resp).await?
     );
 
-    let other = format!("/api/v1/vault/blobs/{user_id}/{}", sha256_hex(b"other"));
+    let other = format!("/api/v1/vault/blobs/{principal}/{}", sha256_hex(b"other"));
     let headers = rfc9421_headers(key, key_id, "PUT", &other, Some(file))?;
     let resp = raw_request(
         &state,

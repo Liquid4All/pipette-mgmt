@@ -61,6 +61,8 @@ pub enum OrgCatalogError {
     /// and probe follow the public pin, so this entry would be dropped as a conflict.
     #[error("a public benchmark pins dataset {0} differently")]
     DatasetPinnedPublicly(Sha256),
+    #[error("benchmark {0} is a session, and only the public catalog holds a session benchmark")]
+    PrivateSession(BenchmarkId),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -86,14 +88,30 @@ pub async fn require(
 /// the id, when a public entry pins its dataset's digest differently, or when
 /// only another organization's entry pins its dataset or names its evals-server
 /// samples, or when an evals-server name is not one plain path segment.
+/// An existing entry with a session prefix can still be replaced with the same type.
 pub async fn put(
     catalog: &dyn CatalogStore,
     public: &HashMap<BenchmarkId, Benchmark>,
     org_id: &OrgId,
     benchmark: Benchmark,
 ) -> Result<Benchmark, OrgCatalogError> {
+    if benchmark.benchmark_type() == BenchmarkType::Session {
+        tracing::warn!(
+            org_id = %org_id,
+            benchmark_id = %benchmark.benchmark_id(),
+            "organization catalog write refused: a session benchmark is public only"
+        );
+        return Err(OrgCatalogError::PrivateSession(
+            benchmark.benchmark_id().clone(),
+        ));
+    }
     if let Some(prefix_type) = BenchmarkType::from_id(benchmark.benchmark_id().as_ref())
         && prefix_type != benchmark.benchmark_type()
+        && !(prefix_type == BenchmarkType::Session
+            && catalog
+                .get_org_benchmark(org_id, benchmark.benchmark_id())
+                .await?
+                .is_some_and(|existing| existing.benchmark_type() == benchmark.benchmark_type()))
     {
         return Err(OrgCatalogError::MisleadingPrefix {
             benchmark_id: benchmark.benchmark_id().clone(),
@@ -212,7 +230,8 @@ fn eval_samples(benchmark: &Benchmark) -> Option<(&str, &str)> {
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::DecisionLatency(_)
-        | BenchmarkDefinition::DecisionMaxMemory(_) => None,
+        | BenchmarkDefinition::DecisionMaxMemory(_)
+        | BenchmarkDefinition::Session(_) => None,
     }
 }
 
@@ -406,8 +425,7 @@ pub enum PrivateRunError {
 pub struct PrivateRun {
     /// Each private benchmark, with the organization holding it.
     pub held: HashMap<BenchmarkId, OrgId>,
-    /// Each organization's vault resource, with that organization. A person's
-    /// own resource is not here: its results are theirs to file anywhere.
+    /// Each organization's vault resource, with that organization.
     pub vault: HashMap<VaultResourceId, OrgId>,
     /// Ids no catalog resolves now: a private entry since deleted, so whose
     /// results they are is no longer known.
@@ -483,12 +501,11 @@ pub async fn private_run(
                 .collect::<Option<Vec<_>>>()
         });
         match owners_named {
-            Some(named) => run.vault.extend(named.into_iter().filter_map(
-                |(resource_id, owner)| match owner {
-                    VaultPrincipalId::Org(org_id) => Some((resource_id, org_id)),
-                    VaultPrincipalId::User(_) => None,
-                },
-            )),
+            Some(named) => run.vault.extend(
+                named
+                    .into_iter()
+                    .map(|(resource_id, VaultPrincipalId::Org(org_id))| (resource_id, org_id)),
+            ),
             None => run.unknown_jobs += 1,
         }
     }
@@ -561,6 +578,33 @@ mod tests {
         ))
     }
 
+    /// Only the public catalog holds a session, whatever the entry's id.
+    #[rstest::rstest]
+    #[case::session_id("session_acme")]
+    #[case::other_id("acme_shell")]
+    #[tokio::test]
+    async fn a_private_entry_cannot_be_a_session(#[case] id: &str) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = stores(&dir)?;
+        let acme = OrgId::mint();
+        let session = Benchmark::from_def(BenchmarkDefinition::Session(
+            pipette_plan_types::SessionBenchmark {
+                benchmark_id: BenchmarkId::try_new(id)?,
+            },
+        ))?;
+
+        let refused = put(&*catalog, &HashMap::new(), &acme, session).await;
+        assert!(
+            matches!(&refused, Err(OrgCatalogError::PrivateSession(b)) if b.as_str() == id),
+            "{refused:?}"
+        );
+        assert!(
+            list(&*catalog, &acme).await?.is_empty(),
+            "nothing was written"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_private_entry_cannot_take_a_public_id() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -582,6 +626,14 @@ mod tests {
                 ..
             })
         ));
+        let refused = put(&*catalog, &public, &acme, entry("session_acme")?).await;
+        assert!(matches!(
+            refused,
+            Err(OrgCatalogError::MisleadingPrefix {
+                prefix_type: BenchmarkType::Session,
+                ..
+            })
+        ));
         assert!(
             list(&*catalog, &acme).await?.is_empty(),
             "nothing was written"
@@ -596,6 +648,41 @@ mod tests {
                 .map(|kept| kept.entry.ok())
                 .collect::<Vec<_>>(),
             vec![Some(written)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_existing_session_prefixed_entry_can_keep_its_type() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = stores(&dir)?;
+        let org = OrgId::mint();
+        let id = "session_acme";
+        let public = HashMap::new();
+        catalog.put_org_benchmark(&org, &entry(id)?).await?;
+
+        let changed_type = Benchmark::from_toml(
+            id,
+            r#"benchmark_type = "decode_throughput"
+parameter_prefill_tokens = 64
+parameter_decode_tokens = 16"#,
+        )?;
+        assert!(matches!(
+            put(&*catalog, &public, &org, changed_type).await,
+            Err(OrgCatalogError::MisleadingPrefix {
+                prefix_type: BenchmarkType::Session,
+                ..
+            })
+        ));
+        let updated = Benchmark::from_toml(
+            id,
+            r#"benchmark_type = "prefill_throughput"
+parameter_prefill_tokens = 128"#,
+        )?;
+        let written = put(&*catalog, &public, &org, updated).await?;
+        assert_eq!(
+            require(&*catalog, &org, written.benchmark_id()).await?,
+            written
         );
         Ok(())
     }
@@ -1210,8 +1297,8 @@ sources = ["https://huggingface.co/org/repo"]
         catalog.unexpected.none()
     }
 
-    /// A person's own vault resource is placed nowhere; a job with no definition or
-    /// an unreadable vault source counts as unknown.
+    /// A job naming an account as a principal, one with no definition, and one
+    /// with an unreadable vault source each count as unknown.
     #[tokio::test]
     async fn a_run_places_vault_resources_and_counts_what_it_cannot() -> anyhow::Result<()> {
         use jiff::Timestamp;
@@ -1238,10 +1325,10 @@ sources = ["https://huggingface.co/org/repo"]
             }
             json!({ "spec": { "benchmark": "prefill_throughput_256", "model": model } })
         };
-        let owner = UserId::mint();
         let bodies = [
             Some(model(&shared, Some(acme.as_str()))),
-            Some(model(&personal, Some(owner.as_str()))),
+            // An account is no principal, so nothing says whose it is.
+            Some(model(&personal, Some(UserId::mint().as_str()))),
             // No principal: a shape filing refuses, so nothing says whose it is.
             Some(model(&shared, None)),
             // Minted before job sources existed.
@@ -1281,7 +1368,9 @@ sources = ["https://huggingface.co/org/repo"]
             .await?;
         let campaign = NewCampaign::new(
             NonEmptyTrimmedString::try_new("Nightly")?,
-            CampaignOwner::User { user_id: owner },
+            CampaignOwner::Org {
+                org_id: acme.clone(),
+            },
         )
         .around(plan_id, Timestamp::now());
         let public: HashMap<BenchmarkId, Benchmark> = [entry("prefill_throughput_256")?]
@@ -1294,7 +1383,7 @@ sources = ["https://huggingface.co/org/repo"]
             run,
             PrivateRun {
                 vault: HashMap::from([(shared.clone(), acme.clone())]),
-                unknown_jobs: 2,
+                unknown_jobs: 3,
                 ..PrivateRun::default()
             }
         );

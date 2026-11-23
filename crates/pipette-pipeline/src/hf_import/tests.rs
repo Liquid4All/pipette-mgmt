@@ -285,6 +285,37 @@ fn public_form(raw: &Value) -> Value {
     }
 }
 
+/// Add the sizes of the GGUF files or the files under the directory prefix.
+/// Count each shared source once.
+#[rstest]
+#[case::gguf_text(typed("gguf_text", hf("vl-gguf", json!({"path": "m.gguf"}))), 12)]
+#[case::gguf_vision(
+    typed("gguf_vision", hf("vl-gguf", json!({"model": "m.gguf", "mmproj": "mmproj/p.gguf"}))),
+    12 + 14
+)]
+#[case::mlx_prefix(typed("mlx", hf("dir", json!({"prefix": "4bit"}))), 10 + 300)]
+#[case::onnx_prefix(typed("onnx_genai", hf("dir", json!({"prefix": "4bit"}))), 10 + 300)]
+#[case::whole_repo(typed("onnx_genai", hf("dir", json!({}))), 2 + 700 + 10 + 300)]
+#[case::speculative(
+    typed("mlx_speculative", json!({"target": hf("dir", json!({"prefix": "4bit"})), "draft": hf("draft", json!({}))})),
+    10 + 300 + 14 + 100
+)]
+#[case::shared_source(
+    typed("torch_speculative", json!({"target": hf("dir", json!({})), "draft": hf("dir", json!({}))})),
+    2 + 700 + 10 + 300
+)]
+#[tokio::test]
+async fn listings_give_the_download_size(
+    #[case] raw: Value,
+    #[case] download_bytes: u64,
+) -> anyhow::Result<()> {
+    let fx = Fixture::start().await?;
+    let model: Model = serde_json::from_value(raw)?;
+    let listings = listings_for(&fx.client, &model).await?;
+    assert_eq!(listings.download_bytes, download_bytes);
+    Ok(())
+}
+
 /// The arm names every record, pins every digest, names the owner and holds no
 /// token; the scorer's alias of it is the HuggingFace form at the commit.
 #[rstest]

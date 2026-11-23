@@ -181,6 +181,7 @@ fn normalized_ids(mut ids: Vec<ClientId>) -> Vec<ClientId> {
 #[serde(deny_unknown_fields)]
 pub struct SchedulerVariant {
     /// Crossed with `runtimes`; each model must pair with one of them.
+    #[cfg_attr(feature = "schemars", schemars(with = "NonEmptyVec<ModelInput>"))]
     pub models: NonEmptyVec<Model>,
     /// Crossed with `models`; each runtime must load one of them.
     #[cfg_attr(feature = "schemars", schemars(with = "NonEmptyVec<RuntimeInput>"))]
@@ -302,8 +303,12 @@ pub(crate) struct SchedulerPlanIntake {
 }
 
 impl SchedulerPlanIntake {
+    pub(crate) fn root_benchmark_ids(&self) -> impl Iterator<Item = &BenchmarkId> {
+        self.benchmarks.iter().flat_map(|b| b.iter())
+    }
+
     pub(crate) fn benchmark_ids(&self) -> impl Iterator<Item = &BenchmarkId> {
-        (self.benchmarks.iter().flat_map(|b| b.iter())).chain(
+        self.root_benchmark_ids().chain(
             self.variants
                 .iter()
                 .flat_map(|v| v.benchmarks.iter().flat_map(|b| b.iter())),
@@ -407,6 +412,12 @@ pub enum SchedulerPlanError {
     EmptyNotAllOfGroup { index: usize },
     #[error("variant {index}: `client_versions` lists {version:?} twice")]
     DuplicateClientVersion { index: usize, version: String },
+    /// A plan pairs each benchmark with each model and runtime. A session has neither.
+    #[error("variant {index}: benchmark `{benchmark}` is a session. A plan cannot name a session.")]
+    SessionBenchmark {
+        index: usize,
+        benchmark: BenchmarkId,
+    },
     // `error`, not `source`: the message already carries it, so a chain would repeat it.
     #[error("variant {index}: {error}")]
     Variant { index: usize, error: VariantError },
@@ -419,6 +430,7 @@ impl SchedulerPlanError {
             Self::NoEligibility { index }
             | Self::EmptyNotAllOfGroup { index }
             | Self::DuplicateClientVersion { index, .. }
+            | Self::SessionBenchmark { index, .. }
             | Self::Variant { index, .. } => *index,
         }
     }
@@ -565,6 +577,17 @@ fn validate_scheduler_plan(plan: &SchedulerPlan) -> Result<(), SchedulerPlanErro
                     version: twice.version().to_owned(),
                 });
             }
+            if let Some(session) = variant
+                .benchmarks
+                .iter()
+                .flat_map(|ids| ids.iter())
+                .find(|b| plan.benchmark_type(b) == Some(BenchmarkType::Session))
+            {
+                return Err(SchedulerPlanError::SessionBenchmark {
+                    index: idx,
+                    benchmark: session.clone(),
+                });
+            }
             let pairs = variant
                 .runnable_type_pairs()
                 .map_err(SchedulerPlanError::variant(idx))?
@@ -604,6 +627,21 @@ impl schemars::JsonSchema for RuntimeInput {
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({"anyOf": [generator.subschema_for::<Runtime>(), {"type": "string"}]})
+    }
+}
+
+/// The published schema accepts a model selector,
+/// `name::format::quantization`. Ingestion replaces each selector with a model
+/// table before the planner parses the document.
+#[cfg(feature = "schemars")]
+struct ModelInput;
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for ModelInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ModelInput".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"anyOf": [generator.subschema_for::<Model>(), {"type": "string"}]})
     }
 }
 

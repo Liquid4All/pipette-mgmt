@@ -31,7 +31,8 @@ left to the per-sample readiness gate.
 compared with (a regular model, or the same artifact with speculation off) is a
 choice, and the model pairing is not on the wire. A stored speedup would fix
 one answer to both at write time. The pairing rule lives with the analysis
-instead, in the methodology's last section.
+instead, in the methodology's
+[§2](../methodology/vl-spec-decode.md#2-analysis-outside-the-server).
 
 **The mode is a runtime flag, read back from the row.** `speculative_enabled`
 on the runtime flags, resolved by the client against the model, and submitted

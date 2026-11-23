@@ -52,5 +52,4 @@ the old name gives `400` on the next page. Start the list again.
 | 200 | The API renamed the entry, or merged it into the entry with the new name |
 | 400 | The body is invalid, the new name fails the name grammar, or the members of a merge differ in kind, runtime type, or build |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable, the entry is absent, or the server has no database catalog |
 | 409 | The entry is tombstoned, the new name is identical to the current name, a tombstoned or importer entry holds the new name, or two members of a merge have the same key or digest |

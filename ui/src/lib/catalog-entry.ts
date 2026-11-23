@@ -81,6 +81,34 @@ export function quantizationError(text: string): string | null {
 export const renameError = (typed: string, current: string): string | null =>
   catalogNameError(typed) ?? (typed === current ? "Type a name that differs from the current name." : null);
 
+/** An empty family is valid: it goes back to the default family. */
+export const familyError = (typed: string): string | null => typed ? catalogNameError(typed) : null;
+
+/** The remote folder for family logos. The console's content security policy admits remote images from it only. */
+export const LOGO_URI_PREFIX = "https://pipette.liquid.ai/logos/";
+export const LOGO_URI_MAX = 65536;
+/** A data URI of a PNG, SVG or WebP image in padded base64. */
+const LOGO_DATA_URI =
+  /^data:image\/(png|svg\+xml|webp);base64,([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$/;
+
+/** The server's logo URI rules. An empty logo URI is valid: it removes the organization's logo. */
+export function logoUriError(typed: string): string | null {
+  if (!typed) return null;
+  if (typed.startsWith("data:")) {
+    if (!LOGO_DATA_URI.test(typed))
+      return "Enter a data URI with image/png, image/svg+xml, or image/webp. Add ;base64, and the image in padded base64.";
+  } else {
+    if (!typed.startsWith(LOGO_URI_PREFIX)) return `Start the logo URI with ${LOGO_URI_PREFIX} or data:.`;
+    const path = typed.slice(LOGO_URI_PREFIX.length);
+    if (!path) return "Give the path of the logo after the folder.";
+    if (!path.split("/").every((segment) => /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(segment)))
+      return "Use path segments of letters, digits, '.', '_' and '-', with one '/' between them. "
+        + "Do not start a segment with '.'.";
+  }
+  if (typed.length > LOGO_URI_MAX) return `Use at most ${LOGO_URI_MAX} characters in the logo URI.`;
+  return null;
+}
+
 export const relabelError = (typed: string, current: string): string | null =>
   quantizationError(typed) ?? (typed === current ? "Type a label that differs from the current label." : null);
 
@@ -276,6 +304,8 @@ const WRITES = {
   member: { noun: "member", outcome: "added the member" },
   name: { noun: "name", outcome: "renamed the entry" },
   label: { noun: "label", outcome: "changed the label" },
+  family: { noun: "family", outcome: "changed the family" },
+  logo: { noun: "logo", outcome: "changed the logo" },
   state: { noun: "change", outcome: "changed the state of the entry" },
 } as const;
 

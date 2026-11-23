@@ -152,6 +152,9 @@ pub enum BenchmarkType {
     DecisionLatency,
     /// Peak memory of the `decision_latency` workload, one ungated run.
     DecisionMaxMemory,
+    /// A session gives a user exclusive remote access to one device for a limited time.
+    /// A session runs no model or runtime. A benchmark plan cannot name a session.
+    Session,
 }
 
 impl FromStr for BenchmarkType {
@@ -186,7 +189,8 @@ impl BenchmarkType {
             | Self::VlMaxMemory
             | Self::VlSpecDecode
             | Self::DecisionLatency
-            | Self::DecisionMaxMemory => false,
+            | Self::DecisionMaxMemory
+            | Self::Session => false,
         }
     }
 
@@ -232,6 +236,8 @@ impl BenchmarkType {
             Some(Self::DecisionLatency)
         } else if id.starts_with("decision_max_memory") {
             Some(Self::DecisionMaxMemory)
+        } else if id.starts_with("session_") || id == "session" {
+            Some(Self::Session)
         } else {
             None
         }
@@ -878,6 +884,13 @@ fn default_num_images() -> NonNegativeCount {
     NonNegativeCount::try_new(1).expect("1 is non-negative")
 }
 
+/// A session catalog entry contains only the benchmark identifier.
+/// The job `spec` holds the session parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBenchmark {
+    pub benchmark_id: BenchmarkId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "benchmark_type", rename_all = "snake_case")]
 pub enum BenchmarkDefinition {
@@ -895,6 +908,7 @@ pub enum BenchmarkDefinition {
     AsrMaxMemory(AsrMaxMemoryBenchmark),
     DecisionLatency(DecisionBenchmark),
     DecisionMaxMemory(DecisionBenchmark),
+    Session(SessionBenchmark),
 }
 
 impl BenchmarkDefinition {
@@ -913,6 +927,7 @@ impl BenchmarkDefinition {
             Self::AsrThroughput(b) => &b.benchmark_id,
             Self::AsrMaxMemory(b) => &b.benchmark_id,
             Self::DecisionLatency(b) | Self::DecisionMaxMemory(b) => &b.benchmark_id,
+            Self::Session(b) => &b.benchmark_id,
         }
     }
 
@@ -932,6 +947,7 @@ impl BenchmarkDefinition {
             Self::AsrMaxMemory(_) => BenchmarkType::AsrMaxMemory,
             Self::DecisionLatency(_) => BenchmarkType::DecisionLatency,
             Self::DecisionMaxMemory(_) => BenchmarkType::DecisionMaxMemory,
+            Self::Session(_) => BenchmarkType::Session,
         }
     }
 
@@ -952,7 +968,8 @@ impl BenchmarkDefinition {
             | Self::VlMaxMemory(_)
             | Self::VlSpecDecode(_)
             | Self::DecisionLatency(_)
-            | Self::DecisionMaxMemory(_) => Ok(SamplingTemperature::greedy()),
+            | Self::DecisionMaxMemory(_)
+            | Self::Session(_) => Ok(SamplingTemperature::greedy()),
         }
     }
 
@@ -1088,7 +1105,8 @@ impl BenchmarkDefinition {
             | Self::VlThroughput(_)
             | Self::VlMaxMemory(_)
             | Self::DecisionLatency(_)
-            | Self::DecisionMaxMemory(_) => None,
+            | Self::DecisionMaxMemory(_)
+            | Self::Session(_) => None,
         }
     }
 
@@ -1108,7 +1126,8 @@ impl BenchmarkDefinition {
             | Self::VlThroughput(_)
             | Self::VlMaxMemory(_)
             | Self::DecisionLatency(_)
-            | Self::DecisionMaxMemory(_) => None,
+            | Self::DecisionMaxMemory(_)
+            | Self::Session(_) => None,
         }
     }
 
@@ -1129,7 +1148,8 @@ impl BenchmarkDefinition {
             | Self::VlThroughput(_)
             | Self::VlMaxMemory(_)
             | Self::AsrThroughput(_)
-            | Self::AsrMaxMemory(_) => None,
+            | Self::AsrMaxMemory(_)
+            | Self::Session(_) => None,
         }
     }
 }
@@ -1437,6 +1457,7 @@ mod tests {
             serde_json::json!({"benchmark_id": "asr_throughput_2500ms_text1024_decode256", "benchmark_type": "asr_throughput", "parameter_audio_duration_ms": 2500, "parameter_audio_sample_rate_hz": 16000, "parameter_audio_channels": 1, "parameter_text_tokens": 1024, "parameter_decode_tokens": 256}),
             serde_json::json!({"benchmark_id": "decision_latency_text64_q1", "benchmark_type": "decision_latency", "parameter_text_tokens": 64, "parameter_questions": 1}),
             serde_json::json!({"benchmark_id": "decision_max_memory_text64_q1", "benchmark_type": "decision_max_memory", "parameter_text_tokens": 64, "parameter_questions": 1}),
+            serde_json::json!({"benchmark_id": "session", "benchmark_type": "session"}),
         ];
         // One definition per type, so a new type fails here until it is added.
         let types: std::collections::HashSet<String> = definitions

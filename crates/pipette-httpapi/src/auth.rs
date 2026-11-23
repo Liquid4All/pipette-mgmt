@@ -630,7 +630,7 @@ pub fn generate_signing_key() -> Result<SigningKey, getrandom::Error> {
 /// The account a request is signed by, and the key it signed with. Spends the
 /// signature ([`ReplayCache::claim`]): take one extractor per request.
 pub struct AuthenticatedUser {
-    /// `disabled` is refused here; `pending` is left to [`ActiveUser`].
+    /// `disabled` is refused here.
     pub user: User,
     /// Recorded, not re-derived: a revoked key is deleted.
     pub key_id: UserKeyId,
@@ -839,10 +839,9 @@ fn admit(
             tracing::warn!(%key_id, "refused: the key's account does not exist");
             AppError::Unauthorized("user not found".into())
         })?;
-    // Disabled reaches nothing; pending reaches `GET /api/v1/users/me` only and
-    // stops at [`ActiveUser`]. Matched, so a new status must pick a side.
+    // Disabled reaches nothing. Matched, so a new status must pick a side.
     match user.status {
-        UserStatus::Active | UserStatus::Pending => {}
+        UserStatus::Active => {}
         UserStatus::Disabled => {
             tracing::warn!("refused: user is disabled");
             return Err(AppError::Forbidden("user is disabled".into()));
@@ -1034,6 +1033,11 @@ impl UserRights {
         self.set.holds(permission)
     }
 
+    /// Whether these are a job's rights, which administer nothing.
+    pub fn is_service(&self) -> bool {
+        self.holder.account_type == UserAccountType::Service
+    }
+
     pub fn fleet_detail(&self) -> FleetDetail {
         if self.holds(UserPermission::ReadClients) {
             FleetDetail::Full
@@ -1076,8 +1080,8 @@ impl UserRights {
     }
 }
 
-/// An [`AuthenticatedUser`] that is `active`; `pending` gets a `403` naming the
-/// decision it waits on. Spends the signature: take one extractor, never two.
+/// An [`AuthenticatedUser`] whose rights met the route's gate. Spends the
+/// signature: take one extractor, never two.
 pub struct ActiveUser {
     pub user: User,
     pub key_id: UserKeyId,
@@ -1204,12 +1208,6 @@ async fn gated_rights(
 pub fn require_active(user: &User) -> Result<(), AppError> {
     match user.status {
         UserStatus::Active => Ok(()),
-        UserStatus::Pending => {
-            tracing::warn!("refused: user is pending an operator's approval");
-            Err(AppError::Forbidden(
-                "user is pending an operator's approval".into(),
-            ))
-        }
         UserStatus::Disabled => {
             tracing::warn!("refused: user is disabled");
             Err(AppError::Forbidden("user is disabled".into()))
@@ -1301,7 +1299,7 @@ pub enum VaultFetcher {
     /// Holds `perform_work`. Boxed: a [`Client`] is far larger than the other
     /// variant.
     Client(Box<Client>),
-    /// No grant is required: an empty set still reaches the caller's own vault.
+    /// No grant is required: an empty set still reaches its organization's vault.
     User { user: User, rights: UserRights },
 }
 
@@ -1339,7 +1337,7 @@ pub enum CatalogReader {
     Anonymous,
     /// A signed device, of any status. Boxed for [`VaultFetcher`]'s reason.
     Client(Box<Client>),
-    /// A signed account, `active` or `pending`.
+    /// A signed account.
     User(User),
 }
 
@@ -1355,7 +1353,7 @@ impl CatalogReader {
             Self::User(user) if user.campaign_scope.is_some() => Ok(None),
             Self::User(user) => match user.status {
                 UserStatus::Active => user_org(state, &user.user_id).await,
-                UserStatus::Pending | UserStatus::Disabled => Ok(None),
+                UserStatus::Disabled => Ok(None),
             },
         }
     }

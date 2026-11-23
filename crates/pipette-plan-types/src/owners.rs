@@ -3,14 +3,13 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{ListOrder, OrgId, UserId, VaultPrincipalId};
+use crate::{ListOrder, OrgId, VaultPrincipalId};
 
-/// The owner of a record that must have one: `{"type": "org", "org_id": …}`
-/// or `{"type": "user", "user_id": …}`.
+/// The owner of a record that must have one: `{"type": "org", "org_id": …}`.
+/// An organization owns everything; an account works through its membership.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PrincipalOwner {
     Org { org_id: OrgId },
-    User { user_id: UserId },
 }
 
 /// A device's owner, in [`PrincipalOwner`]'s shape. Its own type because a
@@ -18,7 +17,6 @@ pub enum PrincipalOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientOwner {
     Org { org_id: OrgId },
-    User { user_id: UserId },
 }
 
 /// An owner's type, as a form offers it.
@@ -28,7 +26,6 @@ pub enum ClientOwner {
 #[strum(serialize_all = "snake_case")]
 pub enum OwnerType {
     Org,
-    User,
 }
 
 /// One destination a form offers: the principal id it posts, the name a reader
@@ -69,8 +66,8 @@ pub struct OwnerLookupQuery {
     pub owner_type: Option<OwnerType>,
 }
 
-/// Which slice of the caller's reach a listing asked for: "mine" and "my
-/// team's" are the questions a reader has, so no owner id to look up first.
+/// Which slice of the caller's reach a listing asked for, with no owner id to
+/// look up first.
 #[derive(
     Debug,
     Clone,
@@ -87,7 +84,6 @@ pub struct OwnerLookupQuery {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum OwnerFilter {
-    Mine,
     /// Organization-owned records, narrowed further by an `org_id` a reader
     /// outside its reach may name to no effect.
     Org,
@@ -152,76 +148,50 @@ pub struct OwnedListQuery {
 #[serde(rename_all = "snake_case")]
 enum Tag {
     Org,
-    User,
 }
 
-/// The fields as they arrive, before the tag says which id must be present.
+/// The fields as they arrive.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Wire {
     #[serde(rename = "type")]
     tag: Tag,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    org_id: Option<OrgId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    user_id: Option<UserId>,
+    org_id: OrgId,
 }
 
 macro_rules! owner_serde {
     ($owner:ident, $schema_name:literal) => {
         impl $owner {
-            /// The owning organization, when an organization owns this.
-            pub fn org_id(&self) -> Option<&OrgId> {
+            /// The owning organization.
+            pub fn org_id(&self) -> &OrgId {
                 match self {
-                    Self::Org { org_id } => Some(org_id),
-                    Self::User { .. } => None,
+                    Self::Org { org_id } => org_id,
                 }
             }
 
-            /// The owning account, when a person owns this.
-            pub fn user_id(&self) -> Option<&UserId> {
-                match self {
-                    Self::User { user_id } => Some(user_id),
-                    Self::Org { .. } => None,
-                }
-            }
-
-            /// The owner as one printable string. Each id carries its kind in
-            /// its prefix, so the id alone is unambiguous.
+            /// The owner as one printable string: the organization's id.
             pub fn label(&self) -> String {
-                match self {
-                    Self::Org { org_id } => org_id.to_string(),
-                    Self::User { user_id } => user_id.to_string(),
-                }
+                self.org_id().to_string()
             }
         }
 
         impl Serialize for $owner {
             fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                let wire = match self {
-                    Self::Org { org_id } => Wire {
-                        tag: Tag::Org,
-                        org_id: Some(org_id.clone()),
-                        user_id: None,
-                    },
-                    Self::User { user_id } => Wire {
-                        tag: Tag::User,
-                        org_id: None,
-                        user_id: Some(user_id.clone()),
-                    },
-                };
-                wire.serialize(s)
+                Wire {
+                    tag: Tag::Org,
+                    org_id: self.org_id().clone(),
+                }
+                .serialize(s)
             }
         }
 
         impl<'de> Deserialize<'de> for $owner {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                let wire = Wire::deserialize(d)?;
-                match (wire.tag, wire.org_id, wire.user_id) {
-                    (Tag::Org, Some(org_id), _) => Ok(Self::Org { org_id }),
-                    (Tag::Org, None, _) => Err(serde::de::Error::missing_field("org_id")),
-                    (Tag::User, _, Some(user_id)) => Ok(Self::User { user_id }),
-                    (Tag::User, _, None) => Err(serde::de::Error::missing_field("user_id")),
-                }
+                let Wire {
+                    tag: Tag::Org,
+                    org_id,
+                } = Wire::deserialize(d)?;
+                Ok(Self::Org { org_id })
             }
         }
 
@@ -241,13 +211,11 @@ macro_rules! owner_serde {
 owner_serde!(PrincipalOwner, "PrincipalOwner");
 owner_serde!(ClientOwner, "ClientOwner");
 
-/// The plan dialect spells an owner as one bare id (`org_…` or `user_…`); the
-/// two agree because the prefixes are disjoint.
+/// The plan dialect spells an owner as one bare `org_…` id.
 impl From<VaultPrincipalId> for PrincipalOwner {
     fn from(principal: VaultPrincipalId) -> Self {
         match principal {
             VaultPrincipalId::Org(org_id) => Self::Org { org_id },
-            VaultPrincipalId::User(user_id) => Self::User { user_id },
         }
     }
 }
@@ -256,7 +224,6 @@ impl From<PrincipalOwner> for VaultPrincipalId {
     fn from(owner: PrincipalOwner) -> Self {
         match owner {
             PrincipalOwner::Org { org_id } => Self::Org(org_id),
-            PrincipalOwner::User { user_id } => Self::User(user_id),
         }
     }
 }
@@ -265,20 +232,10 @@ impl From<PrincipalOwner> for VaultPrincipalId {
 #[cfg(feature = "schemars")]
 fn owner_schema() -> schemars::Schema {
     schemars::json_schema!({
-        "oneOf": [
-            {
-                "type": "object",
-                "properties": { "type": { "const": "org" }, "org_id": { "type": "string" } },
-                "required": ["type", "org_id"],
-                "additionalProperties": false,
-            },
-            {
-                "type": "object",
-                "properties": { "type": { "const": "user" }, "user_id": { "type": "string" } },
-                "required": ["type", "user_id"],
-                "additionalProperties": false,
-            },
-        ]
+        "type": "object",
+        "properties": { "type": { "const": "org" }, "org_id": { "type": "string" } },
+        "required": ["type", "org_id"],
+        "additionalProperties": false,
     })
 }
 
@@ -301,24 +258,23 @@ mod tests {
             serde_json::json!({ "type": "org", "org_id": org_id.as_str() }),
         );
         assert_eq!(
-            serde_json::from_value::<ClientOwner>(serde_json::json!({
-                "type": "user",
-                "user_id": "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
-            }))?,
-            ClientOwner::User {
-                user_id: UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
-            },
+            serde_json::from_value::<ClientOwner>(
+                serde_json::json!({ "type": "org", "org_id": org_id.as_str() })
+            )?,
+            owner,
         );
         Ok(())
     }
 
-    /// A tag without the id it needs is refused by name, rather than read as
-    /// an owner of nobody.
+    /// A malformed owner is refused by name, and an account is no owner.
     #[rstest]
     #[case::org_without_org_id(serde_json::json!({ "type": "org" }), "org_id")]
-    #[case::user_with_the_wrong_id(serde_json::json!({ "type": "user", "org_id": "org_x" }), "user_id")]
+    #[case::a_person(
+        serde_json::json!({ "type": "user", "user_id": "user_x" }),
+        "unknown variant `user`"
+    )]
     #[case::unknown_tag(serde_json::json!({ "type": "team", "org_id": "org_x" }), "team")]
-    #[case::the_retired_kind_tag(serde_json::json!({ "kind": "org", "org_id": "org_x" }), "`type`")]
+    #[case::the_retired_kind_tag(serde_json::json!({ "kind": "org", "org_id": "org_x" }), "kind")]
     fn a_malformed_owner_names_what_is_missing(
         #[case] value: serde_json::Value,
         #[case] fragment: &str,
@@ -326,18 +282,5 @@ mod tests {
         let refused = serde_json::from_value::<PrincipalOwner>(value).err();
         let message = refused.map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains(fragment), "{message}");
-    }
-
-    #[test]
-    fn an_owner_answers_for_one_kind() -> anyhow::Result<()> {
-        let org_owned = ClientOwner::Org {
-            org_id: OrgId::try_new("org_x")?,
-        };
-        let user_owned = ClientOwner::User {
-            user_id: UserId::try_new("user_x")?,
-        };
-        assert!(org_owned.org_id().is_some() && org_owned.user_id().is_none());
-        assert!(user_owned.user_id().is_some() && user_owned.org_id().is_none());
-        Ok(())
     }
 }

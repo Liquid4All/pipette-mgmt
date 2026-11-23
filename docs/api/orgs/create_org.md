@@ -10,6 +10,6 @@ organization produce one.
 | Status | When |
 |--------|------|
 | 201 | The organization is created; the body is the organization and its (zero) counts |
-| 400 | `slug` is empty, too long, outside the charset, or starts with `org_`, which spells an id |
+| 400 | `slug` is empty, too long or outside the charset; starts with `org_`, which spells an id; or is `global` in any letter case, which the descriptor catalog writes as `global/<name>` for a global entry |
 | 403 | The caller does not hold `manage_any_orgs` |
 | 409 | The handle is already held, and the body names which organization holds it |

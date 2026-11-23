@@ -104,8 +104,7 @@ each non-ASCII character.
 | Status | When |
 |--------|------|
 | 200 | The file, named in its `Content-Disposition` as [The file](#the-file) gives |
-| 400 | `plan_id` in the path contains characters outside `[A-Za-z0-9-]` |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | Caller holds neither `read_plans` nor `read_any_plans` |
-| 404 | No such plan, **or** a plan the caller's scope does not admit ([one `404` for both](get_plan.md#one-404-for-both)); or no `[duckdb]` is configured |
+| 404 | No `[duckdb]` is configured |
 | 502 | pipette-duckdb is unreachable, refused the query, or took longer than `[duckdb] timeout_secs`; or it lacks a table or column [it must serve](../plans.md#reading-a-plans-results) |

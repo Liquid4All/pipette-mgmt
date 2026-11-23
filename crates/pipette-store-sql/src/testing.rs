@@ -195,6 +195,7 @@ pub(crate) fn a_client(client_id: ClientId, public_key: PublicKeyHex) -> anyhow:
         public_key,
         organization: NonEmptyTrimmedString::try_new("acme")?,
         client_details: NonEmptyTrimmedString::try_new("details")?,
+        name: None,
         contact_email: ContactEmail::try_new("a@b.com")?,
         status: ClientStatus::Approved,
         registered_at: Timestamp::now(),
@@ -485,6 +486,106 @@ mod tests {
         assert!(has_plan_job_rows().await?);
         let has_plan_tags = || exists("SELECT to_regclass('plan_tags') IS NOT NULL");
         assert!(has_plan_tags().await?);
+        let has_member_size = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'descriptor_members' AND column_name = 'size_bytes')",
+            )
+        };
+        assert!(has_member_size().await?);
+        let has_entry_family = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'descriptor_entries' AND column_name = 'family')",
+            )
+        };
+        assert!(has_entry_family().await?);
+        let has_family_logos =
+            || exists("SELECT to_regclass('descriptor_family_logos') IS NOT NULL");
+        assert!(has_family_logos().await?);
+        let has_open_plans_index = || exists("SELECT to_regclass('plans_open') IS NOT NULL");
+        let has_job_span_index =
+            || exists("SELECT to_regclass('plan_job_spans_members_by_job') IS NOT NULL");
+        let has_cancelled_plans_index =
+            || exists("SELECT to_regclass('plans_cancelled_by_lineage') IS NOT NULL");
+        assert!(has_open_plans_index().await?);
+        assert!(has_job_span_index().await?);
+        assert!(has_cancelled_plans_index().await?);
+        let has_logo_sha256 = || {
+            exists(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'descriptor_family_logos' AND column_name = 'logo_sha256')",
+            )
+        };
+        assert!(has_logo_sha256().await?);
+        let moved = crate::migrate::migrate(db, Some(50), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(50), vec![51]));
+        let set_logo = |uri: &'static str| {
+            sqlx::query(
+                "INSERT INTO descriptor_family_logos (scope, family_key, family, logo_uri)
+                 VALUES ('', 'lfm', 'LFM', $1)
+                 ON CONFLICT (scope, family_key)
+                 DO UPDATE SET family = EXCLUDED.family, logo_uri = EXCLUDED.logo_uri",
+            )
+            .bind(uri)
+            .execute(db.pool())
+        };
+        let read_digest = || {
+            sqlx::query_scalar::<_, String>(
+                "SELECT logo_sha256 FROM descriptor_family_logos WHERE scope = '' AND family_key = 'lfm'",
+            )
+            .fetch_one(db.pool())
+        };
+        let legacy_uri = "https://pipette.liquid.ai/logos/lfm.svg";
+        set_logo(legacy_uri).await?;
+        let moved = crate::migrate::migrate(db, Some(51), false).await?;
+        assert_eq!((moved.to, moved.applied), (Some(51), vec![51]));
+        assert_eq!(
+            read_digest().await?,
+            pipette_plan_types::LogoUri::try_new(legacy_uri)?.sha256()
+        );
+        let updated_uri = "https://pipette.liquid.ai/logos/lfm-new.svg";
+        set_logo(updated_uri).await?;
+        assert_eq!(
+            read_digest().await?,
+            pipette_plan_types::LogoUri::try_new(updated_uri)?.sha256()
+        );
+        // The earlier logo grammar has no data URIs, so a move down drops them.
+        sqlx::query(
+            "INSERT INTO descriptor_family_logos (scope, family_key, family, logo_uri)
+             VALUES ('', 'qwen', 'Qwen', 'data:image/png;base64,abcd')",
+        )
+        .execute(db.pool())
+        .await?;
+        let moved = crate::migrate::migrate(db, Some(50), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(50), vec![51]));
+        assert!(!has_logo_sha256().await?);
+        let (families,): (Vec<String>,) =
+            sqlx::query_as("SELECT array_agg(family) FROM descriptor_family_logos")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(families, ["LFM"]);
+        let moved = crate::migrate::migrate(db, Some(49), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(49), vec![50]));
+        assert!(!has_family_logos().await?);
+        assert!(has_entry_family().await?);
+        let moved = crate::migrate::migrate(db, Some(48), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(48), vec![49]));
+        assert!(!has_entry_family().await?);
+        assert!(has_cancelled_plans_index().await?);
+        let moved = crate::migrate::migrate(db, Some(47), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(47), vec![48]));
+        assert!(!has_job_span_index().await?);
+        assert!(!has_cancelled_plans_index().await?);
+        assert!(has_open_plans_index().await?);
+        let moved = crate::migrate::migrate(db, Some(46), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(46), vec![47]));
+        assert!(!has_open_plans_index().await?);
+        assert!(has_member_size().await?);
+        let moved = crate::migrate::migrate(db, Some(45), false).await?;
+        assert_eq!((moved.to, moved.reverted), (Some(45), vec![46]));
+        assert!(!has_member_size().await?);
+        assert!(has_plan_tags().await?);
         let moved = crate::migrate::migrate(db, Some(44), false).await?;
         assert_eq!((moved.to, moved.reverted), (Some(44), vec![45]));
         assert!(!has_plan_tags().await?);
@@ -676,17 +777,7 @@ mod tests {
         );
 
         let moved = crate::migrate::migrate(db, None, false).await?;
-        assert_eq!(
-            (moved.to, moved.applied),
-            (
-                Some(45),
-                vec![
-                    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
-                    44, 45
-                ]
-            )
-        );
+        assert_eq!((moved.to, moved.applied), (Some(51), (3..=51).collect()));
         assert!(has_type().await?);
         assert!(has_outcomes().await?);
         assert!(has_model_params().await?);
@@ -718,6 +809,13 @@ mod tests {
         assert!(has_failed_codes().await?);
         assert!(has_plan_job_rows().await?);
         assert!(!has_plan_jobs().await?);
+        assert!(has_member_size().await?);
+        assert!(has_open_plans_index().await?);
+        assert!(has_job_span_index().await?);
+        assert!(has_cancelled_plans_index().await?);
+        assert!(has_entry_family().await?);
+        assert!(has_family_logos().await?);
+        assert!(has_logo_sha256().await?);
         crate::migrate::check(db).await
     }
 
@@ -729,15 +827,15 @@ mod tests {
 
         use pipette_core::campaign::{CampaignGroup, CampaignOwner, GroupPolicyState, NewCampaign};
         use pipette_core::types::Mint;
-        use pipette_plan_types::{CampaignId, PlanId, PolicyKind, UserId};
+        use pipette_plan_types::{CampaignId, OrgId, PlanId, PolicyKind};
         use pipette_store::{CampaignGroupStore, CampaignStore};
 
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
         crate::migrate::migrate(db, Some(40), false).await?;
         let store = crate::campaign_groups::SqlCampaignGroupStore::new(db.clone());
-        let owner = CampaignOwner::User {
-            user_id: UserId::mint(),
+        let owner = CampaignOwner::Org {
+            org_id: OrgId::mint(),
         };
         let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Timestamp::now());
         store.create_group(&group).await?;
@@ -803,16 +901,16 @@ mod tests {
         use pipette_core::campaign::{CampaignGroup, CampaignOwner, GroupPolicyState, NewCampaign};
         use pipette_core::types::Mint;
         use pipette_plan_types::{
-            CampaignGroupId, CampaignGroupPolicy, CampaignId, FailureCode, PlanId, PolicyKind,
-            PolicySettings, UserId,
+            CampaignGroupId, CampaignGroupPolicy, CampaignId, FailureCode, OrgId, PlanId,
+            PolicyKind, PolicySettings,
         };
         use pipette_store::{CampaignGroupStore, CampaignStore, JobStateChanges};
 
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
         let store = crate::campaign_groups::SqlCampaignGroupStore::new(db.clone());
-        let owner = CampaignOwner::User {
-            user_id: UserId::mint(),
+        let owner = CampaignOwner::Org {
+            org_id: OrgId::mint(),
         };
         let group = CampaignGroup::new("aa-perf".parse()?, owner.clone(), Timestamp::now());
         let listing = CampaignGroup::new("aa-listed".parse()?, owner.clone(), Timestamp::now());

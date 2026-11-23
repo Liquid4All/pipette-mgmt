@@ -2,22 +2,21 @@
   // The classic console's devices listing (`clients.html`) under any branch:
   // the fleet's clause filters, which the server applies, every page of
   // `GET /api/v1/clients` narrowed to the branch, filtered further, sorted and paged
-  // in `DataTable`, and the two columns only some branches draw: who an
-  // organization holds a device through, and the server's claim.
+  // in `DataTable`, and the server's claim, which only its branch draws.
   import type { Snippet } from "svelte";
-  import { account, clients } from "../api";
-  import { CLAUSES, deviceTable, emptyNotice, fleetQuery, readFilters, throughOwners, type DeviceBranch } from "../fleet";
+  import { clients } from "../api";
+  import { CLAUSES, deviceLabel, deviceTable, emptyNotice, fleetQuery, readFilters, type DeviceBranch } from "../fleet";
   import { offsetPaging } from "../pager";
   import { when } from "../format";
   import { bytesText } from "../plans";
   import { here, href, navigate } from "../route.svelte";
+  import { clientLink } from "../routes";
   import { session } from "../session.svelte";
   import { ROUTE_PAGE_MAX, everyPage, tableState, withCursor, type CursorPage } from "../table";
   import type { ClientListRow, ClientStatus } from "../api-types";
   import ClauseFilters from "./ClauseFilters.svelte";
   import DataTable from "./DataTable.svelte";
   import Loaded from "./Loaded.svelte";
-  import OwnerCell from "./OwnerCell.svelte";
   import { Loader } from "./work.svelte";
 
   let { branch, path, claim, error = "" }: {
@@ -49,22 +48,7 @@
     return read.run(() => every(query), true);
   }
 
-  const owned = $derived(branch.kind === "org");
   const count = $derived(branch.kind === "org" && branch.count !== null ? `Registered clients: ${branch.count}` : "");
-
-  // The `owned` column's addresses: only the members the rows name, as
-  // `owner_labels` does, each under the roster read this page already takes.
-  const names = $state<Record<string, string>>({});
-  const requested = new Set<string>();
-  $effect(() => {
-    const rows = read.data?.items;
-    if (!owned || !rows) return;
-    for (const user_id of throughOwners(rows).filter((id) => !requested.has(id))) {
-      requested.add(user_id);
-      // Unnamed, the id stands in.
-      account(session.signer, user_id).then((view) => (names[user_id] = view.contact_email)).catch(() => {});
-    }
-  });
 
   // When the rows were last read: the `activity` column measures each last-seen time against it.
   let seen = $state(Date.now());
@@ -72,7 +56,7 @@
     void read.data;
     seen = Date.now();
   });
-  const spec = $derived(deviceTable(owned, names, seen));
+  const spec = $derived(deviceTable(seen));
   /** The clause filters' pairs as the address holds them, which the table's links keep. */
   const serverPairs = $derived([...here.query].filter(([key]) =>
     key === "status" || CLAUSES.some((clause) => clause.key === key)));
@@ -83,8 +67,10 @@
                          ["limit", offsetPaging(here.query).asked]], ["status"]));
 </script>
 
-{#snippet ownedCell(row: ClientListRow)}
-  {#if row.owner?.type === "user"}through <OwnerCell owner={row.owner} {names} />{:else}directly{/if}
+<!-- A label that falls back from an unset name is muted, so an admin sees which devices still need one. -->
+{#snippet nameCell(row: ClientListRow)}
+  {@const label = deviceLabel(row)}
+  <a class="label" class:muted={!row.name} href={clientLink(row.client_id)} title={label}>{label}</a>
 {/snippet}
 {#snippet backlog(row: ClientListRow)}
   {#if row.backlog}<span title="counted {when(row.backlog.counted_at)}">{row.backlog.job_count}</span>{:else}—{/if}
@@ -106,9 +92,14 @@
     {#if listed.items.length}
       <DataTable {spec} rows={listed.items} id={(row) => row.client_id} noun="devices" {path} kept={serverPairs}
                  keep={["status"]} empty="No devices at this position." columnsKey="pipette.devices.columns"
-                 cells={{ owned: ownedCell, backlog, device_ram_bytes: ram }} action={claim} actionHead="claim" />
+                 cells={{ name: nameCell, backlog, device_ram_bytes: ram }} action={claim} actionHead="claim" />
     {:else}
       <p class="notice">{emptyNotice(branch, filters, null)}</p>
     {/if}
   {/snippet}
 </Loaded>
+
+<style>
+  .label { display: inline-block; max-width: 24em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+           vertical-align: bottom; }
+</style>

@@ -79,22 +79,8 @@ pub async fn device_reach(
 
 /// Whether `reach` administers the device `owner` holds, by [`in_scope`]'s
 /// rule: who reads its `contact_email`.
-pub(crate) async fn administers(
-    state: &AppState,
-    reach: Option<&DeviceScope>,
-    owner: Option<&ClientOwner>,
-) -> Result<bool, AppError> {
-    let Some(scope) = reach else {
-        return Ok(false);
-    };
-    // Only an organization's scope asks where the device rolls up.
-    let owning = match (scope, owner) {
-        (DeviceScope::Org(_), Some(owner)) => org::org_of(&*state.org_store, owner)
-            .await
-            .map_err(|e| AppError::internal(e.context("failed to resolve the owner")))?,
-        _ => None,
-    };
-    Ok(scope.may_administer(owning.as_ref()))
+pub(crate) fn administers(reach: Option<&DeviceScope>, owner: Option<&ClientOwner>) -> bool {
+    reach.is_some_and(|scope| scope.may_administer(owner.map(ClientOwner::org_id)))
 }
 
 /// Refuse unless `scope` reaches the device `client_id` names, and hand back the
@@ -149,10 +135,11 @@ pub async fn update_client(
         organization: body.organization,
         client_details: body.client_details,
         contact_email: body.contact_email,
+        name: body.name,
     };
     if update.is_empty() {
         return Err(AppError::BadRequest(
-            "nothing to update: send organization, client_details or contact_email".into(),
+            "nothing to update: send organization, client_details, contact_email or name".into(),
         ));
     }
 

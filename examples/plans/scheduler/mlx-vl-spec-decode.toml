@@ -1,34 +1,27 @@
 # Example scheduler-mode plan: the VL spec-decode benchmark on MLX, filed with
-# the management server as a campaign rather than driven over a local transport.
+# the management server as a campaign.
 #
 #   pipette-ctl campaigns create --name mlx-vl-spec-decode \
 #     --plan examples/plans/scheduler/mlx-vl-spec-decode.toml
 #
-# The local-dispatch twin is ../mlx-macos-vl-spec-decode.toml; see it for what
-# `vl_spec_decode` measures, the model types and the runtime row. This file
-# differs in one thing: eligibility instead of transports.
+# The local-dispatch twin, ../mlx-macos-vl-spec-decode.toml, explains the
+# benchmark, the model types and the runtime. This file uses eligibility
+# instead of transports and runs every dataset at k7, k8 and k9: 36 jobs, 18
+# benchmark ids per variant.
 #
-# One job per (model, benchmark id): eighteen with the regular model,
-# speculation off, and eighteen with the spec-decoding pair, speculation on,
-# over the same benchmark ids. Each is its own row; the speedup between a
-# pair is computed outside the server from the stored rows.
-#
-# Eligibility is a named roster and nothing else. Each job pulls an ~80 MB
-# corpus from the server and refuses to start on battery, so the machines that
-# claim it are chosen, not matched. Widen `clients` rather than adding
-# `requires`: a client is eligible when it is rostered *or* matches the flags,
-# so `requires = ["os:macos"]` beside the roster would hand these cells to
-# every Mac.
+# Eligibility is a named roster only: each job pulls an ~80 MB corpus and
+# refuses to start on battery, so its machines are chosen, not matched. Widen
+# `clients` rather than adding `requires`: a client is eligible when rostered
+# *or* matching, so `requires = ["os:macos"]` would hand these cells to every
+# Mac.
 
 # No `expires_at`: each job takes ingestion's 30-day default.
 # Each dataset is its own measurement; do not merge into another plan's run.
 merge_duplicates = false
 
-# Each subset at three draft lengths, alike in everything else: k8 is the
-# reference condition, k7 and k9 measure where the optimum sits on this
-# silicon. A pair is joined on the whole benchmark id, so every k pays for its
-# own speculation-off row even though that arm never drafts. One k at a time is
-# fine; splitting a pair is not.
+# k8 is the reference condition; k7 and k9 find where the optimum sits on this
+# silicon. A pair is joined on the whole benchmark id, so every k needs its own
+# speculation-off row even though that arm never drafts.
 benchmarks = [
   "vl_spec_decode_mmspec_test_gqa_k8",
   "vl_spec_decode_mmspec_test_textvqa_k8",
@@ -62,9 +55,9 @@ runtime_flags = [
 benchmark_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx", http_timeout_seconds = 600 },
 ]
-# The runtime is spelled out rather than referenced by catalog key, because a
-# plan carries the environment it measured: `version` selects nothing here, it
-# only labels what `source.contents` pins. This body is the `0.7.4` row of
+# Spelled out rather than referenced by catalog key so the plan carries the
+# environment it measured; `version` only labels what `source.contents` pins.
+# The body is the `0.7.4` row of
 # crates/pipette-artifacts-catalog/bundled-catalog/mlx/catalog.toml verbatim.
 [[variants.runtimes]]
 type = "mlx_macos_pipette"
@@ -146,10 +139,7 @@ runtime_flags = [
 benchmark_flags = [
   { benchmark_type = "vl_spec_decode", runtime_type = "mlx_macos_pipette", model_type = "mlx_speculative", http_timeout_seconds = 600 },
 ]
-# The runtime is spelled out rather than referenced by catalog key, because a
-# plan carries the environment it measured: `version` selects nothing here, it
-# only labels what `source.contents` pins. This body is the `0.7.4` row of
-# crates/pipette-artifacts-catalog/bundled-catalog/mlx/catalog.toml verbatim.
+# The same `0.7.4` runtime as above.
 [[variants.runtimes]]
 type = "mlx_macos_pipette"
 version = "0.7.4"

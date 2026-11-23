@@ -94,35 +94,27 @@ repointing one is the authority to decide what work runs, which the vocabulary
 already spells. An operator who can file plans today can run campaigns today,
 with nothing re-granted.
 
-The **ownership rule** is the whole of the write model:
+The **ownership rule** is the whole of the write model. Only an organization
+owns a campaign:
 
-- A **user-owned** campaign is its owner's. Nobody else's `submit_plans` reaches
-  it, whatever organization the two share.
-- Once its owner is **disabled**, a user-owned campaign is also its
-  organization's administrators' to wind down, since the owner can no longer
-  do it: they read the record, rename it, delete it, hand it over, and cancel
-  its plans with `cancel_plans`. They do not read its plans or file into it
-  until it is handed over, and they reach no account holding a server-wide
-  name they lack ([the rules that make delegation safe](users.md#the-rules-that-make-delegation-safe)).
-- An **org-owned** campaign is run by that organization's members, whoever
+- A campaign is run by its organization's members, whoever
   created it: each reads it, files into it and revises it with `submit_plans`,
-  and cancels its plans with `cancel_plans`. Its **record** belongs to the
-  organization's administrators, the accounts holding `manage_orgs` **and**
-  belonging to it: they rename it, hand it over and delete it. A vault
-  resource draws the same line, where a member uploads and an administrator
-  deletes ([the vault's who may do what](vault.md#who-may-do-what)).
+  and cancels its plans with `cancel_plans`. Its **record** is renamed,
+  handed over and deleted by a member holding `submit_plans` on a person's
+  account, as it did the campaigns it once owned itself, and by the
+  organization's administrators (`manage_orgs` **and** membership). A service
+  account administers none. A vault resource is uploaded and deleted by every
+  member ([the vault's who may do what](vault.md#who-may-do-what)).
 - `manage_any_orgs` administers every campaign and reads its record, and `read_any_plans` reads every one with its plans.
 
 **A plan has no owner; its campaign does.** The plan grants reach a plan through
 the campaign that filed it, as that campaign's owner stands now
 ([permissions](users.md#permissions)):
 
-- `read_plans` reads the plans of every campaign the caller reads: its own, and
-  its organization's.
-- `cancel_plans` cancels the plans of every campaign the caller owns, its
-  organization owns, or it winds down for a disabled member of it. Its own
-  counts only while it holds `submit_plans`, the grant it owns one under; its
-  organization's counts on membership alone.
+- `read_plans` reads the plans of every campaign the caller reads: its
+  organization's.
+- `cancel_plans` cancels the plans of every campaign its organization owns, on
+  membership alone.
 - `read_any_plans` and `cancel_any_plans` reach every plan.
 
 Who filed a plan (`submitted_by`) grants nothing. So handing a campaign over
@@ -134,20 +126,14 @@ both. Nobody reaches a deleted campaign, so its plans are left to
 the `_any_` grants. A plan filed outside every campaign, which an older build
 allowed, is its filer's.
 
-Ownership is **not** derived through the owner's membership, where a user-owned
-device rolls up to whichever organization its owner belongs to now. Moving an
-account between organizations does not hand that account's personal campaigns to
-a team's administrators, nor take them away.
-
 A campaign outside the caller's scope is a **`403`**, where a plan or an
 organization outside one reads as `404`. Those two are addressed by values a
 caller can guess (a handle somebody typed, a plan id from a shared listing), so
 confirming existence maps the deployment one probe at a time. A campaign id is a
 minted UUIDv7 under a `campaign_` prefix, so a caller that can name one was given
-it, and the refusal tells them the true thing: a campaign the caller owns is
-refused as needing `submit_plans`, a write to the record of one its
-organization owns as needing `manage_orgs`, and any other as belonging to
-another owner.
+it, and the refusal tells them the true thing: a write to the record of one its
+organization owns is refused as needing `submit_plans` or `manage_orgs`, and
+any other as belonging to another owner.
 
 ## Filing a plan document
 
@@ -193,8 +179,8 @@ the model, and a later plan of the same owner that names it downloads nothing.
 The vault arm is `vault_url` for a gguf model and `vault_archive` for a
 directory model, naming the owner in `principal_id`. The rewritten bodies are
 checked as any vault reference is, so the filer needs the owner in its reach
-([naming a resource in a plan](vault.md#who-may-do-what)): the owner, a member
-of the owning organization, or a holder of `submit_any_plans`. A model with a
+([naming a resource in a plan](vault.md#who-may-do-what)): a member of the
+owning organization, or a holder of `submit_any_plans`. A model with a
 field its type does not know is not imported, since the rewrite would drop the
 field, and its token is refused. A plan of another owner
 imports the model again, under that owner. An import that completed keeps its
@@ -574,11 +560,9 @@ stops waiting at its own `expires_at`: once that passes with no result, the
 plan lists the job in `expired_jobs` and counts it `failed`, and the job stays
 queued under the earliest `expires_at` of the plans still waiting on it.
 
-A cell the fleet already measured need not run again. On a server with a
-`[database]`, a cell takes the newest successful run of the same
-cell whose recorded device meets its clauses, from a campaign of the same
-scope: the owner's organization and its users, or, for a user in no
-organization, that user's own campaigns. The plan lists that job, which
+A cell the fleet already measured need not run again. A cell takes the newest
+successful run of the same cell whose recorded device meets its clauses, from a campaign of the same
+owner organization. The plan lists that job, which
 counts `finished`, and `merged_job_count` counts it. A job a later plan
 re-ran or marked failed answers nothing. `merge_duplicates = false` skips both
 this and the merge.
@@ -634,7 +618,8 @@ a plan on offer (below) lists its job for the very body of the cell, which is
 how a revert brings back the runs that its target held. Where several runs
 could answer a cell, the cell first takes one that its plan holds under
 exactly the cell's limit, or one that a plan on offer lists for its body. A cell that
-takes no run runs again, and a failed run answers in no case. The dry run
+takes no run runs again. A failed run answers only with `inherit_failed`
+(below). The dry run
 counts the cells that run again in `requirements_rerun_job_count` and lists
 their jobs in `dropped_job_ids`.
 
@@ -648,6 +633,42 @@ way to such a run unless a client is running it. Carrying ignores
 `merge_duplicates`. With
 `carry_across_limit`, these plans' runs also answer whatever limit each had,
 which is how a campaign under a limit takes runs filed without one.
+
+**`inherit_failed` lets a cell take a failed run.** The run is the superseded
+plan's, under other clauses or another limit, or a plan on offer's. It applies
+where no finished run answers the cell, and the cell drew nothing or a queued
+job no client is running. The failure must say that the cell would fail again.
+A device's `attempt_timeout`, a skip after a smaller run's `attempt_timeout`,
+and a mark answer a cell whose limit is not above the limit the run was
+requested with, or the one the superseded plan holds it under.
+A device's `out_of_memory`, `runtime_error` or `device_error`, and a skip after
+a smaller run's `out_of_memory`, answer any limit. No other failure answers: an
+expiry, a lost lease, a refusal by every client or by none,
+`device_not_ready`, `harness_error`, or no code. Only the run's clauses vouch
+for its device, so the cell must ask nothing they did not require. A skip is
+taken only with the run it names. The new plan holds the failed job and names
+the run it re-ran, as its plan did: a mark stays a mark, and a group policy
+counts the re-runs the job's chain already spent. `carry_across_limit` does not
+widen it. The dry run counts those of other plans in
+`inherited_failed_job_count`, also counted in `inherited_job_count` or
+`restored_job_count`, and marks each body that would take a failed run with
+`"failed": true` in `held_jobs`.
+
+**A model can take the runs of another that is the same file.**
+`replace_model=<old>=<new>`, on the routes that take it, lets a cell that names
+`<new>` take a finished success of the same cell under `<old>`, from the
+superseded plan or a plan on offer, by the same rules. Each side is a model as
+the server prints it: `org/repo@<commit>:file.gguf` for a HuggingFace file,
+`/vault/resources/<id>/content` for a vault file, and the files of a model of
+several joined by `+`. The run is not held: the cell is a fresh job that never
+queues, answered at once with a copy of the run's record under `<new>`, as a
+recalculation answers its cells. The server refuses the pair with `400` when it
+reads the checksum of a file on both sides and they differ, and takes the
+filer's word for a file it cannot read, such as a commit the Hub no longer has.
+`change.replace_model` records whether every file was compared
+([plan-ingestion.md §7](../plan-ingestion.md#carrying-a-campaigns-jobs-over)).
+A locked campaign stays locked: unlock it, file the revision, and lock it
+again.
 
 A re-run withholds the jobs it names: each cell is a fresh job that joins
 nothing, and `rerun_of` maps it to the job it runs again. A recalculation
@@ -663,15 +684,19 @@ superseded plan
 
 ### Catalog names
 
-Catalog names in `runtimes` resolve in the campaign owner's organization and the
-global catalog before expansion. A filing route answers `400` for a name that is
-unknown or tombstoned. It also answers `400` for a name with no member that the
-catalog offers to every admitted device. If the name has an explicit `::flavor`,
-the server does not check the offer rule. A hidden name adds a plan warning.
+Catalog names in `runtimes`, and model selectors in `models`, resolve in the
+campaign owner's organization and the global catalog before expansion. A filing
+route answers `400` for a name that is unknown or tombstoned. It also answers
+`400` for a runtime name with no member that the catalog offers to every
+admitted device. The server skips the offer rule when a runtime name includes
+`::flavor`. A model selector must be complete,
+`name::format::quantization`. The server answers `400` for an incomplete model
+selector, and for a selector whose member has no compatible runtime in its
+variant. A hidden name adds a plan warning.
 
-For each replacement, the server writes the qualified name and the flavor in a
-`# catalog name at filing:` comment. At the full fleet-detail tier, the filing
-answer's `document` is the stored text, after the catalog-name and gated-model
-rewrites. The withheld tier omits `document`. A dry run returns
+For each replacement, the server writes the qualified name and the member key
+in a `# catalog name at filing:` comment. At the full fleet-detail tier, the
+response returns the stored plan in `document`. The plan includes the catalog
+and gated-model rewrites. The withheld tier omits `document`. A dry run returns
 `document` and stores nothing. The server removes the model tokens from that
 `document`.

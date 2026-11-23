@@ -14,7 +14,7 @@ import { campaignLink, campaignPlanLink, pathOf, type OwnedPages } from "./route
 import type { TableSpec } from "./table";
 import { percent } from "./upload";
 import type {
-  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanStatus, PlanSummary, PlanView, PolicyCheck, PlannedImport,
+  CampaignState, CampaignView, DeviceTimeTotal, NamedCampaignOverview, OwnUserView, OwnerMatch, PlanStatus, PlanSummary, PlanView, PolicyCheck, PolicyDeferral, PlannedImport,
   PrincipalOwner, RevisionDryRun, UpdateCampaignRequest,
 } from "./api-types";
 
@@ -29,18 +29,36 @@ export function deviceTimeText(total: DeviceTimeTotal): string {
   return n > 0 ? `${sum} (${n} ${n === 1 ? "job" : "jobs"} reported none)` : sum;
 }
 
+/**
+ * The text that tells how many re-runs and marks wait for the next group
+ * filing, and when it is due, measured from `now`. For example: "2 re-runs and
+ * 1 mark wait for the next group filing, in about 12 min".
+ * Each queue-maintenance evaluation recalculates the estimate.
+ */
+export function deferralText(deferral: PolicyDeferral, now: number): string {
+  const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const found = [
+    ...(deferral.rerun_job_count > 0 ? [count(deferral.rerun_job_count, "re-run")] : []),
+    ...(deferral.marked_job_count > 0 ? [count(deferral.marked_job_count, "mark")] : []),
+  ].join(" and ");
+  const left = Date.parse(deferral.until) - now;
+  const at = Number.isNaN(left) ? `at ${deferral.until}`
+    : left >= 60_000 ? `in about ${Math.ceil(left / 60_000)} min` : "at the next run";
+  return `${found} ${deferral.rerun_job_count + deferral.marked_job_count === 1 ? "waits" : "wait"} for the next group filing, ${at}`;
+}
+
 /** The campaign listing under each branch. */
-export const CAMPAIGN_PAGES: OwnedPages = { mine: "me-campaigns", org: "org-campaigns", all: "campaigns" };
+export const CAMPAIGN_PAGES: OwnedPages = { org: "org-campaigns", all: "campaigns" };
 
 /**
  * A plan page's trail: Plans, or for a campaign's plan the campaign, under its
  * owner's listing once `detail` is read (never, for a reader refused it).
  */
 export function planTrail(plan_id: string, campaign_id: string | null, detail: NamedCampaignOverview | null,
-                          reader: Pick<OwnUserView, "user_id">, known: (OrgRef | null)[]): readonly Crumb[] {
+                          known: (OrgRef | null)[]): readonly Crumb[] {
   if (!campaign_id) return [{ label: "Plans", href: pathOf({ page: "plans" }) }];
   const campaign = { label: detail?.name ?? "Campaign", href: campaignPlanLink(campaign_id, plan_id) };
-  return detail ? [...underTrail(ownerBranch(reader, detail.owner, known, CAMPAIGN_PAGES), "Campaigns"), campaign]
+  return detail ? [...underTrail(ownerBranch(detail.owner, known, CAMPAIGN_PAGES), "Campaigns"), campaign]
     : [campaign];
 }
 
@@ -156,12 +174,12 @@ export const withoutLabel = (labels: Record<string, string> | undefined, key: st
   labelPairs(labels).filter(([at]) => at !== key);
 
 /**
- * Whether `reader` may label a campaign `owner` owns, as `PATCH /api/v1/campaigns/{id}` judges it but for a
- * disabled member's: its own with `submit_plans`, its organization's as an administrator. The route still decides.
+ * Whether `reader` may label a campaign `owner` owns, as `PATCH /api/v1/campaigns/{id}` judges it: its
+ * organization's as an administrator, or as a person's account that files plans. The route still decides.
  */
 export const mayLabel = (reader: OwnUserView, owner: PrincipalOwner): boolean =>
-  (owner.type === "org" ? reaches(reader, reader.may.administer_roster, owner.org_id)
-    : reader.may.administer_roster === "every" || (reader.may.file_plans && owner.user_id === reader.user_id));
+  reaches(reader, reader.may.administer_roster, principalOf(owner))
+  || (reader.may.file_plans && reader.account_type === "human" && reader.org_id === principalOf(owner));
 
 /** `Labels`' bounds: the pairs a record takes, and a key's and a value's characters. */
 export const LABELS_MAX = 50;
@@ -208,14 +226,8 @@ export function labelVocabulary(rows: readonly Pick<CampaignView, "labels">[]): 
 export const knownLabels = (vocabulary: ReadonlyMap<string, readonly string[]>): string[] =>
   [...vocabulary].flatMap(([key, values]) => (values.length ? values.map((value) => labelText([key, value])) : [key]));
 
-/**
- * The listing whose labels a campaign `owner` owns shares: its organization's, or the reader's own; none for
- * another account's campaign.
- */
-export function labelScope(reader: Pick<OwnUserView, "user_id">, owner: PrincipalOwner): OwnedScope | null {
-  if (owner.type === "org") return { kind: "org", org_id: owner.org_id };
-  return owner.user_id === reader.user_id ? { kind: "me" } : null;
-}
+/** The listing whose labels a campaign `owner` owns shares: its organization's. */
+export const labelScope = (owner: PrincipalOwner): OwnedScope => ({ kind: "org", org_id: principalOf(owner) });
 
 /**
  * The campaign listing's columns and filters: `owners` where its rows name their owner, `byId` beside a plan or job
@@ -225,6 +237,7 @@ export function campaignTable(names: Record<string, string>, owners: boolean, by
                               jobs = true): TableSpec<CampaignView> {
   const owner = (row: CampaignView) => ownerName(row.owner, names);
   return {
+    sort: "-created_at",
     columns: [
       { key: "campaign_id", label: "campaign_id", raw: (row) => row.campaign_id, shown: false,
         href: (row) => campaignLink(row.campaign_id) },
@@ -287,7 +300,6 @@ export async function jobCampaigns(read: Promise<{ plans: Pick<PlanSummary, "cam
 /** What a listing under `branch` says when it keeps no campaign for `sought`: a plan id, a job id or both. */
 export function soughtEmpty(branch: OwnedBranch, sought: string): string {
   switch (branch.kind) {
-    case "me": return `You own no campaign that holds ${sought}.`;
     case "org": return `${orgName(branch)} owns no campaign you may see that holds ${sought}.`;
     case "all": return `No campaign you may see holds ${sought}.`;
   }
@@ -318,17 +330,16 @@ export interface OwnerOption {
   label: string;
 }
 
-/** The owners the form offers: the reader, and the organization it belongs to. */
+/** The owners the form offers: the organization the reader belongs to. */
 export function newCampaignOwners(reader: OwnUserView): OwnerOption[] {
   const org = reader.may.file_plans && reader.org_id ? reader.org_id : null;
   const own = ownOrg(reader);
-  return [{ value: "", label: "me" },
-    ...(org ? [{ value: org, label: `${own ? orgName(own) : org} (organization)` }] : [])];
+  return org ? [{ value: org, label: `${own ? orgName(own) : org} (organization)` }] : [];
 }
 
-/** The owner `?owner=` chooses: one the form offers, else the reader. */
+/** The owner `?owner=` chooses: one the form offers, else the first. */
 export const chosenOwner = (offered: OwnerOption[], asked: string | null): string =>
-  offered.find((option) => option.value === asked)?.value ?? "";
+  (offered.find((option) => option.value === asked) ?? offered[0])?.value ?? "";
 
 export interface NewCampaign {
   name: string;
@@ -337,8 +348,8 @@ export interface NewCampaign {
 }
 
 /**
- * `POST /api/v1/campaigns`'s query for `form`. An empty field is left out: the route
- * refuses an empty `owner`, and reads the reader for none.
+ * `POST /api/v1/campaigns`'s query for `form`. An empty field is left out, as the route
+ * refuses an empty `owner`.
  */
 export function createQuery(form: NewCampaign): string {
   const problem = nameProblem(form.name) || noteProblem(form.note);
@@ -498,8 +509,11 @@ export function revisionSummary(preview: RevisionDryRun): string {
   }
   const parts = [
     `keeps ${preview.carried_job_count} of the current plan's jobs, finished ones included`,
-    ...(restored ? [`brings back ${restored} finished from earlier plans`] : []),
-    ...(inherited ? [`takes ${inherited} finished from the plans it inherits from`] : []),
+    ...(restored ? [`brings back ${restored} from earlier plans`] : []),
+    ...(inherited ? [`takes ${inherited} from the plans it inherits from`] : []),
+    ...(preview.inherited_failed_job_count
+      ? [`counts ${preview.inherited_failed_job_count} of those as failed, so they do not run again`]
+      : []),
     ...(satisfied ? [`takes ${satisfied} finished from earlier runs of the same cell`] : []),
     ...(preview.new_job_count ? [`queues ${preview.new_job_count} new`] : []),
     ...(rerun ? [`runs ${rerun} again`] : []),

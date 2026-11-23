@@ -26,6 +26,7 @@ pub mod hf_import;
 mod http_client;
 pub mod model_audit;
 pub mod model_params;
+pub mod model_replacement;
 pub mod org;
 pub mod org_catalog;
 pub mod plan_cells;

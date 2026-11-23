@@ -8,7 +8,7 @@ use futures::stream::{self, StreamExt};
 use pipette_core::audit::new_event;
 use pipette_plan_types::{
     AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget, CampaignGroupId, CampaignId,
-    ClientId, JobId, OrgId, PlanId, PrincipalOwner, UserId, VaultResourceId,
+    ClientId, JobId, OrgId, PlanId, UserId, VaultResourceId,
 };
 use pipette_store::{
     AuditFilter, AuditStores, CampaignGroupStore, CampaignStore, OrgStore, PlanStore, VaultRecords,
@@ -138,28 +138,22 @@ impl<'a> AuditReach<'a> {
         }
     }
 
-    async fn owner_org(&self, owner: &PrincipalOwner) -> anyhow::Result<Option<OrgId>> {
-        match owner {
-            PrincipalOwner::Org { org_id } => Ok(Some(org_id.clone())),
-            PrincipalOwner::User { user_id } => self.orgs.get_membership(user_id).await,
-        }
-    }
-
     async fn campaign_org(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<OrgId>> {
-        match self.campaigns.get_campaign(campaign_id).await? {
-            Some(campaign) => self.owner_org(&campaign.owner).await,
-            None => Ok(None),
-        }
+        Ok(self
+            .campaigns
+            .get_campaign(campaign_id)
+            .await?
+            .map(|campaign| campaign.owner.org_id().clone()))
     }
 
     async fn group_org(&self, group_id: &CampaignGroupId) -> anyhow::Result<Option<OrgId>> {
         let Some(groups) = self.campaign_groups else {
             return Ok(None);
         };
-        match groups.get_group(group_id).await? {
-            Some(group) => self.owner_org(&group.owner).await,
-            None => Ok(None),
-        }
+        Ok(groups
+            .get_group(group_id)
+            .await?
+            .map(|group| group.owner.org_id().clone()))
     }
 
     async fn plan_org(&self, plan_id: &PlanId) -> anyhow::Result<Option<OrgId>> {
@@ -178,10 +172,11 @@ impl<'a> AuditReach<'a> {
     }
 
     async fn vault_org(&self, resource_id: &VaultResourceId) -> anyhow::Result<Option<OrgId>> {
-        match self.vault.get_resource(resource_id).await? {
-            Some(resource) => self.owner_org(&resource.owner).await,
-            None => Ok(None),
-        }
+        Ok(self
+            .vault
+            .get_resource(resource_id)
+            .await?
+            .map(|resource| resource.owner.org_id().clone()))
     }
 
     /// The organizations that `org_refs` name, ids or handles, as targets. A
@@ -344,7 +339,7 @@ mod tests {
 
     use pipette_core::campaign::CampaignGroup;
     use pipette_core::organization::Organization;
-    use pipette_plan_types::{NonEmptyTrimmedString, OrgSlug};
+    use pipette_plan_types::{NonEmptyTrimmedString, OrgSlug, PrincipalOwner};
     use pipette_store::Stores;
     use pipette_store_fs::build_local_fs_stores;
     use pipette_store_sql::scratch::TestDb;

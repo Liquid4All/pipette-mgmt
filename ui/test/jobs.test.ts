@@ -1,13 +1,18 @@
-import { describe, expect, test } from "vitest";
+import { render } from "svelte/server";
+import { describe, expect, test, vi } from "vitest";
+import CellFilters from "../src/lib/components/CellFilters.svelte";
 import {
-  COLUMNS, byJob, cellText, cellsLink, changeOf, columnsOf, listedText, deviceTypeNames, deviceTypes, drawnFilters, drawnLink, earlierRows, filtering, issuesOf, jobChoices, jobFilters, keeps, linesCsv,
+  CHOICE_KEYS, COLUMNS, byJob, cellText, cellsLink, changeOf, columnsOf, listedText, deviceTypeNames, deviceTypes, drawnFilters, drawnLink, earlierRows, filtering, issuesOf, jobChoices, jobFilters, keeps, linesCsv,
   columnNameOf, linesOf, modelNameOf, outcomeOf, rerunOfText, rerunsOf, runtimeNameOf, sortLines, sortOf, spreadOf, swapped, tierOf, toggled, SWAP_COLUMNS, type Line,
 } from "../src/lib/jobs";
 import { bytesText } from "../src/lib/plans";
 import { canonical } from "../src/lib/report";
-import { choiceMatches, drawnColumns, picksOf } from "../src/lib/table";
+import { BLANK, choiceMatches, drawnColumns, picksOf } from "../src/lib/table";
 import type { PlanJobWithResult } from "../src/lib/api";
 import type { JobResult, JobState, Model, PlanCell, ResultRow, Runtime } from "../src/lib/api-types";
+
+// CellFilters imports it, and it reads `location` as it loads.
+vi.mock("../src/lib/route.svelte", () => ({ redirect: () => {} }));
 
 const MODEL: Model = {
   type: "gguf_text", source: "huggingface", org: "LiquidAI", repo_name: "LFM2.5-1.2B-GGUF", path: "LFM2.5-1.2B-Q4_K_M.gguf",
@@ -144,13 +149,18 @@ describe("the cells' lines", () => {
     expect(kept("issue=spread&state=failed")).toEqual([]);
   });
 
-  test("offer what the plan has, counting jobs on a job's select and rows on a row's", () => {
+  test("offer what the plan has, counting jobs on every select, a row's included", () => {
     const choices = jobChoices(lines, ctx, {});
     expect(choices.state.map((c) => [c.label, c.count])).toEqual([["finished", 2], ["failed", 1], ["queued", 1]]);
-    expect(choices.metric.map((c) => [c.value, c.count])).toEqual([["decode", 3], ["ttft", 1]]);
-    expect(choices.spread.map((c) => [c.label, c.count])).toEqual([["≤1%", 1], ["5–10%", 1]]);
-    expect(choices.issue.map((c) => [c.value, c.count])).toEqual([["failed", 1], ["spread", 1]]);
-    expect(choices.device.map((c) => [c.value, c.label])).toEqual([["client_2", "bench-a"], ["client_1", "bench-b"]]);
+    // job-a1's two measured rows count once.
+    expect(choices.result.map((c) => [c.value, c.count])).toEqual([["measured", 2], ["failed", 1], ["none", 1]]);
+    // A line with no value counts under the blank, last: job-c3 has no row, job-d4's row names no device.
+    expect(choices.metric.map((c) => [c.value, c.count])).toEqual([["decode", 3], ["ttft", 1], [BLANK, 1]]);
+    expect(choices.spread.map((c) => [c.label, c.count])).toEqual([["≤1%", 1], ["5–10%", 1], ["(blank)", 3]]);
+    expect(choices.issue.map((c) => [c.value, c.count])).toEqual([["failed", 1], ["spread", 1], [BLANK, 2]]);
+    expect(choices.device.map((c) => [c.value, c.label]))
+      .toEqual([["client_2", "bench-a"], ["client_1", "bench-b"], [BLANK, "(blank)"]]);
+    expect(kept(`device=${BLANK}`)).toEqual(["job-c3", "job-d4:decode"]);
     expect(choices.benchmark_type.map((c) => [c.value, c.count])).toEqual([["decode_throughput", 4]]);
     // A job not run yet, or a failed row that reports none, is chosen by the model and runtime it was planned with.
     expect(choices.model_descriptor.map((c) => [c.label, c.count]))
@@ -162,9 +172,74 @@ describe("the cells' lines", () => {
   test("offer a choice the address holds that no line has under its label, so it can be unchecked", () => {
     const choices = jobChoices(lines.filter((line) => line.job.state !== "available"), ctx,
                                { state: ["available", "bogus"], result: ["none"] });
+    // Every line left has a result, so the result chosen keeps none to count a state by.
     expect(choices.state.map((c) => [c.value, c.label, c.count]))
-      .toEqual([["finished", "finished", 2], ["failed", "failed", 1], ["available", "queued", 0], ["bogus", "bogus", 0]]);
+      .toEqual([["available", "queued", 0], ["bogus", "bogus", 0]]);
     expect(choices.result.at(-1)).toEqual({ value: "none", label: "no result", count: 0 });
+    // One the other filters leave at 0 keeps its place in the fixed order.
+    expect(jobChoices(lines, ctx, jobFilters(new URLSearchParams("state=finished&result=failed"))).state
+      .map((c) => [c.value, c.count])).toEqual([["finished", 0], ["failed", 1]]);
+  });
+
+  test("offer what the other filters leave, a select's own choices narrowing the rest but never itself", () => {
+    const choices = jobChoices(lines, ctx, jobFilters(new URLSearchParams("state=failed")));
+    expect(choices.state.map((c) => [c.label, c.count])).toEqual([["finished", 2], ["failed", 1], ["queued", 1]]);
+    expect([choices.metric, choices.result, choices.device].map((select) => select.map((c) => [c.label, c.count])))
+      .toEqual([[["decode", 1]], [["failed", 1]], [["bench-b", 1]]]);
+    expect(jobChoices(lines, ctx, { q: "b2" }).state.map((c) => [c.label, c.count])).toEqual([["failed", 1]]);
+  });
+
+  test("count a line toward the one select it fails, and toward none where it fails two", () => {
+    const choices = jobChoices(lines, ctx, jobFilters(new URLSearchParams("metric=ttft&state=failed")));
+    expect(choices.metric.map((c) => [c.value, c.count])).toEqual([["decode", 1], ["ttft", 0]]);
+    expect(choices.state.map((c) => [c.label, c.count])).toEqual([["finished", 1], ["failed", 0]]);
+  });
+
+  test("take a select's values from the lines the other filters keep: a failed row shows the planned model", () => {
+    const big = { org: "other", repo_name: "Big-9B" };
+    const mixed = linesOf([job("job-e5", "finished", { result: scored(
+      row("decode", 5, { model_descriptor: { type: "unknown", value: big } }),
+      row("ttft", null, { failed: true, model_descriptor: null })) })]);
+    const models = (query: string) =>
+      jobChoices(mixed, ctx, jobFilters(new URLSearchParams(query))).model_descriptor.map((c) => [c.value, c.count]);
+    expect([models("metric=decode"), models("metric=ttft")])
+      .toEqual([[[canonical(big), 1]], [[canonical(MODEL), 1]]]);
+  });
+
+  test("count each value as the jobs a pick of it alone lists, offering every value that lists one", () => {
+    const every = jobChoices(lines, ctx, {});
+    for (const query of ["", "state=failed", "metric=ttft&state=finished", "q=b2", `device=${BLANK}`, "issue=spread"]) {
+      const filters = jobFilters(new URLSearchParams(query));
+      const choices = jobChoices(lines, ctx, filters);
+      for (const key of CHOICE_KEYS) {
+        for (const { value } of every[key]) {
+          const count = choices[key].find((choice) => choice.value === value)?.count ?? 0;
+          const picked = { ...filters, [key]: [value] };
+          const listed = new Set(lines.filter((line) => keeps(line, picked, ctx)).map((line) => line.job)).size;
+          expect([query, key, value, count]).toEqual([query, key, value, listed]);
+        }
+      }
+    }
+  });
+
+  test("draw each select in place, a row's one the address chose before the results were read", () => {
+    const fields = (query: string, rows: boolean, of: readonly Line[] = lines) => {
+      const filters = jobFilters(new URLSearchParams(query));
+      const { body } = render(CellFilters, { props: {
+        filters, choices: jobChoices(of, ctx, filters), unfiltered: jobChoices(of, ctx, {}), rows, link: () => "",
+      } });
+      return { selects: [...body.matchAll(/<div class="field[^"]*"><span[^>]*>([^<]+)<\/span>/g)].map((m) => m[1]), body };
+    };
+    const ALL = ["state", "benchmark type", "benchmark", "model", "runtime", "runtime flags", "device", "result", "metric",
+                 "stddev %", "issues"];
+    // A queued job with a metric matches no line, so every other select is emptied, and each stays.
+    const emptied = fields("state=available&metric=decode", true);
+    expect(emptied.selects).toEqual(ALL);
+    expect(emptied.body).toContain("Nothing to choose.");
+    expect(fields("result=failed", false).selects).toEqual([...ALL.slice(0, 7), "result"]);
+    // No device, spread or issue on any line: only the blank would fill those, so they are left out.
+    const clean = linesOf([job("j1", "finished", { result: scored(row("decode", 1)) })]);
+    expect(fields("", true, clean).selects).toEqual([...ALL.slice(0, 6), "result", "metric"]);
   });
 
   test("offer a select's choices by label, numbers by size, the fixed ones in their own order", () => {
@@ -240,8 +315,8 @@ describe("the cells' lines", () => {
     expect(toggled(toggled(one, "state", "running", true), "state", "failed", false).state).toEqual(["running"]);
     expect(cellsLink({ plan_id: "plan-1", campaign_id: "cmp_1" }, { ...NONE, state: ["failed", "running"], q: "lfm" },
                      "20"))
-      .toBe("/app/campaigns/cmp_1/plans/plan-1/cells?q=lfm&state=failed&state=running&limit=20");
-    expect(cellsLink({ plan_id: "plan-1", campaign_id: null }, NONE, "", 100)).toBe("/app/plans/plan-1/cells?offset=100");
+      .toBe("/app/campaigns/cmp_1/plans/plan-1/cells?q=lfm&state=failed&state=running&sort=job&limit=20");
+    expect(cellsLink({ plan_id: "plan-1", campaign_id: null }, NONE, "", 100)).toBe("/app/plans/plan-1/cells?sort=job&offset=100");
   });
 });
 
@@ -299,7 +374,8 @@ describe("a job's re-runs", () => {
   test("are a column, a select by count and a filter", () => {
     const reruns = COLUMNS.find((column) => column.key === "reruns")!;
     expect(lines.map((line) => cellText(reruns, line, ctx))).toEqual(["0", "1", "2", "", ""]);
-    expect(jobChoices(lines, ctx, {}).reruns.map((c) => [c.value, c.count])).toEqual([["0", 1], ["1", 1], ["2", 1]]);
+    expect(jobChoices(lines, ctx, {}).reruns.map((c) => [c.value, c.count]))
+      .toEqual([["0", 1], ["1", 1], ["2", 1], [BLANK, 2]]);
     expect(lines.filter((line) => keeps(line, jobFilters(new URLSearchParams("reruns=1&reruns=2")), ctx))
       .map((line) => line.job.job_id)).toEqual(["job-b", "job-c"]);
   });
@@ -315,11 +391,11 @@ describe("the cells' sort", () => {
   const order = (sort: string) =>
     sortLines(lines, sort, ctx).map((line) => `${line.job.job_id}${line.row ? `:${line.row.metric}` : ""}`);
 
-  test("is read from the address only for a column the table has", () => {
+  test("is read from the address for a column the table has, else by job", () => {
     expect([jobFilters(new URLSearchParams("sort=-value")).sort, jobFilters(new URLSearchParams("sort=nope")).sort])
-      .toEqual(["-value", ""]);
+      .toEqual(["-value", "job"]);
     expect(["sort=swap", "sort=-swap", "sort=nope", ""].map((query) => sortOf(new URLSearchParams(query))))
-      .toEqual(["swap", "-swap", "", ""]);
+      .toEqual(["swap", "-swap", "job", "job"]);
     expect(cellsLink({ plan_id: "plan-1", campaign_id: null }, { ...NONE, sort: "-value" }, ""))
       .toBe("/app/plans/plan-1/cells?sort=-value");
   });
@@ -463,8 +539,11 @@ describe("the descriptor selects", () => {
       model_flags: { enable_thinking: true } as never, runtime_flags: { type: "unknown", value: "-ngl 99" } as never })) }),
                              job("f2", "finished", { result: scored(row("decode", 1)) }), job("f3", "available")]);
     const choices = jobChoices(flagged, ctx, {});
-    expect(choices.model_flags.map((c) => [c.value, c.count])).toEqual([['{"enable_thinking":true}', 1], ["null", 1]]);
-    expect(choices.benchmark_flags.map((c) => [c.value, c.count])).toEqual([["null", 2]]);
+    // `null` ran with no flags; the blank, job-f3, has not run.
+    expect(choices.model_flags.map((c) => [c.value, c.count]))
+      .toEqual([['{"enable_thinking":true}', 1], ["null", 1], [BLANK, 1]]);
+    expect(choices.benchmark_flags.map((c) => [c.value, c.count])).toEqual([["null", 2], [BLANK, 1]]);
+    expect(choices.model_flags.filter((c) => choiceMatches(c, "null")).map((c) => c.value)).toEqual(["null"]);
     expect(flagged.filter((l) => keeps(l, jobFilters(new URLSearchParams("model_flags=null")), ctx))
       .map((l) => l.job.job_id)).toEqual(["f2"]);
   });
@@ -806,6 +885,13 @@ describe("the model's catalog name", () => {
     const labels = jobChoices(lines, named, {}).model_descriptor.map((c) => [c.label, c.value]);
     expect(labels).toContainEqual([`AcmeLM-3B::gguf::q4_0 ${canonical(GGUF)}`, canonical(GGUF)]);
     expect(labels).toContainEqual([canonical(DESCRIPTOR), canonical(DESCRIPTOR)]);
+  });
+
+  test("a chosen model the other filters leave out keeps its name and synonyms", () => {
+    const choices = jobChoices(lines, named, { model_descriptor: [canonical(GGUF)], state: ["available"] }).model_descriptor;
+    expect(choices.map((c) => [c.label, c.count]))
+      .toEqual([[`AcmeLM-3B::gguf::q4_0 ${canonical(GGUF)}`, 0], [`AcmeLM-3B::mlx::4bit ${canonical(MLX)}`, 1]]);
+    expect(choiceMatches(choices[0]!, "acme/Acme-3B::gguf")).toBe(true);
   });
 
   test("the model select finds a synonym without showing it in the label", () => {

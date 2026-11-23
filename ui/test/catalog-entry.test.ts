@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
 import {
   CATALOG_NAME_MAX, DIGEST_BATCH, catalogNameError, catalogOrgOf, digestBatches, displayOf, entryOffer, entryTarget,
+  LOGO_URI_MAX, LOGO_URI_PREFIX, familyError, logoUriError,
   memberTree, namedIn, offerReason, quantizationError, quantizationHints, storedName, writeFailure, type EntryTarget,
   type MemberNode,
 } from "../src/lib/catalog-entry";
@@ -60,6 +61,40 @@ describe("a catalog entry from a campaign's progress table", () => {
     ["x".repeat(CATALOG_NAME_MAX + 1), `Use at most ${CATALOG_NAME_MAX} characters in the name.`],
   ])("checks the name %j with the server's grammar", (text, error) => {
     expect(catalogNameError(text)).toBe(error);
+  });
+
+  test.each([
+    ["", null],
+    ["LFM2.5", null],
+    ["-LFM", "Start the name with a letter or a digit."],
+  ])("checks the family %j: empty goes back to the default", (text, error) => {
+    expect(familyError(text)).toBe(error);
+  });
+
+  const segments = "Use path segments of letters, digits, '.', '_' and '-', with one '/' between them. "
+    + "Do not start a segment with '.'.";
+  const dataUri = "Enter a data URI with image/png, image/svg+xml, or image/webp. Add ;base64, and the image in padded base64.";
+  test.each([
+    ["", null],
+    [`${LOGO_URI_PREFIX}lfm.svg`, null],
+    [`${LOGO_URI_PREFIX}vendors/Qwen_3-x.png`, null],
+    ["https://example.com/logos/lfm.svg", `Start the logo URI with ${LOGO_URI_PREFIX} or data:.`],
+    ["http://pipette.liquid.ai/logos/lfm.svg", `Start the logo URI with ${LOGO_URI_PREFIX} or data:.`],
+    ["data:image/png;base64,iVBORw0KGgo=", null],
+    ["data:image/svg+xml;base64,PHN2Zy8+", null],
+    ["data:image/webp;base64,UklGRg==", null],
+    ["data:image/png;base64,abc", dataUri],
+    ["data:image/png;base64,", dataUri],
+    ["data:image/jpeg;base64,abcd", dataUri],
+    ["data:image/png,abcd", dataUri],
+    [`data:image/png;base64,${"a".repeat(LOGO_URI_MAX)}`, `Use at most ${LOGO_URI_MAX} characters in the logo URI.`],
+    [LOGO_URI_PREFIX, "Give the path of the logo after the folder."],
+    [`${LOGO_URI_PREFIX}../lfm.svg`, segments],
+    [`${LOGO_URI_PREFIX}a//lfm.svg`, segments],
+    [`${LOGO_URI_PREFIX}lfm.svg?v=1`, segments],
+    [`${LOGO_URI_PREFIX}${"a".repeat(LOGO_URI_MAX)}`, `Use at most ${LOGO_URI_MAX} characters in the logo URI.`],
+  ])("checks the logo URI %j with the server's rules", (text, error) => {
+    expect(logoUriError(text)).toBe(error);
   });
 
   test("shows a digest's names as the jobs read does: the first over the others as synonyms", () => {

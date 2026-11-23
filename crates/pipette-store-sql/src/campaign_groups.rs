@@ -5,6 +5,7 @@
 //! re-run and kind that filed it, and a member's JSON state on each job of
 //! its plan in `campaign_group_job_states`.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
@@ -191,6 +192,29 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
         Ok(row.map(|(id,)| CampaignGroupId::try_new(id)).transpose()?)
     }
 
+    async fn group_and_member(
+        &self,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<Option<(CampaignGroup, GroupMember)>> {
+        let row: Option<(String, String, Option<String>)> = self
+            .db
+            .fetch_optional("campaign_group_and_member", || {
+                sqlx::query_as(
+                    "SELECT g.group_id, g.body, m.policy_state
+                     FROM campaign_group_members m
+                     JOIN campaign_groups g ON g.group_id = m.group_id
+                     WHERE m.campaign_id = $1",
+                )
+                .bind(campaign_id.as_str())
+            })
+            .await?;
+        row.map(|(id, body, policy_state)| {
+            let group = serde_json::from_str(&body).with_context(|| GROUPS.report_key(&id))?;
+            Ok((group, member((campaign_id.to_string(), policy_state))?))
+        })
+        .transpose()
+    }
+
     async fn list_policies(
         &self,
         group_id: &CampaignGroupId,
@@ -282,7 +306,8 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
                 )
             })
             .await?;
-        rows.into_iter().try_fold(
+        let stored: BTreeSet<String> = rows.iter().map(|(group_id, ..)| group_id.clone()).collect();
+        let mut enabled = rows.into_iter().try_fold(
             EnabledPolicies::default(),
             |mut enabled, (group_id, kind, body)| {
                 // An older binary can store failed on without codes, which flags nothing.
@@ -307,7 +332,24 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
                 }
                 anyhow::Ok(enabled)
             },
-        )
+        )?;
+        let not_off: BTreeSet<&str> = enabled
+            .policies
+            .iter()
+            .map(|policy| policy.group_id.as_str())
+            .chain(
+                enabled
+                    .unreadable
+                    .iter()
+                    .map(|(group_id, _)| group_id.as_str()),
+            )
+            .collect();
+        enabled.off = stored
+            .into_iter()
+            .filter(|group_id| !not_off.contains(group_id.as_str()))
+            .map(CampaignGroupId::try_new)
+            .collect::<Result<_, _>>()?;
+        Ok(enabled)
     }
 
     async fn policy_states(&self, group_id: &CampaignGroupId) -> anyhow::Result<Vec<GroupMember>> {
@@ -359,17 +401,7 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
         retry("set_campaign_group_policy_state", move || {
             Box::pin(async move {
                 let mut tx = db.begin().await?;
-                let written = sqlx::query(
-                    "UPDATE campaign_group_members SET policy_state = $3
-                     WHERE campaign_id = $1 AND group_id = $2",
-                )
-                .bind(campaign)
-                .bind(group)
-                .bind(body.as_str())
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-                if written == 0 {
+                if !write_member_state(&mut tx, campaign, group, body).await? {
                     return Ok(false);
                 }
                 if !removed.is_empty() {
@@ -394,6 +426,32 @@ impl CampaignGroupStore for SqlCampaignGroupStore {
                     .execute(&mut *tx)
                     .await?;
                 }
+                tx.commit().await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn clear_policy_state(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+        state: &GroupPolicyState,
+    ) -> anyhow::Result<bool> {
+        let body = serde_json::to_string(state)?;
+        let (db, campaign, group, body) =
+            (&self.db, campaign_id.as_str(), group_id.as_str(), &body);
+        retry("clear_campaign_group_policy_state", move || {
+            Box::pin(async move {
+                let mut tx = db.begin().await?;
+                if !write_member_state(&mut tx, campaign, group, body).await? {
+                    return Ok(false);
+                }
+                sqlx::query("DELETE FROM campaign_group_job_states WHERE campaign_id = $1")
+                    .bind(campaign)
+                    .execute(&mut *tx)
+                    .await?;
                 tx.commit().await?;
                 Ok(true)
             })
@@ -743,6 +801,27 @@ fn member((campaign_id, policy_state): (String, Option<String>)) -> anyhow::Resu
     })
 }
 
+/// Write a member's policy state `body` in `tx`; `false` when the campaign is
+/// not a member of `group`, as after a move to another group.
+async fn write_member_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    campaign: &str,
+    group: &str,
+    body: &str,
+) -> Result<bool, sqlx::Error> {
+    let written = sqlx::query(
+        "UPDATE campaign_group_members SET policy_state = $3
+         WHERE campaign_id = $1 AND group_id = $2",
+    )
+    .bind(campaign)
+    .bind(group)
+    .bind(body)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(written > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -751,15 +830,17 @@ mod tests {
 
     use pipette_core::campaign::{CampaignOwner, GroupFiling, NewCampaign, Refusal};
     use pipette_core::types::Mint;
-    use pipette_plan_types::{FailureCode, PolicyKind, PolicySettings, RerunOutcome, UserId};
+    use pipette_plan_types::{
+        FailureCode, OrgId, PolicyDeferral, PolicyKind, PolicySettings, RerunOutcome, UserId,
+    };
     use pipette_store::CampaignStore;
 
     use super::*;
     use crate::campaigns::SqlCampaignStore;
 
     fn an_owner() -> CampaignOwner {
-        CampaignOwner::User {
-            user_id: UserId::mint(),
+        CampaignOwner::Org {
+            org_id: OrgId::mint(),
         }
     }
 
@@ -880,6 +961,18 @@ mod tests {
             enabled_at: Some(Timestamp::now()),
             ..policy.clone()
         }
+    }
+
+    /// A decided job state of `job`, which `flagged` flag.
+    fn a_job_state(job: &str, flagged: &[PolicyKind]) -> anyhow::Result<JobPolicyState> {
+        Ok(JobPolicyState {
+            job_id: JobId::try_new(job)?,
+            flagged: flagged.iter().copied().collect(),
+            decided: true,
+            missing_params: BTreeSet::new(),
+            family: None,
+            failed: false,
+        })
     }
 
     /// A replace writes the group's policy of its kind and keeps the others,
@@ -1036,12 +1129,16 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let db = test_db.db();
         let store = SqlCampaignGroupStore::new(db.clone());
-        let (first, second, broken, uncoded) = (
+        let (first, second, broken, uncoded, idle) = (
+            a_stored_group(&store).await?,
             a_stored_group(&store).await?,
             a_stored_group(&store).await?,
             a_stored_group(&store).await?,
             a_stored_group(&store).await?,
         );
+        // Stored, and off.
+        let idle_swap = PolicyKind::Swap.defaults(idle.clone());
+        assert!(store.replace_policy(&idle_swap, &idle_swap).await?);
         let policies = [
             PolicyKind::Swap.defaults(first.clone()),
             PolicyKind::Spread.defaults(first.clone()),
@@ -1099,6 +1196,7 @@ mod tests {
             reported,
             [(&broken, keys[0].as_str()), (&uncoded, keys[1].as_str())]
         );
+        assert_eq!(enabled.off, [idle]);
         Ok(())
     }
 
@@ -1152,20 +1250,15 @@ mod tests {
             }),
             unreadable_at: Some(Timestamp::now()),
             rules: 1,
-        };
-        let job_state = |job: &str, flagged: &[PolicyKind]| -> anyhow::Result<JobPolicyState> {
-            Ok(JobPolicyState {
-                job_id: JobId::try_new(job)?,
-                flagged: flagged.iter().copied().collect(),
-                decided: true,
-                missing_params: BTreeSet::new(),
-                family: None,
-                failed: false,
-            })
+            deferred: Some(PolicyDeferral {
+                until: Timestamp::now(),
+                rerun_job_count: 3,
+                marked_job_count: 1,
+            }),
         };
         let (kept, flagged) = (
-            job_state("job-1", &[])?,
-            job_state("job-2", &[PolicyKind::Spread])?,
+            a_job_state("job-1", &[])?,
+            a_job_state("job-2", &[PolicyKind::Spread])?,
         );
         let both = JobStateChanges {
             put: vec![kept.clone(), flagged.clone()],
@@ -1176,7 +1269,7 @@ mod tests {
             store.job_states(&group, &a).await?,
             [kept.clone(), flagged.clone()]
         );
-        let cleared = job_state("job-2", &[])?;
+        let cleared = a_job_state("job-2", &[])?;
         let changes = JobStateChanges {
             put: vec![cleared.clone()],
             removed: vec![kept.job_id.clone()],
@@ -1214,6 +1307,56 @@ mod tests {
         assert_eq!(states(&store, &other).await?, [(a.clone(), Ok(None))]);
         assert_eq!(states(&store, &group).await?, [unreadable]);
         assert_eq!(store.job_states(&other, &a).await?, []);
+        Ok(())
+    }
+
+    /// A clear writes the member's state and deletes its job states unread,
+    /// one that does not decode included, and leaves a campaign of another
+    /// group as it is.
+    #[tokio::test]
+    async fn a_clear_deletes_the_job_states_unread() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let db = test_db.db();
+        let store = SqlCampaignGroupStore::new(db.clone());
+        let (group, other) = (a_stored_group(&store).await?, a_stored_group(&store).await?);
+        let (a, b) = (a_campaign(db).await?, a_campaign(db).await?);
+        store.add_members(&group, std::slice::from_ref(&a)).await?;
+        store.add_members(&other, std::slice::from_ref(&b)).await?;
+        let state = GroupPolicyState {
+            policies: vec![turned_on(&PolicyKind::Swap.defaults(group.clone()))],
+            triggered: BTreeSet::from([PolicyKind::Swap]),
+            ..GroupPolicyState::default()
+        };
+        let job_state = a_job_state("job-1", &[PolicyKind::Swap])?;
+        let changes = JobStateChanges {
+            put: vec![job_state.clone()],
+            removed: Vec::new(),
+        };
+        assert!(store.set_policy_state(&group, &a, &state, &changes).await?);
+        assert!(store.set_policy_state(&other, &b, &state, &changes).await?);
+        sqlx::query(
+            "UPDATE campaign_group_job_states SET body = 'not a job state' WHERE campaign_id = $1",
+        )
+        .bind(a.as_str())
+        .execute(db.pool())
+        .await?;
+        let cleared = GroupPolicyState::default();
+        assert!(store.clear_policy_state(&group, &a, &cleared).await?);
+        assert_eq!(
+            (
+                states(&store, &group).await?,
+                store.job_states(&group, &a).await?
+            ),
+            (vec![(a.clone(), Ok(Some(cleared.clone())))], Vec::new())
+        );
+        assert!(!store.clear_policy_state(&group, &b, &cleared).await?);
+        assert_eq!(
+            (
+                states(&store, &other).await?,
+                store.job_states(&other, &b).await?
+            ),
+            (vec![(b.clone(), Ok(Some(state)))], vec![job_state])
+        );
         Ok(())
     }
 

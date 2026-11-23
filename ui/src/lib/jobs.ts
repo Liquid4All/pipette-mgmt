@@ -8,7 +8,7 @@ import {
 import {
   BEYOND_LIMIT, beyondAudioLimit, canonical, descriptorText, deviceNames, deviceType, knobsText, lowerIsBetter, ttftOver,
 } from "./report";
-import { csvOf, offeredChoices } from "./table";
+import { countedChoices, csvOf, orBlank } from "./table";
 import { tabLink, type TabBase } from "./tabs";
 import { nameOf, nameTexts, type DescriptorNames } from "./descriptor-names";
 import { namedLabel, namedAs } from "./vault";
@@ -457,10 +457,10 @@ export const REPORTED: [ChoiceKey, string][] = [
   ["runtime_flags", "runtime flags"], ["benchmark_flags", "benchmark flags"],
 ];
 
-/** The sort the address sets, empty where it names no column, a column of the rows' own (`columnsOf`) included. */
+/** The sort the address sets, a column of the rows' own (`columnsOf`) included; by job where it names no column. */
 export function sortOf(query: URLSearchParams): string {
   const key = query.get("sort")?.replace(/^-/, "") ?? "";
-  return COLUMNS.some((column) => column.key === key) || DISCOVERED.test(key) ? query.get("sort")! : "";
+  return COLUMNS.some((column) => column.key === key) || DISCOVERED.test(key) ? query.get("sort")! : "job";
 }
 
 /** The filters the address sets, each empty where it sets none, a choice named twice once. */
@@ -597,17 +597,22 @@ const CHOSEN: Record<ChoiceKey, (line: Line, ctx: Context) => string[]> = {
   issue: (line) => issuesOf(line).map((issue) => issue.key),
 };
 
+const textsHold = (line: Line, filters: Partial<JobFilters>, ctx: Context): boolean => TEXT_KEYS.every((key) => {
+  const want = filters[key]?.toLowerCase();
+  return !want || TEXTS[key](line.job, ctx).some((text) => text?.toLowerCase().includes(want));
+});
+
+const choiceHolds = (line: Line, filters: Partial<JobFilters>, key: ChoiceKey, ctx: Context): boolean => {
+  const chosen = filters[key] ?? [];
+  return !chosen.length || orBlank(CHOSEN[key](line, ctx)).some((v) => chosen.includes(v));
+};
+
 /** Whether `line` passes every filter set: a text box by any part of its text, case aside; a select by any choice. */
 export function keeps(line: Line, filters: JobFilters, ctx: Context): boolean {
-  const holds = (key: TextKey) => {
-    const want = filters[key].toLowerCase();
-    return !want || TEXTS[key](line.job, ctx).some((text) => text?.toLowerCase().includes(want));
-  };
-  return TEXT_KEYS.every(holds)
-    && CHOICE_KEYS.every((key) => !filters[key].length || CHOSEN[key](line, ctx).some((v) => filters[key].includes(v)));
+  return textsHold(line, filters, ctx) && CHOICE_KEYS.every((key) => choiceHolds(line, filters, key, ctx));
 }
 
-/** One option of a select, and how many jobs (or result rows, on a row's select) have it. */
+/** One option of a select, and how many of the jobs the other filters keep have it. */
 export interface JobChoice {
   value: string;
   label: string;
@@ -623,54 +628,58 @@ const OUTCOME_LABELS: Record<Outcome, string> = { measured: "measured", failed: 
 const TIER_LABELS = Object.fromEntries(TIERS.map(([tier, , label]) => [tier, label])) as Record<Tier, string>;
 
 /**
- * Each select's options over all of `lines`, counted: jobs for a job's select, rows for a row's. Then those of
- * `chosen` no line has.
+ * Each select's options, counted in jobs over the lines every other filter keeps, the search box included, so each
+ * value left to add stays offered, as on pipette-datasheet.
  */
-export function jobChoices(lines: readonly Line[], ctx: Context, chosen: Partial<Record<ChoiceKey, readonly string[]>>,
+export function jobChoices(lines: readonly Line[], ctx: Context, filters: Partial<JobFilters>,
 ): Record<ChoiceKey, JobChoice[]> {
-  // Unordered ones by label, its numbers by size (`_256` before `_1024`), as the other listings' selects order theirs.
-  const count = (key: ChoiceKey, perJob: boolean, label: (value: string) => string, order?: readonly string[]) => {
-    const seen = new Map<string, Set<unknown>>();
-    for (const line of lines) {
-      for (const value of CHOSEN[key](line, ctx)) {
-        if (!value) continue;
+  const counted = lines.flatMap((line) => {
+    if (!textsHold(line, filters, ctx)) return [];
+    const failed = CHOICE_KEYS.filter((key) => !choiceHolds(line, filters, key, ctx));
+    return failed.length > 1 ? [] : [{ line, failed: failed[0] }];
+  });
+  const count = (key: ChoiceKey, label: (value: string) => string, order?: readonly string[]) => {
+    const seen = new Map<string, Set<Listed>>();
+    for (const { line, failed } of counted) {
+      if (failed && failed !== key) continue;
+      for (const value of orBlank(CHOSEN[key](line, ctx))) {
         if (!seen.has(value)) seen.set(value, new Set());
-        seen.get(value)!.add(perJob ? line.job : line);
+        seen.get(value)!.add(line.job);
       }
     }
-    const found = [...seen].map(([value, of]) => ({ value, label: label(value), count: of.size }));
-    return offeredChoices(order ? order.flatMap((value) => found.filter((choice) => choice.value === value))
-      : found.sort((a, b) => a.label.localeCompare(b.label, "en", { numeric: true })), chosen[key] ?? [], label);
+    const jobs = new Map([...seen].map(([value, of]) => [value, of.size]));
+    return countedChoices(jobs, filters[key] ?? [], label, order);
   };
-  const stored = (key: ChoiceKey) => count(key, true, (v) => v);
+  const stored = (key: ChoiceKey) => count(key, (v) => v);
   // A descriptor with a catalog name reads under that name first. A descriptor that names the vault reads under what
   // it names. The search finds a descriptor by both.
   const described = (key: ChoiceKey, nameOfLine: (line: Line, ctx: Context) => DescriptorDisplay | null,
                      textOf: (line: Line) => string) => {
+    // Over every line, so a choice the other filters leave at 0 keeps its name and synonyms.
     const names = new Map(lines.flatMap((line) => {
       const name = nameOfLine(line, ctx);
       return name ? [[textOf(line), name] as const] : [];
     }));
-    return count(key, true, (v) => [names.get(v)?.display, namedLabel(v, ctx.names)].filter(Boolean).join(" "))
+    return count(key, (v) => [names.get(v)?.display, namedLabel(v, ctx.names)].filter(Boolean).join(" "))
       .map((choice) => ({ ...choice, searchText: names.get(choice.value)?.synonyms.join("\n") }));
   };
   // A value the address holds may be none the labels know.
   const labelled = (labels: Record<string, string>) => (v: string) => labels[v] ?? v;
   return {
-    state: count("state", true, labelled(STATE_LABELS), Object.keys(STATE_LABELS)),
+    state: count("state", labelled(STATE_LABELS), Object.keys(STATE_LABELS)),
     reruns: stored("reruns"),
-    result: count("result", false, labelled(OUTCOME_LABELS), Object.keys(OUTCOME_LABELS)),
+    result: count("result", labelled(OUTCOME_LABELS), Object.keys(OUTCOME_LABELS)),
     benchmark: stored("benchmark"),
     benchmark_type: stored("benchmark_type"),
-    device: count("device", true, (id) => ctx.names[id] ?? ctx.typeNames?.get(id) ?? id),
+    device: count("device", (id) => ctx.names[id] ?? ctx.typeNames?.get(id) ?? id),
     model_descriptor: described("model_descriptor", modelNameOf, modelOf),
     runtime_descriptor: described("runtime_descriptor", runtimeNameOf, runtimeOf),
     model_flags: stored("model_flags"),
     runtime_flags: stored("runtime_flags"),
     benchmark_flags: stored("benchmark_flags"),
-    metric: count("metric", false, (v) => v),
-    spread: count("spread", false, labelled(TIER_LABELS), TIERS.map(([tier]) => tier)),
-    issue: count("issue", false, labelled(ISSUES), Object.keys(ISSUES)),
+    metric: stored("metric"),
+    spread: count("spread", labelled(TIER_LABELS), TIERS.map(([tier]) => tier)),
+    issue: count("issue", labelled(ISSUES), Object.keys(ISSUES)),
   };
 }
 

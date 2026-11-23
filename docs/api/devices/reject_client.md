@@ -15,5 +15,4 @@ machine that is doing work. Use [`DELETE`](delete_client.md) deliberately for th
 | Status | When |
 |--------|------|
 | 204 | The registration is deleted and its keypair freed |
-| 404 | No such device |
 | 409 | The device is not `pending` |

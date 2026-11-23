@@ -29,6 +29,7 @@
   const filtered = $derived(filtering(filters));
   const kept = $derived(lines.filter((line) => keeps(line, filters, ctx)));
   const choices = $derived(jobChoices(lines, ctx, filters));
+  const unfiltered = $derived(jobChoices(lines, ctx, {}));
   const limit = $derived(offsetPaging(here.query).asked);
 
   /** Swap under `to`, from job `offset`; the chart tabs' own keys ride along for the way back, `device` in Jobs' pairs. */
@@ -38,7 +39,7 @@
   ]);
 </script>
 
-<CellFilters {filters} {choices} rows reported link={(to) => link(to)} />
+<CellFilters {filters} {choices} {unfiltered} rows reported link={(to) => link(to)} />
 <JobLines {base} {plan} {jobs} lines={kept} {ctx} kind="swap" columns={columnsOf(lines, SWAP_COLUMNS)} sort={filters.sort}
           link={(sort, offset) => link({ ...filters, sort }, offset)} empty="No line matches these filters."
           {onchange}>

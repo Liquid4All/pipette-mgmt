@@ -267,6 +267,12 @@ pub enum IdError {
         expected: &'static str,
         got: usize,
     },
+    /// A value outside the forms that its kind accepts.
+    #[error("{field} must be {expected}")]
+    Form {
+        field: &'static str,
+        expected: &'static str,
+    },
     #[error(transparent)]
     Principal(#[from] PrincipalIdError),
     /// A key segment its id's parse rewrites, so the id would name another key.

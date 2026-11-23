@@ -54,22 +54,11 @@ export const groupsCrumb = (under: Under): Crumb | null =>
 
 /**
  * Whether `reader` may create `owner`'s groups and change their members and policies, as the routes judge filing:
- * `submit_plans`, and `owner` is the reader or its organization unless it holds `manage_any_orgs`. The route still
+ * `submit_plans`, and `owner` is the reader's organization unless it holds `manage_any_orgs`. The route still
  * decides.
  */
 export const mayFile = (reader: OwnUserView, owner: PrincipalOwner): boolean =>
-  reader.may.file_plans && (reader.may.administer_roster === "every"
-    || (owner.type === "org" ? owner.org_id === reader.org_id : owner.user_id === reader.user_id));
-
-/**
- * Whether the group page offers the rename and the delete, which take a campaign rename's rights (`mayLabel`). An
- * organization's administrator also administers a disabled member's group, the only other account's group it can
- * open unless it reads every plan.
- */
-export const mayAdminister = (reader: OwnUserView, owner: PrincipalOwner): boolean =>
-  mayLabel(reader, owner)
-  || (owner.type === "user" && owner.user_id !== reader.user_id && reader.may.administer_roster === "own"
-    && reader.may.read_plans !== "every");
+  reader.may.file_plans && (reader.may.administer_roster === "every" || principalOf(owner) === reader.org_id);
 
 /** Each member with the plan `listed` reads for it. */
 export function memberRows(members: readonly CampaignView[], listed: readonly CampaignView[]): CampaignView[] {
@@ -94,10 +83,11 @@ export function memberOffers(listed: readonly CampaignView[],
 export const MAX_RERUNS = 15;
 
 /**
- * Whether a `kind` policy re-runs or marks jobs, as `PolicyKind::reruns_or_marks` says; model_params and smaller_failed
- * only flag.
+ * Whether a `kind` policy re-runs or marks jobs, as `PolicyKind::reruns_or_marks` says; model_params, smaller_failed
+ * and vault_resource only flag.
  */
-export const rerunsOrMarks = (kind: PolicyKind): boolean => kind !== "model_params" && kind !== "smaller_failed";
+export const rerunsOrMarks = (kind: PolicyKind): boolean =>
+  kind !== "model_params" && kind !== "smaller_failed" && kind !== "vault_resource";
 
 /** Whether a `kind` policy takes its re-runs in `max_reruns`; failed takes them per failure code in its settings. */
 const rerunsOwn = (kind: PolicyKind): boolean => rerunsOrMarks(kind) && kind !== "failed";
@@ -175,6 +165,11 @@ const CHECKS: Record<PolicyKind, Check> = {
     still: "It re-runs and marks nothing, and queue-maintenance does not read it: the jobs it flags are on the Activity "
       + "tab.",
   },
+  vault_resource: {
+    title: () => "Vault model or runtime",
+    finds: () => "model or runtime is a vault resource, a gated Hugging Face model copied into the vault included",
+    still: "It re-runs and marks nothing: a campaign with such a job shows the policy triggered.",
+  },
 };
 
 /** A policy's title, spread's at its stored settings, failed's without the codes its text names. */
@@ -197,7 +192,8 @@ export function policyText({ kind, max_reruns: n, settings }: CampaignGroupPolic
       + `any of these codes count toward the limit of its last one. ${still}`;
   }
   const whose = `whose ${finds({ ...settings, codes: null })}`;
-  if (!rerunsOrMarks(kind)) return `Flags the result rows ${whose}. ${still}`;
+  // vault_resource reads the job a run was queued with, not its rows.
+  if (!rerunsOrMarks(kind)) return `Flags the ${kind === "vault_resource" ? "jobs" : "result rows"} ${whose}. ${still}`;
   if (n > 0) return `Re-runs a job ${whose}, ${times(n)}. ${still}`;
   // With no re-run, a check that keeps the result does nothing, which is why the route takes none for swap alone.
   const fate = kind === "swap" ? "is marked failed, with no re-run" : "is left as it is, so this policy does nothing";
@@ -300,6 +296,7 @@ const memberState = (row: MemberPolicyPreview): string => MEMBER_STATES[row.stat
 export function checkText({ kind, flagged, rerun, marked, kept }: PolicyCheckCounts): string {
   if (kind === "model_params") return `${flagged} job${flagged === 1 ? "" : "s"} whose rows lack model params`;
   if (kind === "smaller_failed") return `${flagged} failed job${flagged === 1 ? "" : "s"} below a clean larger run`;
+  if (kind === "vault_resource") return `${flagged} job${flagged === 1 ? "" : "s"} on a vault model or runtime`;
   if (!flagged) return "0 flagged";
   // A job left aside, for good or until its re-run chain reads, counts as flagged alone.
   const skipped = flagged - rerun - marked - kept;
@@ -309,14 +306,19 @@ export function checkText({ kind, flagged, rerun, marked, kept }: PolicyCheckCou
 /** What a Turn on of `policy` says before it writes: its rule as stored, and when it acts. */
 export function turnOnText(policy: CampaignGroupPolicy): string {
   if (policy.kind === "smaller_failed") return policyText(policy);
-  return `${policyText(policy)} From the next queue-maintenance run on, it `
-    + `${rerunsOrMarks(policy.kind) ? "acts on" : "logs the rows that lack model params in"} each campaign's current `
+  const does = policy.kind === "vault_resource" ? "flags the jobs of"
+    : policy.kind === "model_params" ? "logs the rows that lack model params in" : "acts on";
+  return `${policyText(policy)} From the next queue-maintenance run on, it ${does} each campaign's current `
     + "plan, jobs that finished before it was turned on included.";
 }
 
 /** What a Turn off of a policy that is on, of `kind`, changes. */
 export function turnOffText(kind: PolicyKind): string {
   if (kind === "smaller_failed") return "Turning it off only marks it off; the Activity tab still shows these jobs.";
+  if (kind === "vault_resource") {
+    return "Turning it off stops flagging jobs from the next queue-maintenance run; the Activity tab still counts these "
+      + "jobs.";
+  }
   return rerunsOrMarks(kind)
     ? "Turning it off files no new re-runs or marks from the next queue-maintenance run; re-runs it already filed still run."
     : "Turning it off stops queue-maintenance logging these rows from its next run; the Activity tab still shows them.";
@@ -347,6 +349,7 @@ export function policyPreviewTable(policies: readonly CampaignGroupPolicy[],
                                    names: Record<string, string>): TableSpec<MemberPolicyPreview> {
   const checked = (row: MemberPolicyPreview) => row.state === "evaluated";
   return {
+    sort: "name",
     columns: [
       { key: "name", label: "Campaign", raw: (row) => names[row.campaign_id] ?? row.campaign_id },
       { key: "state", label: "State", raw: memberState },
@@ -377,6 +380,7 @@ export const recentFilings = (rows: readonly MemberPolicyPreview[]): FiledMember
 /** The recent revisions' table: a revised member campaign a row, named by `names`. */
 export function filingsTable(names: Record<string, string>): TableSpec<FiledMember> {
   return {
+    sort: "-filed_at",
     columns: [
       { key: "name", label: "Campaign", raw: (row) => names[row.campaign_id] ?? row.campaign_id },
       { key: "plan", label: "Plan", raw: (row) => row.last_filing.plan_id,
@@ -408,6 +412,7 @@ export function paramsGaps(rows: readonly MemberPolicyPreview[]): ParamsGap[] {
 /** The missing model params' table: a key a row, its member campaigns named by `names`. */
 export function gapsTable(names: Record<string, string>): TableSpec<ParamsGap> {
   return {
+    sort: "key",
     columns: [
       { key: "key", label: "Key", raw: (gap) => gap.key, as: "id" },
       { key: "rows", label: "Result rows", num: true, raw: (gap) => gap.row_count },
@@ -427,6 +432,7 @@ export const smallerFailedRows = (rows: readonly MemberPolicyPreview[]): Smaller
 /** The table of failed jobs below a clean larger run: a job a row, its member campaign named by `names`. */
 export function smallerFailedTable(names: Record<string, string>): TableSpec<SmallerFailedRow> {
   return {
+    sort: "name",
     columns: [
       { key: "name", label: "Campaign", raw: (row) => names[row.campaign_id] ?? row.campaign_id },
       { key: "model", label: "Model", raw: (row) => row.model_key },
@@ -501,6 +507,7 @@ export function rerunSummaryText(summary: PolicyRerunSummary): string {
 /** The re-runs' table: a re-run a row, its campaign named by `names`. */
 export function rerunsTable(names: Record<string, string>): TableSpec<PolicyRerun> {
   return {
+    sort: "-filed",
     columns: [
       { key: "name", label: "Campaign", raw: (row) => names[row.campaign_id] ?? row.campaign_id },
       { key: "model", label: "Model key", raw: (row) => row.model_key, as: "id" },
