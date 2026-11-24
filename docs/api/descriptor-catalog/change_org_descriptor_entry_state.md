@@ -28,5 +28,4 @@ a quantization label, use
 | 204 | The state changed |
 | 400 | The body is invalid or tombstone confirmation is absent or wrong |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable, the entry is absent, or the server has no database catalog |
 | 409 | The entry is tombstoned or the current state does not allow the action |

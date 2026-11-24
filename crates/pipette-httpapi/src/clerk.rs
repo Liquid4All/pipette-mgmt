@@ -201,6 +201,13 @@ impl ClerkSignIn {
             })
     }
 
+    /// Whether a first sign-in from `email` with no provision rule creates an
+    /// account with an organization of its own: only at a listed domain, so an
+    /// empty list never opens sign-up to every address.
+    pub fn creates_personal(&self, email: &ContactEmail) -> bool {
+        !self.allowed_domains.is_empty() && self.admits(email)
+    }
+
     /// The domains `admits` accepts; empty accepts any.
     pub fn allowed_domains(&self) -> &[String] {
         &self.allowed_domains

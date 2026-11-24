@@ -396,7 +396,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    use pipette_plan_types::{OrgId, UserId, VaultPrincipalId};
+    use pipette_plan_types::{OrgId, VaultPrincipalId};
 
     use super::*;
 
@@ -404,9 +404,9 @@ mod tests {
         Ok(Sha256::try_new(c.to_string().repeat(64))?)
     }
 
-    fn a_user() -> VaultOwner {
-        VaultOwner::User {
-            user_id: UserId::mint(),
+    fn an_org() -> VaultOwner {
+        VaultOwner::Org {
+            org_id: OrgId::mint(),
         }
     }
 
@@ -490,7 +490,7 @@ mod tests {
     /// each keeping the whole artifact, and each knowing which file it is.
     #[test]
     fn an_upload_makes_one_record_per_file() -> anyhow::Result<()> {
-        let owner = a_user();
+        let owner = an_org();
         let records = a_vision_upload(owner.clone())?;
         let [model, mmproj] = records.as_slice() else {
             anyhow::bail!("expected two records, got {records:?}");
@@ -547,7 +547,7 @@ mod tests {
     /// nothing about what it is.
     #[test]
     fn a_record_without_an_artifact_still_reads() -> anyhow::Result<()> {
-        let mut value = serde_json::to_value(a_vision_upload(a_user())?.first())?;
+        let mut value = serde_json::to_value(a_vision_upload(an_org())?.first())?;
         value
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("a record is an object"))?
@@ -560,10 +560,9 @@ mod tests {
     }
 
     /// An owner and its bare plan-dialect id convert both ways.
-    #[rstest]
-    #[case::user(a_user())]
-    #[case::org(VaultOwner::Org { org_id: OrgId::mint() })]
-    fn an_owner_is_its_principal_id(#[case] owner: VaultOwner) {
+    #[test]
+    fn an_owner_is_its_principal_id() {
+        let owner = an_org();
         let principal = VaultPrincipalId::from(owner.clone());
         assert_eq!(principal.to_string(), owner.label());
         assert_eq!(VaultOwner::from(principal), owner);
@@ -573,14 +572,14 @@ mod tests {
     /// would be invisible to a round trip and would strand every record written.
     #[test]
     fn the_owner_shape_is_pinned() -> anyhow::Result<()> {
-        let records = a_vision_upload(a_user())?;
+        let records = a_vision_upload(an_org())?;
         let resource = records
             .first()
             .ok_or_else(|| anyhow::anyhow!("no record"))?;
         let value = serde_json::to_value(resource)?;
-        assert_eq!(value["owner"]["type"], "user");
+        assert_eq!(value["owner"]["type"], "org");
         assert_eq!(
-            value["owner"]["user_id"],
+            value["owner"]["org_id"],
             resource.owner.label(),
             "the id sits beside the tag"
         );
@@ -590,13 +589,13 @@ mod tests {
         let mut value = value;
         value["owner"] = json!({ "type": "org", "org_id": org_id.as_str() });
         let read: VaultResource = serde_json::from_value(value)?;
-        assert_eq!(read.owner.org_id(), Some(&org_id));
+        assert_eq!(read.owner.org_id(), &org_id);
         Ok(())
     }
 
     #[test]
     fn a_resource_round_trips() -> anyhow::Result<()> {
-        a_vision_upload(a_user())?
+        a_vision_upload(an_org())?
             .into_iter()
             .try_for_each(|resource| {
                 let read: VaultResource = serde_json::from_value(serde_json::to_value(&resource)?)?;
@@ -609,7 +608,7 @@ mod tests {
     /// `origin` key.
     #[test]
     fn an_upload_has_no_origin() -> anyhow::Result<()> {
-        a_vision_upload(a_user())?
+        a_vision_upload(an_org())?
             .into_iter()
             .try_for_each(|resource| {
                 assert_eq!(resource.origin, None);
@@ -623,7 +622,7 @@ mod tests {
     /// Its files share no name, so its entry carries no label.
     #[test]
     fn an_import_names_each_record_by_its_own_origin() -> anyhow::Result<()> {
-        let owner = a_user();
+        let owner = an_org();
         let origin = |path: &str| -> anyhow::Result<VaultOrigin> {
             Ok(serde_json::from_value(json!({
                 "source": "huggingface", "org": "LiquidAI", "repo_name": "LFM2-VL-3B-GGUF",
@@ -666,7 +665,7 @@ mod tests {
     /// A source takes the name its uploads share, or says why it has none.
     #[test]
     fn a_source_takes_the_name_its_uploads_share() -> anyhow::Result<()> {
-        let upload = a_vision_upload(a_user())?;
+        let upload = a_vision_upload(an_org())?;
         let [model, mmproj] = upload.as_slice() else {
             anyhow::bail!("expected two records, got {upload:?}");
         };
@@ -700,9 +699,7 @@ mod tests {
     /// The wire record is the stored one minus its key.
     #[test]
     fn a_vault_record_serializes_without_its_key() -> anyhow::Result<()> {
-        let owner = PrincipalOwner::User {
-            user_id: UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
-        };
+        let owner = an_org();
         let sha256 = Sha256::try_new("a".repeat(64))?;
         let resource = VaultResource {
             resource_id: VaultResourceId::try_new("vault_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,

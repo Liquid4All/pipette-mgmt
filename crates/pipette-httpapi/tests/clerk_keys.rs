@@ -22,8 +22,8 @@ use pipette_store_fs::build_local_fs_stores;
 use pipette_store_testkit::CapturingAuditStore;
 use pipette_web_testkit::{
     ClerkInstance, authed_user_get, body_json, create_user, json_request, json_str,
-    make_state_with_clerk, make_state_with_clerk_section, request_user_account, seed_org,
-    set_user_status, setup_benchmarks, signing_key, test_config, test_http_client,
+    make_state_with_clerk, make_state_with_clerk_section, seed_org, set_user_status,
+    setup_benchmarks, signing_key, test_config, test_http_client,
 };
 
 const ROUTE: &str = "/api/v1/users/register/clerk";
@@ -440,7 +440,6 @@ async fn test_a_refused_clerk_token_registers_nothing(
 #[derive(Debug, Clone, Copy)]
 enum RefusedClerkAccount {
     UnprovisionedDomain,
-    PendingAccount,
     DisabledAccount,
     ServiceAccount,
     MissingOrganization,
@@ -449,14 +448,13 @@ enum RefusedClerkAccount {
 
 /// A verified address registers only to a person's account in good standing,
 /// and is given one only under a rule naming an organization that is there to
-/// join.
+/// join, or at a listed domain; with no domain listed, any other is refused.
 #[rstest]
 #[case::unprovisioned_domain(
     RefusedClerkAccount::UnprovisionedDomain,
     StatusCode::FORBIDDEN,
     "no account holds person@elsewhere.example"
 )]
-#[case::pending_account(RefusedClerkAccount::PendingAccount, StatusCode::FORBIDDEN, "pending")]
 #[case::disabled_account(
     RefusedClerkAccount::DisabledAccount,
     StatusCode::FORBIDDEN,
@@ -493,15 +491,6 @@ async fn test_a_verified_address_without_a_usable_account_registers_nothing(
         RefusedClerkAccount::UnprovisionedDomain => {
             seed_org(&state, "acme").await?;
             email = "person@elsewhere.example";
-        }
-        // At a domain with no rule: one with a rule refuses the keyless request.
-        RefusedClerkAccount::PendingAccount => {
-            seed_org(&state, "acme").await?;
-            email = "person@elsewhere.example";
-            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            let resp = request_user_account(&state, email, &key, "test laptop").await?;
-            assert_eq!(resp.status(), StatusCode::CREATED);
-            accounts = 1;
         }
         // Offboarded, and not handed a fresh account by the provision rule.
         RefusedClerkAccount::DisabledAccount => {
@@ -600,6 +589,75 @@ async fn test_a_stranded_address_claim_registers_nothing() -> anyhow::Result<()>
     Ok(())
 }
 
+/// At a listed domain with no provision rule, the first sign-in creates an
+/// account that administers an organization of its own: named as the body
+/// asks, with a slug from the account's id. A later name is ignored.
+#[tokio::test]
+async fn test_a_listed_domain_without_a_rule_registers_to_an_org_of_its_own() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let clerk = ClerkInstance::new()?;
+    let mut section = clerk.config(&[])?;
+    section.allowed_domains = vec!["example.test".to_string()];
+    let state = make_state_with_clerk_section(dir.path(), section).await?;
+    let named = |org_name: &str| -> anyhow::Result<serde_json::Value> {
+        let mut body = fresh_key_body()?;
+        body["org_name"] = json!(org_name);
+        crate::api_schema::assert_conforms("RegisterClerkUserKeyRequest", &body)?;
+        Ok(body)
+    };
+
+    let email = "kyle.wheeler@example.test";
+    let token = clerk.token(&clerk.claims(email))?;
+    let resp = register(&state, &token, &named("Kyle's lab")?).await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let user_id = UserId::try_new(json_str(&body_json(resp).await?, "user_id")?)?;
+    let org_id = state
+        .org_store
+        .get_membership(&user_id)
+        .await?
+        .context("the account belongs to an organization")?;
+    let org = state
+        .org_store
+        .get_org(&org_id)
+        .await?
+        .context("the organization exists")?;
+    assert_eq!(org.slug, pipette_plan_types::OrgSlug::personal(&user_id)?);
+    assert_eq!(org.display_name.as_str(), "Kyle's lab");
+    let user = state
+        .user_store
+        .get_user(&user_id)
+        .await?
+        .context("the account exists")?;
+    let held = pipette_core::user_permission::effective(
+        state.user_store.get_user_permissions(&user_id).await?,
+        pipette_core::user_permission::Holder::of(&user),
+    );
+    let missing: Vec<_> = UserPermissionGroup::OrgAdmin
+        .permissions()
+        .iter()
+        .filter(|permission| !held.holds(**permission))
+        .collect();
+    assert!(missing.is_empty(), "org_admin lacks {missing:?}");
+
+    let again = register(
+        &state,
+        &clerk.token(&clerk.claims(email))?,
+        &named("Another name")?,
+    )
+    .await?;
+    assert_eq!(again.status(), StatusCode::CREATED);
+    let orgs = state.org_store.list_orgs().await?;
+    assert_eq!(
+        orgs.iter()
+            .map(|org| org.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["Kyle's lab"],
+        "one organization, named once"
+    );
+    Ok(())
+}
+
 /// Another domain is refused before the account is looked up; the match is
 /// exact.
 #[rstest]
@@ -628,40 +686,6 @@ async fn test_allowed_domains_limits_who_registers_through_clerk(
             "{error}"
         );
     }
-    Ok(())
-}
-
-/// Refused so no unverified claim holds the address against the Clerk sign-in
-/// that would create it. Other domains still ask.
-#[rstest]
-#[case::provisioned("person@Example.test", StatusCode::FORBIDDEN)]
-#[case::elsewhere("person@elsewhere.example", StatusCode::CREATED)]
-#[tokio::test]
-async fn test_a_provisioned_address_is_not_requested_without_clerk(
-    #[case] email: &str,
-    #[case] status: StatusCode,
-) -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let clerk = ClerkInstance::new()?;
-    let state = make_state_with_clerk(dir.path(), &clerk, &[("example.test", "acme")]).await?;
-    seed_org(&state, "acme").await?;
-    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-
-    let resp = request_user_account(&state, email, &key, "test laptop").await?;
-    assert_eq!(resp.status(), status);
-    if status == StatusCode::CREATED {
-        return Ok(());
-    }
-    let error = error_of(resp).await?;
-    assert!(error.contains("through Clerk"), "{error}");
-    assert!(state.user_store.list_users().await?.is_empty());
-
-    let registered = register_token(&state, &clerk.token(&clerk.claims(email))?).await?;
-    assert_eq!(
-        registered.status(),
-        StatusCode::CREATED,
-        "Clerk still creates it"
-    );
     Ok(())
 }
 
@@ -830,6 +854,8 @@ async fn test_the_first_sign_in_surfaces_the_keys_held_before_it(
                 | AuditAction::CatalogRename { .. }
                 | AuditAction::CatalogMerge { .. }
                 | AuditAction::CatalogRemoveMember { .. }
+                | AuditAction::CatalogSetFamily { .. }
+                | AuditAction::CatalogSetFamilyLogo { .. }
                 | AuditAction::CatalogMoveToGlobal { .. }
                 | AuditAction::GroupPolicy { .. } => None,
             })

@@ -260,7 +260,8 @@ pub struct AbsolutePath(String);
         Serialize,
         Deserialize,
         AsRef,
-        Display
+        Display,
+        FromStr
     )
 )]
 pub struct Sha256(String);

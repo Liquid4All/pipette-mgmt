@@ -37,8 +37,7 @@ use crate::vault_access::{VaultAuthority, VaultReach, client_may_fetch};
 
 /// The refusal for an owner outside the caller's scope, on the files and the
 /// records alike.
-const OUT_OF_SCOPE: &str = "you may only upload to the vault for yourself, your organization, \
-     or a member of an organization you administer";
+const OUT_OF_SCOPE: &str = "you may only upload to the vault for your organization";
 
 /// Whether `resource`'s file is still stored: a stat, never a read of it,
 /// which would log a missing file as the alarm-raising `vault_object_missing`.
@@ -304,9 +303,10 @@ pub async fn upload_resources(
 ) -> Result<impl IntoResponse, AppError> {
     let authority = VaultAuthority::resolve(&state, active.caller()).await?;
     check_name(&upload.name)?;
-    let owner = upload
-        .owner
-        .map_or_else(|| authority.own_owner(), VaultOwner::from);
+    let owner = upload.owner.map_or_else(
+        || authority.own_owner(),
+        |owner| Ok(VaultOwner::from(owner)),
+    )?;
     // The owner decides who may fetch the bytes, so it is settled before
     // anything is read or written.
     require_destination(&state, &authority, &owner, OUT_OF_SCOPE).await?;
@@ -351,13 +351,11 @@ pub async fn list_resources(
     ApiQuery(read): ApiQuery<VaultReadQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let caller = active.caller();
-    let user = caller.user;
     let reach = VaultReach::resolve(&state, caller).await?;
     let authority = VaultAuthority::resolve(&state, caller).await?;
     let page = page_within_reach(
         &state.config,
         query,
-        &user.user_id,
         |resource: &VaultResource| reach.admits(&resource.owner),
         "vault resources",
         |after, limit| {

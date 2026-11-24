@@ -14,8 +14,8 @@ use pipette_core::vault::{
     is_blob_key, looks_like,
 };
 use pipette_plan_types::{
-    NonEmptyTrimmedString, Sha256, UserId, VaultArtifact, VaultFileFormat, VaultFileRole,
-    VaultResourceId, VaultUploadFile,
+    NonEmptyTrimmedString, Sha256, VaultArtifact, VaultFileFormat, VaultFileRole, VaultResourceId,
+    VaultUploadFile,
 };
 use pipette_store::{BlobBody, BlobWrite, Stores, VaultBlob, VaultStore, drain_vault_resources};
 
@@ -27,13 +27,8 @@ use crate::org::OrgRef;
 pub enum VaultAdminError {
     #[error("no vault resource {0}")]
     NotFound(VaultResourceId),
-    #[error("no account {0}")]
-    NoSuchUser(UserId),
     #[error("no organization {0}")]
     NoSuchOrg(OrgRef),
-    /// No owner named; each surface names its own way of taking one.
-    #[error("name an owner: an account or an organization")]
-    NoOwnerNamed,
     /// The uploaded bytes hash to something other than the digest they were
     /// sent under, so nothing was kept.
     #[error("the bytes hash to {actual}, not {expected}")]
@@ -70,27 +65,12 @@ pub async fn require(
         .ok_or_else(|| VaultAdminError::NotFound(resource_id.clone()))
 }
 
-/// Resolve the `--user` / `--org` pair into the one owner a resource must have,
-/// against its roster, so an artifact is never owned by a missing record.
-pub async fn owner(
-    stores: &Stores,
-    user: Option<UserId>,
-    org: Option<OrgRef>,
-) -> Result<VaultOwner, VaultAdminError> {
-    match (user, org) {
-        (Some(user_id), None) => {
-            if stores.users.get_user(&user_id).await?.is_none() {
-                return Err(VaultAdminError::NoSuchUser(user_id));
-            }
-            Ok(VaultOwner::User { user_id })
-        }
-        (None, Some(reference)) => {
-            let found = org::resolve(&*stores.orgs, &reference).await?;
-            let org = found.ok_or(VaultAdminError::NoSuchOrg(reference))?;
-            Ok(VaultOwner::Org { org_id: org.org_id })
-        }
-        _ => Err(VaultAdminError::NoOwnerNamed),
-    }
+/// Resolve `--org` into the owner a resource must have, against the roster, so
+/// an artifact is never owned by a missing record.
+pub async fn owner(stores: &Stores, reference: OrgRef) -> Result<VaultOwner, VaultAdminError> {
+    let found = org::resolve(&*stores.orgs, &reference).await?;
+    let org = found.ok_or(VaultAdminError::NoSuchOrg(reference))?;
+    Ok(VaultOwner::Org { org_id: org.org_id })
 }
 
 /// Where `owner`'s blob with `sha256` sits. Always a valid key, since both
@@ -397,6 +377,7 @@ mod tests {
 
     use pipette_core::types::Mint;
     use pipette_core::vault::BlobDigest;
+    use pipette_plan_types::OrgId;
     use pipette_store::{ArtifactBody, VaultResourcePage, drain_vault_resources};
 
     use super::*;
@@ -516,8 +497,8 @@ mod tests {
     async fn vision_upload(
         vault: &dyn VaultStore,
     ) -> anyhow::Result<Result<Vec<VaultResource>, VaultAdminError>> {
-        let owner = VaultOwner::User {
-            user_id: UserId::mint(),
+        let owner = VaultOwner::Org {
+            org_id: OrgId::mint(),
         };
         let model = stored(vault, &owner, b"GGUF weights").await?;
         let mmproj = stored(vault, &owner, b"GGUF projector").await?;
@@ -552,8 +533,8 @@ mod tests {
     async fn a_file_past_the_limit_keeps_nothing() -> anyhow::Result<()> {
         const BYTES: &[u8] = b"GGUF weights";
         let (_dir, vault) = fs_vault()?;
-        let owner = VaultOwner::User {
-            user_id: UserId::mint(),
+        let owner = VaultOwner::Org {
+            org_id: OrgId::mint(),
         };
         let sha256 = sha256_of(BYTES)?;
         let len = BYTES.len() as u64;
@@ -601,8 +582,8 @@ mod tests {
         let (_dir, vault) = fs_vault()?;
         let vault = vault.as_ref();
         let records = vision_upload(vault).await??;
-        let owner = VaultOwner::User {
-            user_id: UserId::mint(),
+        let owner = VaultOwner::Org {
+            org_id: OrgId::mint(),
         };
         let orphan = blob_key(&owner, &stored(vault, &owner, b"GGUF left behind").await?)?;
         let now = Timestamp::now();
@@ -637,8 +618,8 @@ mod tests {
     async fn a_prune_refuses_beside_an_unreadable_record() -> anyhow::Result<()> {
         let (dir, vault) = fs_vault()?;
         let vault = vault.as_ref();
-        let owner = VaultOwner::User {
-            user_id: UserId::mint(),
+        let owner = VaultOwner::Org {
+            org_id: OrgId::mint(),
         };
         let orphan = blob_key(&owner, &stored(vault, &owner, b"GGUF left behind").await?)?;
         let record = dir

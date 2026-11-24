@@ -14,7 +14,7 @@ request is the query string, which the signature covers:
 | Query parameter | Required | Description |
 |---|---|---|
 | `name` | yes | What to print for a human. Trimmed, non-empty, at most 4096 characters. Nothing keys on it, and two campaigns may share one |
-| `owner` | no | A `user_…` or `org_…` id. Defaults to the caller. Bounded by the same rule [the hand-off](set_campaign_owner.md) applies |
+| `owner` | no | An `org_…` id. Defaults to the caller's organization; a caller in none gets a `400` asking it to name one. The caller's own organization, or any under `manage_any_orgs` |
 | `note` | no | The first plan's note, as [the request body of a filing](../campaigns.md#request-body) describes |
 | `dry_run` | no | `true` expands and validates the document, and creates nothing |
 
@@ -22,8 +22,8 @@ There is **no empty create** and no JSON form: a campaign is the stable name for
 work, so it is created with the work. It cannot be created around a plan that
 already exists, because a plan belongs to the campaign that minted it.
 
-The owner follows the hand-off rule, so a member of an organization may create
-that organization's campaign without `manage_orgs`. Every member then files
+A member of an organization creates that organization's campaign without
+`manage_orgs`. Every member then files
 into it, the creator included, and only the organization's administrators
 rename it, hand it over or delete it.
 
@@ -75,7 +75,7 @@ The route also answers the errors every filing answers
 |--------|------|
 | 200 | A dry run, or the progress stream for `Accept: application/x-ndjson` |
 | 201 | The campaign is created, with the report on its first plan |
-| 400 | `name` is missing, empty or too long, `owner` is not a principal id or names an account or organization that does not exist or an account that holds no `submit_plans`, the query string carries a parameter this route does not list, or the document is refused for a reason [the filing errors](../campaigns.md#errors) list. Or HuggingFace refuses the import of a job's model, for a reason that [the filing errors](../campaigns.md#errors) list |
+| 400 | `name` is missing, empty or too long, `owner` is not an organization id or names one that does not exist, `owner` is omitted by a caller in no organization, the query string carries a parameter this route does not list, or the document is refused for a reason [the filing errors](../campaigns.md#errors) list. Or HuggingFace refuses the import of a job's model, for a reason that [the filing errors](../campaigns.md#errors) list |
 | 401 | Missing or invalid auth headers, or a device signed ([filing errors](../campaigns.md#errors)) |
 | 403 | The owner is outside the caller's scope, or the caller lacks `submit_plans` |
 | 413 | The body is over `plan_body_limit_bytes` ([request size limits](../../httpapi.md#12-request-size-limits)). Nothing is written |

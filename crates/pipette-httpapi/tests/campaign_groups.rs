@@ -21,27 +21,32 @@ use pipette_core::user_permission::UserPermissionGroup;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
     AuditAction, AuditOutcome, AuditTarget, CampaignGroupId, CampaignGroupPolicy, CampaignId,
-    ExpiresAt, JobId, PlanId, PlanStatus, PolicyKind, PolicyRerun, RerunOutcome, UserPermission,
-    UserStatus,
+    ExpiresAt, JobId, PlanId, PlanStatus, PolicyDeferral, PolicyKind, PolicyRerun, RerunOutcome,
+    UserPermission,
 };
 use pipette_store::{AuditFilter, JobStateChanges};
 use pipette_web_testkit::{
-    UserSigner, body_json, created_campaign, json_str, put_idle_campaign_of, registered_user,
-    seed_avail, seed_org, seeded_object_state, seeded_sql_state, set_user_org, set_user_status,
+    UserSigner, body_json, created_campaign, json_str, org_of, put_idle_campaign_of,
+    registered_user, seed_avail, seed_org, seeded_object_state, seeded_sql_state, set_user_org,
     signed_empty, signed_json, with_duckdb,
 };
 
 const GROUPS: &str = "/api/v1/campaign-groups";
 
-/// Owns campaigns and reads them.
-const OPERATOR: &[UserPermission] = &[UserPermission::SubmitPlans, UserPermission::ReadPlans];
+/// Files and reads its organization's campaigns, and administers them.
+const OPERATOR: &[UserPermission] = &[
+    UserPermission::SubmitPlans,
+    UserPermission::ReadPlans,
+    UserPermission::ManageOrgs,
+];
 
-/// Owns campaigns and re-runs them, so it may leave a group's policies on.
+/// [`OPERATOR`] that re-runs them too, so it may leave a group's policies on.
 const RERUNNER: &[UserPermission] = &[
     UserPermission::SubmitPlans,
     UserPermission::ReadPlans,
     UserPermission::CancelPlans,
     UserPermission::ReadClients,
+    UserPermission::ManageOrgs,
 ];
 
 /// A request as `signer`: its status, and its body or `null` when it has none.
@@ -73,10 +78,13 @@ async fn created_group(
     Ok(json_str(&answer, "group_id")?.to_owned())
 }
 
-/// An `OPERATOR` in a fresh `acme` organization.
+/// Files and reads its organization's campaigns, and administers none.
+const MEMBER: &[UserPermission] = &[UserPermission::SubmitPlans, UserPermission::ReadPlans];
+
+/// A [`MEMBER`] of a fresh `acme` organization.
 async fn org_operator(state: &AppState) -> anyhow::Result<(Organization, UserSigner)> {
     let org = seed_org(state, "acme").await?;
-    let operator = registered_user(state, OPERATOR).await?;
+    let operator = registered_user(state, MEMBER).await?;
     set_user_org(state, &operator.1, Some(org.org_id.clone())).await?;
     Ok((org, operator))
 }
@@ -139,25 +147,35 @@ async fn campaign_record(
     Ok(record)
 }
 
-async fn overview_group(
+async fn overview_field(
     state: &AppState,
     signer: &UserSigner,
     campaign_id: &str,
+    field: &str,
 ) -> anyhow::Result<Value> {
     let uri = format!("/api/v1/campaigns/{campaign_id}/overview");
     let (status, overview) = send(state, signer, "GET", &uri, None).await?;
     anyhow::ensure!(status == StatusCode::OK, "{status} {overview}");
     crate::api_schema::assert_conforms("NamedCampaignOverview", &overview)?;
     overview
-        .get("group")
+        .get(field)
         .cloned()
-        .context("an overview has a group")
+        .with_context(|| format!("an overview has a {field}"))
 }
 
-fn personal(signer: &UserSigner) -> CampaignOwner {
-    CampaignOwner::User {
-        user_id: signer.1.clone(),
-    }
+async fn overview_group(
+    state: &AppState,
+    signer: &UserSigner,
+    campaign_id: &str,
+) -> anyhow::Result<Value> {
+    overview_field(state, signer, campaign_id, "group").await
+}
+
+/// The organization `signer` belongs to, as a campaign owner.
+async fn personal(state: &AppState, signer: &UserSigner) -> anyhow::Result<CampaignOwner> {
+    Ok(CampaignOwner::Org {
+        org_id: org_of(state, &signer.1).await?,
+    })
 }
 
 async fn add(
@@ -218,7 +236,7 @@ async fn a_group_is_created_read_renamed_and_deleted() -> anyhow::Result<()> {
     assert_eq!(created["name"], "aa-perf");
     assert_eq!(
         created["owner"],
-        json!({ "type": "user", "user_id": owner.1.as_str() })
+        json!({ "type": "org", "org_id": org_of(state, &owner.1).await?.as_str() })
     );
 
     let uri = format!("{GROUPS}/{group_id}");
@@ -266,8 +284,9 @@ async fn the_listing_shows_each_policy_cleared_or_triggered() -> anyhow::Result<
     let state = &sql.state;
     let owner = registered_user(state, OPERATOR).await?;
     let group = created_group(state, &owner, json!({ "name": "aa-perf" })).await?;
+    let owned = personal(state, &owner).await?;
     let mut campaigns = futures::future::try_join_all(
-        (0..4).map(|_| put_idle_campaign_of(state, personal(&owner), "aa-perf")),
+        (0..4).map(|_| put_idle_campaign_of(state, owned.clone(), "aa-perf")),
     )
     .await?;
     campaigns.sort_by(|a, b| a.campaign_id.cmp(&b.campaign_id));
@@ -341,8 +360,8 @@ async fn the_listing_shows_each_policy_cleared_or_triggered() -> anyhow::Result<
 }
 
 /// The listing and a read reach the groups of every owner whose campaigns the
-/// caller reads: its own and its organization's. A campaign reader reaches
-/// none, and nobody creates a group for an owner outside its scope.
+/// caller reads: its organization's. A campaign reader reaches none, and
+/// nobody creates a group for an owner outside its scope.
 #[tokio::test]
 async fn the_groups_read_are_the_campaigns_read() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -367,8 +386,8 @@ async fn the_groups_read_are_the_campaigns_read() -> anyhow::Result<()> {
     futures::stream::iter(
         [
             (&alice, "", vec![&own, &team]),
-            (&alice, "?owner=org", vec![&team]),
-            (&reader, "", vec![&team]),
+            (&alice, "?owner=org", vec![&own, &team]),
+            (&reader, "", vec![&own, &team]),
             (&scoped, "", vec![]),
             (&bob, "", vec![&others]),
         ]
@@ -391,7 +410,7 @@ async fn the_groups_read_are_the_campaigns_read() -> anyhow::Result<()> {
             Some("a campaign reader reads no campaign group")
         )
     );
-    let theirs = json!({ "name": "theirs", "owner": bob.1.as_str() });
+    let theirs = json!({ "name": "theirs", "owner": org_of(state, &bob.1).await?.as_str() });
     let (status, answer) = send(state, &alice, "POST", GROUPS, Some(&theirs)).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
     Ok(())
@@ -408,7 +427,7 @@ async fn a_stranger_reaches_no_route_of_a_group() -> anyhow::Result<()> {
     let stranger = registered_user(state, OPERATOR).await?;
     let own = created_group(state, &owner, json!({ "name": "mine" })).await?;
     let team = team_group(state, &owner, &org).await?;
-    let campaign = campaign_of(state, &personal(&stranger)).await?;
+    let campaign = campaign_of(state, &personal(state, &stranger).await?).await?;
 
     let (name, members) = (
         &json!({ "name": "renamed" }),
@@ -456,7 +475,7 @@ async fn a_read_lists_the_members_the_reader_reads() -> anyhow::Result<()> {
     let uri = format!("/api/v1/campaigns/{planned}");
     let (status, answer) = send(state, &owner, "PATCH", &uri, Some(&edit)).await?;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    let idle = campaign_of(state, &personal(&owner)).await?;
+    let idle = campaign_of(state, &personal(state, &owner).await?).await?;
     added(state, &owner, &group, &[&idle, &planned]).await?;
 
     let (status, read) = send(state, &owner, "GET", &format!("{GROUPS}/{group}"), None).await?;
@@ -469,7 +488,7 @@ async fn a_read_lists_the_members_the_reader_reads() -> anyhow::Result<()> {
     assert_eq!(read["members"], json!(expected));
 
     let stranger = registered_user(state, OPERATOR).await?;
-    owner_written(state, &idle, personal(&stranger)).await?;
+    owner_written(state, &idle, personal(state, &stranger).await?).await?;
     assert_eq!(
         member_ids(state, &owner, &group).await?,
         BTreeSet::from([planned])
@@ -487,26 +506,32 @@ async fn a_hand_off_takes_a_campaign_out_of_its_group() -> anyhow::Result<()> {
     };
     let state = &sql.state;
     let (org, owner) = org_operator(state).await?;
-    let mine = created_group(state, &owner, json!({ "name": "mine" })).await?;
+    let rival = seed_org(state, "rival").await?;
+    let rival_owner = org_user(state, &rival, MEMBER).await?;
+    let server = registered_user(state, &[UserPermission::ManageAnyOrgs]).await?;
+    let team = team_group(state, &owner, &org).await?;
+    let team_owner = CampaignOwner::Org {
+        org_id: org.org_id.clone(),
+    };
     let (kept, handed) = (
-        campaign_of(state, &personal(&owner)).await?,
-        campaign_of(state, &personal(&owner)).await?,
+        campaign_of(state, &team_owner).await?,
+        campaign_of(state, &team_owner).await?,
     );
-    added(state, &owner, &mine, &[&kept, &handed]).await?;
+    added(state, &owner, &team, &[&kept, &handed]).await?;
 
-    let to_team = json!({ "owner": { "type": "org", "org_id": org.org_id.as_str() } });
+    let to_rival = json!({ "owner": { "type": "org", "org_id": rival.org_id.as_str() } });
     let uri = format!("/api/v1/campaigns/{handed}/owner");
-    let (status, answer) = send(state, &owner, "PUT", &uri, Some(&to_team)).await?;
+    let (status, answer) = send(state, &server, "PUT", &uri, Some(&to_rival)).await?;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(
-        member_ids(state, &owner, &mine).await?,
+        member_ids(state, &owner, &team).await?,
         BTreeSet::from([kept])
     );
 
-    let team = team_group(state, &owner, &org).await?;
-    added(state, &owner, &team, &[&handed]).await?;
+    let theirs = team_group(state, &rival_owner, &rival).await?;
+    added(state, &rival_owner, &theirs, &[&handed]).await?;
     assert_eq!(
-        member_ids(state, &owner, &team).await?,
+        member_ids(state, &rival_owner, &theirs).await?,
         BTreeSet::from([handed])
     );
     Ok(())
@@ -525,19 +550,21 @@ async fn a_repeated_hand_off_takes_a_campaign_out_of_its_group() -> anyhow::Resu
     let owner = registered_user(state, OPERATOR).await?;
     let taker = registered_user(state, OPERATOR).await?;
     let group = created_group(state, &owner, json!({ "name": "aa-perf" })).await?;
-    let campaign = campaign_of(state, &personal(&owner)).await?;
+    let campaign = campaign_of(state, &personal(state, &owner).await?).await?;
     added(state, &owner, &group, &[&campaign]).await?;
     let uri = format!("/api/v1/campaigns/{campaign}/owner");
-    let to_owner = json!({ "owner": { "type": "user", "user_id": owner.1.as_str() } });
+    let to_owner =
+        json!({ "owner": { "type": "org", "org_id": org_of(state, &owner.1).await?.as_str() } });
     let (status, answer) = send(state, &owner, "PUT", &uri, Some(&to_owner)).await?;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(
         member_ids(state, &owner, &group).await?,
         BTreeSet::from([campaign.clone()])
     );
-    owner_written(state, &campaign, personal(&taker)).await?;
+    owner_written(state, &campaign, personal(state, &taker).await?).await?;
 
-    let to_taker = json!({ "owner": { "type": "user", "user_id": taker.1.as_str() } });
+    let to_taker =
+        json!({ "owner": { "type": "org", "org_id": org_of(state, &taker.1).await?.as_str() } });
     let (status, answer) = send(state, &taker, "PUT", &uri, Some(&to_taker)).await?;
     assert_eq!(
         (status, &answer["changed"]),
@@ -590,8 +617,8 @@ async fn deleting_a_group_or_a_member_keeps_the_campaigns() -> anyhow::Result<()
     let first = created_group(state, &owner, json!({ "name": "first" })).await?;
     let second = created_group(state, &owner, json!({ "name": "second" })).await?;
     let (kept, removed) = (
-        campaign_of(state, &personal(&owner)).await?,
-        campaign_of(state, &personal(&owner)).await?,
+        campaign_of(state, &personal(state, &owner).await?).await?,
+        campaign_of(state, &personal(state, &owner).await?).await?,
     );
     added(state, &owner, &first, &[&kept, &removed]).await?;
 
@@ -645,22 +672,13 @@ async fn adding_members_is_all_or_nothing() -> anyhow::Result<()> {
         campaign_of(state, &owner).await?,
         campaign_of(state, &owner).await?,
     );
-    let mine = campaign_of(state, &personal(&member)).await?;
-    let strangers = campaign_of(state, &personal(&stranger)).await?;
+    let strangers = campaign_of(state, &personal(state, &stranger).await?).await?;
     added(state, &member, &other, &[&taken]).await?;
 
     let unknown = "campaign_0195c3e2a4f37b8c".to_owned();
     let (signer, group_id) = (&member, group.as_str());
     futures::stream::iter(
         [
-            (
-                [&a, &mine],
-                StatusCode::CONFLICT,
-                format!(
-                    "campaign {mine} belongs to {}, not to the group's owner {}",
-                    member.1, org.org_id
-                ),
-            ),
             (
                 [&b, &taken],
                 StatusCode::CONFLICT,
@@ -702,62 +720,11 @@ async fn adding_members_is_all_or_nothing() -> anyhow::Result<()> {
     let uri = format!("{GROUPS}/{group}");
     let (status, answer) = send(state, &member, "PATCH", &uri, Some(&rename)).await?;
     assert_eq!(
-        (status, answer["error"].as_str()),
-        (
-            StatusCode::FORBIDDEN,
-            Some("administering your organization's campaigns needs manage_orgs")
-        )
+        status,
+        StatusCode::OK,
+        "a member administers its organization's group: {answer}"
     );
     Ok(())
-}
-
-/// An organization's administrator renames and deletes its groups, and a
-/// disabled member's as it winds the member down. Another organization's
-/// administrator does neither.
-#[tokio::test]
-async fn an_org_admin_administers_its_groups_and_a_disabled_member_s() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(sql) = seeded_sql_state(dir.path()).await? else {
-        return Ok(());
-    };
-    let state = &sql.state;
-    let (org, member) = org_operator(state).await?;
-    let rival = seed_org(state, "rival").await?;
-    let admin = registered_user(state, &[UserPermission::ManageOrgs]).await?;
-    let rival_admin = registered_user(state, &[UserPermission::ManageOrgs]).await?;
-    set_user_org(state, &admin.1, Some(org.org_id.clone())).await?;
-    set_user_org(state, &rival_admin.1, Some(rival.org_id.clone())).await?;
-    let team = format!("{GROUPS}/{}", team_group(state, &member, &org).await?);
-    let own = json!({ "name": "mine" });
-    let own = format!("{GROUPS}/{}", created_group(state, &member, own).await?);
-    let rename = &json!({ "name": "renamed" });
-
-    let (status, answer) = send(state, &admin, "PATCH", &own, Some(rename)).await?;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "an active member's: {answer}"
-    );
-    set_user_status(state, &member.1, UserStatus::Disabled).await?;
-
-    futures::stream::iter(
-        [
-            (&rival_admin, "PATCH", &own, StatusCode::FORBIDDEN),
-            (&rival_admin, "DELETE", &own, StatusCode::FORBIDDEN),
-            (&admin, "PATCH", &team, StatusCode::OK),
-            (&admin, "PATCH", &own, StatusCode::OK),
-            (&admin, "DELETE", &team, StatusCode::NO_CONTENT),
-            (&admin, "DELETE", &own, StatusCode::NO_CONTENT),
-        ]
-        .map(anyhow::Ok),
-    )
-    .try_for_each(|(signer, method, uri, expected)| async move {
-        let body = (method == "PATCH").then_some(rename);
-        let (status, answer) = send(state, signer, method, uri, body).await?;
-        assert_eq!(status, expected, "{method} {uri}: {answer}");
-        anyhow::Ok(())
-    })
-    .await
 }
 
 /// Every kind's defaults, as a group that stores none answers them.
@@ -786,6 +753,7 @@ fn default_policies(group_id: &str) -> Value {
         policy("ttft_over_e2e", 3, json!({})),
         policy("model_params", 0, json!({})),
         policy("smaller_failed", 0, json!({})),
+        policy("vault_resource", 0, json!({})),
     ])
 }
 
@@ -1414,11 +1382,18 @@ async fn adding_a_member_while_a_policy_is_on_takes_a_rerun_s_grants() -> anyhow
     Ok(())
 }
 
-/// The model_params policy re-runs and marks nothing, so turning it on, and
-/// adding a member while it alone is on, take the route's gate alone. It takes
-/// no re-run and no setting.
+/// The flag-only policies re-run and mark nothing, so turning one on, or adding
+/// a member while it alone is on, takes the route's gate alone. Each takes no
+/// re-run and no setting.
+#[rstest]
+#[case::model_params("model_params", 4)]
+#[case::smaller_failed("smaller_failed", 5)]
+#[case::vault_resource("vault_resource", 6)]
 #[tokio::test]
-async fn the_model_params_policy_takes_no_rerun_grant() -> anyhow::Result<()> {
+async fn a_policy_that_only_flags_takes_no_rerun_grant(
+    #[case] kind: &str,
+    #[case] at: usize,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(sql) = seeded_sql_state(dir.path()).await? else {
         return Ok(());
@@ -1428,17 +1403,17 @@ async fn the_model_params_policy_takes_no_rerun_grant() -> anyhow::Result<()> {
     let filer = org_user(state, &org, &[UserPermission::SubmitPlans]).await?;
     let team = team_group(state, &filer, &org).await?;
     let defaults = default_policies(&team);
-    let model_params = &defaults[4];
-    let uri = format!("{GROUPS}/{team}/policies/model_params");
+    let flags = &defaults[at];
+    let uri = format!("{GROUPS}/{team}/policies/{kind}");
     futures::stream::iter(
         [
             (
-                policy_body(true, 1, json!({}), model_params),
-                "max_reruns is 1: a model_params policy takes 0 re-runs",
+                policy_body(true, 1, json!({}), flags),
+                format!("max_reruns is 1: a {kind} policy takes 0 re-runs"),
             ),
             (
-                policy_body(true, 0, json!({ "percent": 5 }), model_params),
-                "a model_params policy takes no settings",
+                policy_body(true, 0, json!({ "percent": 5 }), flags),
+                format!("a {kind} policy takes no settings"),
             ),
         ]
         .map(anyhow::Ok),
@@ -1449,7 +1424,7 @@ async fn the_model_params_policy_takes_no_rerun_grant() -> anyhow::Result<()> {
             let (status, answer) = send(state, filer, "PUT", uri, Some(&body)).await?;
             assert_eq!(
                 (status, answer["error"].as_str()),
-                (StatusCode::BAD_REQUEST, Some(error)),
+                (StatusCode::BAD_REQUEST, Some(error.as_str())),
                 "{body}"
             );
             anyhow::Ok(())
@@ -1457,8 +1432,8 @@ async fn the_model_params_policy_takes_no_rerun_grant() -> anyhow::Result<()> {
     })
     .await?;
 
-    let turn_on = policy_body(true, 0, json!({}), model_params);
-    policy_written(state, &filer, &team, "model_params", &turn_on).await?;
+    let turn_on = policy_body(true, 0, json!({}), flags);
+    policy_written(state, &filer, &team, kind, &turn_on).await?;
     let owner = CampaignOwner::Org {
         org_id: org.org_id.clone(),
     };
@@ -1466,9 +1441,9 @@ async fn the_model_params_policy_takes_no_rerun_grant() -> anyhow::Result<()> {
     added(state, &filer, &team, &[&campaign]).await?;
     let mut expected = defaults.clone();
     let read = policies(state, &filer, &team).await?;
-    expected[4]["enabled"] = json!(true);
-    expected[4]["enabled_by"] = json!(filer.1.as_str());
-    expected[4]["enabled_at"] = read[4]["enabled_at"].clone();
+    expected[at]["enabled"] = json!(true);
+    expected[at]["enabled_by"] = json!(filer.1.as_str());
+    expected[at]["enabled_at"] = read[at]["enabled_at"].clone();
     assert_eq!(read, expected);
     assert_eq!(
         member_ids(state, &filer, &team).await?,
@@ -1521,7 +1496,7 @@ async fn the_policies_take_the_group_s_rights() -> anyhow::Result<()> {
             (&member, &own, ok, ok, None, None),
             (&member, &team, ok, ok, None, None),
             (&teammate, &team, ok, ok, None, None),
-            (&teammate, &own, refused, refused, another, another),
+            (&teammate, &own, ok, ok, None, None),
             (&admin, &team, ok, refused, None, unfiled),
             (&server, &own, ok, ok, None, None),
             (&stranger, &team, refused, refused, another, another),
@@ -1694,10 +1669,11 @@ async fn a_member_of_another_owner_leaving_is_in_the_group_owner_s_log() -> anyh
         campaign_of(state, &owner).await?,
     );
     added(state, &member, &team, &[&handed, &deleted]).await?;
-    owner_written(state, &handed, personal(&taker)).await?;
-    owner_written(state, &deleted, personal(&taker)).await?;
+    owner_written(state, &handed, personal(state, &taker).await?).await?;
+    owner_written(state, &deleted, personal(state, &taker).await?).await?;
 
-    let to_taker = json!({ "owner": { "type": "user", "user_id": taker.1.as_str() } });
+    let to_taker =
+        json!({ "owner": { "type": "org", "org_id": org_of(state, &taker.1).await?.as_str() } });
     let uri = format!("/api/v1/campaigns/{handed}/owner");
     let (status, answer) = send(state, &taker, "PUT", &uri, Some(&to_taker)).await?;
     assert_eq!(status, StatusCode::OK, "{answer}");
@@ -1752,6 +1728,75 @@ async fn an_overview_names_the_campaign_s_group() -> anyhow::Result<()> {
     let (status, answer) = send(state, &admin, "DELETE", &uri, None).await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
     assert_eq!(overview_group(state, &owner, &member).await?, Value::Null);
+    Ok(())
+}
+
+/// The overview shows the deferral to a group reader while an enabled policy
+/// can file and the campaign is active.
+#[tokio::test]
+async fn an_overview_shows_the_kept_policy_deferral() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(sql) = seeded_sql_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let state = &sql.state;
+    let (org, owner) = org_operator(state).await?;
+    let team = CampaignOwner::Org {
+        org_id: org.org_id.clone(),
+    };
+    let member = campaign_of(state, &team).await?;
+    let group_id = CampaignGroupId::try_new(team_group(state, &owner, &org).await?)?;
+    added(state, &owner, group_id.as_str(), &[&member]).await?;
+    let reader = campaign_reader(state, &org, &member).await?;
+    let groups = state
+        .campaign_group_store
+        .as_deref()
+        .context("a [database] keeps campaign groups")?;
+    let disabled = PolicyKind::Swap.defaults(group_id.clone());
+    let enabled = CampaignGroupPolicy {
+        enabled: true,
+        ..disabled.clone()
+    };
+    assert!(groups.replace_policy(&disabled, &enabled).await?);
+    let campaign_id = CampaignId::try_new(member.as_str())?;
+    let keep = |deferred: Option<PolicyDeferral>| async {
+        let kept = GroupPolicyState {
+            deferred,
+            ..GroupPolicyState::default()
+        };
+        let written = groups
+            .set_policy_state(&group_id, &campaign_id, &kept, &JobStateChanges::default())
+            .await?;
+        anyhow::ensure!(written, "the campaign is a member");
+        anyhow::Ok(())
+    };
+    let deferral = PolicyDeferral {
+        until: Timestamp::now(),
+        rerun_job_count: 3,
+        marked_job_count: 1,
+    };
+    keep(Some(deferral.clone())).await?;
+    let shown = |signer| overview_field(state, signer, &member, "policy_deferral");
+
+    assert_eq!(shown(&owner).await?, serde_json::to_value(&deferral)?);
+    assert_eq!(shown(&reader).await?, Value::Null);
+    keep(None).await?;
+    assert_eq!(shown(&owner).await?, Value::Null);
+    keep(Some(deferral.clone())).await?;
+    assert!(groups.replace_policy(&enabled, &disabled).await?);
+    assert_eq!(shown(&owner).await?, Value::Null);
+
+    // An archived campaign is not revised, so it shows no deferral.
+    assert!(groups.replace_policy(&disabled, &enabled).await?);
+    assert_eq!(shown(&owner).await?, serde_json::to_value(&deferral)?);
+    let mut campaign = state
+        .campaign_store
+        .get_campaign(&campaign_id)
+        .await?
+        .context("the member campaign")?;
+    campaign.state = pipette_plan_types::CampaignState::Archived;
+    state.campaign_store.put_campaign(&campaign).await?;
+    assert_eq!(shown(&owner).await?, Value::Null);
     Ok(())
 }
 
@@ -1892,6 +1937,15 @@ fn check_counts(kind: &str, on: bool, flagged: u32, rerun: u32, marked: u32) -> 
     })
 }
 
+/// A llama.cpp build filed in the vault.
+fn vault_build() -> Value {
+    json!({
+        "type": "llamacpp_cli_stock_tools", "source": "vault_remote_archive",
+        "url": "/vault/resources/vault_1/content", "principal_id": "org_1",
+        "flavor": "linux-x64-rocm",
+    })
+}
+
 /// A member's preview that read no job, while swap and spread are on.
 fn unread_member(campaign: &Campaign, state: &str) -> Value {
     let check = |kind: &str, on: bool| check_counts(kind, on, 0, 0, 0);
@@ -1910,6 +1964,7 @@ fn unread_member(campaign: &Campaign, state: &str) -> Value {
             check("ttft_over_e2e", false),
             check("model_params", false),
             check("smaller_failed", false),
+            check("vault_resource", false),
         ],
         "rerun_job_ids": [],
         "marked_job_ids": [],
@@ -1954,8 +2009,9 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
     policy_written(state, &owner, &group, "swap", &at_once).await?;
     let spread = policy_body(true, 3, json!({ "percent": 5 }), &defaults[1]);
     policy_written(state, &owner, &group, "spread", &spread).await?;
+    let owned = personal(state, &owner).await?;
     let mut campaigns = futures::future::try_join_all(
-        (0..6).map(|_| put_idle_campaign_of(state, personal(&owner), "aa-perf")),
+        (0..6).map(|_| put_idle_campaign_of(state, owned.clone(), "aa-perf")),
     )
     .await?;
     // Member order is campaign id order.
@@ -1992,7 +2048,7 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
         state,
         handed_off.campaign_id.as_str(),
         CampaignOwner::Org {
-            org_id: org.org_id.clone(),
+            org_id: seed_org(state, "rival").await?.org_id,
         },
     )
     .await?;
@@ -2023,7 +2079,13 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
     );
 
     let uri = format!("{GROUPS}/{group}/policy-preview");
-    let (status, preview) = send(state, &owner, "GET", &uri, None).await?;
+    // A reader of every plan, so the handed-off member reads as another owner's.
+    let any_reader = registered_user(
+        state,
+        &[UserPermission::ReadAnyPlans, UserPermission::ReadClients],
+    )
+    .await?;
+    let (status, preview) = send(state, &any_reader, "GET", &uri, None).await?;
     assert_eq!(status, StatusCode::OK, "{preview}");
     crate::api_schema::assert_conforms("CampaignGroupPolicyPreview", &preview)?;
     // It records nothing: the re-run still waits, and nothing it would file
@@ -2077,8 +2139,8 @@ async fn the_preview_reads_each_member_s_plan() -> anyhow::Result<()> {
 /// The preview takes what holds a member from what queue-maintenance kept of
 /// it, with the plan and the count, shows its last filing, and reads every
 /// answered job, a decided one too, and those of a member that waits or was
-/// refused for their rows that lack model params. It writes nothing and
-/// cancels nothing.
+/// refused for their rows that lack model params and their sources that name
+/// a vault build. It writes nothing and cancels nothing.
 #[tokio::test]
 async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2092,8 +2154,9 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
     let group = created_group(state, &owner, json!({ "name": "aa-perf" })).await?;
     let swap_on = policy_body(true, 3, json!({}), &default_policies(&group)[0]);
     policy_written(state, &owner, &group, "swap", &swap_on).await?;
+    let owned = personal(state, &owner).await?;
     let mut campaigns = futures::future::try_join_all(
-        (0..4).map(|_| put_idle_campaign_of(state, personal(&owner), "aa-perf")),
+        (0..4).map(|_| put_idle_campaign_of(state, owned.clone(), "aa-perf")),
     )
     .await?;
     campaigns.sort_by(|a, b| a.campaign_id.cmp(&b.campaign_id));
@@ -2109,6 +2172,14 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
         .map(|campaign| campaign.campaign_id.as_str())
         .to_vec();
     added(state, &owner, &group, &ids).await?;
+    let source = json!({
+        "job_id": "job-a",
+        "spec": { "benchmark": "prefill_throughput_256", "runtime": vault_build() },
+    });
+    state
+        .plan_store
+        .put_job_source(&JobId::try_new("job-a")?, &source)
+        .await?;
 
     // The filing that did not advance still runs beside the head.
     let not_advanced = PlanId::from_uuid(uuid::Uuid::now_v7());
@@ -2240,6 +2311,9 @@ async fn the_preview_shows_what_holds_a_member() -> anyhow::Result<()> {
     queue_held["checks"][4] = json!({
         "kind": "model_params", "on": false, "flagged": 1, "rerun": 0, "marked": 0, "kept": 1,
     });
+    queue_held["checks"][6] = json!({
+        "kind": "vault_resource", "on": false, "flagged": 1, "rerun": 0, "marked": 0, "kept": 1,
+    });
     queue_held["missing_model_params"] = json!([
         { "key": "granite-4.2-8b", "row_count": 1, "job_count": 1 },
     ]);
@@ -2292,7 +2366,8 @@ async fn the_preview_shows_rows_that_lack_model_params_and_the_last_filing() -> 
     let org = seed_org(state, "acme").await?;
     let owner = org_user(state, &org, RERUNNER).await?;
     let group = created_group(state, &owner, json!({ "name": "aa-perf" })).await?;
-    let mut campaign = put_idle_campaign_of(state, personal(&owner), "aa-perf").await?;
+    let mut campaign =
+        put_idle_campaign_of(state, personal(state, &owner).await?, "aa-perf").await?;
     let future = "2099-01-01T00:00:00Z";
     let jobs = ["job-q4", "job-q5", "job-filled"];
     let head = running(state, &mut campaign, PlanStatus::Active, &jobs, future).await?;
@@ -2360,8 +2435,10 @@ async fn the_preview_shows_rows_that_lack_model_params_and_the_last_filing() -> 
 
 /// The preview flags a failed job whose cell ran clean at a larger size, by
 /// the jobs' sources and the catalog, whether the policy is on or not; a job
-/// with no source has no family. The failed policy, on with a code's re-runs
-/// and none at the top level, triggers the member by that code alone.
+/// with no source has no family. Both sourced jobs run a vault build, so it
+/// counts both on a vault runtime, the failed one too, though its row records
+/// no runtime. The failed policy, on with a code's re-runs and none at the top
+/// level, triggers the member by that code alone.
 #[tokio::test]
 async fn the_preview_shows_a_failure_below_a_clean_larger_run() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2381,7 +2458,8 @@ async fn the_preview_shows_a_failure_below_a_clean_larger_run() -> anyhow::Resul
     let codes = json!({ "codes": { "out_of_memory": 1 } });
     let failed = policy_body(true, 0, codes, &default_policies(&group)[2]);
     policy_written(state, &owner, &group, "failed", &failed).await?;
-    let mut campaign = put_idle_campaign_of(state, personal(&owner), "aa-perf").await?;
+    let mut campaign =
+        put_idle_campaign_of(state, personal(state, &owner).await?, "aa-perf").await?;
     let future = "2099-01-01T00:00:00Z";
     let jobs = ["job-small", "job-large", "job-sourceless"];
     running(state, &mut campaign, PlanStatus::Active, &jobs, future).await?;
@@ -2390,8 +2468,13 @@ async fn the_preview_shows_a_failure_below_a_clean_larger_run() -> anyhow::Resul
         ("job-small", "prefill_throughput_256"),
         ("job-large", "prefill_throughput_1024"),
     ];
+    // One build for both, so they stay one family.
+    let runtime = &vault_build();
     futures::future::try_join_all(sources.map(|(job_id, benchmark)| async move {
-        let body = json!({ "job_id": job_id, "spec": { "benchmark": benchmark } });
+        let body = json!({
+            "job_id": job_id,
+            "spec": { "benchmark": benchmark, "runtime": runtime },
+        });
         state
             .plan_store
             .put_job_source(&JobId::try_new(job_id)?, &body)
@@ -2460,6 +2543,12 @@ async fn the_preview_shows_a_failure_below_a_clean_larger_run() -> anyhow::Resul
             "clean_job_id": "job-large",
             "clean_benchmark_id": "prefill_throughput_1024",
         }])
+    );
+    assert_eq!(
+        preview["members"][0]["checks"][6],
+        json!({
+            "kind": "vault_resource", "on": false, "flagged": 2, "rerun": 0, "marked": 0, "kept": 2,
+        })
     );
     Ok(())
 }
@@ -2636,8 +2725,11 @@ async fn the_rerun_results_sum_up_and_page_the_readable_members_reruns() -> anyh
         campaign_of(state, &team_owner).await?,
     );
     added(state, &member, &team, &[&read, &unread]).await?;
-    // The member's own campaign now, which the previewer does not read.
-    owner_written(state, &unread, personal(&member)).await?;
+    // Another organization's campaign now, which the previewer does not read.
+    let rival = CampaignOwner::Org {
+        org_id: seed_org(state, "rival").await?.org_id,
+    };
+    owner_written(state, &unread, rival).await?;
 
     let (read, unread) = (CampaignId::try_new(&read)?, CampaignId::try_new(&unread)?);
     let at = Timestamp::now();

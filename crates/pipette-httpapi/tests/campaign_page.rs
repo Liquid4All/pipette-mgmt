@@ -12,16 +12,18 @@ use httpmock::{Mock, MockServer};
 use rstest::rstest;
 use serde_json::{Value, json};
 
+use pipette_core::campaign::CampaignOwner;
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_pipeline::plan_results::JOB_RESULTS_TIMEOUT;
-use pipette_plan_types::{CampaignId, OrgId, PlanId, UserId, UserPermission};
+use pipette_plan_types::{CampaignId, OrgId, PlanId, UserPermission};
 use pipette_web_testkit::{
-    DUCKDB_TIMEOUT, FULL_EDITOR, MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner, add_starved_snapshot,
-    approved_client, approved_object_client, body_json, created_campaign, file_job_bodies,
-    filed_plan, json_str, post_plan_document, put_idle_campaign, put_plan_document,
-    registered_user, seed_org, seed_org_named, seeded_object_state, seeded_sql_state, seeded_state,
-    set_user_org, signed_empty, signed_json, user_address, with_duckdb,
+    DUCKDB_TIMEOUT, FULL_EDITOR, FULL_OWNER, MLX_700M_VARIANT, ONE_CELL_PLAN, UserSigner,
+    add_starved_snapshot, approved_client, approved_object_client, body_json, created_campaign,
+    file_job_bodies, filed_plan, json_str, org_of, post_plan_document, put_idle_campaign,
+    put_idle_campaign_of, put_plan_document, registered_user, seed_org, seed_org_named,
+    seeded_object_state, seeded_sql_state, seeded_state, set_user_org, signed_empty, signed_json,
+    user_address, with_duckdb,
 };
 
 async fn read(
@@ -159,7 +161,7 @@ async fn duckdb_campaign() -> anyhow::Result<DuckdbCampaign> {
 async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, client_id) = approved_object_client(dir.path()).await?;
-    let owner = registered_user(&state, FULL_EDITOR).await?;
+    let owner = registered_user(&state, FULL_OWNER).await?;
     let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
     let head = filed_plan(&state, &owner, &campaign_id, &client_id, "second").await?;
     add_starved_snapshot(&state, &head).await?;
@@ -192,6 +194,7 @@ async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Res
             "name",
             "names",
             "owner",
+            "policy_deferral",
             "updated_at",
         ]
     );
@@ -244,19 +247,22 @@ async fn test_the_overview_answers_the_campaign_and_its_history() -> anyhow::Res
     crate::api_schema::assert_conforms("NamedCampaignView", &record)?;
 
     let address = user_address(&state, &owner.1).await?;
+    let own = org_of(&state, &owner.1).await?;
     assert_eq!(
         body["names"],
-        json!({ owner.1.as_str(): address }),
-        "the owner, who filed both plans, by address"
+        json!({
+            own.as_str(): format!("{address}'s personal org"),
+            owner.1.as_str(): address,
+        }),
+        "the owning organization, and the filer of both plans by address"
     );
     Ok(())
 }
 
 /// A member of the owning organization is offered the revisions it may file,
-/// and no write to the record.
+/// and, holding `submit_plans`, the writes to the record.
 #[tokio::test]
-async fn test_the_overview_offers_a_member_the_revisions_and_not_the_record() -> anyhow::Result<()>
-{
+async fn test_the_overview_offers_a_member_the_revisions_and_the_record() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, _client_id) = approved_client(dir.path()).await?;
     let acme = seed_org(&state, "acme").await?.org_id;
@@ -266,7 +272,7 @@ async fn test_the_overview_offers_a_member_the_revisions_and_not_the_record() ->
 
     let colleague = member(&state, &acme, FULL_EDITOR).await?;
     let body = overview(&state, &colleague, &campaign_id).await?;
-    assert_eq!(body["may_administer"], json!(false));
+    assert_eq!(body["may_administer"], json!(true));
     assert_eq!(body["may_edit_variants"], json!(true));
     assert_eq!(body["may_rerun"], json!(true));
 
@@ -480,7 +486,12 @@ async fn test_the_overview_names_nobody_as_an_empty_object() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let reader = registered_user(&state, &[UserPermission::ReadAnyPlans]).await?;
-    let orphan = put_idle_campaign(&state, &UserId::mint(), "Orphan").await?;
+    let owner = CampaignOwner::Org {
+        org_id: OrgId::mint(),
+    };
+    let orphan = put_idle_campaign_of(&state, owner, "Orphan")
+        .await?
+        .campaign_id;
     let body = overview(&state, &reader, orphan.as_str()).await?;
     assert_eq!(body.get("names"), Some(&json!({})), "{body}");
     Ok(())
@@ -520,10 +531,11 @@ async fn owners(
     .await
 }
 
-/// The signed lookup answers what the console's hand-off field offers: a member
-/// its own organization alone, the organization's administrator its members
-/// who file plans, never the current owner. A campaign no longer the reader's
-/// to give is a `403`, and one it may not read is refused as its read is.
+/// The signed lookup answers what the console's hand-off field offers: a
+/// campaign stays inside its organization, so its administrator is offered
+/// nothing but its current owner, which is left out. A member holding
+/// `submit_plans` administers it too, and one outside the reach is refused as
+/// its read is.
 #[tokio::test]
 async fn test_the_owner_lookup_offers_where_the_campaign_may_go() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -531,48 +543,17 @@ async fn test_the_owner_lookup_offers_where_the_campaign_may_go() -> anyhow::Res
     let acme = seed_org(&state, "acme").await?.org_id;
     let rival = seed_org(&state, "rival").await?.org_id;
     let author = member(&state, &acme, &[UserPermission::SubmitPlans]).await?;
-    let colleague = member(&state, &acme, &[UserPermission::SubmitPlans]).await?;
-    let idle = member(&state, &acme, &[]).await?;
     let outsider = member(&state, &rival, &[UserPermission::SubmitPlans]).await?;
     let lead = member(&state, &acme, &[UserPermission::ManageOrgs]).await?;
     let (campaign_id, _) = created_campaign(&state, &author, &[("name", "Handed")]).await?;
 
     let (status, body) = owners(&state, &author, &campaign_id, "q=").await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(offered(&body)?, [acme.to_string()]);
-
-    // The app posts the picked value to the signed hand-off.
-    let request = json!({ "owner": { "type": "org", "org_id": acme } });
-    crate::api_schema::assert_conforms("SetCampaignOwnerRequest", &request)?;
-    let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-    let resp = signed_json(&state, &author, "PUT", &uri, &request).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let (status, _) = owners(&state, &author, &campaign_id, "q=").await?;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "no longer the author's to give"
-    );
-
-    let (_, body) = owners(&state, &lead, &campaign_id, "q=").await?;
-    let values = offered(&body)?;
-    for (principal, wanted) in [
-        (colleague.1.to_string(), true),
-        (author.1.to_string(), true),
-        (idle.1.to_string(), false),
-        (acme.to_string(), false),
-        (rival.to_string(), false),
-        (outsider.1.to_string(), false),
-    ] {
-        assert_eq!(values.contains(&principal), wanted, "{principal}: {body}");
-    }
-
-    let (_, body) = owners(&state, &lead, &campaign_id, "q=&type=org").await?;
+    assert_eq!(status, StatusCode::OK, "a member administers its team's");
     assert_eq!(offered(&body)?, Vec::<String>::new());
-    let typed = user_address(&state, &colleague.1).await?.to_uppercase();
-    let (_, body) = owners(&state, &lead, &campaign_id, &format!("q={typed}")).await?;
-    assert_eq!(offered(&body)?, [colleague.1.to_string()]);
+
+    let (status, body) = owners(&state, &lead, &campaign_id, "q=").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(offered(&body)?, Vec::<String>::new());
     let (status, _) = owners(&state, &lead, &campaign_id, "type=device").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
@@ -738,7 +719,11 @@ async fn test_the_document_follows_the_head() -> anyhow::Result<()> {
 async fn test_the_rename_request_conforms() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
-    let owner = registered_user(&state, &[UserPermission::SubmitPlans]).await?;
+    let owner = registered_user(
+        &state,
+        &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
+    )
+    .await?;
     let (campaign_id, _) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
     let request = json!({ "name": "Nightly v2" });
     crate::api_schema::assert_conforms("UpdateCampaignRequest", &request)?;
@@ -766,17 +751,6 @@ const CATALOG_AUTHOR: [UserPermission; 3] = [
     UserPermission::EditCatalog,
 ];
 
-/// The owner of the campaign in [`test_the_overview_names_the_catalog_org`].
-#[derive(Clone, Copy, Debug)]
-enum Owned {
-    /// The organization `acme`.
-    Acme,
-    /// The author, a member of `acme`.
-    AcmeMember,
-    /// The author, a member of no organization.
-    Unaffiliated,
-}
-
 /// The reader in [`test_the_overview_names_the_catalog_org`].
 #[derive(Clone, Copy, Debug)]
 enum Reader {
@@ -796,19 +770,14 @@ enum Reader {
 /// own organization, or if the reader has no organization and holds
 /// `edit_any_catalog`.
 #[rstest]
-#[case::org_member_with_edit_catalog(Owned::Acme, Reader::AcmeEditor, true)]
-#[case::org_member_without_edit_catalog(Owned::Acme, Reader::AcmeWithoutEdit, false)]
-#[case::other_org_member_with_edit_any(Owned::Acme, Reader::BetaAnyEditor, false)]
-#[case::unaffiliated_edit_any(Owned::Acme, Reader::UnaffiliatedAnyEditor, true)]
-#[case::user_owned_owner(Owned::AcmeMember, Reader::Author, true)]
-#[case::user_owned_org_mate(Owned::AcmeMember, Reader::AcmeEditorReadingAny, true)]
-#[case::user_owned_other_org_edit_any(Owned::AcmeMember, Reader::BetaAnyEditor, false)]
-#[case::user_owned_unaffiliated_edit_any(Owned::AcmeMember, Reader::UnaffiliatedAnyEditor, true)]
-#[case::owner_in_no_org(Owned::Unaffiliated, Reader::Author, false)]
-#[case::owner_in_no_org_edit_any(Owned::Unaffiliated, Reader::UnaffiliatedAnyEditor, false)]
+#[case::org_member_with_edit_catalog(Reader::AcmeEditor, true)]
+#[case::org_member_without_edit_catalog(Reader::AcmeWithoutEdit, false)]
+#[case::other_org_member_with_edit_any(Reader::BetaAnyEditor, false)]
+#[case::unaffiliated_edit_any(Reader::UnaffiliatedAnyEditor, true)]
+#[case::author(Reader::Author, true)]
+#[case::org_mate_reading_any(Reader::AcmeEditorReadingAny, true)]
 #[tokio::test]
 async fn test_the_overview_names_the_catalog_org(
-    #[case] owned: Owned,
     #[case] reader: Reader,
     #[case] in_acme: bool,
 ) -> anyhow::Result<()> {
@@ -819,15 +788,9 @@ async fn test_the_overview_names_the_catalog_org(
     let state = &sql.state;
     let acme = seed_org(state, "acme").await?.org_id;
     let beta = seed_org(state, "beta").await?.org_id;
-    let author = match owned {
-        Owned::Acme | Owned::AcmeMember => member(state, &acme, &CATALOG_AUTHOR).await?,
-        Owned::Unaffiliated => registered_user(state, &CATALOG_AUTHOR).await?,
-    };
-    let params: &[(&str, &str)] = match owned {
-        Owned::Acme => &[("name", "Team"), ("owner", acme.as_str())],
-        Owned::AcmeMember | Owned::Unaffiliated => &[("name", "Own")],
-    };
-    let (campaign_id, _) = created_campaign(state, &author, params).await?;
+    let author = member(state, &acme, &CATALOG_AUTHOR).await?;
+    let params = [("name", "Team"), ("owner", acme.as_str())];
+    let (campaign_id, _) = created_campaign(state, &author, &params).await?;
 
     let edit = UserPermission::EditCatalog;
     let read_any = UserPermission::ReadAnyPlans;
@@ -838,7 +801,11 @@ async fn test_the_overview_names_the_catalog_org(
         Reader::AcmeWithoutEdit => member(state, &acme, &[UserPermission::ReadPlans]).await?,
         Reader::AcmeEditorReadingAny => member(state, &acme, &[read_any, edit]).await?,
         Reader::BetaAnyEditor => member(state, &beta, &[read_any, edit_any]).await?,
-        Reader::UnaffiliatedAnyEditor => registered_user(state, &[read_any, edit_any]).await?,
+        Reader::UnaffiliatedAnyEditor => {
+            let unaffiliated = registered_user(state, &[read_any, edit_any]).await?;
+            set_user_org(state, &unaffiliated.1, None).await?;
+            unaffiliated
+        }
     };
     let body = overview(state, &signer, &campaign_id).await?;
     let expected = if in_acme {
@@ -846,10 +813,7 @@ async fn test_the_overview_names_the_catalog_org(
     } else {
         Value::Null
     };
-    assert_eq!(
-        body["catalog_org_id"], expected,
-        "{owned:?} read by {reader:?}"
-    );
+    assert_eq!(body["catalog_org_id"], expected, "read by {reader:?}");
     Ok(())
 }
 

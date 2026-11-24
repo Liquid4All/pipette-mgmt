@@ -17,4 +17,3 @@ and `names=true` names the ids the reader may see
 | 200 | A page of events, newest first |
 | 400 | An outcome or an actor kind that is not in the vocabulary, or a `target` that cannot be an id |
 | 403 | The caller does not hold `manage_any_orgs`, or is a service account |
-| 404 | The server has no `[database]`, so keeps no audit log |

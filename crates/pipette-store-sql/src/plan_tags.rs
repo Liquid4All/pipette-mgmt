@@ -70,7 +70,7 @@ mod tests {
 
     use pipette_core::campaign::{CampaignOwner, NewCampaign};
     use pipette_core::types::Mint;
-    use pipette_plan_types::{NonEmptyTrimmedString, PlanId, UserId};
+    use pipette_plan_types::{NonEmptyTrimmedString, OrgId, PlanId, UserId};
     use pipette_store::CampaignStore;
 
     use super::*;
@@ -86,8 +86,8 @@ mod tests {
         let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
         let campaign = NewCampaign::new(
             NonEmptyTrimmedString::try_new("Nightly")?,
-            CampaignOwner::User {
-                user_id: UserId::mint(),
+            CampaignOwner::Org {
+                org_id: OrgId::mint(),
             },
         )
         .around(plan_id.clone(), Timestamp::now());

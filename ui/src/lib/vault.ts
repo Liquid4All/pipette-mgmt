@@ -10,7 +10,7 @@ import type {
 } from "./api-types";
 
 /** The vault's listing under each branch. */
-export const VAULT_PAGES: OwnedPages = { mine: "me-vault", org: "org-vault", all: "vault" };
+export const VAULT_PAGES: OwnedPages = { org: "org-vault", all: "vault" };
 
 /** The `GET /api/v1/vault/resources` query for `branch`, with each file's state and every owner's name. */
 export const vaultQuery = (branch: OwnedBranch, cursor: string | null, limit: string): string =>
@@ -161,6 +161,7 @@ export function vaultTable(names: Record<string, string>, kind: VaultKind, owner
   const descriptor = (row: VaultResourceDetail) => jsonText(entryDescriptor(row.entry));
   const only = <T>(of: VaultKind, items: T[]): T[] => (kind === of ? items : []);
   return {
+    sort: "-created_at",
     columns: [
       { key: "resource_id", label: "resource_id", raw: (row) => row.resource_id,
         href: (row) => vaultLink(row.resource_id) },

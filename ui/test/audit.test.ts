@@ -124,6 +124,26 @@ describe("a row", () => {
                  title: "global: AcmeLM\ngguf::q4_0: digest_a", status: null });
   });
 
+  test.each([
+    ["LFM", "Set the family of catalog entry LFM2.5-1.2B to LFM"],
+    [null, "Set catalog entry LFM2.5-1.2B to its default family"],
+  ])("a family change to %s names the entry and the family", (family, text) => {
+    expect(actionShown({ action: { type: "catalog_set_family", name: "LFM2.5-1.2B", scope: "org_acme", family },
+                         outcome: "succeeded" }))
+      .toEqual({ text, title: "org_acme: LFM2.5-1.2B", status: null });
+  });
+
+  test.each([
+    ["https://pipette.liquid.ai/logos/lfm.svg",
+     "Set the logo of catalog family LFM2.5 to https://pipette.liquid.ai/logos/lfm.svg"],
+    ["data:image/png;base64,abcd", "Set the logo of catalog family LFM2.5 to an embedded image"],
+    [null, "Removed the logo of catalog family LFM2.5"],
+  ])("a family logo change to %s names the family and the logo", (logo_uri, text) => {
+    expect(actionShown({ action: { type: "catalog_set_family_logo", family: "LFM2.5", scope: "org_acme", logo_uri },
+                         outcome: "succeeded" }))
+      .toEqual({ text, title: "org_acme: LFM2.5", status: null });
+  });
+
   test("a move to global scope shows the entry and organization, with the original creator on hover", () => {
     expect(actionShown({ action: { type: "catalog_move_to_global", name: "AcmeLM", org_id: "org_acme",
                                    original_created_by: "account:user_a" }, outcome: "succeeded" }))

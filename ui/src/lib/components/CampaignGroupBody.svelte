@@ -28,8 +28,9 @@
 
   const files = $derived(mayFile(reader, group.owner));
   // The rows are read already, so the members' table filters in the page alone; they carry no models to search.
+  // The group lists its members oldest first, where the listings come newest first.
   const table = campaignTable({}, false);
-  const spec = { ...table, server: [],
+  const spec = { ...table, sort: "created_at", server: [],
                  texts: table.texts?.map((text) => ({ ...text, placeholder: "campaign id, name or label" })) };
   const members = $derived(memberRows(group.members, listed));
   // The members queue-maintenance has read under the group's policies.

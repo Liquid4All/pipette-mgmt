@@ -80,8 +80,9 @@ fn path_and_query(path: &str, params: &[(&str, &str)]) -> anyhow::Result<String>
     })
 }
 
-/// File a plan as `user` into a fresh campaign that `user` owns, so that every
-/// scope check that depends on the campaign sees the caller as its owner. `note`
+/// File a plan as `user` into a fresh campaign that `user`'s organization owns,
+/// so that every scope check that depends on the campaign sees the caller as a
+/// member of its owner. `note`
 /// also names the campaign, so `note` must not be blank.
 pub async fn submit_plan_as(
     state: &AppState,
@@ -432,15 +433,15 @@ pub async fn created_campaign_from(
     ))
 }
 
-/// Write a campaign `owner` holds that runs nothing, as legacy records do: no
-/// route creates one.
+/// Write a campaign the organization of `member` holds that runs nothing, as
+/// legacy records do: no route creates one.
 pub async fn put_idle_campaign(
     state: &AppState,
-    owner: &UserId,
+    member: &UserId,
     name: &str,
 ) -> anyhow::Result<CampaignId> {
-    let owner = CampaignOwner::User {
-        user_id: owner.clone(),
+    let owner = CampaignOwner::Org {
+        org_id: crate::org_of(state, member).await?,
     };
     Ok(put_idle_campaign_of(state, owner, name).await?.campaign_id)
 }

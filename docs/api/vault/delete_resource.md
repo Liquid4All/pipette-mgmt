@@ -8,7 +8,7 @@ describing a deleted file again means uploading it again. This is also the
 only way to change anything about a resource: delete it, and upload again
 under new ids.
 
-It takes the owner, or `manage_orgs` (and membership) for an organization's
+It takes membership of the owning organization, or `manage_any_orgs`
 ([who may do what](../vault.md#who-may-do-what)).
 
 ## Statuses
@@ -16,5 +16,4 @@ It takes the owner, or `manage_orgs` (and membership) for an organization's
 | Status | When |
 |--------|------|
 | 204 | The record, the rest of its upload, and each file no other record names are deleted |
-| 403 | A member deleting its organization's resource is told it needs `manage_orgs`; any other resource outside the caller's scope is refused as belonging to another owner |
-| 404 | No such resource |
+| 403 | The resource is outside the caller's scope: refused as belonging to another owner |

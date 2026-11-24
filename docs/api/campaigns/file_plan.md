@@ -16,10 +16,7 @@ with `note` and `dry_run` in the query string
 `200` with the [dry-run body](../campaigns.md#response-201-created), stages
 nothing, and leaves the campaign where it is. What the campaign adds is the
 chain: the plan this mints records `campaign_id` and `previous_plan_id`, and the
-campaign advances onto it. **This, a [variant edit](edit_variants.md), a
-[document revision](revise_document.md), a [re-run](rerun_jobs.md) and a
-[recalculation](recalculate_jobs.md) are the only ways a
-campaign's pointer moves.**
+campaign advances onto it.
 
 Responds `201 Created` with the [report](../campaigns.md#response-201-created).
 
@@ -36,12 +33,13 @@ is read and cancelled as every plan of the campaign is
 Superseding is **not cancelling**. The plan the campaign leaves behind keeps its
 jobs, its lifecycle and its claimability; stopping it is
 [`POST /api/v1/plans/{plan_id}/cancel`](../plans/cancel_plan.md), a separate decision under a separate grant.
-Nor does this route carry the old plan's finished jobs over: a cell the old
-plan finished runs again. To revise the plan the campaign runs, use a
-[variant edit](edit_variants.md) or, to edit the whole
-document, [`PUT /api/v1/campaigns/{campaign_id}/document`](revise_document.md).
-Those routes and a [re-run](rerun_jobs.md) do both, because each knows which
-of the old plan's jobs the new one keeps.
+Nor does this route carry the old plan's jobs over. A cell joins a live job or
+takes an earlier successful run of its cell, as
+[shared jobs](../campaigns.md#shared-jobs) describes, so a cell whose old job
+failed runs again. A [variant edit](edit_variants.md), a
+[document revision](revise_document.md), a [re-run](rerun_jobs.md), a
+[recalculation](recalculate_jobs.md) or a [revert](revert_campaign.md) keeps
+the old plan's jobs, failed ones included.
 
 The `403` and `404` come **before the body is read**, as on
 [`POST /api/v1/campaigns`](create_campaign.md).

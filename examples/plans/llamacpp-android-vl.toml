@@ -1,10 +1,5 @@
-# Example plan: unified pipette client, llama.cpp vision-language benchmarks.
-#
-# Vision-language GGUF models carry both the main weights and the
-# projector filename in the model entry.
-#
-# State written to
-# .pipette-ctl/plans/llamacpp-android-vl-example/state.jsonl.
+# Example plan: llama.cpp vision-language benchmarks on Android. A
+# `gguf_vision` entry names both the weights and the projector (`mmproj`).
 
 plan_id = "llamacpp-android-vl-example"
 benchmarks = [

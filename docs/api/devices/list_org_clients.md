@@ -1,6 +1,6 @@
 # `GET /api/v1/orgs/{org_id}/clients`
 
-The devices the organization owns, directly or through its members. The body
+The devices the organization owns. The body
 is `ClientViewPage`, every row
 in one page ([pagination](../../httpapi.md#13-pagination)). It does not repeat
 the organization's id, so a caller that named it by handle reads the id from
@@ -16,14 +16,6 @@ rows are client records, `contact_email` omitted unless the caller's
 serving it on `read_orgs` alone would let an account that administers people
 enumerate device hardware and public keys without ever being granted fleet
 access.
-
-It includes **both owner kinds**, told apart by each row's `owner`: "who do I
-talk to about this machine" has different answers for a device the organization
-owns and one a member owns.
-
-A user-owned device rolls up to whichever organization its owner belongs to
-**now**, so moving an account moves its devices. That join is derived rather
-than stored a second time, which is why there is no third route to keep in step.
 
 ## Statuses
 

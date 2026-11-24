@@ -7,16 +7,17 @@
   // A listing's table, as the Jobs tab draws one: its filters, the columns the
   // reader picks and the widths dragged to, a header that sorts per column, a
   // row a line, and the pager.
-  // Its filters, sort and page live in the address at `path`; without one they
-  // live in the page, for a table that shares its address with another, which
-  // draws every row and offers its filters only once it is long.
+  // Its filters, sort and page live in the address, under `name` where the page
+  // draws another table too. A listing gives its `path`; a table without one
+  // sits on a page about something else and offers its filters only once it is long.
+  // An address that names no sort is replaced by one that names the table's own.
   import { untrack, type Snippet } from "svelte";
   import { when } from "../format";
   import { offsetPaging } from "../pager";
   import { PickedColumns } from "../picked.svelte";
-  import { here, href } from "../route.svelte";
+  import { here, href, redirect } from "../route.svelte";
   import {
-    FILTERS_FROM, choicesOf, drawnColumns, filtering, statePairs, tableState, tableView, unsorted,
+    FILTERS_FROM, choicesOf, drawnColumns, filtering, ownQuery, statePairs, tableState, tableView, withOthers,
     type TableSpec, type TableState,
   } from "../table";
   import { ColumnWidths, headerWidths } from "../widths.svelte";
@@ -26,7 +27,7 @@
   import StatusPill from "./StatusPill.svelte";
   import TableBar from "./TableBar.svelte";
 
-  let { spec, rows, id, noun, empty, path, kept = [], keep = [], columnsKey, cells = {}, heads = {}, action,
+  let { spec, rows, id, noun, empty, path, name = "", kept = [], keep = [], columnsKey, cells = {}, heads = {}, action,
         actionHead = "", marked }: {
     spec: TableSpec<R>;
     /** Every row read, before the filters. */
@@ -37,8 +38,10 @@
     noun: string;
     /** What the table says with no row to filter. */
     empty: string;
-    /** The page's own address, which the filters, the sort and the pager keep. */
+    /** The listing's own address, which the filters, the sort and the pager keep; the page's without one. */
     path?: string;
+    /** What leads this table's keys in the address, as `<name>.sort`, on a page that draws another table. */
+    name?: string;
     /** The address pairs the server's filters read, which every link keeps, and the keys of those kept empty. */
     kept?: [string, string][];
     keep?: string[];
@@ -55,13 +58,17 @@
     marked?: (row: R) => boolean;
   } = $props();
 
-  let held = $state<TableState | null>(null);
-  const table = $derived(path === undefined ? held ?? unsorted(spec) : tableState(spec, here.query));
-  const paging = $derived(path === undefined ? null : offsetPaging(here.query));
+  const own = $derived(ownQuery(here.query, name));
+  const table = $derived(tableState(spec, own));
+  const paging = $derived(offsetPaging(own));
   const listed = $derived(tableView(spec, table, rows));
-  const shown = $derived(paging ? listed.slice(paging.offset, paging.offset + paging.limit) : listed);
-  const link = (to: TableState, offset = 0) => href(path!,
-    [...kept, ...statePairs(to), ["limit", paging!.asked], ["offset", offset ? String(offset) : ""]], keep);
+  const shown = $derived(listed.slice(paging.offset, paging.offset + paging.limit));
+  const link = (to: TableState, offset = 0) => href(path ?? here.path, [...kept, ...withOthers(here.query, name,
+    [...statePairs(to), ["limit", paging.asked], ["offset", offset ? String(offset) : ""]])], keep);
+  // The hash is kept, as the reader may have followed a link to it.
+  $effect(() => {
+    if (table.sort && own.get("sort") !== table.sort) redirect(`${link(table, paging.offset)}${location.hash}`);
+  });
 
   const picked = $derived(columnsKey ? new PickedColumns(columnsKey, untrack(() => spec.columns)) : null);
   const columns = $derived(drawnColumns(spec.columns, picked?.picks ?? null));
@@ -69,10 +76,9 @@
   let head = $state<HTMLTableRowElement>();
 </script>
 
-{#if paging || rows.length > FILTERS_FROM || filtering(table)}
-  <TableBar {spec} state={table} choices={choicesOf(spec, rows, table.choices)}
-            kept={listed.length} total={rows.length} {noun}
-            link={paging ? link : undefined} onchange={paging ? undefined : (to) => (held = to)} />
+{#if path !== undefined || rows.length > FILTERS_FROM || filtering(table)}
+  <TableBar {spec} state={table} choices={choicesOf(spec, rows, table)}
+            kept={listed.length} total={rows.length} {noun} {link} />
 {/if}
 {#if picked}
   <div class="bar"><ColumnPicker columns={spec.columns} drawn={columns.map((column) => column.key)} {picked}
@@ -89,8 +95,7 @@
     <thead><tr bind:this={head}>
       {#each columns as column (column.key)}
         <SortTh key={column.key} label={column.label} sort={table.sort} num={column.num}
-                link={paging ? (sort) => link({ ...table, sort }) : undefined}
-                onsort={paging ? undefined : (sort) => (held = { ...table, sort })}
+                link={(sort) => link({ ...table, sort })}
                 resize={widths?.grip(column.key, () => headerWidths(head))} extra={heads[column.key]} />
       {/each}
       {#if action}<th aria-label={actionHead ? undefined : "actions"} data-key={ACTION}>{actionHead}</th>{/if}
@@ -121,10 +126,8 @@
     </tbody>
   </table>
 </div>
-{#if paging}
-  <Pager offset={paging.offset} shown={shown.length} size={paging.limit} total={listed.length}
-         at={(offset) => link(table, offset)} />
-{/if}
+<Pager offset={paging.offset} shown={shown.length} size={paging.limit} total={listed.length}
+       at={(offset) => link(table, offset)} />
 
 <style>
   /* A descriptor wraps in its own width, as on the Jobs tab; the table scrolls sideways. */

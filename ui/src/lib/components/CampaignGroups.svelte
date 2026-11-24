@@ -17,7 +17,7 @@
   import { Busy, Loader } from "./work.svelte";
 
   let { branch, base }: {
-    branch: Exclude<OwnedBranch, { kind: "all" }>;
+    branch: Extract<OwnedBranch, { kind: "org" }>;
     /** The owner's campaign listing, as the tree names it: its campaigns are there, its groups under it. */
     base: string;
   } = $props();
@@ -26,6 +26,7 @@
   $effect(() => { here.under = base; });
 
   const SPEC: TableSpec<CampaignGroup> = {
+    sort: "-created_at",
     columns: [
       { key: "name", label: "name", raw: (row) => row.name },
       { key: "created_at", label: "created_at", raw: (row) => row.created_at, as: "time" },
@@ -39,8 +40,7 @@
     read.run(() => everyPage((cursor) => campaignGroups(session.signer, withCursor(query, cursor))));
   $effect(() => { void load(asked); });
 
-  const owner = $derived(branch.kind === "org" ? { type: "org" as const, org_id: branch.org_id }
-    : { type: "user" as const, user_id: session.account!.user_id });
+  const owner = $derived({ type: "org" as const, org_id: branch.org_id });
   let name = $state("");
   const creating = new Busy();
 
@@ -51,9 +51,7 @@
     await creating.attempt(async () => {
       const problem = nameProblem(name);
       if (problem) throw new Error(problem);
-      // The route's owner is the reader when the body names none.
-      const created = await createCampaignGroup(session.signer,
-                                                { name: name.trim(), ...(branch.kind === "org" ? { owner: branch.org_id } : {}) });
+      const created = await createCampaignGroup(session.signer, { name: name.trim(), owner: branch.org_id });
       navigateFrom(from, campaignGroupLink(created.group_id));
     });
   }

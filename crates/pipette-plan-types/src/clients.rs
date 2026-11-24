@@ -332,6 +332,9 @@ pub struct Client {
     pub public_key: PublicKeyHex,
     pub organization: NonEmptyTrimmedString,
     pub client_details: NonEmptyTrimmedString,
+    /// An operator sets the name. The response omits it when the device has no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<NonEmptyTrimmedString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "ContactEmail"))]
     pub contact_email: Option<ContactEmail>,
@@ -343,17 +346,6 @@ pub struct Client {
     /// The flags the device reports itself, e.g. `runtime:llama_cpp`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub capabilities: BTreeSet<String>,
-}
-
-/// `owner=` on `GET /api/v1/clients`. An organization's devices are `org_id=`,
-/// since they roll up through its members.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum FleetOwner {
-    /// The devices the caller owns as a person.
-    Mine,
 }
 
 /// The scalar query parameters of `GET /api/v1/clients`. The repeatable
@@ -394,13 +386,7 @@ pub struct ClientListQuery {
         skip_serializing_if = "Option::is_none"
     )]
     pub owned: Option<bool>,
-    #[serde(
-        default,
-        deserialize_with = "crate::empty_as_none",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub owner: Option<FleetOwner>,
-    /// The devices an organization owns, directly or through a member.
+    /// The devices an organization owns.
     #[serde(
         default,
         deserialize_with = "crate::empty_as_none",
@@ -456,7 +442,7 @@ pub struct SetClientPermissionsRequest {
     pub permissions: BTreeSet<ClientPermission>,
 }
 
-/// `PATCH /api/v1/clients/{client_id}` request body: the three mutable detail
+/// `PATCH /api/v1/clients/{client_id}` request body: the four mutable detail
 /// fields. The owner has its own route, and status its own verbs, so either
 /// sent here is a `400` rather than ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,6 +455,10 @@ pub struct UpdateClientRequest {
     pub client_details: Option<NonEmptyTrimmedString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_email: Option<ContactEmail>,
+    /// The device's new name. The server trims it. A blank value clears the
+    /// name. If the field is absent or `null`, the name does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A device as its writes and its organization's roster answer it: the record
@@ -532,11 +522,6 @@ pub struct ClientDetail {
     pub view: ClientListRow,
     /// `manage_clients` whose device scope reaches the device.
     pub may_administer: bool,
-    /// The organization the device rolls up to, only for a reader of that
-    /// roster or the organization's own device administrator.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
-    pub owning_org_id: Option<OrgId>,
     /// The device's backlog by campaign, counted for this response. The value
     /// is `null` if the server cannot count it.
     pub backlog_by_campaign: Option<BacklogByCampaign>,

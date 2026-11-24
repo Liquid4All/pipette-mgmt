@@ -20,19 +20,14 @@ and implies it.
 
 | The device is | `manage_clients` | `manage_any_clients` |
 |---|---|---|
-| held by the caller's organization, directly or through a member | yes | yes |
-| held by nobody, or by an account in no organization | **no** | yes |
+| held by the caller's organization | yes | yes |
+| held by nobody | **no** | yes |
 | held by another organization | **no** | yes |
 
 The same bound applies to where a device may be **put down**: a scoped caller
 may assign only into its own organization, or detach, so a move can never widen
 another roster. Taking a device out of one organization and into another is
 `manage_any_clients` alone.
-
-A scoped caller may name only **itself** as a device's personal owner. A device a
-person owns fetches that person's private [vault](vault.md) artifacts, so handing
-one to a colleague would hand over the colleague's weights; that is
-`manage_any_clients` alone too.
 
 **Unowned devices are a server admin's.** An organization onboards through its
 own [client pre-auth keys](#client-pre-auth-keys), which
@@ -48,7 +43,7 @@ A refusal names the scope, never the organization that holds the device, so the
 route cannot be used to map another roster's inventory one probe at a time.
 
 It is separate from `manage_orgs` because the two decide different things about
-the same record: ownership says which organization a device rolls up to and is
+the same record: ownership says which organization holds a device and is
 a roster decision; this says whether the device may act at all. An operator who
 administers people need not be the one who admits machines. `manage_clients`
 implies `read_clients`, since every operation is a read-modify-write of a record
@@ -80,7 +75,8 @@ leave it out, and
 | The `warnings` of a filing route's report, and a plan's `warnings` and `progress_snapshot.starved_groups` | withheld tier |
 | [`GET /api/v1/plans/{plan_id}/explain`](plans/explain_plan.md): the `fleet` standing, clause ladder, roster and live match counts | withheld tier |
 | [`GET /api/v1/plans/{plan_id}/jobs`](plans/list_plan_jobs.md): lease holders and, with `results=true`, the device that ran each job and the reason it failed (its `failure_code` is served as recorded); the same in [`results.csv`](plans/get_plan_results_csv.md) | withheld tier |
-| The plan document, which names client ids and requirement sets: [`/document`](plans/get_plan_document.md), [`/variants`](plans/get_plan_variants.md), a revision that starts from it ([variant edit](campaigns/edit_variants.md)), and a job body in [`GET /api/v1/jobs/{job_id}/plans`](plans/list_job_plans.md) | withheld whole; `403` where the document is the whole response |
+| The plan document, which names client ids and requirement sets: [`/document`](plans/get_plan_document.md), [`/variants`](plans/get_plan_variants.md) and a revision that starts from it ([variant edit](campaigns/edit_variants.md)) | withheld whole; `403` where the document is the whole response |
+| A job body in [`GET /api/v1/jobs/{job_id}/plans`](plans/list_job_plans.md) | keeps `job_id`, `expires_at` and `spec`, and drops its six eligibility fields |
 
 **The withheld tier keeps the route and drops the fleet**, so a submitter can
 still file a plan, read it and ask why it waits. It keeps the caller's own job
@@ -105,6 +101,7 @@ A `ClientListRow` is the stored record plus what the server reads beside it.
 
 | Field | Meaning |
 |---|---|
+| `name` | An operator sets the name with [`PATCH /api/v1/clients/{client_id}`](devices/update_client.md). The response omits the field when the device has no name. |
 | `status` | `pending` or `approved` ([device status](#device-status)) |
 | `permissions` | The stored set, a name a device cannot hold included; `[]` when it holds none |
 | `tags` | Assigned by an operator ([client tags](#client-tags)) |
@@ -214,8 +211,8 @@ an organization vouches for is on its roster.
 **`perform_work` reaches past the organization.** The queue is shared: a device
 holding it claims any job whose requirements it matches, whichever
 organization's campaign filed it, and reports that job's result. What it
-fetches stays bounded by its owner ([the vault](vault.md)) and by the
-organization it rolls up to (a private benchmark's corpus,
+fetches stays bounded by the organization that owns it ([the vault](vault.md), a
+private benchmark's corpus,
 [`/api/v1/orgs/{org_id}/benchmarks`](orgs/put_org_benchmark.md)). Granting it vouches for a machine to the whole
 server, as approving one does.
 

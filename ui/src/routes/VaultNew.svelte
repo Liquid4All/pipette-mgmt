@@ -13,10 +13,9 @@
   let { route: _ }: { route: RouteOf<"vault-new"> } = $props();
 
   const account = $derived(session.account!);
-  const me = $derived(account.user_id);
   const owners = $derived(uploadOwners(account));
   let name = $state("");
-  let owner = $state(session.account!.user_id);
+  let owner = $state(uploadOwners(session.account!)[0]?.value ?? "");
   let type = $state("");
   let flavor = $state("");
   /** The file chosen for each role of the type shown. */
@@ -62,7 +61,7 @@
     });
     await work.attempt(async () => {
       lines = [];
-      const id = await upload(signedTransport(session.signer, gone.signal), { name, ...picked, owner, me, flavor },
+      const id = await upload(signedTransport(session.signer, gone.signal), { name, ...picked, owner, flavor },
                               chosen, (index, line) => { lines[index] = line; });
       if (!gone.signal.aborted) navigate(vaultLink(id));
     });

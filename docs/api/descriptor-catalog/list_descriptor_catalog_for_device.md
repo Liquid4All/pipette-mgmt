@@ -4,11 +4,21 @@ List the catalog members offered to a registered device. The caller needs
 `read_clients`, the same fleet-read permission as
 `GET /api/v1/clients/{client_id}`. An unknown device returns `404`.
 
+A device reads its own short list at
+[`GET /clients/me/descriptor-catalog`](../../httpapi.md#219-get-clientsmedescriptor-catalog).
+
 The response is one whole list. `items` contains pinned and active entries
 only: first the runtime entries, then the model entries, each newest release
 first. Each item has the entry's `name`, `scope`, `display_name`,
-`release_time`, `descriptor_kind` and `members`. Each member contains its
-selector, structured `member_key`, digest, and full descriptor.
+`release_time`, `descriptor_kind` and `members`. Each model entry also has a
+`family` field. Model pickers group entries by family. If the family has a
+logo, the item also has `family_logo_sha256`, the digest of the logo. Get
+the logo with
+[`GET /api/v1/descriptor-catalog/family-logos/{sha256}`](get_descriptor_family_logo.md).
+The device gets it with
+[`GET /clients/me/descriptor-catalog/family-logos/{sha256}`](../../httpapi.md#220-get-clientsmedescriptor-catalogfamily-logossha256).
+Each member has its selector, structured `member_key`, digest, and full
+descriptor.
 
 - **A runtime entry** gives one member: the first member in precedence that
   the device's stored flags and assigned tags satisfy. `member_key.flavor` is
@@ -53,10 +63,10 @@ A run can fail because of the model or the benchmark. So a success suggests
 that a build works, and does not prove it. A member matches a run through its
 digest, or through its verified alias. The scorer records each run as it
 scores it. A run that the server failed, and a run that a recalculation
-scored again, give no evidence. Without a `[database]`, `evidence` is absent.
+scored again, give no evidence.
 
-Offer rules can offer stock llama.cpp, OVMS, and the three runtimes built into
-the iOS app. The catalog offers a model member when the device can use an
+Offer rules can offer stock llama.cpp, OVMS, desktop MLX, the three runtimes
+built into the iOS app, and Apple Foundation. The catalog offers a model member when the device can use an
 offered runtime that loads it.
 
 `next_cursor` is always `null`; `unreadable` counts catalog records that could
@@ -87,4 +97,4 @@ Hidden and tombstoned entries are absent from both lists and counts.
 |--------|------|
 | 200 | The whole short list and withheld report |
 | 403 | The caller lacks `read_clients` |
-| 404 | The device is unknown, or the server has no `[database]` catalog |
+| 404 | The device is unknown |

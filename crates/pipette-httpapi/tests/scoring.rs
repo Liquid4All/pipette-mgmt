@@ -282,6 +282,82 @@ async fn test_throughput_scoring_produces_metrics() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A successful session writes one warehouse row with its duration in seconds.
+/// The model and runtime columns are null.
+#[tokio::test]
+async fn test_a_session_scores_to_its_duration_alone() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    std::fs::write(
+        dir.path().join("benchmarks/session.toml"),
+        r#"benchmark_type = "session""#,
+    )?;
+    let state = make_state(dir.path()).await?;
+    let (sk, client_id) = register_and_approve(&state).await?;
+
+    let job_id = submit_benchmark(
+        &state,
+        &sk,
+        &client_id,
+        &json!({
+            "benchmark_id": "session",
+            "benchmark_type": "session",
+            "benchmark_params": {},
+            "device_name": "test-device",
+            "device_form_factor": "desktop",
+            "device_os_name": "Linux",
+            "device_os_version": "24.04",
+            "device_chip_model": "test-chip",
+            "device_ram_bytes": 17179869184i64,
+            "session_duration": 5400
+        }),
+    )
+    .await?;
+
+    score::run_process_submissions(&state.config, stores_of(&state)).await?;
+
+    let resp = authed_get(&state, &sk, &client_id, &format!("/jobs/{job_id}")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await?;
+    assert_eq!(body["status"], "processed");
+    assert_eq!(body["benchmark_type"], "session");
+    let metrics = body["metrics"]
+        .as_array()
+        .context("missing metrics array")?;
+    let [metric] = metrics.as_slice() else {
+        anyhow::bail!("expected one metric, got {metrics:?}");
+    };
+    assert_eq!(metric["metric"], "session_duration");
+    assert_eq!(metric["value"], 5400.0);
+    assert_eq!(metric["unit"], "s");
+
+    let submitted_at = body["submitted_at"]
+        .as_str()
+        .context("missing submission timestamp")?
+        .parse::<jiff::Timestamp>()?;
+    let data_dir = state
+        .config
+        .storage
+        .data_dir()
+        .context("expected local_fs config")?;
+    let partition = warehouse::warehouse_day_partition_dir(
+        &data_dir.join("warehouse/results"),
+        &BenchmarkId::try_new("session")?,
+        &client_id,
+        &submitted_at.strftime("%Y-%m-%d").to_string(),
+    );
+    let rows = assert_string_column(&partition, "metric", Some("session_duration"))?;
+    assert_eq!(rows, 1, "a session writes one row");
+    [
+        "model_name",
+        "model_descriptor",
+        "runtime_name",
+        "runtime_descriptor",
+    ]
+    .into_iter()
+    .try_for_each(|column| assert_string_column(&partition, column, None).map(drop))
+}
+
 #[tokio::test]
 async fn test_scorer_preserves_mlx_model_name_and_quant() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

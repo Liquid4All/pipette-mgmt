@@ -9,8 +9,7 @@ a `403`:
 
 | Query parameter | Meaning |
 |---|---|
-| `owner=mine` | Only the resources this account owns |
-| `owner=org` | Only organization-owned resources |
+| `owner=org` | Only organization-owned resources, which is every resource; any other `owner` value is a `400` |
 | `org_id=…` | Narrow to one organization |
 | `limit`, `cursor`, `order` | [Pagination](../../httpapi.md#13-pagination) |
 | `names=true` | `names` beside the page, for the owners of its rows ([names](../../httpapi.md#14-names)) |
@@ -21,3 +20,4 @@ a `403`:
 | Status | When |
 |--------|------|
 | 200 | A page of resources |
+| 400 | `owner` is not `org` |

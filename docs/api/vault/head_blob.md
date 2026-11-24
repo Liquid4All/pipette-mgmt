@@ -10,6 +10,6 @@ not the file exists.
 | Status | When |
 |--------|------|
 | 200 | The file is uploaded for that principal |
-| 400 | `{principal_id}` is not an organization or account id, `{sha256}` is not 64 lowercase hex characters, or the principal does not exist |
+| 400 | `{principal_id}` is not an organization id, `{sha256}` is not 64 lowercase hex characters, or the principal does not exist |
 | 403 | The principal is outside the caller's scope |
 | 404 | The file is not uploaded for that principal |

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { orgLink, pathOf } from "../src/lib/routes";
-import { canonical, meLeaves, orgBranches, orgLeaves, serverLeaves } from "../src/lib/tree";
+import { ME_LEAVES, canonical, orgBranches, orgLeaves, serverLeaves } from "../src/lib/tree";
 import type { Route } from "../src/lib/routes";
 
 const own = { org_id: "org_own", slug: "acme" };
@@ -23,8 +23,7 @@ describe("tree", () => {
 
   test("each leaf opens its page in the app", () => {
     const reads = { roster: true, fleet: true, audit: true };
-    expect(meLeaves(reads).map((leaf) => leaf.href)).toEqual(
-      ["/app/me/campaigns", "/app/me/vault", "/app/me/devices", "/app/account"]);
+    expect(ME_LEAVES.map((leaf) => leaf.href)).toEqual(["/app/account"]);
     expect(orgLeaves({ org_id: "org_new", slug: "new" }, reads).map((leaf) => leaf.href)).toEqual([
       "/app/orgs/org_new/campaigns", "/app/orgs/org_new/vault",
       "/app/orgs/org_new/benchmarks", "/app/orgs/org_new/members", "/app/orgs/org_new/devices",
@@ -48,8 +47,6 @@ describe("tree", () => {
   });
 
   test("leaves follow the reader's grants", () => {
-    expect(meLeaves({ roster: false, fleet: false, audit: false }).map((leaf) => leaf.label)).toEqual(
-      ["Campaigns", "Vault", "Account"]);
     expect(orgLeaves(own, { roster: false, fleet: true, audit: false }).map((leaf) => leaf.label)).toEqual(
       ["Campaigns", "Vault", "Benchmarks"]);
     expect(orgLeaves(own, { roster: true, fleet: false, audit: true }).map((leaf) => leaf.label)).toEqual(

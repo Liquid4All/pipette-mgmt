@@ -7,13 +7,15 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use nutype::nutype;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::Digest;
 
+use crate::principal::GLOBAL_CATALOG_QUALIFIER;
 use crate::{
     GgufText, GgufTextSource, GgufVision, GgufVisionSource, GgufVisionSpeculative,
     GgufVisionSpeculativeSource, GitOid, HfRepo, IdError, Mlx, Model, ModelSource, ModelType,
     NonEmptyVec, OnnxGenai, Openvino, OrgId, OrgSlug, OrgSlugError, PrincipalIdError, Runtime,
-    RuntimeType, Torch, UserId, descriptor_digest, drop_vault_custom_labels, is_vault_source,
-    names_vault_source,
+    RuntimeType, Sha256, Torch, UserId, descriptor_digest, drop_vault_custom_labels,
+    is_vault_source, names_vault_source,
 };
 
 /// The namespace that owns a catalog name. The database stores the global
@@ -47,7 +49,7 @@ pub enum CatalogParseError {
 
 impl CatalogScope {
     /// The word that names the global scope.
-    pub const GLOBAL: &str = "global";
+    pub const GLOBAL: &str = GLOBAL_CATALOG_QUALIFIER;
 
     pub fn sql_key(&self) -> &str {
         match self {
@@ -116,6 +118,8 @@ pub struct CatalogName(String);
 
 impl CatalogName {
     pub const MAX_LEN: usize = 200;
+    /// The character and spacing rules for a catalog name in JSON Schema.
+    pub const SCHEMA_PATTERN: &str = "^[A-Za-z0-9](?: ?[A-Za-z0-9._-])*$";
 
     pub fn as_str(&self) -> &str {
         self.as_ref()
@@ -155,6 +159,171 @@ fn validate_catalog_name(s: &str) -> Result<(), IdError> {
         });
     }
     Ok(())
+}
+
+/// The URI of a model family's logo. It has one of two forms:
+///
+/// - A URI under [`LogoUri::PREFIX`], the one remote image source that the
+///   web console's content security policy admits.
+/// - A data URI that holds the image: `data:`, a media type of
+///   [`LogoUri::DATA_MEDIA_TYPES`], `;base64,`, and then padded base64.
+#[nutype(
+    validate(with = validate_logo_uri, error = IdError),
+    derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Display, Serialize, Deserialize, FromStr),
+)]
+pub struct LogoUri(String);
+
+impl LogoUri {
+    pub const PREFIX: &str = "https://pipette.liquid.ai/logos/";
+    /// The image types that a logo data URI can have.
+    pub const DATA_MEDIA_TYPES: [&str; 3] = ["image/png", "image/svg+xml", "image/webp"];
+    pub const MAX_LEN: usize = 65_536;
+    /// The rules of [`validate_logo_uri`] in JSON Schema.
+    pub const SCHEMA_PATTERN: &str = "^(?:https://pipette\\.liquid\\.ai/logos/[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*|data:image/(?:png|svg\\+xml|webp);base64,(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4}))$";
+
+    pub fn as_str(&self) -> &str {
+        self.as_ref()
+    }
+
+    /// The lowercase hex SHA-256 of the URI's bytes. A catalog read gives
+    /// this digest, and a client fetches the logo with it.
+    pub fn sha256(&self) -> String {
+        hex::encode(sha2::Sha256::digest(self.as_str().as_bytes()))
+    }
+}
+
+/// A logo URI is [`LogoUri::PREFIX`] and a path, or a data URI. It has at
+/// most [`LogoUri::MAX_LEN`] characters.
+fn validate_logo_uri(s: &str) -> Result<(), IdError> {
+    const FIELD: &str = "logo URI";
+    if let Some(path) = s.strip_prefix(LogoUri::PREFIX) {
+        validate_logo_path(path)?;
+    } else if let Some(data) = s.strip_prefix("data:") {
+        validate_logo_data(data)?;
+    } else {
+        return Err(IdError::Form {
+            field: FIELD,
+            expected: "a URI under https://pipette.liquid.ai/logos/ or a data URI",
+        });
+    }
+    // Every character is ASCII here, so the byte length is the character count.
+    if s.len() > LogoUri::MAX_LEN {
+        return Err(IdError::Width {
+            field: FIELD,
+            expected: "at most 65536 characters",
+            got: s.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Use `/` between path segments after [`LogoUri::PREFIX`]. A segment uses
+/// the characters `[A-Za-z0-9._-]`. A segment does not start with `.`.
+/// No segment is `..`, so the path stays in the logo folder.
+fn validate_logo_path(path: &str) -> Result<(), IdError> {
+    const ALLOWED: &str = "path segments of [A-Za-z0-9._-] separated by '/'; a segment must not be empty or start with '.'";
+    if path.is_empty() {
+        return Err(IdError::Empty {
+            field: "logo URI path",
+        });
+    }
+    let bad = path.split('/').find_map(|segment| {
+        let mut chars = segment.chars();
+        match chars.next() {
+            None => Some('/'),
+            Some(first) if first == '.' || !is_logo_char(first) => Some(first),
+            Some(_) => chars.find(|&ch| !is_logo_char(ch)),
+        }
+    });
+    match bad {
+        Some(ch) => Err(IdError::InvalidChar {
+            field: "logo URI",
+            ch,
+            allowed: ALLOWED,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The part of a data URI after `data:` is a media type of
+/// [`LogoUri::DATA_MEDIA_TYPES`], `;base64,`, and then base64 of the standard
+/// alphabet. Use a nonempty base64 value with a length that is a multiple of
+/// four. End the value with at most two `=` characters.
+fn validate_logo_data(data: &str) -> Result<(), IdError> {
+    let payload = data
+        .split_once(";base64,")
+        .filter(|(media_type, _)| LogoUri::DATA_MEDIA_TYPES.contains(media_type))
+        .map(|(_, payload)| payload)
+        .ok_or(IdError::Form {
+            field: "logo data URI",
+            expected: "data:image/png, data:image/svg+xml or data:image/webp, then ;base64,",
+        })?;
+    let digits = payload.trim_end_matches('=');
+    let valid = !payload.is_empty()
+        && payload.len() % 4 == 0
+        && payload.len() - digits.len() <= 2
+        && digits
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/'));
+    if valid {
+        Ok(())
+    } else {
+        Err(IdError::Form {
+            field: "logo data URI",
+            expected: "padded base64 of the standard alphabet after ;base64,",
+        })
+    }
+}
+
+fn is_logo_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
+}
+
+/// The logo of a model family in one scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct FamilyLogo {
+    pub scope: CatalogScope,
+    /// The family in the case that the operator wrote. Lookup ignores case.
+    pub family: CatalogName,
+    pub logo_uri: LogoUri,
+}
+
+/// The digest of the logo of a model family in one scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyLogoDigest {
+    pub scope: CatalogScope,
+    /// The family in the case that the operator wrote. Lookup ignores case.
+    pub family: CatalogName,
+    /// [`LogoUri::sha256`] of the logo.
+    pub sha256: Sha256,
+}
+
+/// The family logo digests of some scopes, for the readers of their entries.
+#[derive(Debug, Default)]
+pub struct FamilyLogos(HashMap<(CatalogScope, String), Sha256>);
+
+impl FromIterator<FamilyLogoDigest> for FamilyLogos {
+    fn from_iter<I: IntoIterator<Item = FamilyLogoDigest>>(logos: I) -> Self {
+        Self(
+            logos
+                .into_iter()
+                .map(|logo| ((logo.scope, logo.family.key()), logo.sha256))
+                .collect(),
+        )
+    }
+}
+
+impl FamilyLogos {
+    /// The logo digest of the family of `entry`: the digest of the entry's
+    /// scope, or else the global digest. A runtime entry has no family, so it
+    /// has no logo.
+    pub fn of(&self, entry: &DescriptorEntry) -> Option<&Sha256> {
+        let key = entry.family()?.to_ascii_lowercase();
+        self.0
+            .get(&(entry.scope.clone(), key.clone()))
+            .or_else(|| self.0.get(&(CatalogScope::Global, key)))
+    }
 }
 
 /// The scope part of a qualified catalog name: `global`, or an organization
@@ -377,22 +546,24 @@ pub enum ModelFormat {
     Torch,
     Openvino,
     Onnx,
+    // A model that ships with the operating system, so it names no files.
+    System,
 }
 
 impl ModelFormat {
     /// The format of a model type. A speculative type has the format of its
-    /// base type. `apple_foundation_text` names no files, so it has no format.
-    pub fn of(model_type: ModelType) -> Option<Self> {
+    /// base type.
+    pub fn of(model_type: ModelType) -> Self {
         match model_type {
             ModelType::GgufText | ModelType::GgufVision | ModelType::GgufVisionSpeculative => {
-                Some(Self::Gguf)
+                Self::Gguf
             }
-            ModelType::Mlx | ModelType::MlxSpeculative => Some(Self::Mlx),
-            ModelType::AppleCoreAi => Some(Self::CoreAi),
-            ModelType::Torch | ModelType::TorchSpeculative => Some(Self::Torch),
-            ModelType::Openvino => Some(Self::Openvino),
-            ModelType::OnnxGenai => Some(Self::Onnx),
-            ModelType::AppleFoundationText => None,
+            ModelType::Mlx | ModelType::MlxSpeculative => Self::Mlx,
+            ModelType::AppleCoreAi => Self::CoreAi,
+            ModelType::Torch | ModelType::TorchSpeculative => Self::Torch,
+            ModelType::Openvino => Self::Openvino,
+            ModelType::OnnxGenai => Self::Onnx,
+            ModelType::AppleFoundationText => Self::System,
         }
     }
 }
@@ -457,8 +628,6 @@ pub enum MemberError {
     DigestMismatch,
     #[error("The member key does not match its descriptor.")]
     KeyMismatch,
-    #[error("model type {0} has no catalog format")]
-    NoFormat(ModelType),
     #[error("each source of a model member must be a Hugging Face repository")]
     NotHuggingFace,
     #[error("{0} must pin a commit: a revision of 40 lowercase hex characters")]
@@ -481,6 +650,9 @@ pub struct DescriptorMember {
     body: MemberBody,
     digest: String,
     alias_digest: Option<String>,
+    /// The download size in bytes for a model member. The digest excludes
+    /// this value. The member's JSON representation also omits it.
+    size_bytes: Option<u64>,
     added_at: Timestamp,
 }
 
@@ -695,6 +867,16 @@ impl DescriptorMember {
         self.alias_digest = alias_digest;
         self
     }
+    /// The bytes that a client downloads for this model member, if the
+    /// server recorded them.
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+    /// Attach the download size that the caller read at the pinned commit.
+    pub fn with_size_bytes(mut self, size_bytes: Option<u64>) -> Self {
+        self.size_bytes = size_bytes;
+        self
+    }
     /// The same model member with the label `quantization`. The label is not
     /// part of the digest, so the digest stays the same. A runtime member has
     /// no label, so the result is `None` for it.
@@ -748,6 +930,7 @@ impl DescriptorMember {
             body: MemberBody::Runtime { runtime, flavor },
             digest,
             alias_digest: None,
+            size_bytes: None,
             added_at: whole_micros(added_at),
         })
     }
@@ -760,7 +943,7 @@ impl DescriptorMember {
         added_at: Timestamp,
     ) -> Result<Self, MemberError> {
         let model_type = ModelType::of(&model);
-        let format = ModelFormat::of(model_type).ok_or(MemberError::NoFormat(model_type))?;
+        let format = ModelFormat::of(model_type);
         let value = serde_json::to_value(&model)?;
         if only_vault_sources(&value) {
             // The writer checks each resource's org owner and its record.
@@ -789,6 +972,7 @@ impl DescriptorMember {
             },
             digest,
             alias_digest: None,
+            size_bytes: None,
             added_at: whole_micros(added_at),
         })
     }
@@ -952,6 +1136,15 @@ pub enum EntryError {
     SpeculativeMix,
     #[error("duplicate member digest: {0}")]
     DuplicateDigest(String),
+    #[error("only a model catalog entry has a family")]
+    RuntimeFamily,
+}
+
+/// The family of a model entry with no override: the text of `name` before
+/// its first hyphen, or the whole name if it has no hyphen.
+fn default_family(name: &CatalogName) -> &str {
+    let name = name.as_str();
+    name.split_once('-').map_or(name, |(head, _)| head)
 }
 
 /// A named, ordered sequence of descriptors of one kind: runtimes of one
@@ -972,6 +1165,11 @@ pub struct DescriptorEntry {
     pub created_at: Timestamp,
     pub created_by: DescriptorEntryCreator,
     pub members: NonEmptyVec<DescriptorMember>,
+    /// The family that an operator set for a model entry. A runtime entry has
+    /// none. [`DescriptorEntry::family`] gives the family that readers see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub family: Option<CatalogName>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -988,6 +1186,9 @@ struct EntryWire {
     created_at: Timestamp,
     created_by: DescriptorEntryCreator,
     members: NonEmptyVec<DescriptorMember>,
+    #[serde(default)]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    family: Option<CatalogName>,
 }
 
 impl TryFrom<EntryWire> for DescriptorEntry {
@@ -1001,7 +1202,7 @@ impl TryFrom<EntryWire> for DescriptorEntry {
         )?;
         Self::validate_members(&wire.members)?;
         Self::validate_scope_members(&wire.scope, &wire.members)?;
-        Ok(Self {
+        Self {
             scope: wire.scope,
             name: wire.name,
             kind: wire.kind,
@@ -1010,7 +1211,9 @@ impl TryFrom<EntryWire> for DescriptorEntry {
             created_at: whole_micros(wire.created_at),
             created_by: wire.created_by,
             members: wire.members,
-        })
+            family: None,
+        }
+        .with_family(wire.family)
     }
 }
 
@@ -1044,6 +1247,29 @@ impl DescriptorEntry {
             created_at: whole_micros(created_at),
             created_by,
             members,
+            family: None,
+        })
+    }
+
+    /// Set or clear the family override. A runtime entry refuses a family.
+    pub fn with_family(mut self, family: Option<CatalogName>) -> Result<Self, EntryError> {
+        if family.is_some() && self.descriptor_kind() != DescriptorKind::Model {
+            return Err(EntryError::RuntimeFamily);
+        }
+        self.family = family;
+        Ok(self)
+    }
+
+    /// The family that readers see for a model entry: the operator's
+    /// override, or else the text of the name before its first hyphen. A
+    /// runtime entry has no family.
+    pub fn family(&self) -> Option<&str> {
+        if self.descriptor_kind() != DescriptorKind::Model {
+            return None;
+        }
+        Some(match &self.family {
+            Some(family) => family.as_str(),
+            None => default_family(&self.name),
         })
     }
 
@@ -1512,7 +1738,7 @@ mod tests {
         "python_version": "3.12",
         "source": {
             "type": "vault_wheelhouse", "url": "/vault/resources/vault_1/content",
-            "contents": "x", "principal_id": "user_1"
+            "contents": "x", "principal_id": "org_1"
         }
     }))]
     fn vault_member_requires_org_scope(#[case] runtime: Value) -> anyhow::Result<()> {
@@ -1584,19 +1810,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case::gguf_text(ModelType::GgufText, Some(ModelFormat::Gguf))]
-    #[case::gguf_vision(ModelType::GgufVision, Some(ModelFormat::Gguf))]
-    #[case::gguf_vision_speculative(ModelType::GgufVisionSpeculative, Some(ModelFormat::Gguf))]
-    #[case::mlx(ModelType::Mlx, Some(ModelFormat::Mlx))]
-    #[case::mlx_speculative(ModelType::MlxSpeculative, Some(ModelFormat::Mlx))]
-    #[case::torch(ModelType::Torch, Some(ModelFormat::Torch))]
-    #[case::torch_speculative(ModelType::TorchSpeculative, Some(ModelFormat::Torch))]
-    #[case::openvino(ModelType::Openvino, Some(ModelFormat::Openvino))]
-    #[case::onnx_genai(ModelType::OnnxGenai, Some(ModelFormat::Onnx))]
-    #[case::apple_foundation_text(ModelType::AppleFoundationText, None)]
+    #[case::gguf_text(ModelType::GgufText, ModelFormat::Gguf)]
+    #[case::gguf_vision(ModelType::GgufVision, ModelFormat::Gguf)]
+    #[case::gguf_vision_speculative(ModelType::GgufVisionSpeculative, ModelFormat::Gguf)]
+    #[case::mlx(ModelType::Mlx, ModelFormat::Mlx)]
+    #[case::mlx_speculative(ModelType::MlxSpeculative, ModelFormat::Mlx)]
+    #[case::torch(ModelType::Torch, ModelFormat::Torch)]
+    #[case::torch_speculative(ModelType::TorchSpeculative, ModelFormat::Torch)]
+    #[case::openvino(ModelType::Openvino, ModelFormat::Openvino)]
+    #[case::onnx_genai(ModelType::OnnxGenai, ModelFormat::Onnx)]
+    #[case::apple_foundation_text(ModelType::AppleFoundationText, ModelFormat::System)]
     fn model_format_follows_the_type_table(
         #[case] model_type: ModelType,
-        #[case] format: Option<ModelFormat>,
+        #[case] format: ModelFormat,
     ) {
         assert_eq!(ModelFormat::of(model_type), format);
     }
@@ -1657,10 +1883,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::apple_foundation_text(
-        json!({"type": "apple_foundation_text"}),
-        |e: &MemberError| matches!(e, MemberError::NoFormat(ModelType::AppleFoundationText)),
-    )]
     #[case::url(
         json!({"type": "gguf_text", "source": "url", "url": "https://example.com/model.gguf"}),
         |e: &MemberError| matches!(e, MemberError::NotHuggingFace),
@@ -1769,6 +1991,199 @@ mod tests {
             members,
         );
         assert!(matches!(refused, Err(EntryError::ModelKind)), "{refused:?}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("LFM2.5-1.2B-Instruct", None, "LFM2.5")]
+    #[case("Gemma", None, "Gemma")]
+    #[case("Qwen3 Coder -7B", None, "Qwen3 Coder ")]
+    #[case("LFM2.5-1.2B", Some("LFM"), "LFM")]
+    fn a_model_entry_has_a_family(
+        #[case] name: &str,
+        #[case] family: Option<&str>,
+        #[case] expected: &str,
+    ) -> anyhow::Result<()> {
+        let at = Timestamp::now();
+        let members = NonEmptyVec::try_new(vec![a_model(pinned("mlx", "AcmeLM-3B"), "4bit", at)?])?;
+        let entry = DescriptorEntry::new(
+            CatalogScope::Global,
+            CatalogName::try_new(name)?,
+            DescriptorEntryKind::HandMade,
+            DescriptorEntryState::Active,
+            at,
+            at,
+            DescriptorEntryCreator::Operator,
+            members,
+        )?
+        .with_family(family.map(CatalogName::try_new).transpose()?)?;
+        assert_eq!(entry.family(), Some(expected));
+        assert_eq!(
+            serde_json::from_str::<DescriptorEntry>(&serde_json::to_string(&entry)?)?,
+            entry
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_runtime_entry_has_no_family() -> anyhow::Result<()> {
+        let at = Timestamp::now();
+        let entry = DescriptorEntry::new(
+            CatalogScope::Global,
+            CatalogName::try_new("apple-1")?,
+            DescriptorEntryKind::HandMade,
+            DescriptorEntryState::Active,
+            at,
+            at,
+            DescriptorEntryCreator::Operator,
+            NonEmptyVec::try_new(vec![a_member(apple(), at)?])?,
+        )?;
+        assert_eq!(entry.family(), None);
+        let refused = entry.with_family(Some(CatalogName::try_new("Apple")?));
+        assert!(
+            matches!(refused, Err(EntryError::RuntimeFamily)),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case("https://pipette.liquid.ai/logos/lfm.svg", true)]
+    #[case("https://pipette.liquid.ai/logos/vendors/Qwen_3-x.png", true)]
+    #[case("https://pipette.liquid.ai/logos/", false)]
+    #[case("https://pipette.liquid.ai/logos/a//b.png", false)]
+    #[case("https://pipette.liquid.ai/logos/a/", false)]
+    #[case("https://pipette.liquid.ai/logos/../x.png", false)]
+    #[case("https://pipette.liquid.ai/logos/a/../../x.png", false)]
+    #[case("https://pipette.liquid.ai/logos/.hidden", false)]
+    #[case("https://pipette.liquid.ai/logos/a.png?v=1", false)]
+    #[case("https://pipette.liquid.ai/logos/a.png#top", false)]
+    #[case("https://pipette.liquid.ai/logos/a b.png", false)]
+    #[case("https://pipette.liquid.ai/logos/a%2F.png", false)]
+    #[case("http://pipette.liquid.ai/logos/a.png", false)]
+    #[case("https://pipette.liquid.ai/a.png", false)]
+    #[case("https://pipette.liquid.ai.example.com/logos/a.png", false)]
+    #[case("https://user@pipette.liquid.ai/logos/a.png", false)]
+    #[case("https://pipette.liquid.ai:8443/logos/a.png", false)]
+    #[case("HTTPS://pipette.liquid.ai/logos/a.png", false)]
+    #[case("data:image/png;base64,iVBORw0KGgo=", true)]
+    #[case("data:image/svg+xml;base64,PHN2Zy8+", true)]
+    #[case("data:image/webp;base64,UklGRg==", true)]
+    #[case("data:image/png;base64,a+/9", true)]
+    #[case("data:image/png;base64,", false)]
+    #[case("data:image/png;base64,abc", false)]
+    #[case("data:image/png;base64,a===", false)]
+    #[case("data:image/png;base64,ab=c", false)]
+    #[case("data:image/png;base64,ab-_", false)]
+    #[case("data:image/png;base64,ab c", false)]
+    #[case("data:image/png,abcd", false)]
+    #[case("data:image/jpeg;base64,abcd", false)]
+    #[case("data:text/html;base64,abcd", false)]
+    #[case("data:image/svg+xml;charset=utf-8;base64,abcd", false)]
+    #[case("data:;base64,abcd", false)]
+    #[case("DATA:image/png;base64,abcd", false)]
+    #[case("data:IMAGE/PNG;base64,abcd", false)]
+    #[case("data://image/png;base64,abcd", false)]
+    fn a_logo_uri_is_in_the_logo_folder_or_a_data_uri(
+        #[case] uri: &str,
+        #[case] ok: bool,
+    ) -> anyhow::Result<()> {
+        assert_eq!(LogoUri::try_new(uri).is_ok(), ok, "{uri}");
+        let pattern = regex::Regex::new(LogoUri::SCHEMA_PATTERN)?;
+        assert_eq!(pattern.is_match(uri), ok, "schema pattern disagrees: {uri}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::https_at_limit(LogoUri::PREFIX, 0, true)]
+    #[case::https_over_limit(LogoUri::PREFIX, 1, false)]
+    // Base64 grows in groups of four characters.
+    #[case::data_at_limit("data:image/png;base64,", 0, true)]
+    #[case::data_over_limit("data:image/png;base64,", 4, false)]
+    fn a_logo_uri_has_a_length_limit(
+        #[case] prefix: &str,
+        #[case] extra: usize,
+        #[case] ok: bool,
+    ) -> anyhow::Result<()> {
+        let room = LogoUri::MAX_LEN - prefix.len();
+        let fill = if prefix.starts_with("data:") {
+            room - room % 4
+        } else {
+            room
+        };
+        let uri = format!("{prefix}{}", "a".repeat(fill + extra));
+        if ok {
+            LogoUri::try_new(uri)?;
+        } else {
+            assert!(LogoUri::try_new(uri).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_logo_digest_is_the_sha256_of_the_uri() -> anyhow::Result<()> {
+        let uri = LogoUri::try_new("data:image/png;base64,abcd")?;
+        assert_eq!(
+            uri.sha256(),
+            "c2e7d21098f9131392a4dc3789f3b8de9561b38e3ad627389872d24a5ca4fa02"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::own_scope(&[("org", "LFM2.5", "org.svg"), ("global", "LFM2.5", "global.svg")], "org", false, Some("org.svg"))]
+    #[case::global_fallback(&[("global", "LFM2.5", "global.svg")], "org", false, Some("global.svg"))]
+    #[case::case_ignored(&[("global", "lfm2.5", "global.svg")], "global", false, Some("global.svg"))]
+    #[case::other_org_ignored(&[("other", "LFM2.5", "other.svg")], "org", false, None)]
+    #[case::org_logo_not_global(&[("org", "LFM2.5", "org.svg")], "global", false, None)]
+    #[case::other_family(&[("global", "LFM2", "global.svg")], "global", false, None)]
+    // A runtime entry has no family, so the logo of the family its name would give does not apply.
+    #[case::runtime_entry(&[("global", "LFM2.5", "global.svg")], "global", true, None)]
+    fn a_family_logo_comes_from_the_entry_scope_then_global(
+        #[case] logos: &[(&str, &str, &str)],
+        #[case] entry_scope: &str,
+        #[case] runtime: bool,
+        #[case] expected: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let scope = |name: &str| -> anyhow::Result<CatalogScope> {
+            Ok(match name {
+                "global" => CatalogScope::Global,
+                org => CatalogScope::Org(OrgId::try_new(format!("org_{org}"))?),
+            })
+        };
+        // A stand-in digest that differs for each file.
+        let digest = |file: &str| format!("{:0>64}", hex::encode(file));
+        let logos = logos
+            .iter()
+            .map(|&(at, family, file)| {
+                Ok(FamilyLogoDigest {
+                    scope: scope(at)?,
+                    family: CatalogName::try_new(family)?,
+                    sha256: Sha256::try_new(digest(file))?,
+                })
+            })
+            .collect::<anyhow::Result<FamilyLogos>>()?;
+        let at = Timestamp::now();
+        let member = if runtime {
+            a_member(apple(), at)?
+        } else {
+            a_model(pinned("mlx", "AcmeLM-3B"), "4bit", at)?
+        };
+        let mut entry = DescriptorEntry::new(
+            CatalogScope::Global,
+            CatalogName::try_new("LFM2.5-1.2B")?,
+            DescriptorEntryKind::HandMade,
+            DescriptorEntryState::Active,
+            at,
+            at,
+            DescriptorEntryCreator::Operator,
+            NonEmptyVec::try_new(vec![member])?,
+        )?;
+        entry.scope = scope(entry_scope)?;
+        assert_eq!(
+            logos.of(&entry).map(AsRef::as_ref),
+            expected.map(digest).as_deref()
+        );
         Ok(())
     }
 

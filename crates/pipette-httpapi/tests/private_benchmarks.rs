@@ -536,7 +536,7 @@ async fn an_outsider_without_the_claim_learns_nothing(
 #[rstest]
 #[case::member_user(Owner::Acme, false, true)]
 #[case::outsider_user(Owner::OtherOrg, false, false)]
-#[case::unaffiliated_user(Owner::Nobody, false, false)]
+#[case::own_org_user(Owner::Nobody, false, false)]
 #[case::operator(Owner::Nobody, true, true)]
 #[tokio::test]
 async fn a_plan_names_a_private_benchmark_only_from_inside(
@@ -552,7 +552,10 @@ async fn a_plan_names_a_private_benchmark_only_from_inside(
         grants.push(UserPermission::SubmitAnyPlans);
     }
     let signer = registered_user(state, &grants).await?;
-    set_user_org(state, &signer.1, world.org(owner)).await?;
+    // `Nobody` keeps the signer on its own organization.
+    if let Some(org_id) = world.org(owner) {
+        set_user_org(state, &signer.1, Some(org_id)).await?;
+    }
     let campaign_id = put_idle_campaign(state, &signer.1, "Private").await?;
     let uri = format!("/api/v1/campaigns/{campaign_id}/plans");
     let post =
@@ -689,10 +692,9 @@ async fn a_plan_records_its_benchmark_types() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A campaign that ran an organization's private benchmark stays inside it: a
-/// filer who moves away cannot hand it to the new organization, whose readers
-/// would read the private results, and can hand it back inside. With the
-/// entry deleted, only a server admin hands it over.
+/// A campaign that ran an organization's private benchmark stays inside it:
+/// another organization's readers would read the private results. With the
+/// entry deleted, nobody can say whose they are, and a server admin hands it over.
 #[tokio::test]
 async fn a_campaign_with_private_results_stays_in_its_organization() -> anyhow::Result<()> {
     let world = world().await?;
@@ -705,44 +707,17 @@ async fn a_campaign_with_private_results_stays_in_its_organization() -> anyhow::
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-    set_user_org(state, &filer.1, Some(world.labs.clone())).await?;
+    let root = registered_user(state, UserPermissionGroup::ServerAdmin.permissions()).await?;
     let to_labs = json!({ "owner": { "type": "org", "org_id": world.labs } });
-    let resp = signed_json(state, &filer, "PUT", &uri, &to_labs).await?;
+    let resp = signed_json(state, &root, "PUT", &uri, &to_labs).await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let error = json_str(&body_json(resp).await?, "error")?.to_string();
     assert!(error.contains(PRIVATE), "{error}");
 
-    set_user_org(state, &filer.1, Some(world.acme.clone())).await?;
-    let to_acme = json!({ "owner": { "type": "org", "org_id": world.acme } });
-    let resp = signed_json(state, &filer, "PUT", &uri, &to_acme).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // A person is held to the same line, by the organization they belong to.
-    let root = registered_user(state, UserPermissionGroup::ServerAdmin.permissions()).await?;
-    let outsider = registered_user(state, &[UserPermission::SubmitPlans]).await?;
-    set_user_org(state, &outsider.1, Some(world.labs.clone())).await?;
-    let to_outsider = json!({ "owner": { "type": "user", "user_id": outsider.1 } });
-    let resp = signed_json(state, &root, "PUT", &uri, &to_outsider).await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    // Once the entry is deleted nobody can say whose results these are, so
-    // the hand-over is a server admin's.
     state
         .catalog_store
         .delete_org_benchmark(&world.acme, &BenchmarkId::try_new(PRIVATE)?)
         .await?;
-    let lead = registered_user(
-        state,
-        &[UserPermission::ManageOrgs, UserPermission::SubmitPlans],
-    )
-    .await?;
-    set_user_org(state, &lead.1, Some(world.acme.clone())).await?;
-    let to_lead = json!({ "owner": { "type": "user", "user_id": lead.1 } });
-    let resp = signed_json(state, &lead, "PUT", &uri, &to_lead).await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let error = json_str(&body_json(resp).await?, "error")?.to_string();
-    assert!(error.contains("no catalog holds"), "{error}");
-    assert!(error.contains(PRIVATE), "{error}");
     let resp = signed_json(state, &root, "PUT", &uri, &to_labs).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     Ok(())

@@ -17,7 +17,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde_json::Value;
 
 use pipette_core::canonical_json::sort_keys;
-use pipette_plan_types::ErrorBody;
+use pipette_plan_types::{CatalogName, ErrorBody};
 
 use self::table::operations;
 use crate::auth::TIMESTAMP_TOLERANCE_SECS;
@@ -360,12 +360,9 @@ the `ErrorBody` envelope. A TOML body's schema is of its parsed data: a plan doc
 `SchedulerPlan`.\n\n\
 **Getting a key.** Every request but registration and this document's own is signed by one of \
 the account's Ed25519 keys, as the `userSignature` scheme describes. A caller makes a keypair and \
-registers its public key at `POST /api/v1/users/register`, unsigned, with one of:\n\n\
-- `user_preauth_key`: the invite an administrator of the account minted at \
-`POST /api/v1/users/{user_id}/preauth-keys` and handed over. The key joins that account, \
-normally `active`.\n\
-- `contact_email`: a request for a new account. It starts `pending`, holding no permissions, \
-and its key reads `GET /api/v1/users/me` alone until an operator approves it.\n\n\
+registers its public key at `POST /api/v1/users/register`, unsigned, with the \
+`user_preauth_key` an administrator of the account minted at \
+`POST /api/v1/users/{user_id}/preauth-keys` and handed over. The key joins that account.\n\n\
 The app registers a browser's key through a Clerk sign-in instead, at \
 `POST /api/v1/users/register/clerk`. The answer's `key_id` is the `keyid` each signature names, \
 and a signing account adds keys at `POST /api/v1/users/me/keys`. The [Users](#tag/users) section \
@@ -396,7 +393,8 @@ leave it out when there are none.\n\n\
 **Size limits.** A body over its route's cap is a `413`, never parsed. A body carrying a plan \
 document (the plan and campaign routes that file or check one) may be 128 MiB by default (the \
 server's `plan_body_limit_bytes`), a vault blob 128 GiB by default (`vault_blob_limit_bytes`), \
-streamed; every other body 64 KiB by default (`default_body_limit_bytes`).\n\n\
+streamed; a family logo upload 65 KiB; every other body 64 KiB by default \
+(`default_body_limit_bytes`).\n\n\
 **Write answers.** A write that edits one record answers the record as stored after it, \
 plus `changed`. `changed: false` is a success that wrote nothing, since the record already \
 held what was asked, so a retry is safe.\n\n\
@@ -1022,7 +1020,7 @@ impl Auth {
         match self {
             Self::Open => "Unsigned.".to_owned(),
             Self::Clerk => "Authenticated by a Clerk session token, unsigned.".to_owned(),
-            Self::Signed => "Any account's signature, pending accounts' included.".to_owned(),
+            Self::Signed => "Any account's signature.".to_owned(),
             Self::Gated(gate, _) => match gate {
                 Active => "Any active account.".to_owned(),
                 Needs(permission) => format!("Needs `{}`.", permission.as_ref()),
@@ -1091,6 +1089,24 @@ struct PathRule {
     description: &'static str,
 }
 
+const CATALOG_NAME_PATH: &str = "/descriptor-catalog/{name}";
+const FAMILY_PATH: &str = "/descriptor-families/{family}";
+
+impl PathRule {
+    fn schema(&self) -> Value {
+        let fields = [
+            ("type", "string".into()),
+            ("pattern", self.pattern.into()),
+            ("examples", vec![self.example].into()),
+            ("description", self.description.into()),
+        ];
+        let max_length = [CATALOG_NAME_PATH, FAMILY_PATH]
+            .contains(&self.at)
+            .then_some(("maxLength", CatalogName::MAX_LEN.into()));
+        object(fields.into_iter().chain(max_length))
+    }
+}
+
 /// One per route fragment; `test_every_path_parameter_states_its_rule` holds
 /// each pattern to its type's parser. Patterns take the canonical form, so a
 /// padded or upper-case value the parser trims or lowercases fails them.
@@ -1110,7 +1126,7 @@ const PATH_RULES: &[PathRule] = &[
     },
     PathRule {
         at: "/policies/{kind}",
-        pattern: "^(swap|spread|failed|ttft_over_e2e|model_params|smaller_failed)$",
+        pattern: "^(swap|spread|failed|ttft_over_e2e|model_params|smaller_failed|vault_resource)$",
         example: "spread",
         description: "The check the policy acts on.",
     },
@@ -1153,10 +1169,16 @@ const PATH_RULES: &[PathRule] = &[
         description: "The organization ID, not its handle.",
     },
     PathRule {
-        at: "/descriptor-catalog/{name}",
-        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$",
+        at: CATALOG_NAME_PATH,
+        pattern: CatalogName::SCHEMA_PATTERN,
         example: "Fork-1",
         description: "The case-preserving catalog entry name in this organization.",
+    },
+    PathRule {
+        at: FAMILY_PATH,
+        pattern: CatalogName::SCHEMA_PATTERN,
+        example: "LFM2.5",
+        description: "The model family in this organization. Matching ignores case.",
     },
     PathRule {
         at: "/keys/{key_id}",
@@ -1200,16 +1222,15 @@ const PATH_RULES: &[PathRule] = &[
     },
     PathRule {
         at: "/{principal_id}",
-        pattern: "^(org|user)_[A-Za-z0-9_-]*$",
+        pattern: "^org_[A-Za-z0-9_-]*$",
         example: "org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
-        description: "The owning principal: an organization id or a user id, never a \
-                      handle.",
+        description: "The owning principal: an organization id, never a handle.",
     },
     PathRule {
         at: "/{sha256}",
         pattern: "^[0-9a-f]{64}$",
         example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        description: "The blob's SHA-256: 64 lower-case hex characters.",
+        description: "The SHA-256 digest in 64 lower-case hex characters.",
     },
 ];
 
@@ -1222,7 +1243,8 @@ fn path_names(path: &str) -> impl Iterator<Item = &str> {
 /// The rules governing path parameter `name` on `path`; the test wants one.
 fn path_rules<'a>(path: &'a str, name: &'a str) -> impl Iterator<Item = &'static PathRule> + 'a {
     let braced = format!("{{{name}}}");
-    let org_catalog = path.starts_with("/api/v1/orgs/{org_id}/descriptor-catalog");
+    let org_catalog = path.starts_with("/api/v1/orgs/{org_id}/descriptor-catalog")
+        || path.starts_with("/api/v1/orgs/{org_id}/descriptor-families");
     PATH_RULES.iter().filter(move |rule| {
         if org_catalog && name == "org_id" {
             return rule.at == "/orgs/{org_id}/descriptor-catalog";
@@ -1236,14 +1258,7 @@ fn path_rules<'a>(path: &'a str, name: &'a str) -> impl Iterator<Item = &'static
 fn path_schema(path: &str, name: &str) -> Value {
     path_rules(path, name)
         .next()
-        .map_or_else(string_schema, |rule| {
-            object([
-                ("type", "string".into()),
-                ("pattern", rule.pattern.into()),
-                ("examples", vec![rule.example].into()),
-                ("description", rule.description.into()),
-            ])
-        })
+        .map_or_else(string_schema, PathRule::schema)
 }
 
 /// A query struct's fields, each its own parameter.
@@ -1651,6 +1666,10 @@ mod tests {
                 config.vault_blob_limit_bytes.get() >> 30
             ),
             format!(
+                "family logo upload {} KiB",
+                crate::router::FAMILY_LOGO_BODY_LIMIT_BYTES >> 10
+            ),
+            format!(
                 "every other body {} KiB by default",
                 config.default_body_limit_bytes.get() >> 10
             ),
@@ -1760,11 +1779,11 @@ mod tests {
     #[rstest]
     #[case::variants(
         "/api/v1/campaigns/{campaign_id}/variants",
-        &["carry_earlier", "carry_across_limit", "inherit_from", "add_from", "restore"]
+        &["carry_earlier", "carry_across_limit", "inherit_failed", "inherit_from", "add_from", "restore"]
     )]
     #[case::document(
         "/api/v1/campaigns/{campaign_id}/document",
-        &["carry_earlier", "carry_across_limit", "inherit_from"]
+        &["carry_earlier", "carry_across_limit", "inherit_failed", "inherit_from"]
     )]
     fn test_the_revision_routes_describe_what_they_inherit(
         #[case] path: &str,
@@ -1845,16 +1864,28 @@ mod tests {
         let kinds: Vec<String> = pipette_plan_types::PolicyKind::iter()
             .map(|kind| kind.to_string())
             .collect();
+        let max_catalog_name = "a".repeat(CatalogName::MAX_LEN);
+        let catalog_names = [
+            "Qwen3 Coder -7B",
+            "Qwen3  Coder",
+            "Qwen3 ",
+            &max_catalog_name,
+        ];
         PATH_RULES
             .iter()
             .try_for_each(|rule| -> anyhow::Result<()> {
-                let schema = serde_json::json!({ "type": "string", "pattern": rule.pattern });
+                let schema = rule.schema();
                 let validator = jsonschema::validator_for(&schema)?;
                 probes
                     .iter()
                     .copied()
                     .chain([rule.example])
                     .chain(kinds.iter().map(String::as_str))
+                    .chain(
+                        catalog_names
+                            .into_iter()
+                            .filter(|_| [CATALOG_NAME_PATH, FAMILY_PATH].contains(&rule.at)),
+                    )
                     .try_for_each(|raw| {
                         anyhow::ensure!(
                             validator.is_valid(&raw.into()) == parses(rule.at, raw)?,
@@ -1883,7 +1914,7 @@ mod tests {
             "/{user_id}" => raw.parse::<types::UserId>().is_ok(),
             "/{org_id}" => raw.parse::<crate::api_v1::orgs::OrgPath>().is_ok(),
             "/orgs/{org_id}/descriptor-catalog" => raw.parse::<types::OrgId>().is_ok(),
-            "/descriptor-catalog/{name}" => raw.parse::<types::CatalogName>().is_ok(),
+            CATALOG_NAME_PATH | FAMILY_PATH => raw.parse::<types::CatalogName>().is_ok(),
             "/keys/{key_id}" => raw.parse::<types::UserKeyId>().is_ok(),
             "/preauth-keys/{key_id}" => raw.parse::<types::UserPreauthKeyId>().is_ok(),
             "/client-preauth-keys/{key_id}" => raw.parse::<types::ClientPreauthKeyId>().is_ok(),

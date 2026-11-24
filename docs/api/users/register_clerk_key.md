@@ -14,8 +14,11 @@ states.
 The body is `RegisterClerkUserKeyRequest`
 ([The OpenAPI document](../../httpapi.md#15-the-openapi-document)). It is read
 before the token, so a malformed one is a `400` that leaves the token unspent.
+Its optional `org_name` names the organization a first sign-in creates for an
+address no provision rule covers, `<email>'s personal org` when omitted; once
+the account exists it is ignored.
 The answer is
-[`POST /api/v1/users/register`'s](register_user_key.md#response-201-created),
+[`POST /api/v1/users/register`'s](register_user_key.md#response),
 and the key carries an `expires_at` 7 days out: the token proved a sign-in, not
 a machine, so the key lapses like a session rather than staying for good.
 
@@ -27,6 +30,6 @@ the account already held and logs them, as
 
 | Status | When |
 |--------|------|
-| 201 | Registered, as at [`POST /api/v1/users/register`](register_user_key.md#response-201-created), the key expiring 7 days out |
+| 201 | Registered, as at [`POST /api/v1/users/register`](register_user_key.md#response), the key expiring 7 days out |
 | 400 | A malformed body, read before the token, so the token is left unspent |
 | 404 | `[clerk]` is not set |

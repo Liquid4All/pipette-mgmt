@@ -28,4 +28,3 @@ would tell a scoped caller which ids exist. `{org_id}` is the id only
 | Status | When |
 |--------|------|
 | 400 | `client_ids` is empty, or `org_id` is not an organization id |
-| 404 | The organization is outside the caller's scope or does not exist |

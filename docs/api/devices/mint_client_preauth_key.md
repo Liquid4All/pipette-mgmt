@@ -35,4 +35,3 @@ time the token is shown**: only its `sha256` is stored, and the answer carries
 | 201 | The key and its token, the one time the token is shown |
 | 400 | An unknown field, a `usage` other than `single_use` or `multi_use`, `expires_in_days` outside 1 to 90, or a `note` past 4096 characters; or `org_id` is not an organization id |
 | 403 | The caller does not hold `manage_clients` |
-| 404 | The organization is outside the caller's scope or does not exist |

@@ -2,11 +2,11 @@
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 
-use pipette_core::{matching::FleetTags, vault::VaultOwner};
+use pipette_core::matching::FleetTags;
 use pipette_plan_types::{
-    CatalogQualifier, CatalogScope, ClientId, MemberSelector, QualifiedCatalogName,
+    CatalogQualifier, CatalogScope, ClientId, DescriptorKind, DescriptorMemberKey, MemberSelector,
+    ModelType, OrgId, QualifiedCatalogName,
 };
-use pipette_store::OrgStore;
 
 use crate::descriptor_names::{self, CatalogReadScope};
 use crate::descriptor_plan::{self, Eligibility, ResolveError};
@@ -53,13 +53,19 @@ impl OffsetMap {
 #[derive(Debug, Clone)]
 pub struct ResolvedName {
     pub variant: usize,
+    /// The qualified name of the entry, for example `global/example`.
     pub catalog_name: String,
-    pub flavor: String,
+    /// The selector value from the submitted document.
+    pub selector: String,
+    /// The span of the string in the submitted text.
+    pub span: Option<Range<usize>>,
+    pub member_key: DescriptorMemberKey,
+    pub(crate) model_type: Option<ModelType>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanNameError {
-    #[error("this server has no descriptor catalog; write a runtime table instead of a name")]
+    #[error("this server has no descriptor catalog; write a table instead of a catalog name")]
     NoCatalog,
     #[error("variant {variant}: {source}")]
     Resolve {
@@ -84,13 +90,31 @@ pub enum PlanNameError {
     },
     #[error("variant {variant}: `{field}` must be an array of strings")]
     FieldNotStrings { variant: usize, field: &'static str },
-    #[error("variant {variant}: a runtime catalog name must select a runtime")]
-    NotARuntime { variant: usize },
+    #[error("variant {variant}: `{selector}` names a model entry; `runtimes` takes a runtime")]
+    NotARuntime {
+        variant: usize,
+        selector: String,
+        span: Option<Range<usize>>,
+    },
+    #[error("variant {variant}: `{selector}` names a runtime entry; `models` takes a model")]
+    NotAModel {
+        variant: usize,
+        selector: String,
+        span: Option<Range<usize>>,
+    },
+    #[error(
+        "variant {variant}: model selector `{selector}` has no compatible runtime in this variant"
+    )]
+    NoCompatibleRuntime {
+        variant: usize,
+        selector: String,
+        span: Option<Range<usize>>,
+    },
     #[error("catalog organization `{0}` disappeared while the name resolved")]
     OrgMissing(pipette_plan_types::OrgId),
     #[error("the submitted document's digest is invalid")]
     Digest(#[from] pipette_plan_types::Sha256Error),
-    #[error("the resolved runtime does not serialize as TOML")]
+    #[error("the resolved descriptor does not serialize as TOML")]
     Serialize(#[from] toml_edit::ser::Error),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
@@ -104,7 +128,9 @@ impl PlanNameError {
             | Self::InvalidName { .. }
             | Self::InvalidClientId { .. }
             | Self::FieldNotStrings { .. }
-            | Self::NotARuntime { .. } => true,
+            | Self::NotARuntime { .. }
+            | Self::NotAModel { .. }
+            | Self::NoCompatibleRuntime { .. } => true,
             Self::OrgMissing(_) | Self::Digest(_) | Self::Serialize(_) | Self::Store(_) => false,
         }
     }
@@ -115,7 +141,9 @@ impl PlanNameError {
             | Self::InvalidName { variant, .. }
             | Self::InvalidClientId { variant, .. }
             | Self::FieldNotStrings { variant, .. }
-            | Self::NotARuntime { variant } => Some(*variant),
+            | Self::NotARuntime { variant, .. }
+            | Self::NotAModel { variant, .. }
+            | Self::NoCompatibleRuntime { variant, .. } => Some(*variant),
             Self::NoCatalog
             | Self::OrgMissing(_)
             | Self::Digest(_)
@@ -125,11 +153,14 @@ impl PlanNameError {
     }
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
-            Self::Resolve { span, .. } | Self::InvalidName { span, .. } => span.clone(),
+            Self::Resolve { span, .. }
+            | Self::InvalidName { span, .. }
+            | Self::NotARuntime { span, .. }
+            | Self::NotAModel { span, .. }
+            | Self::NoCompatibleRuntime { span, .. } => span.clone(),
             Self::NoCatalog
             | Self::InvalidClientId { .. }
             | Self::FieldNotStrings { .. }
-            | Self::NotARuntime { .. }
             | Self::OrgMissing(_)
             | Self::Digest(_)
             | Self::Serialize(_)
@@ -138,25 +169,13 @@ impl PlanNameError {
     }
 }
 
-pub async fn owner_scope(
-    orgs: &dyn OrgStore,
-    owner: &VaultOwner,
-) -> anyhow::Result<CatalogReadScope> {
-    let org = match owner {
-        VaultOwner::Org { org_id } => Some(org_id.clone()),
-        VaultOwner::User { user_id } => orgs.get_membership(user_id).await?,
-    };
-    Ok(CatalogReadScope::own(org))
-}
-
-/// Replace each catalog-name string in a variant's `runtimes` with its runtime
-/// table. The bytes outside the replaced strings stay unchanged, array decor
-/// included. Parsing and rewriting the document each read the whole text, so
-/// they run off the executor; only the store reads run on it. Names resolve in
-/// the catalog scope of `owner` ([`owner_scope`]).
+/// Replace each catalog name in `runtimes` with its runtime table. Replace each
+/// model selector in `models` with its model table. Preserve all other bytes,
+/// including array whitespace and comments. Parse and rewrite the document
+/// off the executor. Resolve names in the catalog scope of `own_org`.
 pub async fn resolve_names(
     ctx: &IngestContext<'_>,
-    owner: &VaultOwner,
+    own_org: Option<&OrgId>,
     text: String,
 ) -> Result<NamedDocument, PlanNameError> {
     let (text, submitted_sha256, variants) = tokio::task::spawn_blocking(move || {
@@ -178,7 +197,7 @@ pub async fn resolve_names(
     if variants.is_empty() {
         return Ok(result);
     }
-    let scope = owner_scope(ctx.orgs, owner).await?;
+    let scope = CatalogReadScope::own(own_org.cloned());
     let mut edits = Vec::new();
     for named in variants {
         let variant = named.variant;
@@ -199,7 +218,12 @@ pub async fn resolve_names(
                     .capabilities_of(&client),
             );
         }
-        for (selector, span) in named.slots {
+        for Slot {
+            selector,
+            span,
+            kind,
+        } in named.slots
+        {
             let refuse = |source| PlanNameError::Resolve {
                 variant,
                 span: span.clone(),
@@ -223,22 +247,41 @@ pub async fn resolve_names(
             else {
                 return Err(refuse(ResolveError::UnknownName(selector.clone())));
             };
-            let (requires, clients) = if selector.contains("::") {
+            let wrong_kind = || match kind {
+                DescriptorKind::Runtime => PlanNameError::NotARuntime {
+                    variant,
+                    selector: selector.clone(),
+                    span: span.clone(),
+                },
+                DescriptorKind::Model => PlanNameError::NotAModel {
+                    variant,
+                    selector: selector.clone(),
+                    span: span.clone(),
+                },
+            };
+            if found.descriptor_kind() != kind {
+                return Err(wrong_kind());
+            }
+            // Only a bare runtime name checks an offer rule.
+            let (requires, clients) = if kind == DescriptorKind::Model || selector.contains("::") {
                 (&BTreeSet::new(), &[][..])
             } else {
                 (&named.requires, &clients[..])
             };
-            // An explicit member is the only one whose resources the resolver
-            // checks. A bare name's member is unknown until it resolves.
+            // Check only the explicit member's resources. With a bare runtime
+            // name, the resolver still needs to choose the member.
             let key = selector
                 .contains("::")
                 .then(|| MemberSelector::parse_for_entry(&selector, &found).ok())
                 .flatten()
                 .map(|selected| selected.member_key);
+            let check_all_members = kind == DescriptorKind::Runtime && key.is_none();
             let resources: BTreeSet<_> = found
                 .members
                 .iter()
-                .filter(|member| key.as_ref().is_none_or(|key| member.key() == *key))
+                .filter(|member| {
+                    check_all_members || key.as_ref().is_some_and(|key| member.key() == *key)
+                })
                 .flat_map(|member| named_resources(&member.descriptor()))
                 .collect();
             let mut available = HashSet::new();
@@ -275,36 +318,55 @@ pub async fn resolve_names(
                 qualifier: Some(qualifier),
                 name: found.name.clone(),
             };
-            let label = descriptor_names::member_selector(&qualified, &selected.member.key());
-            let runtime = selected
-                .member
-                .runtime()
-                .ok_or(PlanNameError::NotARuntime { variant })?;
-            let value =
-                serde::Serialize::serialize(runtime, toml_edit::ser::ValueSerializer::new())?;
+            let member = selected.member;
+            let member_key = member.key();
+            let label = descriptor_names::member_selector(&qualified, &member_key);
+            let (value, model_type) = match kind {
+                DescriptorKind::Runtime => {
+                    let runtime = member.runtime().ok_or_else(wrong_kind)?;
+                    (
+                        serde::Serialize::serialize(
+                            runtime,
+                            toml_edit::ser::ValueSerializer::new(),
+                        )?,
+                        None,
+                    )
+                }
+                DescriptorKind::Model => {
+                    let model = member.model().ok_or_else(wrong_kind)?;
+                    (
+                        serde::Serialize::serialize(model, toml_edit::ser::ValueSerializer::new())?,
+                        Some(ModelType::of(model)),
+                    )
+                }
+            };
             if !selected.warnings.is_empty() {
                 result.warnings.push(pipette_planner::PlanWarning {
                     variant,
                     message: format!("variant {variant}: `{qualified}` is hidden"),
                 });
             }
-            if let Some(span) = span {
+            if let Some(span) = &span {
                 edits.push((
-                    span,
+                    span.clone(),
                     format!("\n# catalog name at filing: {label}\n{value}"),
                 ));
             }
-            tracing::debug!(variant, catalog_name = %qualified, selector = %label, "catalog name resolved");
+            tracing::debug!(variant, ?kind, catalog_name = %qualified, selector = %label, "catalog name resolved");
             result.resolved.push(ResolvedName {
                 variant,
                 catalog_name: qualified.to_string(),
-                flavor: selected.member.flavor().unwrap_or_default().into(),
+                selector,
+                span,
+                member_key,
+                model_type,
             });
         }
     }
     if edits.is_empty() {
         return Ok(result);
     }
+    edits.sort_unstable_by_key(|(span, _)| span.start);
     result.offsets = OffsetMap(
         edits
             .iter()
@@ -329,18 +391,26 @@ pub async fn resolve_names(
 /// The catalog names of one variant, read from the document.
 struct NamedVariant {
     variant: usize,
-    /// Each string in `runtimes`, with its span in the document.
-    slots: Vec<(String, Option<Range<usize>>)>,
-    /// The variant's `requires`; empty unless a slot is a bare name.
+    /// Catalog references in the variant.
+    slots: Vec<Slot>,
+    /// The variant's `requires`; empty unless a slot is a bare runtime name.
     requires: BTreeSet<String>,
     /// The variant's `clients` less its `exclude_clients`, whose offer rule a
-    /// bare name checks; empty unless a slot is a bare name. A client in
-    /// `exclude_clients` never runs the variant's jobs.
+    /// bare runtime name checks; empty unless a slot is a bare runtime name. A
+    /// client in `exclude_clients` never runs the variant's jobs.
     clients: Vec<String>,
 }
 
-/// Each variant of `text` that names a catalog entry in `runtimes`. A text
-/// that does not parse names none; expansion reports its fault.
+struct Slot {
+    selector: String,
+    span: Option<Range<usize>>,
+    /// The descriptor kind accepted by the array.
+    kind: DescriptorKind,
+}
+
+/// Each variant of `text` that names a catalog entry in `runtimes` or
+/// `models`. A text that does not parse names none; expansion reports its
+/// fault.
 fn named_variants(text: &str) -> Result<Vec<NamedVariant>, PlanNameError> {
     let Ok(doc) = toml_edit::Document::parse(text) else {
         return Ok(Vec::new());
@@ -348,15 +418,31 @@ fn named_variants(text: &str) -> Result<Vec<NamedVariant>, PlanNameError> {
     let mut found = Vec::new();
     let mut variant = 0;
     while let Some(entry) = doc.get("variants").and_then(|v| v.get(variant)) {
-        let slots: Vec<_> = entry
-            .get("runtimes")
-            .and_then(toml_edit::Item::as_array)
-            .into_iter()
-            .flat_map(|runtimes| runtimes.iter())
-            .filter_map(|slot| Some((slot.as_str()?.to_owned(), slot.span())))
-            .collect();
+        let slots: Vec<_> = [
+            ("runtimes", DescriptorKind::Runtime),
+            ("models", DescriptorKind::Model),
+        ]
+        .into_iter()
+        .flat_map(|(field, kind)| {
+            entry
+                .get(field)
+                .and_then(toml_edit::Item::as_array)
+                .into_iter()
+                .flat_map(|array| array.iter())
+                .filter_map(move |slot| {
+                    Some(Slot {
+                        selector: slot.as_str()?.to_owned(),
+                        span: slot.span(),
+                        kind,
+                    })
+                })
+        })
+        .collect();
         if !slots.is_empty() {
-            let (requires, clients) = if slots.iter().any(|(s, _)| !s.contains("::")) {
+            let bare_runtime = slots
+                .iter()
+                .any(|slot| slot.kind == DescriptorKind::Runtime && !slot.selector.contains("::"));
+            let (requires, clients) = if bare_runtime {
                 let excluded: HashSet<_> = strings(entry, "exclude_clients", variant)?
                     .into_iter()
                     .collect();
@@ -411,8 +497,10 @@ mod tests {
 
     use super::*;
 
-    /// A store set and a catalog that holds one global runtime entry,
-    /// `example`, whose one member the catalog offers to `os:macos`.
+    /// A store set and a catalog that holds two global entries in one state:
+    /// the runtime entry `example`, whose one member the catalog offers to
+    /// `os:macos`, and the model entry `example-model`, with the members
+    /// `gguf::q4_0` and `gguf::q8_0`.
     struct Fixture {
         _dir: tempfile::TempDir,
         stores: pipette_store::Stores,
@@ -422,9 +510,11 @@ mod tests {
             pipette_plan_types::BenchmarkId,
             pipette_core::benchmark::Benchmark,
         >,
-        /// A user in no organization, so names resolve in the global catalog.
-        owner: VaultOwner,
+        /// No organization, so names resolve in the global catalog.
+        own_org: Option<pipette_plan_types::OrgId>,
         runtime: pipette_plan_types::Runtime,
+        /// The model of `example-model::gguf::q4_0`.
+        model: pipette_plan_types::Model,
     }
 
     impl Fixture {
@@ -459,6 +549,29 @@ mod tests {
             )?;
             entry.state = state;
             catalog.create_entry(&entry).await?;
+            let members = [("example-q4", "q4_0"), ("example-q8", "q8_0")]
+                .iter()
+                .map(|(repo, quantization)| {
+                    pipette_store_testkit::a_model_member("gguf_text", repo, quantization)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let model = members
+                .first()
+                .and_then(DescriptorMember::model)
+                .context("a model member")?
+                .clone();
+            let mut models = DescriptorEntry::new(
+                CatalogScope::Global,
+                CatalogName::try_new("example-model")?,
+                DescriptorEntryKind::HandMade,
+                DescriptorEntryState::Active,
+                now,
+                now,
+                DescriptorEntryCreator::Operator,
+                NonEmptyVec::try_new(members)?,
+            )?;
+            models.state = state;
+            catalog.create_entry(&models).await?;
             let config = toml::from_str(
                 "[[offer_rules]]\nruntime_type = 'llamacpp_cli_stock_tools'\nflavor = 'macos-arm64'\nrequires = ['os:macos']\n",
             )?;
@@ -468,10 +581,9 @@ mod tests {
                 catalog,
                 config,
                 benchmarks: std::collections::HashMap::new(),
-                owner: VaultOwner::User {
-                    user_id: pipette_plan_types::UserId::try_new("user_names")?,
-                },
+                own_org: None,
                 runtime,
+                model,
             })
         }
 
@@ -485,6 +597,7 @@ mod tests {
                 )?,
                 organization: pipette_plan_types::NonEmptyTrimmedString::try_new("lab")?,
                 client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("rig")?,
+                name: None,
                 contact_email: pipette_plan_types::ContactEmail::try_new("ops@example.com")?,
                 status: pipette_core::client::ClientStatus::Approved,
                 registered_at: "2026-01-01T00:00:00Z".parse()?,
@@ -543,7 +656,7 @@ mod tests {
         let fixture = Fixture::new(state).await?;
         let ctx = fixture.ctx();
         let text = named_variant(selector, requires, layout);
-        let named = resolve_names(&ctx, &fixture.owner, text.clone()).await?;
+        let named = resolve_names(&ctx, fixture.own_org.as_ref(), text.clone()).await?;
         assert!(named.text.starts_with("# header\n[[variants]]\nrequires ="));
         assert!(named.text.ends_with(&format!("{}] # end\n", layout.1)));
         assert!(
@@ -575,7 +688,7 @@ mod tests {
             named.warnings.len(),
             usize::from(state == DescriptorEntryState::Hidden)
         );
-        let second = resolve_names(&ctx, &fixture.owner, named.text.clone()).await?;
+        let second = resolve_names(&ctx, fixture.own_org.as_ref(), named.text.clone()).await?;
         assert_eq!(second.text, named.text);
         assert!(second.resolved.is_empty());
         Ok(())
@@ -594,7 +707,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let fixture = Fixture::new(state).await?;
         let text = named_variant(selector, requires, ("", ""));
-        let result = resolve_names(&fixture.ctx(), &fixture.owner, text).await;
+        let result = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await;
         assert!(
             matches!(result, Err(PlanNameError::Resolve { .. })),
             "{result:?}"
@@ -608,7 +721,7 @@ mod tests {
     async fn a_name_comment_survives_the_gated_rewrite() -> anyhow::Result<()> {
         let fixture = Fixture::new(DescriptorEntryState::Active).await?;
         let text = named_variant("example", "os:macos", ("", ""));
-        let named = resolve_names(&fixture.ctx(), &fixture.owner, text).await?;
+        let named = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await?;
         let gated = format!(
             "benchmarks = ['decode_throughput_512_100']\n{}\nmodels = [{{type='gguf_text', source='huggingface', org='acme', repo_name='example', path='example.gguf', auth_token='hf_test'}}]\n",
             named.text
@@ -642,7 +755,7 @@ mod tests {
         fixture.linux_client().await?;
         let text =
             format!("[[variants]]\nrequires = ['os:macos']\n{clients}\nruntimes = ['example']");
-        let result = resolve_names(&fixture.ctx(), &fixture.owner, text).await;
+        let result = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await;
         assert_eq!(result.is_ok(), accepted, "{result:?}");
         Ok(())
     }
@@ -653,7 +766,7 @@ mod tests {
     async fn an_unparsable_name_keeps_its_fault() -> anyhow::Result<()> {
         let fixture = Fixture::new(DescriptorEntryState::Active).await?;
         let text = "[[variants]]\nruntimes = ['Not A Slug/example']";
-        let result = resolve_names(&fixture.ctx(), &fixture.owner, text.into()).await;
+        let result = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text.into()).await;
         assert!(
             matches!(
                 result,
@@ -674,11 +787,11 @@ mod tests {
             ..fixture.ctx()
         };
         let plain = "# intact\n[[variants]]\nruntimes = [{type='apple_foundation'}]\n";
-        let kept = resolve_names(&ctx, &fixture.owner, plain.into()).await?;
+        let kept = resolve_names(&ctx, fixture.own_org.as_ref(), plain.into()).await?;
         assert_eq!(kept.text.as_bytes(), plain.as_bytes());
         let named = "[[variants]]\nruntimes=['example']";
         assert!(matches!(
-            resolve_names(&ctx, &fixture.owner, named.into()).await,
+            resolve_names(&ctx, fixture.own_org.as_ref(), named.into()).await,
             Err(PlanNameError::NoCatalog)
         ));
         Ok(())
@@ -706,7 +819,8 @@ mod tests {
         let fixture = Fixture::new(DescriptorEntryState::Hidden).await?;
         let header = "benchmarks = ['decode_throughput_512_100']\n[[variants]]\nruntimes = [{type='apple_foundation'}]\nmodels = [{type='gguf_text', source='huggingface', org='acme', repo_name='example', path='example.gguf'}]\n[[variants]]\n";
         let bad = format!("{header}requires = [1]\nruntimes = ['example']\n");
-        let Err(error) = resolve_names(&fixture.ctx(), &fixture.owner, bad.clone()).await else {
+        let Err(error) = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), bad.clone()).await
+        else {
             anyhow::bail!("a numeric flag resolved");
         };
         let verdict = crate::plan_validation::refusal(&bad, error.into())?;
@@ -717,7 +831,7 @@ mod tests {
         let hidden = format!(
             "{header}requires = ['os:macos']\nruntimes = ['example']\nmodels = [{{type='gguf_text', source='huggingface', org='acme', repo_name='example', path='example.gguf'}}]\nunknown_field = 1\n"
         );
-        let named = resolve_names(&fixture.ctx(), &fixture.owner, hidden.clone()).await?;
+        let named = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), hidden.clone()).await?;
         let stage = crate::plan_validation::expand(
             std::num::NonZeroUsize::MAX,
             pipette_planner::prefix_types(&hidden),
@@ -742,7 +856,8 @@ mod tests {
     async fn a_fault_after_a_name_is_placed_in_the_submitted_text() -> anyhow::Result<()> {
         let fixture = Fixture::new(DescriptorEntryState::Active).await?;
         let text = "benchmarks = ['decode_throughput_512_100']\n[[variants]]\nruntimes = ['example::macos-arm64']\nmodels = [{type='gguf_text', source='huggingface', org='acme', repo_name='example', path='example.gguf'}]\n[[variants]]\nruntimes = [{type='apple_foundation'}]\nmodels = [{type='gguf_text', source='huggingface', org='acme', repo_name='example', path='example.gguf'}]\nunknown_field = 1\n";
-        let named = resolve_names(&fixture.ctx(), &fixture.owner, text.to_owned()).await?;
+        let named =
+            resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text.to_owned()).await?;
         assert_ne!(named.text, text);
         let stage = crate::plan_validation::expand(
             std::num::NonZeroUsize::MAX,
@@ -759,6 +874,225 @@ mod tests {
         assert!(issue.message.contains("unknown_field"), "{issue:?}");
         assert_eq!(issue.line, Some(8));
         assert_eq!(issue.column, Some(1));
+        Ok(())
+    }
+
+    /// One variant on macOS with the runtime of `example` and `model` in its
+    /// `models`, which a `# end` comment follows.
+    fn model_variant(model: &str) -> String {
+        format!(
+            "benchmarks = ['decode_throughput_512_100']\n[[variants]]\nrequires = ['os:macos']\nruntimes = ['example::macos-arm64']\nmodels = [{model}] # end\n"
+        )
+    }
+
+    #[rstest]
+    #[case::explicit("example-model::gguf::q4_0", DescriptorEntryState::Active)]
+    #[case::qualified("global/example-model::gguf::q4_0", DescriptorEntryState::Active)]
+    #[case::hidden("example-model::gguf::q4_0", DescriptorEntryState::Hidden)]
+    #[tokio::test]
+    async fn a_model_selector_resolves_and_rewrites_in_place(
+        #[case] selector: &str,
+        #[case] state: DescriptorEntryState,
+    ) -> anyhow::Result<()> {
+        let fixture = Fixture::new(state).await?;
+        let text = model_variant(&format!("\"{selector}\""));
+        let named = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text.clone()).await?;
+        assert!(named.text.ends_with("] # end\n"));
+        assert!(
+            named
+                .text
+                .contains("# catalog name at filing: global/example-model::gguf::q4_0\n"),
+            "{}",
+            named.text
+        );
+        let parsed: toml::Value = toml::from_str(&named.text)?;
+        let written: pipette_plan_types::Model =
+            parsed["variants"][0]["models"][0].clone().try_into()?;
+        assert_eq!(written, fixture.model);
+        let comment = named
+            .text
+            .rfind("\n# catalog name at filing:")
+            .context("rewrite has the model comment")?;
+        assert_eq!(
+            named.offsets.submitted(comment),
+            text.find(&format!("\"{selector}\""))
+                .context("text has the selector")?
+        );
+        // The hidden runtime entry warns too.
+        assert_eq!(
+            named.warnings.len(),
+            2 * usize::from(state == DescriptorEntryState::Hidden)
+        );
+        let model = named
+            .resolved
+            .iter()
+            .find_map(|name| match &name.member_key {
+                DescriptorMemberKey::Model {
+                    format,
+                    quantization,
+                } => Some((name, format, quantization)),
+                DescriptorMemberKey::Runtime { .. } => None,
+            })
+            .context("a resolved model")?;
+        assert_eq!(model.0.catalog_name, "global/example-model");
+        assert_eq!(model.0.selector, selector);
+        assert_eq!(model.1.to_string(), "gguf");
+        assert_eq!(model.2.as_str(), "q4_0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_selector_expands_as_its_table() -> anyhow::Result<()> {
+        let fixture = Fixture::new(DescriptorEntryState::Active).await?;
+        let text = "benchmarks = ['decode_throughput_512_100']\n[[variants]]\nrequires = ['os:macos']\nmodels = ['example-model::gguf::q4_0']\nruntimes = ['example::macos-arm64']\n";
+        let named =
+            resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text.to_owned()).await?;
+        let table = model_variant(
+            &serde::Serialize::serialize(&fixture.model, toml_edit::ser::ValueSerializer::new())?
+                .to_string(),
+        );
+        let table = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), table).await?;
+        let types = pipette_planner::prefix_types(text);
+        let expand = |text: &str| {
+            crate::plan_document::expand_text(std::num::NonZeroUsize::MAX, &types, text)
+        };
+        let from_selector = expand(&named.text)?.bodies;
+        assert!(!from_selector.is_empty());
+        assert_eq!(from_selector, expand(&table.text)?.bodies);
+        Ok(())
+    }
+
+    /// The resolver reports incomplete, unknown, and tombstoned selectors at
+    /// their source spans. It lists members for incomplete selectors and treats
+    /// an old quantization label as an unknown member.
+    #[rstest]
+    #[case::bare_name(
+        "example-model",
+        DescriptorEntryState::Active,
+        Some("gguf::q4_0, gguf::q8_0")
+    )]
+    #[case::format_only(
+        "example-model::gguf",
+        DescriptorEntryState::Active,
+        Some("gguf::q4_0, gguf::q8_0")
+    )]
+    #[case::unknown_name("missing::gguf::q4_0", DescriptorEntryState::Active, None)]
+    #[case::unknown_label("example-model::gguf::q2_k", DescriptorEntryState::Active, None)]
+    #[case::tombstoned("example-model::gguf::q4_0", DescriptorEntryState::Tombstoned, None)]
+    #[tokio::test]
+    async fn a_model_selector_is_refused(
+        #[case] selector: &str,
+        #[case] state: DescriptorEntryState,
+        #[case] members: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // The runtime is a table, so a tombstoned `example` refuses nothing.
+        let fixture = Fixture::new(state).await?;
+        let text = format!(
+            "[[variants]]\nrequires = ['os:macos']\nruntimes = [{{type='apple_foundation'}}]\nmodels = ['{selector}']\n"
+        );
+        let result = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await;
+        let Err(error @ PlanNameError::Resolve { span: Some(_), .. }) = result else {
+            anyhow::bail!("expected a refusal at the selector, got {result:?}");
+        };
+        if let Some(members) = members {
+            let message = std::error::Error::source(&error)
+                .context("a resolve source")?
+                .to_string();
+            assert!(message.contains(members), "{message}");
+        }
+        Ok(())
+    }
+
+    /// The resolver reports a catalog reference in the wrong array at its
+    /// source span.
+    #[rstest]
+    #[case::model_in_runtimes("runtimes = ['example-model::gguf::q4_0']", false)]
+    #[case::runtime_in_models("models = ['example::macos-arm64']", true)]
+    #[tokio::test]
+    async fn a_name_in_the_wrong_array_is_refused(
+        #[case] slot: &str,
+        #[case] in_models: bool,
+    ) -> anyhow::Result<()> {
+        let fixture = Fixture::new(DescriptorEntryState::Active).await?;
+        let text = format!("[[variants]]\nrequires = ['os:macos']\n{slot}\n");
+        let result = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await;
+        let refused = if in_models {
+            matches!(result, Err(PlanNameError::NotAModel { span: Some(_), .. }))
+        } else {
+            matches!(
+                result,
+                Err(PlanNameError::NotARuntime { span: Some(_), .. })
+            )
+        };
+        assert!(refused, "{result:?}");
+        Ok(())
+    }
+
+    /// The compatibility error names the selector. Validation places the error
+    /// at the selector.
+    #[rstest]
+    #[case::selector_only("", 6)]
+    #[case::inline_model_first(
+        "  {type='gguf_text', source='huggingface', org='acme', repo_name='inline', path='inline.gguf'},\n",
+        7
+    )]
+    #[tokio::test]
+    async fn a_model_selector_with_no_compatible_runtime_names_the_selector(
+        #[case] preceding_models: &str,
+        #[case] line: usize,
+    ) -> anyhow::Result<()> {
+        let fixture = Fixture::new(DescriptorEntryState::Active).await?;
+        let text = format!(
+            "benchmarks = ['decode_throughput_512_100']\n[[variants]]\nrequires = ['os:ios']\nruntimes = [{{type='apple_foundation'}}]\nmodels = [\n{preceding_models}  'example-model::gguf::q4_0',\n]\n"
+        );
+        let named = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text.clone()).await?;
+        let stage = crate::plan_validation::expand(
+            std::num::NonZeroUsize::MAX,
+            pipette_planner::prefix_types(&text),
+            crate::plan_validation::Submission::named(text, named),
+        )
+        .await?;
+        let crate::plan_validation::Stage::Refused(verdict) = stage else {
+            anyhow::bail!("the document expanded");
+        };
+        let [issue] = verdict.issues.as_slice() else {
+            anyhow::bail!("not one issue: {:?}", verdict.issues);
+        };
+        assert_eq!(
+            issue.message,
+            "variant 0: model selector `example-model::gguf::q4_0` has no compatible runtime in this variant"
+        );
+        assert_eq!(
+            (issue.line, issue.column),
+            (Some(line), Some(3)),
+            "{issue:?}"
+        );
+        Ok(())
+    }
+
+    /// A model comment survives the gated-model rewrite of another model in
+    /// the same variant, and the selector's model reaches it unchanged.
+    #[tokio::test]
+    async fn a_model_comment_survives_the_gated_rewrite() -> anyhow::Result<()> {
+        let fixture = Fixture::new(DescriptorEntryState::Active).await?;
+        let text = model_variant(
+            "'example-model::gguf::q4_0', {type='gguf_text', source='huggingface', org='acme', repo_name='gated', path='gated.gguf', auth_token='hf_test'}",
+        );
+        let named = resolve_names(&fixture.ctx(), fixture.own_org.as_ref(), text).await?;
+        let stored = crate::plan_document::with_vault_arms(
+            pipette_core::plan::PlanSource::new(named.text)?,
+            &std::collections::HashMap::new(),
+        )?;
+        assert!(
+            stored
+                .text()
+                .contains("# catalog name at filing: global/example-model::gguf::q4_0")
+        );
+        assert!(!stored.text().contains("hf_test"));
+        let parsed: toml::Value = toml::from_str(stored.text())?;
+        let written: pipette_plan_types::Model =
+            parsed["variants"][0]["models"][0].clone().try_into()?;
+        assert_eq!(written, fixture.model);
         Ok(())
     }
 }

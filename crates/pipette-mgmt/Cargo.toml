@@ -25,6 +25,18 @@ path = "tests/catalog_move_to_global.rs"
 name = "catalog_find"
 path = "tests/catalog_find.rs"
 
+[[test]]
+name = "catalog_set_family"
+path = "tests/catalog_set_family.rs"
+
+[[test]]
+name = "catalog_set_family_logo"
+path = "tests/catalog_set_family_logo.rs"
+
+[[test]]
+name = "orgs_list"
+path = "tests/orgs_list.rs"
+
 # Levels and the reasoning for each live in the root manifest.
 [lints]
 workspace = true

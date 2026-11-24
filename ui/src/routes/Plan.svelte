@@ -48,7 +48,7 @@
   const refused = $derived(lineage.status === 403 || lineage.status === 404);
 
   const trail = $derived(page.data || page.error
-    ? planTrail(id, campaign, lineage.data, session.account!, session.known) : []);
+    ? planTrail(id, campaign, lineage.data, session.known) : []);
 </script>
 
 {#snippet revisions()}

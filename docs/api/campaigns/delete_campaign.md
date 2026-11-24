@@ -19,7 +19,5 @@ id, whatever the caller's plan scope, as
 | Status | When |
 |--------|------|
 | 204 | The campaign record is deleted; its plans are kept |
-| 400 | `campaign_id` is not a campaign id |
 | 403 | The caller may not administer the record ([who may do what](../campaigns.md#who-may-do-what)) |
-| 404 | No such campaign |
 | 409 | The campaign is [locked](update_campaign.md), or a plan the campaign filed still runs. The message quotes the lock note or names each such plan |

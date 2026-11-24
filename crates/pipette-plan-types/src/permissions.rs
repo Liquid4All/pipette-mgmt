@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::text::ascii_lowercase;
 
 /// What an account may do. The `_any_` form of a right reaches every owner's
-/// records, the plain one the account's own and its organization's.
+/// records, the plain one its organization's.
 #[derive(
     Debug,
     Clone,

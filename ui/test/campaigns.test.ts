@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { ApiError } from "../src/lib/api";
 import {
   CAMPAIGN_PAGES, LABELS_MAX, NAME_MAX_CHARS, NOTE_MAX_CHARS, campaignPlan, campaignQuery, campaignTable, chosenOwner, createQuery,
-  deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelHue, labelLink, labelPairs, labelText, labelToggled, labelVocabulary, labelsBody,
+  deferralText, deviceTimeText, handedAway, stateOf, headAddress, jobCampaigns, knownLabels, labelHue, labelLink, labelPairs, labelText, labelToggled, labelVocabulary, labelsBody,
   labelScope, labelsProblem, mayLabel, nameProblem, newCampaignAction, newCampaignOwners, newCampaignRefusal, noteProblem,
   parseLabel, planTrail, progressFill, progressText, unlessWithheld, inheritOffers, namedOffer, planSourceOf, sourceText, soughtEmpty, outsideCount,
   repeatedText, restoreEdit, revertOffered, revisionQuery, revisionSummary, importKey, importLine, importText, withLabel, withoutLabel, withVariantsOf,
@@ -10,7 +10,7 @@ import {
 import { ownedEmpty, ownerBranch, underTrail } from "../src/lib/owned";
 import { legacyOwnerFilter } from "../src/lib/routes";
 import { PickedColumns } from "../src/lib/picked.svelte";
-import { choicesOf, drawnColumns, type Picks } from "../src/lib/table";
+import { choicesOf, drawnColumns, unfiltered, type Picks } from "../src/lib/table";
 import type { CampaignView, NamedCampaignOverview, OwnUserView, UserPermission } from "../src/lib/api-types";
 import { abilitiesOf } from "./abilities";
 import { drawnKeys, stubStorage } from "./picks";
@@ -25,11 +25,12 @@ const acme = { kind: "org", org_id: "org_acme", slug: "acme" } as const;
 describe("the campaign listings", () => {
   test("each branch asks the newest first with each plan, and only every campaign's names owners", () => {
     expect(campaignQuery({ kind: "all" }, null, "")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&names=true");
-    expect(campaignQuery({ kind: "me" }, "campaign_9", "")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&owner=mine&cursor=campaign_9");
+    expect(campaignQuery(acme, "campaign_9", "")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&owner=org&org_id=org_acme&cursor=campaign_9");
     expect(campaignQuery(acme, null, "5")).toBe("order=newest&plan=true&models=true&state=active%2Clocked&owner=org&org_id=org_acme&limit=5");
-    expect(campaignQuery({ kind: "me" }, null, "", "plan-1", "archived")).toBe("order=newest&plan=true&models=true&plan_id=plan-1&owner=mine");
-    expect([campaignQuery({ kind: "me" }, null, "", "", "archived"), campaignQuery({ kind: "me" }, null, "", "", "all")])
-      .toEqual(["order=newest&plan=true&models=true&state=archived&owner=mine", "order=newest&plan=true&models=true&owner=mine"]);
+    expect(campaignQuery(acme, null, "", "plan-1", "archived")).toBe("order=newest&plan=true&models=true&plan_id=plan-1&owner=org&org_id=org_acme");
+    expect([campaignQuery(acme, null, "", "", "archived"), campaignQuery(acme, null, "", "", "all")])
+      .toEqual(["order=newest&plan=true&models=true&state=archived&owner=org&org_id=org_acme",
+                "order=newest&plan=true&models=true&owner=org&org_id=org_acme"]);
   });
 
   test("a job id keeps the campaigns of the plans that asked for it, and none for a job in no plan the reader reads", async () => {
@@ -44,35 +45,31 @@ describe("the campaign listings", () => {
   });
 
   test("an empty branch says so in the classic words", () => {
-    expect(ownedEmpty({ kind: "me" }, "campaigns")).toBe("You own no campaigns.");
     expect(ownedEmpty(acme, "campaigns")).toBe("acme owns no campaigns you may see.");
     expect(ownedEmpty({ kind: "all" }, "campaigns")).toBe("No campaigns you may see.");
   });
 
   test("a branch that keeps no campaign for an id names the branch", () => {
-    expect(soughtEmpty({ kind: "me" }, "job-1")).toBe("You own no campaign that holds job-1.");
     expect(soughtEmpty(acme, "plan-1 and job-1")).toBe("acme owns no campaign you may see that holds plan-1 and job-1.");
     expect(soughtEmpty({ kind: "all" }, "job-1")).toBe("No campaign you may see holds job-1.");
   });
 
-  test("a job's campaigns outside the listing are counted on one's own and an organization's, without a plan id", () => {
+  test("a job's campaigns outside the listing are counted on an organization's, without a plan id", () => {
     const ran = new Set(["campaign_1", "campaign_2", "campaign_3"]);
-    expect([outsideCount({ kind: "me" }, "", ran, 1), outsideCount(acme, "", ran, 3), outsideCount({ kind: "all" }, "", ran, 2),
-            outsideCount({ kind: "me" }, "plan-1", ran, 1), outsideCount({ kind: "me" }, "", undefined, 0)])
+    expect([outsideCount(acme, "", ran, 1), outsideCount(acme, "", ran, 3), outsideCount({ kind: "all" }, "", ran, 2),
+            outsideCount(acme, "plan-1", ran, 1), outsideCount(acme, "", undefined, 0)])
       .toEqual([2, 0, 0, 0, 0]);
   });
 
   test("an organization's New campaign opens the form with it as the owner", () => {
-    expect(newCampaignAction({ kind: "me" })).toEqual({ href: "/app/campaigns/new", label: "New campaign" });
+    expect(newCampaignAction({ kind: "all" })).toEqual({ href: "/app/campaigns/new", label: "New campaign" });
     expect(newCampaignAction(acme).href).toBe("/app/campaigns/new?owner=org_acme");
   });
 
   test("a campaign's page sits under its owner's listing, in its section", () => {
     const known = [{ org_id: "org_acme", slug: "acme" }];
-    const mine = { type: "user", user_id: "user_me" } as const;
-    const trail = (owner: Parameters<typeof ownerBranch>[1]) =>
-      underTrail(ownerBranch({ user_id: "user_me" }, owner, known, CAMPAIGN_PAGES), "Campaigns");
-    expect(trail(mine)).toEqual([{ label: "Me" }, { label: "Campaigns", href: "/app/me/campaigns" }]);
+    const trail = (owner: Parameters<typeof ownerBranch>[0]) =>
+      underTrail(ownerBranch(owner, known, CAMPAIGN_PAGES), "Campaigns");
     expect(trail({ type: "org", org_id: "org_acme" }))
       .toEqual([...[{ label: "Organizations", href: "/app/orgs" }, { label: "acme", href: "/app/orgs/acme" }], { label: "Campaigns", href: "/app/orgs/acme/campaigns" }]);
     expect(trail({ type: "org", org_id: "org_rival" })).toEqual([{ label: "Campaigns", href: "/app/campaigns" }]);
@@ -90,7 +87,7 @@ describe("the campaign listings", () => {
                                { label: "Campaigns", href: "/app/orgs/acme/campaigns" }, atCampaign]],
     ];
     for (const [campaign, read, trail] of cases) {
-      expect(planTrail("plan_1", campaign, read, { user_id: "user_me" }, known)).toEqual(trail);
+      expect(planTrail("plan_1", campaign, read, known)).toEqual(trail);
     }
   });
 
@@ -230,7 +227,7 @@ describe("the campaign listings", () => {
     const spec = campaignTable({}, false);
     expect([active, archived].map((row) => spec.columns.find((column) => column.key === "status")?.raw(row)))
       .toEqual(["active", "archived"]);
-    expect(choicesOf(spec, [active, archived], {}).status!.map((c) => c.label)).toEqual(["active", "archived"]);
+    expect(choicesOf(spec, [active, archived], unfiltered(spec)).status!.map((c) => c.label)).toEqual(["active", "archived"]);
   });
 
   test("labels are refused in the browser where the route would refuse them, and sent trimmed as the whole set", () => {
@@ -254,10 +251,7 @@ describe("the campaign listings", () => {
     const rows: Pick<CampaignView, "labels">[] =
       [{ labels: { study: "acmelm-text", device: "s26" } }, { labels: { study: "24b", canary: "" } }, {}];
     expect([...labelVocabulary(rows)]).toEqual([["canary", []], ["device", ["s26"]], ["study", ["24b", "acmelm-text"]]]);
-    const me = { user_id: "user_me" };
-    expect(labelScope(me, { type: "org", org_id: "org_acme" })).toEqual({ kind: "org", org_id: "org_acme" });
-    expect(labelScope(me, { type: "user", user_id: "user_me" })).toEqual({ kind: "me" });
-    expect(labelScope(me, { type: "user", user_id: "user_other" })).toBeNull();
+    expect(labelScope({ type: "org", org_id: "org_acme" })).toEqual({ kind: "org", org_id: "org_acme" });
   });
 
   test("one box adds a label typed key=value, split at the first =, in place of its key's value", () => {
@@ -278,23 +272,20 @@ describe("the campaign listings", () => {
       .toEqual(["canary", "study=24b", "study=acmelm-text"]);
   });
 
-  test("the add is offered where the route would take it: the reader's own campaign, or one it administers", () => {
+  test("the add is offered where the route would take it: a campaign of the reader's organization it files into or administers", () => {
     const as = (permissions: UserPermission[], org?: string) => reader(permissions, org);
-    const [mine, theirs] = [{ type: "user", user_id: "user_me" }, { type: "user", user_id: "user_x" }] as const;
     const [acme, rival] = [{ type: "org", org_id: "org_acme" }, { type: "org", org_id: "org_rival" }] as const;
-    expect([mine, theirs, acme].map((owner) => mayLabel(as(["submit_plans"], "org_acme"), owner)))
-      .toEqual([true, false, false]);
-    expect(mayLabel(as(["read_plans"]), mine)).toBe(false);
-    expect([acme, rival, theirs].map((owner) => mayLabel(as(["manage_orgs"], "org_acme"), owner)))
-      .toEqual([true, false, false]);
-    expect([rival, theirs].map((owner) => mayLabel(as(["manage_any_orgs"]), owner))).toEqual([true, true]);
+    expect([acme, rival].map((owner) => mayLabel(as(["submit_plans"], "org_acme"), owner))).toEqual([true, false]);
+    expect(mayLabel({ ...as(["submit_plans"], "org_acme"), account_type: "service" }, acme)).toBe(false);
+    expect(mayLabel(as(["read_plans"], "org_acme"), acme)).toBe(false);
+    expect([acme, rival].map((owner) => mayLabel(as(["manage_orgs"], "org_acme"), owner))).toEqual([true, false]);
+    expect(mayLabel(as(["manage_any_orgs"]), rival)).toBe(true);
   });
 
   test("a link with the old owner filter lands on its branch", () => {
     const member = reader(["read_plans"], "org_acme");
-    expect(legacyOwnerFilter(new URLSearchParams("owner=mine&limit=3"), CAMPAIGN_PAGES, member))
-      .toBe("/app/me/campaigns?limit=3");
-    expect(legacyOwnerFilter(new URLSearchParams("owner=org"), CAMPAIGN_PAGES, member)).toBe("/app/orgs/acme/campaigns");
+    expect(legacyOwnerFilter(new URLSearchParams("owner=org&limit=3"), CAMPAIGN_PAGES, member))
+      .toBe("/app/orgs/acme/campaigns?limit=3");
     expect(legacyOwnerFilter(new URLSearchParams("owner=org"), CAMPAIGN_PAGES, reader([]))).toBe("/app/campaigns");
   });
 });
@@ -309,21 +300,21 @@ describe("the new-campaign form", () => {
   });
 
   test("offers its organization to a member that files plans", () => {
-    const me = [{ value: "", label: "me" }];
     const org = { value: "org_acme", label: "acme (organization)" };
-    expect(newCampaignOwners(reader(["submit_plans"], "org_acme"))).toEqual([...me, org]);
-    expect(newCampaignOwners(reader(["manage_orgs"], "org_acme"))).toEqual(me);
-    expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"], "org_acme"))).toEqual([...me, org]);
-    expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"]))).toEqual(me);
+    expect(newCampaignOwners(reader(["submit_plans"], "org_acme"))).toEqual([org]);
+    expect(newCampaignOwners(reader(["manage_orgs"], "org_acme"))).toEqual([]);
+    expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"], "org_acme"))).toEqual([org]);
+    expect(newCampaignOwners(reader(["submit_any_plans", "submit_plans"]))).toEqual([]);
     expect(newCampaignOwners({ ...reader(["submit_plans"], "org_acme"), org_display_name: "Acme Corp" }))
-      .toEqual([...me, { value: "org_acme", label: "Acme Corp (organization)" }]);
+      .toEqual([{ value: "org_acme", label: "Acme Corp (organization)" }]);
   });
 
-  test("chooses the owner an address names only when it offers it", () => {
+  test("chooses the owner an address names only when it offers it, else the reader's organization", () => {
     const offered = newCampaignOwners(reader(["submit_plans", "manage_orgs"], "org_acme"));
     expect(chosenOwner(offered, "org_acme")).toBe("org_acme");
-    expect(chosenOwner(offered, "org_rival")).toBe("");
-    expect(chosenOwner(offered, null)).toBe("");
+    expect(chosenOwner(offered, "org_rival")).toBe("org_acme");
+    expect(chosenOwner(offered, null)).toBe("org_acme");
+    expect(chosenOwner([], null)).toBe("");
   });
 
   test("leaves an empty field out of the query, and refuses a blank name", () => {
@@ -416,7 +407,7 @@ describe("a document revision", () => {
 
 describe("the plans a revision inherits from", () => {
   const row = (campaign_id: string, name: string, current_plan_id: string | null, finished: number | null) => ({
-    campaign_id, name, current_plan_id, owner: { type: "user" as const, user_id: "user_a" },
+    campaign_id, name, current_plan_id, owner: { type: "org" as const, org_id: "org_a" },
     created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z",
     plan: current_plan_id ? { plan_id: current_plan_id, status: "active" as const, created_at: "2026-10-01T00:00:00Z",
       cancel_requested: false,
@@ -494,8 +485,9 @@ describe("a restore of one variant", () => {
 
 describe("a revision's preview", () => {
   const preview = { bodies: [], plan_warnings: [], imports: [], document: "", unchanged: false, carried_job_count: 3, new_job_count: 0,
-    requirements_rerun_job_count: 0, satisfied_job_count: 0, restored_job_count: 0, inherited_job_count: 0, rerun_job_ids: [] as string[],
-    marked_job_ids: [] as string[], recalculated_job_count: 0, dropped_job_ids: [] as string[], held_jobs: [], repeated_variants: [] as number[] };
+    requirements_rerun_job_count: 0, satisfied_job_count: 0, restored_job_count: 0, inherited_job_count: 0, inherited_failed_job_count: 0, rerun_job_ids: [] as string[],
+    marked_job_ids: [] as string[], recalculated_job_count: 0, dropped_job_ids: [] as string[], held_jobs: [], repeated_variants: [] as number[],
+    replaced_job_count: 0, replaced_jobs: [], replaced_models: [] };
 
   test("says what filing it does to the current plan's jobs", () => {
     expect(revisionSummary(preview)).toBe("Filing it changes no job: every job carries over as it is.");
@@ -516,10 +508,13 @@ describe("a revision's preview", () => {
         + "or they are not known to have passed the attempt limit), stops 2.");
     expect(revisionSummary({ ...preview, restored_job_count: 2, dropped_job_ids: ["job-1", "job-2"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
-        + "brings back 2 finished from earlier plans, stops 2.");
+        + "brings back 2 from earlier plans, stops 2.");
     expect(revisionSummary({ ...preview, inherited_job_count: 1, dropped_job_ids: ["job-1"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
-        + "takes 1 finished from the plans it inherits from, stops 1.");
+        + "takes 1 from the plans it inherits from, stops 1.");
+    expect(revisionSummary({ ...preview, inherited_job_count: 2, inherited_failed_job_count: 1, dropped_job_ids: ["job-1"] }))
+      .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
+        + "takes 2 from the plans it inherits from, counts 1 of those as failed, so they do not run again, stops 1.");
     expect(revisionSummary({ ...preview, satisfied_job_count: 2, dropped_job_ids: ["job-1"] }))
       .toBe("Filing it keeps 3 of the current plan's jobs, finished ones included, "
         + "takes 2 finished from earlier runs of the same cell, stops 1.");
@@ -544,6 +539,17 @@ describe("a revision's preview", () => {
 });
 
 describe("the campaign's device time", () => {
+  test("a deferral counts what waits and when the next group filing is due", () => {
+    const now = Date.parse("2026-11-19T12:00:00Z");
+    const deferral = (rerun_job_count: number, marked_job_count: number, until: string) =>
+      deferralText({ rerun_job_count, marked_job_count, until }, now);
+    expect(deferral(2, 1, "2026-11-19T12:11:30Z")).toBe("2 re-runs and 1 mark wait for the next group filing, in about 12 min");
+    expect(deferral(1, 0, "2026-11-19T12:30:00Z")).toBe("1 re-run waits for the next group filing, in about 30 min");
+    expect(deferral(0, 3, "2026-11-19T12:00:30Z")).toBe("3 marks wait for the next group filing, at the next run");
+    expect(deferral(1, 0, "2026-11-19T11:55:00Z")).toBe("1 re-run waits for the next group filing, at the next run");
+    expect(deferral(1, 0, "soon")).toBe("1 re-run waits for the next group filing, at soon");
+  });
+
   test("a total prints its duration and the jobs it leaves out", () => {
     expect(deviceTimeText({ device_time_ms: 7_500_000, unreported_job_count: 0 })).toBe("2h 05m");
     expect(deviceTimeText({ device_time_ms: 184_250, unreported_job_count: 1 })).toBe("3m 04s (1 job reported none)");

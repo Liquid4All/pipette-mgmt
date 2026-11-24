@@ -11,10 +11,9 @@ The permissive licenses covering the dependency tree (MIT, Apache-2.0, the BSD
 family, ISC, Unicode-3.0, Zlib, MPL-2.0) all grant their permissions on the
 condition that their copyright and license notices be reproduced when the
 covered code is redistributed. `pipette-mgmt` redistributes that code in
-compiled form, publicly, through two channels:
-
-- the `liquidai/pipette-mgmt` image on Docker Hub, and
-- the binary tarballs attached to each GitHub release.
+compiled form through two channels: the container image built from
+`docker/pipette-mgmt.Dockerfile`, and the binary tarballs attached to each
+GitHub release.
 
 Both carry the notice. The Dockerfile copies it to
 `/usr/share/doc/pipette-mgmt/THIRD-PARTY-LICENSES.md`, and the CI packaging

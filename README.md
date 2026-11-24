@@ -8,9 +8,9 @@ It scores eval completions through an upstream scoring service and writes the
 results to a Parquet warehouse.
 
 **Users** sign in, belong to **organizations**, and are granted permissions;
-devices are owned by a user or an organization. The **vault** holds private
-artifacts, such as a customer's own model weights, and serves them only to their
-owner's devices. The **console app** at `/app/` is the web UI over the same API
+an organization owns the devices, campaigns and vault resources. The **vault**
+holds private artifacts, such as a customer's own model weights, and serves them
+only to their organization's devices. The **console app** at `/app/` is the web UI over the same API
 ([ui/README.md](ui/README.md)). Records
 (accounts, organizations, devices, plans, campaigns, vault records) live on
 PostgreSQL; the queue, submissions, warehouse and blobs live on an object store.

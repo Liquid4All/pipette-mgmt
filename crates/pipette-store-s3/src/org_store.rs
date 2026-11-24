@@ -171,8 +171,8 @@ mod tests {
         store
             .put_ownership(&Ownership {
                 client_id,
-                owner: ClientOwner::User {
-                    user_id: user_id.clone(),
+                owner: ClientOwner::Org {
+                    org_id: org_id.clone(),
                 },
             })
             .await?;
@@ -191,7 +191,7 @@ mod tests {
             read("test-prefix/client-owners/ev1_rack.json".to_string()).await?,
             serde_json::json!({
                 "client_id": "ev1_rack",
-                "owner": { "type": "user", "user_id": user_id.as_str() },
+                "owner": { "type": "org", "org_id": org_id.as_str() },
             })
         );
         Ok(())

@@ -347,17 +347,14 @@ pub async fn register_client(
                 // After the consume: a gone owner never resolves again, so
                 // burning a single-use key loses nothing.
                 if let Some(key_owner) = grant.default_owner {
-                    let exists = pipette_pipeline::org::owner_exists(
-                        state.org_store.as_ref(),
-                        state.user_store.as_ref(),
-                        &key_owner,
-                    )
-                    .await
-                    .map_err(|e| {
-                        AppError::Internal(format!(
-                            "failed to resolve the pre-auth key's owner: {e:#}"
-                        ))
-                    })?;
+                    let exists =
+                        pipette_pipeline::org::owner_exists(state.org_store.as_ref(), &key_owner)
+                            .await
+                            .map_err(|e| {
+                                AppError::Internal(format!(
+                                    "failed to resolve the pre-auth key's owner: {e:#}"
+                                ))
+                            })?;
                     if !exists {
                         tracing::warn!(%key_id, owner = %key_owner.label(), "pre-auth key names an owner that no longer exists");
                         return Err(AppError::Unauthorized(
@@ -401,6 +398,7 @@ pub async fn register_client(
         public_key,
         organization,
         client_details: body.client_details,
+        name: None,
         contact_email: body.contact_email,
         status,
         registered_at: Timestamp::now(),

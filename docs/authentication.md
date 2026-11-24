@@ -349,11 +349,10 @@ it equals any entry in `emails` or its domain equals any entry in `domains`.
 It is evaluated **once, at registration**: changing the config does not
 retroactively promote already-registered `pending` clients.
 
-There is no auto-approve for users: nothing here sends mail, so an address is
-self-reported on that side too, and an account requested with one comes up
-`pending` for an operator to admit ([§5.11](#511-users)). A Clerk sign-in is the
-exception, because Clerk verified the address
-([§5.12](#signing-in-through-clerk)).
+There is no self-registration for users: nothing here sends mail, so an
+address would be self-reported. An account comes from an operator, an
+administrator, or a Clerk sign-in, because Clerk verified the address
+([§5.11](#511-users), [§5.12](#signing-in-through-clerk)).
 
 ### 3.2. Pre-auth keys
 
@@ -371,11 +370,9 @@ the key is the operator's vouching for it. A key an organization's
 administrator mints over HTTP seeds the owner alone. Unlike auto-approve, this
 **is** a real gate: the key is a high-entropy secret, so a deployment can
 require a key for every registration (`require_client_preauth_key = true`).
-A user's keys are the same mechanism over its own keyspace, with
-`require_user_preauth_key` closing the keyless request for an account
-([§5.11](#511-users)). Two settings rather than
-one, because they are two decisions: a deployment that mints every operator
-identity by hand may still want devices to self-register, and the reverse.
+A user's keys are the same mechanism over its own keyspace, and for a user it is
+the only one: no account registers without an invite or a Clerk sign-in
+([§5.11](#511-users)).
 
 - **Token**: `client_preauth_{key_id}.{secret}`. The older `preauth_{key_id}.{secret}`
   token and `preauth_key` request field are still accepted, so a client holding
@@ -456,9 +453,8 @@ New clients start as `pending`, and an admin approves them out-of-band via
 `pipette-mgmt clients approve <client_id>` (see [cli.md](cli.md)), which
 prevents abuse and DDoS from unapproved submitters
 ([Device administration: Device status](api/devices.md#device-status)). A user
-has an equivalent gate: an account a machine requests for itself is `pending`
-until `users approve` ([Users: Accounts and keys](api/users.md#accounts-and-keys)),
-and `require_user_preauth_key = true` closes that path ([§5.11](#511-users)).
+needs no such gate: no account asks for itself
+([Users: Accounts and keys](api/users.md#accounts-and-keys)).
 
 The host commands (`campaigns …`, `vault …`, and the maintenance passes) run on
 the server host with direct storage access, where shell access to the storage
@@ -618,8 +614,7 @@ Two ways a set gets written at creation, and one state that is never filled in:
   operator grants a fleet its rights in one step.
 - **A user** has no registration default. A user pre-auth key carries no
   template because the account exists before its key, so it is granted directly
-  (`users create --permission`, `users permission add`, or the grant flags of
-  `users approve` for a requested account).
+  (`users create --permission` or `users permission add`).
 - **A principal with no permissions object holds nothing**
   ([§5.8](#58-storage)). This is not a default. It is the absence of one. The
   state is reachable two ways: a client record registered before permissions
@@ -959,7 +954,7 @@ than a rediscovery.
 | `user_id` | Minted, not key-derived. A user has many keys, so there is no one key to derive from. `user_` followed by a hyphenated **UUIDv7**, matching the `job-`/`plan-` minted ids. v7 is time-ordered, so accounts list in creation order. |
 | `contact_email` | The handle an operator knows the account by, and where a pre-auth key is sent. Stored case-folded. **Unique across accounts** (see below). Nothing here sends mail, so it is an identifier and a contact, never a verified fact. |
 | `account_type` | `human`, or `service` for a job's account: one an organization keeps for a program, signing with keys registered from its pre-auth key. A Clerk sign-in never reaches a service account ([§5.12](#signing-in-through-clerk)), since a person who can verify its address is not the job. `human` for a record written before the field. Set at creation and changed by `users set-type` or `PATCH /api/v1/users/{user_id}`. |
-| `status` | `active`, `pending` or `disabled`. Which one an account starts at is decided by how it came to exist, not by the kind: created by an operator (`users create`, or the registration an invite admits) it is `active` at once, because the decision has already been made; requested by a machine with nothing but an address it is `pending` until `users approve`, which is the client's `pending`/`approved` split under different words. `disabled` is the reverse transition: offboarding. No route deletes an account, so the plans it filed and the campaigns and vault resources it owns keep resolving to a principal that exists; the host's `users delete` refuses while it owns a campaign or a vault resource, and while it owns a device unless `--detach` releases the devices. |
+| `status` | `active` or `disabled`. Every account starts `active`: an operator, an administrator or a Clerk sign-in made it, so the decision has already been made. `disabled` is the reverse transition: offboarding. No route deletes an account, so the plans it filed keep resolving to a principal that exists; the host's `users delete` is for an account created in error. |
 | `created_at` | — |
 | `campaign_scope` | Only on a campaign reader: the ids of the campaigns a service account reads, and the only ones. It is the one field something reads on every request, which is why it is on the record and not beside it: a lost record is a lost account, so the scope cannot be lost while the account still signs. Set at creation or by `PATCH /api/v1/users/{user_id}` and `users set-campaigns`, replaced and never removed ([Users: The rules that make delegation safe](api/users.md#the-rules-that-make-delegation-safe)). |
 
@@ -1054,7 +1049,7 @@ listed, until it is revoked.
 
 #### Provisioning and routes
 
-There are three ways in, and each ends at the operator
+There are two ways in, and each is an operator's decision
 ([Users: User routes](api/users.md#user-routes)):
 
 - **Invited.** An operator creates the account and mints a **user pre-auth key**
@@ -1066,33 +1061,22 @@ There are three ways in, and each ends at the operator
   `users create --permission` or `users permission add`. The app shows a
   minted key once, on the page that minted it, never in the address, the
   history or storage.
-- **Requested.** A machine registers with a `contact_email` and no invite, and
-  `users approve` admits the `pending` account. That is also the moment the
-  operator decides what it may do, which is why the grant flags live on that
-  command. `require_user_preauth_key = true` closes this path, the way
-  `require_client_preauth_key` closes the keyless client registration
-  ([§3.2](#32-pre-auth-keys)), and so does a `[clerk]` provision rule for the
-  addresses it covers
-  ([`POST /api/v1/users/register`](api/users/register_user_key.md)).
 - **Provisioned.** A Clerk sign-in at a domain a `[clerk]` provision rule names
-  creates the account ([§5.12](#signing-in-through-clerk)). The rule is an
-  operator's grant made in advance.
+  creates the account in the rule's organization, and one at another domain
+  `allowed_domains` lists creates it in a new organization of its own, which it
+  administers ([§5.12](#signing-in-through-clerk)). The rule, or the listed
+  domain, is an operator's grant made in advance.
 
 Each grant to an account is logged at `info` with the names it grants, as
 `granted`, whether it comes from `POST /api/v1/users` or a provision rule at a
 Clerk sign-in, as
 `PUT /api/v1/users/{user_id}/permissions` already does.
 
-There is still no self-service `POST /api/v1/users`: a request creates a record that
-reaches nothing but `GET /api/v1/users/me`, where it watches for its own admission, so
-the decision that an identity may *act* is made on the operator's side, exactly
-as client approval is. That is also why a request for
-an address some account already holds is refused rather than admitted to it.
-Admitting it would be a stranger having an operator approve *their* key on
-someone else's account. The one exception is the keypair already registered
-there, which is the caller retrying a response it never saw
-([`POST /api/v1/users/register`](api/users/register_user_key.md)). A user's pre-auth
-key is a client's key's design over its own record and its own keyspace
+There is no self-service account: `POST /api/v1/users/register` takes an
+invite and nothing else
+([`POST /api/v1/users/register`](api/users/register_user_key.md)), so the
+decision that an identity may *act* is made on the operator's side. A user's
+pre-auth key is a client's key's design over its own record and its own keyspace
 ([storage.md §3.1.5](storage.md#315-permissions-and-pre-auth-each-kinds-own)):
 same hashing, same single- or multi-use, same optional expiry, but it names the
 account it admits and carries neither a permission template nor any of a
@@ -1249,9 +1233,7 @@ provisioned account's record is written last, after the address claim, the
 membership and the `org_member` grant
 ([cli.md](cli.md#pipette-mgmt-users-permission-addremovesetlist)), so an
 account that exists is complete. A disabled account is never replaced, which is
-why offboarding is `users disable`. A keyless `POST /api/v1/users/register` for
-an address a rule covers is refused because its unverified claim would hold the
-address against this sign-in and win the account for whoever asked first.
+why offboarding is `users disable`.
 
 **Keys from before the first sign-in are shown, not revoked.** An administrator
 who creates an account for an address can register a key to it through a

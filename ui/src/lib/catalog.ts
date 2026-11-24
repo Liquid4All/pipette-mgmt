@@ -95,6 +95,7 @@ const scopeChoice = (scopeOf: ScopeOf) => ({ key: "scope", label: "Scope", value
   [scopeOf(row)] });
 
 export const catalogTable = (scopeOf: ScopeOf): TableSpec<DescriptorEntryListRow> => ({
+  sort: "-release_time",
   columns: [
     ...nameColumns(scopeOf),
     { key: "kind", label: "Kind", raw: (row) => row.kind, as: "state" },
@@ -120,8 +121,12 @@ export const catalogTable = (scopeOf: ScopeOf): TableSpec<DescriptorEntryListRow
  * no offer-rule column.
  */
 export const modelCatalogTable = (scopeOf: ScopeOf): TableSpec<DescriptorEntryListRow> => ({
+  sort: "-release_time",
   columns: [
     ...nameColumns(scopeOf),
+    { key: "family", label: "Family", raw: (row) => row.family ?? null },
+    // The page draws the logo; a sort puts the entries with one logo together.
+    { key: "family_logo", label: "Family logo", raw: (row) => row.family_logo_sha256 ?? null, shown: false },
     { key: "state", label: "State", raw: (row) => row.state === "active" ? null : row.state, as: "state" },
     { key: "release_time", label: "Release", raw: (row) => row.release_time, as: "time" },
     { key: "created_at", label: "Created", raw: (row) => row.created_at, as: "time" },
@@ -134,6 +139,7 @@ export const modelCatalogTable = (scopeOf: ScopeOf): TableSpec<DescriptorEntryLi
     scopeChoice(scopeOf),
     { key: "state", label: "State", values: (row) => [row.state], order: ["pinned", "active", "hidden"] },
     { key: "type", label: "Model type", values: (row) => row.descriptor_types },
+    { key: "family", label: "Family", values: (row) => row.family ? [row.family] : [] },
   ],
 });
 
@@ -207,12 +213,17 @@ export function parameterText(parameters: DescriptorMemberParameters | null | un
     ? total : `${total} total, ${parameters.active_millions.toLocaleString("en-US")}M active`;
 }
 
-/** A device's short list, split into its runtime entries and its model entries. */
+/**
+ * A device's short list, split into its runtime entries and its model entries. The runtime entries come newest
+ * release first. The model entries come in alphabetical order by display name.
+ */
 export function shortListSections(list: DescriptorCatalogShortList):
   Record<DescriptorKind, DescriptorCatalogShortListItem[]> {
   return {
-    runtime: list.items.filter((item) => item.descriptor_kind === "runtime"),
-    model: list.items.filter((item) => item.descriptor_kind === "model"),
+    runtime: list.items.filter((item) => item.descriptor_kind === "runtime")
+      .sort((a, b) => Date.parse(b.release_time) - Date.parse(a.release_time)),
+    model: list.items.filter((item) => item.descriptor_kind === "model")
+      .sort((a, b) => a.display_name.localeCompare(b.display_name)),
   };
 }
 

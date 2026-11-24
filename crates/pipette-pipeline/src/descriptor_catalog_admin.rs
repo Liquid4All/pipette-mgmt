@@ -1,6 +1,6 @@
 //! Shared administration of readable runtime and model descriptor names.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
@@ -9,18 +9,19 @@ use jiff::Timestamp;
 use serde::Deserialize;
 
 use pipette_plan_types::{
-    AddDescriptorMemberRequest, AuditAction, CatalogName, CatalogScope,
+    AddDescriptorMemberRequest, AuditAction, AuditActor, CatalogName, CatalogScope,
     CreateDescriptorEntryRequest, DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind,
     DescriptorEntryState, DescriptorKind, DescriptorMember, DescriptorMemberKey, EntryError,
-    GitOid, HfRevision, MemberError, Model, ModelFormat, ModelMemberRequest, ModelType,
-    NonEmptyVec, QuantizationLabel, Runtime, descriptor_digest, hf_repos, hf_repos_mut,
-    names_vault_source,
+    FamilyLogo, FamilyLogos, GitOid, HfRevision, LogoUri, MemberError, Model, ModelFormat,
+    ModelMemberRequest, NonEmptyVec, QuantizationLabel, Runtime, descriptor_digest, hf_repos,
+    hf_repos_mut, names_vault_source,
 };
 use pipette_store::{
-    AppendOutcome, CatalogEntryKey, CreateEntryOutcome, DescriptorCatalogStore,
+    AppendOutcome, CatalogEntryKey, CreateEntryOutcome, DRAIN_PAGE_SIZE, DescriptorCatalogStore,
     DescriptorEntryFilter, DescriptorEntryPage, MergeOutcome, MergedMembers, MoveToGlobalOutcome,
-    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetStateOutcome, TransitionOutcome,
-    VaultStore, merge_outcome, move_to_global_outcome, remove_outcome,
+    RelabelOutcome, RemoveMemberOutcome, RenameOutcome, SetFamilyLogoOutcome, SetFamilyOutcome,
+    SetStateOutcome, TransitionOutcome, UnknownCursorError, VaultStore, merge_outcome,
+    move_to_global_outcome, remove_outcome,
 };
 
 use crate::hf_import::{self, HfImportError, HubClient, HubError, HubGate, ImportFault};
@@ -75,12 +76,14 @@ fn log_model_member(
         return;
     };
     let hf_refs = member_refs(member);
+    let size_bytes = member.size_bytes();
     match scope {
         CatalogScope::Global => tracing::info!(
             catalog_name = %name,
             format = %format,
             quantization = %quantization,
             hf_refs,
+            size_bytes,
             "{event}"
         ),
         CatalogScope::Org(org_id) => tracing::info!(
@@ -89,6 +92,7 @@ fn log_model_member(
             format = %format,
             quantization = %quantization,
             hf_refs,
+            size_bytes,
             "{event}"
         ),
     }
@@ -132,6 +136,8 @@ struct CreateDocument {
     runtimes: Option<NonEmptyVec<Runtime>>,
     #[serde(default)]
     models: Option<NonEmptyVec<ModelMemberRequest>>,
+    #[serde(default)]
+    family: Option<CatalogName>,
 }
 
 /// Accepts a quoted RFC 3339 string or a native TOML datetime.
@@ -172,6 +178,7 @@ struct CreateInput {
     name: CatalogName,
     release_time: Option<Timestamp>,
     members: MemberInput,
+    family: Option<CatalogName>,
 }
 
 /// The commit that one Hugging Face revision in a file resolved to.
@@ -252,6 +259,7 @@ fn parse_create(scope: &CatalogScope, document: &str) -> anyhow::Result<CreateIn
             release_time: input.release_time,
             runtimes: input.runtimes,
             models: input.models,
+            family: input.family,
         },
     )
 }
@@ -261,10 +269,15 @@ fn create_input(
     request: CreateDescriptorEntryRequest,
 ) -> anyhow::Result<CreateInput> {
     check_reserved_name(scope, &request.name)?;
+    let members = MemberInput::of_entry(request.runtimes, request.models)?;
+    if request.family.is_some() && members.descriptor_kind() == DescriptorKind::Runtime {
+        return Err(EntryError::RuntimeFamily.into());
+    }
     Ok(CreateInput {
         name: request.name,
         release_time: request.release_time,
-        members: MemberInput::of_entry(request.runtimes, request.models)?,
+        members,
+        family: request.family,
     })
 }
 
@@ -291,12 +304,15 @@ async fn build_create(
         name,
         release_time,
         members,
+        family,
     } = create_input(scope, input).map_err(CatalogWriteError::Invalid)?;
     let (members, _) = members
         .resolve(hub, vault, scope, now)
         .await
         .map_err(resolve_error)?;
-    new_entry(scope, name, release_time, members, now, creator).map_err(CatalogWriteError::Invalid)
+    new_entry(scope, name, release_time, members, now, creator)
+        .and_then(|entry| Ok(entry.with_family(family)?))
+        .map_err(CatalogWriteError::Invalid)
 }
 
 fn parse_member(document: &str) -> anyhow::Result<MemberInput> {
@@ -428,6 +444,14 @@ impl MemberInput {
                                 })
                                 .transpose()?;
                             (member.with_alias_digest(alias_digest), Vec::new())
+                        } else if hf_repos(&document.model).is_some_and(|repos| repos.is_empty()) {
+                            // A system model ships with the OS: nothing to pin or download.
+                            let member = DescriptorMember::new_model(
+                                document.model,
+                                document.quantization,
+                                now,
+                            )?;
+                            (member.with_size_bytes(Some(0)), Vec::new())
                         } else {
                             pin_model(hub, document, now).await?
                         };
@@ -441,10 +465,6 @@ impl MemberInput {
 }
 
 fn validate_model_source(scope: &CatalogScope, model: &Model) -> anyhow::Result<()> {
-    let model_type = ModelType::of(model);
-    if ModelFormat::of(model_type).is_none() {
-        return Err(MemberError::NoFormat(model_type).into());
-    }
     if names_vault_source(&serde_json::to_value(model)?) {
         anyhow::ensure!(
             matches!(scope, CatalogScope::Org(_)),
@@ -499,7 +519,10 @@ async fn pin_model(
         quantization,
         mut model,
     } = document;
-    let listings = hf_import::listings_for(hub, &model)
+    let hf_import::ModelListings {
+        listings,
+        download_bytes,
+    } = hf_import::listings_for(hub, &model)
         .await
         .map_err(|error| {
             if let HfImportError::Hub(HubError::Refused { repo, status }) = &error {
@@ -556,7 +579,9 @@ async fn pin_model(
             pins.push(pin);
         }
     }
-    Ok((DescriptorMember::new_model(model, quantization, now)?, pins))
+    let member = DescriptorMember::new_model(model, quantization, now)?
+        .with_size_bytes(Some(download_bytes));
+    Ok((member, pins))
 }
 
 /// Report why a repository cannot back a public catalog member.
@@ -653,6 +678,7 @@ pub async fn create_with_vault(
         name,
         release_time,
         members,
+        family,
     } = match document {
         Document::Toml(text) => parse_create(scope, text)?,
         Document::Parsed(request) => create_input(scope, request)?,
@@ -672,7 +698,8 @@ pub async fn create_with_vault(
         members,
         now,
         DescriptorEntryCreator::Operator,
-    )?;
+    )?
+    .with_family(family)?;
     let synonyms = synonyms(store, scope, &entry.members, &entry.name).await?;
     let entry = create_checked(store, scope, entry, dry_run, true).await?;
     Ok(Preview {
@@ -954,7 +981,8 @@ async fn add_checked(
         | EntryError::RuntimeBuildMismatch
         | EntryError::RuntimeBuildInvalid(_)
         | EntryError::FormatTypeClash { .. }
-        | EntryError::SpeculativeMix) => CatalogWriteError::Invalid(other.into()),
+        | EntryError::SpeculativeMix
+        | EntryError::RuntimeFamily) => CatalogWriteError::Invalid(other.into()),
     })?;
     same_build(&members).map_err(CatalogWriteError::Invalid)?;
     let mut stored = None;
@@ -1606,6 +1634,246 @@ pub async fn relabel_entry(
     Ok(entry)
 }
 
+/// Predict the outcome of [`DescriptorCatalogStore::set_family`] using the current entry.
+async fn preview_set_family(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    family: Option<Option<&CatalogName>>,
+) -> anyhow::Result<SetFamilyOutcome> {
+    let Some(entry) = store.get_entry(scope, name).await? else {
+        return Ok(SetFamilyOutcome::NoSuchEntry);
+    };
+    if entry.state == DescriptorEntryState::Tombstoned {
+        return Ok(SetFamilyOutcome::Tombstoned);
+    }
+    if entry.descriptor_kind() == DescriptorKind::Runtime {
+        return Ok(SetFamilyOutcome::RuntimeEntry);
+    }
+    let entry = match family {
+        Some(family) => entry.with_family(family.cloned())?,
+        None => entry,
+    };
+    Ok(SetFamilyOutcome::Set(entry))
+}
+
+/// Set a model entry's family override and return the resulting entry.
+/// Pass `None` to read the current entry or `Some(None)` to clear the override.
+/// A dry run checks the proposed change without writing it.
+pub async fn set_entry_family(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    name: &CatalogName,
+    family: Option<Option<&CatalogName>>,
+    actor: Option<&AuditActor>,
+    dry_run: bool,
+) -> Result<DescriptorEntry, CatalogWriteError> {
+    let write = family.filter(|_| !dry_run);
+    let outcome = match write {
+        Some(family) => store.set_family(scope, name, family, actor).await,
+        None => preview_set_family(store, scope, name, family).await,
+    }
+    .map_err(CatalogWriteError::Storage)?;
+    let entry = match outcome {
+        SetFamilyOutcome::Set(entry) => entry,
+        SetFamilyOutcome::NoSuchEntry => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "no catalog entry {name}"
+            )));
+        }
+        SetFamilyOutcome::Tombstoned => {
+            return Err(CatalogWriteError::Conflict(format!(
+                "catalog entry {name} is tombstoned"
+            )));
+        }
+        SetFamilyOutcome::RuntimeEntry => {
+            return Err(CatalogWriteError::Invalid(anyhow::anyhow!(
+                "catalog entry {name} holds runtimes, and only a model entry has a family"
+            )));
+        }
+    };
+    if write.is_some() {
+        log_set_family(scope, &entry);
+    }
+    Ok(entry)
+}
+
+pub fn set_family_audit_action(scope: &CatalogScope, entry: &DescriptorEntry) -> AuditAction {
+    AuditAction::CatalogSetFamily {
+        scope: scope.clone(),
+        name: entry.name.clone(),
+        family: entry.family.clone(),
+    }
+}
+
+fn log_set_family(scope: &CatalogScope, entry: &DescriptorEntry) {
+    let family = entry.family().unwrap_or_default();
+    let overridden = entry.family.is_some();
+    match scope {
+        CatalogScope::Global => tracing::info!(
+            catalog_name = %entry.name,
+            family,
+            overridden,
+            "catalog entry family set"
+        ),
+        CatalogScope::Org(org_id) => tracing::info!(
+            catalog_name = %entry.name,
+            org_id = %org_id,
+            family,
+            overridden,
+            "catalog entry family set"
+        ),
+    }
+}
+
+/// The family logos that a reader of entries in `scopes` sees: the logos of
+/// those scopes and the global logos.
+pub async fn family_logos(
+    store: &dyn DescriptorCatalogStore,
+    scopes: impl IntoIterator<Item = CatalogScope>,
+) -> anyhow::Result<FamilyLogos> {
+    let scopes: BTreeSet<CatalogScope> = scopes.into_iter().chain([CatalogScope::Global]).collect();
+    let scopes: Vec<CatalogScope> = scopes.into_iter().collect();
+    Ok(store.family_logos(&scopes).await?.into_iter().collect())
+}
+
+/// Predict the outcome of [`DescriptorCatalogStore::set_family_logo`] from
+/// the current entries and logos.
+async fn preview_set_family_logo(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    family: &CatalogName,
+    logo_uri: Option<&LogoUri>,
+) -> anyhow::Result<SetFamilyLogoOutcome> {
+    let Some(logo_uri) = logo_uri else {
+        let key = family.key();
+        let found = store
+            .family_logos(std::slice::from_ref(scope))
+            .await?
+            .into_iter()
+            .find(|logo| logo.family.key() == key);
+        let Some(found) = found else {
+            return Ok(SetFamilyLogoOutcome::Cleared(None));
+        };
+        let removed = store
+            .family_logos_with_digest(&found.sha256)
+            .await?
+            .into_iter()
+            .find(|logo| logo.scope == *scope && logo.family.key() == key);
+        return Ok(SetFamilyLogoOutcome::Cleared(removed));
+    };
+    if !has_family(store, scope, family).await? {
+        return Ok(SetFamilyLogoOutcome::NoSuchFamily);
+    }
+    Ok(SetFamilyLogoOutcome::Set(FamilyLogo {
+        scope: scope.clone(),
+        family: family.clone(),
+        logo_uri: logo_uri.clone(),
+    }))
+}
+
+/// Whether a model entry of `scope` that is not tombstoned has `family`.
+/// Family comparison ignores case. This is the check of the SQL `EXISTS` in
+/// `set_family_logo`, so the two change together.
+async fn has_family(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    family: &CatalogName,
+) -> anyhow::Result<bool> {
+    let filter = DescriptorEntryFilter {
+        scopes: [scope.clone()].into(),
+        descriptor_kind: Some(DescriptorKind::Model),
+        ..Default::default()
+    };
+    let mut after = None;
+    loop {
+        let page = store
+            .list_entries(&filter, after.as_ref(), DRAIN_PAGE_SIZE)
+            .await?;
+        // A store can apply only part of the filter, so each entry is checked again.
+        let found = page.items.iter().any(|entry| {
+            entry.scope == *scope
+                && entry.descriptor_kind() == DescriptorKind::Model
+                && entry.state != DescriptorEntryState::Tombstoned
+                && entry
+                    .family()
+                    .is_some_and(|shown| shown.eq_ignore_ascii_case(family.as_str()))
+        });
+        match page.resume_after {
+            _ if found => return Ok(true),
+            Some(next) => after = Some(next),
+            None => return Ok(false),
+        }
+    }
+}
+
+/// Set the logo of a model family in `scope`, or clear it with `None`. A new
+/// logo needs a model entry in the scope with the family. A dry run checks
+/// the change without writing it.
+pub async fn set_family_logo(
+    store: &dyn DescriptorCatalogStore,
+    scope: &CatalogScope,
+    family: &CatalogName,
+    logo_uri: Option<&LogoUri>,
+    actor: Option<&AuditActor>,
+    dry_run: bool,
+) -> Result<SetFamilyLogoOutcome, CatalogWriteError> {
+    let outcome = if dry_run {
+        preview_set_family_logo(store, scope, family, logo_uri).await
+    } else {
+        store.set_family_logo(scope, family, logo_uri, actor).await
+    }
+    .map_err(CatalogWriteError::Storage)?;
+    match &outcome {
+        SetFamilyLogoOutcome::NoSuchFamily => {
+            return Err(CatalogWriteError::NotFound(format!(
+                "no model entry has family {family}"
+            )));
+        }
+        SetFamilyLogoOutcome::Set(_) | SetFamilyLogoOutcome::Cleared(Some(_)) if !dry_run => {
+            log_set_family_logo(scope, family, logo_uri);
+        }
+        SetFamilyLogoOutcome::Set(_) | SetFamilyLogoOutcome::Cleared(_) => {}
+    }
+    Ok(outcome)
+}
+
+pub fn set_family_logo_audit_action(
+    scope: &CatalogScope,
+    family: &CatalogName,
+    logo_uri: Option<&LogoUri>,
+) -> AuditAction {
+    AuditAction::CatalogSetFamilyLogo {
+        scope: scope.clone(),
+        family: family.clone(),
+        logo_uri: logo_uri.cloned(),
+    }
+}
+
+fn log_set_family_logo(scope: &CatalogScope, family: &CatalogName, logo_uri: Option<&LogoUri>) {
+    match (scope, logo_uri) {
+        (CatalogScope::Global, Some(logo_uri)) => tracing::info!(
+            family = %family,
+            logo_sha256 = %logo_uri.sha256(),
+            "catalog family logo set"
+        ),
+        (CatalogScope::Org(org_id), Some(logo_uri)) => tracing::info!(
+            family = %family,
+            org_id = %org_id,
+            logo_sha256 = %logo_uri.sha256(),
+            "catalog family logo set"
+        ),
+        (CatalogScope::Global, None) => {
+            tracing::info!(family = %family, "catalog family logo cleared");
+        }
+        (CatalogScope::Org(org_id), None) => tracing::info!(
+            family = %family,
+            org_id = %org_id,
+            "catalog family logo cleared"
+        ),
+    }
+}
+
 /// A member removal from a hand-made entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedMember {
@@ -1787,9 +2055,150 @@ pub async fn move_entry_to_global(
     Ok(moved)
 }
 
+/// A model member and its calculated download size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizedMember {
+    pub entry: CatalogEntryKey,
+    /// The member's `format::quantization`.
+    pub member: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SizeFill {
+    pub sized: Vec<SizedMember>,
+    /// The number of members for which the command could not determine a
+    /// size that the catalog can store.
+    pub failed: usize,
+}
+
+/// Record the download size of each Hugging Face model member in `scopes`
+/// that has none. The size comes from the Hub listing at the member's pinned
+/// commit. A vault model member and a tombstoned entry stay unsized. A dry
+/// run prints the sizes without saving them. The command skips a member if
+/// the lookup fails or its size exceeds the catalog storage limit. If a
+/// cursor becomes invalid, the command restarts the scan once.
+pub async fn fill_member_sizes(
+    store: &dyn DescriptorCatalogStore,
+    hub: &HubClient,
+    scopes: BTreeSet<CatalogScope>,
+    dry_run: bool,
+) -> anyhow::Result<SizeFill> {
+    let filter = DescriptorEntryFilter {
+        scopes,
+        descriptor_kind: Some(DescriptorKind::Model),
+        ..DescriptorEntryFilter::default()
+    };
+    let mut fill = SizeFill::default();
+    let mut after = None;
+    let mut restarted = false;
+    loop {
+        let page = match list(store, filter.clone(), after.as_ref(), DRAIN_PAGE_SIZE).await {
+            Err(error) if !restarted && after.is_some() && error.is::<UnknownCursorError>() => {
+                tracing::warn!(%error, "restarting the catalog member size backfill scan");
+                restarted = true;
+                after = None;
+                fill.failed = 0;
+                // Keep reports of committed writes. A dry run previews the new scan.
+                if dry_run {
+                    fill.sized.clear();
+                }
+                continue;
+            }
+            page => page?,
+        };
+        page.unreadable.iter().for_each(|unreadable| {
+            tracing::warn!(error = %unreadable, "catalog member size backfill skipped an unreadable entry");
+        });
+        for entry in page.items {
+            let key = CatalogEntryKey {
+                scope: entry.scope.clone(),
+                name: entry.name.clone(),
+            };
+            for member in entry.members.iter() {
+                let Some(model) = member
+                    .model()
+                    .filter(|model| member.size_bytes().is_none() && hf_repos(model).is_some())
+                else {
+                    continue;
+                };
+                let size = hf_import::listings_for(hub, model)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|listings| {
+                        let bytes = listings.download_bytes;
+                        i64::try_from(bytes)
+                            .with_context(|| {
+                                format!("download size {bytes} exceeds the catalog storage limit")
+                            })
+                            .map(|_| bytes)
+                    });
+                let size_bytes = match size {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            catalog_name = %key.name,
+                            org_id = %key.scope,
+                            digest = member.digest(),
+                            hf_refs = member_refs(member),
+                            error = %error,
+                            "catalog member size backfill could not determine a storable size"
+                        );
+                        fill.failed += 1;
+                        continue;
+                    }
+                };
+                if !dry_run {
+                    if !store
+                        .fill_member_size(&key.scope, &key.name, member.digest(), size_bytes)
+                        .await?
+                    {
+                        continue;
+                    }
+                    tracing::info!(
+                        catalog_name = %key.name,
+                        org_id = %key.scope,
+                        digest = member.digest(),
+                        size_bytes,
+                        "catalog member size backfilled"
+                    );
+                }
+                fill.sized.push(SizedMember {
+                    entry: key.clone(),
+                    member: member_key(member),
+                    size_bytes,
+                });
+            }
+        }
+        match page.resume_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    if restarted {
+        let mut reported = HashSet::new();
+        fill.sized.retain(|row| {
+            reported.insert((
+                row.entry.scope.clone(),
+                row.entry.name.key(),
+                row.member.clone(),
+                row.size_bytes,
+            ))
+        });
+    }
+    tracing::info!(
+        sized = fill.sized.len(),
+        failed = fill.failed,
+        dry_run,
+        "catalog member size backfill finished"
+    );
+    Ok(fill)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::ops::Bound::{Excluded, Unbounded};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1798,7 +2207,7 @@ pub(crate) mod tests {
 
     use pipette_core::vault::VaultOwner;
     use pipette_hub_testkit::{MockFile, MockGate, MockHub, MockRepo, PR_REF};
-    use pipette_plan_types::{OrgId, UserId, VaultResourceId};
+    use pipette_plan_types::{FamilyLogoDigest, OrgId, Sha256, UserId, VaultResourceId};
 
     use super::*;
 
@@ -1954,6 +2363,7 @@ pub(crate) mod tests {
                 release_time: None,
                 runtimes: Some(NonEmptyVec::try_new(vec![runtime("macos-arm64")?])?),
                 models: None,
+                family: None,
             })
         };
         let store = Memory::default();
@@ -2173,23 +2583,11 @@ pub(crate) mod tests {
         };
         let unknown = refusals(vault_record(vault, org, false).await?, "org_1").await?;
         assert!(unknown[0].contains("does not exist"), "{unknown:?}");
-        for (owner, principal) in [
-            (
-                VaultOwner::Org {
-                    org_id: OrgId::try_new("org_2")?,
-                },
-                "org_2",
-            ),
-            (
-                VaultOwner::User {
-                    user_id: UserId::try_new("user_1")?,
-                },
-                "user_1",
-            ),
-        ] {
-            let foreign = vault_record(vault, owner, true).await?;
-            assert_eq!(refusals(foreign, principal).await?, unknown);
-        }
+        let owner = VaultOwner::Org {
+            org_id: OrgId::try_new("org_2")?,
+        };
+        let foreign = vault_record(vault, owner, true).await?;
+        assert_eq!(refusals(foreign, "org_2").await?, unknown);
         Ok(())
     }
 
@@ -2247,6 +2645,7 @@ pub(crate) mod tests {
         Mutex<BTreeMap<String, DescriptorEntry>>,
         AtomicBool,
         Mutex<Option<Arc<tokio::sync::Barrier>>>,
+        Mutex<Vec<FamilyLogo>>,
     );
 
     impl Memory {
@@ -2255,6 +2654,88 @@ pub(crate) mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("memory store poisoned"))
         }
+
+        fn logos(&self) -> anyhow::Result<MutexGuard<'_, Vec<FamilyLogo>>> {
+            self.3
+                .lock()
+                .map_err(|_| anyhow::anyhow!("memory store poisoned"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_family_logo_checks_and_writes_nothing() -> anyhow::Result<()> {
+        let store = Memory::default();
+        let model = pipette_store_testkit::a_descriptor_entry(
+            "LFM2.5-1.2B",
+            DescriptorEntryKind::HandMade,
+            300,
+            pipette_store_testkit::a_model_member("mlx", "LFM2.5-1.2B-MLX", "4bit")?,
+        )?;
+        assert_eq!(
+            store.create_entry(&model).await?,
+            CreateEntryOutcome::Created
+        );
+        let global = CatalogScope::Global;
+        let logo_uri = LogoUri::try_new("data:image/svg+xml;base64,PHN2Zy8+")?;
+        let unknown = set_family_logo(
+            &store,
+            &global,
+            &CatalogName::try_new("Qwen3")?,
+            Some(&logo_uri),
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err(CatalogWriteError::NotFound(_))),
+            "{unknown:?}"
+        );
+        let family = CatalogName::try_new("lfm2.5")?;
+        assert_eq!(
+            set_family_logo(&store, &global, &family, Some(&logo_uri), None, true).await?,
+            SetFamilyLogoOutcome::Set(FamilyLogo {
+                scope: global.clone(),
+                family: family.clone(),
+                logo_uri: logo_uri.clone(),
+            })
+        );
+        assert_eq!(store.family_logos(std::slice::from_ref(&global)).await?, []);
+
+        set_family_logo(&store, &global, &family, Some(&logo_uri), None, false).await?;
+        let stored = store.family_logos(std::slice::from_ref(&global)).await?;
+        assert_eq!(
+            set_family_logo(&store, &global, &family, None, None, true).await?,
+            SetFamilyLogoOutcome::Cleared(Some(FamilyLogo {
+                scope: global.clone(),
+                family,
+                logo_uri,
+            }))
+        );
+        assert_eq!(
+            store.family_logos(std::slice::from_ref(&global)).await?,
+            stored
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_refuses_to_clear_a_runtime_family() -> anyhow::Result<()> {
+        let store = Memory::default();
+        let runtime = pipette_store_testkit::a_descriptor_entry(
+            "Fork",
+            DescriptorEntryKind::HandMade,
+            200,
+            pipette_store_testkit::a_member("b1", "linux-x64-rocm")?,
+        )?;
+        assert_eq!(
+            store.create_entry(&runtime).await?,
+            CreateEntryOutcome::Created
+        );
+        assert!(matches!(
+            preview_set_family(&store, &runtime.scope, &runtime.name, Some(None)).await?,
+            SetFamilyOutcome::RuntimeEntry
+        ));
+        Ok(())
     }
 
     #[async_trait::async_trait]
@@ -2459,6 +2940,82 @@ pub(crate) mod tests {
             Ok(RelabelOutcome::Relabeled(relabeled))
         }
 
+        async fn set_family(
+            &self,
+            scope: &CatalogScope,
+            name: &CatalogName,
+            family: Option<&CatalogName>,
+            _actor: Option<&AuditActor>,
+        ) -> anyhow::Result<SetFamilyOutcome> {
+            let outcome = preview_set_family(self, scope, name, Some(family)).await?;
+            if let SetFamilyOutcome::Set(entry) = &outcome {
+                self.entries()?.insert(entry.name.key(), entry.clone());
+            }
+            Ok(outcome)
+        }
+
+        async fn set_family_logo(
+            &self,
+            scope: &CatalogScope,
+            family: &CatalogName,
+            logo_uri: Option<&LogoUri>,
+            _actor: Option<&AuditActor>,
+        ) -> anyhow::Result<SetFamilyLogoOutcome> {
+            let outcome = preview_set_family_logo(self, scope, family, logo_uri).await?;
+            if outcome != SetFamilyLogoOutcome::NoSuchFamily {
+                let mut logos = self.logos()?;
+                logos.retain(|logo| logo.scope != *scope || logo.family.key() != family.key());
+                if let SetFamilyLogoOutcome::Set(logo) = &outcome {
+                    logos.push(logo.clone());
+                }
+            }
+            Ok(outcome)
+        }
+
+        async fn family_logos(
+            &self,
+            scopes: &[CatalogScope],
+        ) -> anyhow::Result<Vec<FamilyLogoDigest>> {
+            self.logos()?
+                .iter()
+                .filter(|logo| scopes.contains(&logo.scope))
+                .map(|logo| {
+                    Ok(FamilyLogoDigest {
+                        scope: logo.scope.clone(),
+                        family: logo.family.clone(),
+                        sha256: Sha256::try_new(logo.logo_uri.sha256())?,
+                    })
+                })
+                .collect()
+        }
+
+        async fn family_logos_with_digest(
+            &self,
+            sha256: &Sha256,
+        ) -> anyhow::Result<Vec<FamilyLogo>> {
+            Ok(self
+                .logos()?
+                .iter()
+                .filter(|logo| logo.logo_uri.sha256() == sha256.as_ref())
+                .cloned()
+                .collect())
+        }
+
+        async fn family_logo_uri_by_digest(
+            &self,
+            sha256: &Sha256,
+            scopes: Option<&[CatalogScope]>,
+        ) -> anyhow::Result<Option<LogoUri>> {
+            Ok(self
+                .logos()?
+                .iter()
+                .find(|logo| {
+                    scopes.is_none_or(|scopes| scopes.contains(&logo.scope))
+                        && logo.logo_uri.sha256() == sha256.as_ref()
+                })
+                .map(|logo| logo.logo_uri.clone()))
+        }
+
         async fn remove_member(
             &self,
             _scope: &CatalogScope,
@@ -2518,17 +3075,37 @@ pub(crate) mod tests {
         async fn list_entries(
             &self,
             filter: &DescriptorEntryFilter,
-            _after: Option<&CatalogEntryKey>,
-            _limit: NonZeroUsize,
+            after: Option<&CatalogEntryKey>,
+            limit: NonZeroUsize,
         ) -> anyhow::Result<DescriptorEntryPage> {
-            let items = self
-                .entries()?
-                .values()
-                .filter(|entry| filter.states.is_empty() || filter.states.contains(&entry.state))
-                .cloned()
-                .collect();
+            let entries = self.entries()?;
+            let start = match after {
+                Some(after) if entries.contains_key(&after.name.key()) => {
+                    Excluded(after.name.key())
+                }
+                Some(after) => {
+                    return Err(UnknownCursorError {
+                        cursor: after.clone(),
+                    }
+                    .into());
+                }
+                None => Unbounded,
+            };
+            let mut matching = entries
+                .range((start, Unbounded))
+                .map(|(_, entry)| entry)
+                .filter(|entry| filter.states.is_empty() || filter.states.contains(&entry.state));
+            let items: Vec<_> = matching.by_ref().take(limit.get()).cloned().collect();
+            let resume_after = items
+                .last()
+                .filter(|_| matching.next().is_some())
+                .map(|entry| CatalogEntryKey {
+                    scope: entry.scope.clone(),
+                    name: entry.name.clone(),
+                });
             Ok(DescriptorEntryPage {
                 items,
+                resume_after,
                 ..Default::default()
             })
         }
@@ -2574,6 +3151,43 @@ pub(crate) mod tests {
             _org_id: &pipette_plan_types::OrgId,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn fill_member_size(
+            &self,
+            scope: &CatalogScope,
+            name: &CatalogName,
+            digest: &str,
+            size_bytes: u64,
+        ) -> anyhow::Result<bool> {
+            let mut entries = self.entries()?;
+            let Some(entry) = entries
+                .get(&name.key())
+                .filter(|entry| {
+                    &entry.scope == scope && entry.state != DescriptorEntryState::Tombstoned
+                })
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            let mut filled = false;
+            let members = entry
+                .members
+                .into_inner()
+                .into_iter()
+                .map(|member| match member.size_bytes() {
+                    None if member.digest() == digest => {
+                        filled = true;
+                        member.with_size_bytes(Some(size_bytes))
+                    }
+                    _ => member,
+                })
+                .collect();
+            let sized = DescriptorEntry {
+                members: NonEmptyVec::try_new(members)?,
+                ..entry
+            };
+            entries.insert(sized.name.key(), sized);
+            Ok(filled)
         }
     }
 
@@ -2948,6 +3562,18 @@ pub(crate) mod tests {
                 "acme/Unreported".to_owned(),
                 repo('f', true, MockGate::Unreported, gguf_files()),
             ),
+            (
+                "acme/Oversized-GGUF".to_owned(),
+                repo(
+                    'a',
+                    true,
+                    MockGate::Open,
+                    vec![
+                        MockFile::lfs("AcmeLM-Q4_0.gguf", b"GGUF q4_0")
+                            .with_reported_size(i64::MAX.unsigned_abs() + 1),
+                    ],
+                ),
+            ),
         ]))
         .await
     }
@@ -3033,11 +3659,6 @@ pub(crate) mod tests {
             ", auth_token = 'hf_good_SECRET'"
         ),
         "must not carry an access token",
-        0
-    )]
-    #[case::no_format(
-        "{ type = 'apple_foundation_text' }".to_owned(),
-        "has no catalog format",
         0
     )]
     #[tokio::test]
@@ -3148,6 +3769,203 @@ pub(crate) mod tests {
         let reference = hub.reference(GGUF_REPO).context("mock repo")?;
         assert_eq!(member_refs(stored.members.head()), reference);
         assert_eq!(member_key(stored.members.head()), "gguf::q4_0");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::gguf_file(gguf("AcmeLM-VL-3B-GGUF", "AcmeLM-Q4_0.gguf", ""), 9)]
+    #[case::mlx_tree(mlx(""), 2 + 16)]
+    #[tokio::test]
+    async fn create_records_the_download_size(
+        #[case] model: String,
+        #[case] size_bytes: u64,
+    ) -> anyhow::Result<()> {
+        let hub = model_hub().await?;
+        let store = Memory::default();
+        let document = model_entry("AcmeLM-VL-3B", &[("q4_0", &model)]);
+        let preview = create(
+            &store,
+            &client(&hub)?,
+            &CatalogScope::Global,
+            &document,
+            Timestamp::now(),
+            false,
+        )
+        .await?;
+        let stored = store
+            .get_entry(&CatalogScope::Global, &preview.entry.name)
+            .await?
+            .context("the entry must be stored")?;
+        assert_eq!(stored.members.head().size_bytes(), Some(size_bytes));
+        Ok(())
+    }
+
+    fn unsized_gguf(repo_name: &str, commit: &str) -> anyhow::Result<DescriptorMember> {
+        let model = toml::from_str::<Model>(&format!(
+            "type = 'gguf_text'\nsource = 'huggingface'\norg = 'acme'\nrepo_name = '{repo_name}'\npath = 'AcmeLM-Q4_0.gguf'\nrevision = '{commit}'"
+        ))?;
+        Ok(DescriptorMember::new_model(
+            model,
+            QuantizationLabel::try_new("q4_0")?,
+            Timestamp::now(),
+        )?)
+    }
+
+    #[rstest]
+    #[case::dry_run(true)]
+    #[case::write(false)]
+    #[tokio::test]
+    async fn fix_sizes_fills_only_unsized_members(#[case] dry_run: bool) -> anyhow::Result<()> {
+        let hub = model_hub().await?;
+        let store = Memory::default();
+        let scope = CatalogScope::Global;
+        let now = Timestamp::now();
+        let entry = |name: &str, member: DescriptorMember| {
+            new_entry(
+                &scope,
+                CatalogName::try_new(name)?,
+                None,
+                NonEmptyVec::try_new(vec![member])?,
+                now,
+                DescriptorEntryCreator::Operator,
+            )
+        };
+        let sized = unsized_gguf("AcmeLM-VL-3B-GGUF", &commit('a'))?.with_size_bytes(Some(1));
+        store.create_entry(&entry("Sized", sized)?).await?;
+        store
+            .create_entry(&entry(
+                "Unsized",
+                unsized_gguf("AcmeLM-VL-3B-GGUF", &commit('a'))?,
+            )?)
+            .await?;
+        store
+            .create_entry(&entry("Gone", unsized_gguf("Gone-GGUF", &commit('a'))?)?)
+            .await?;
+        let oversized = entry("Oversized", unsized_gguf("Oversized-GGUF", &commit('a'))?)?;
+        store.create_entry(&oversized).await?;
+
+        let fill =
+            fill_member_sizes(&store, &client(&hub)?, [scope.clone()].into(), dry_run).await?;
+
+        let unsized_name = CatalogName::try_new("Unsized")?;
+        assert_eq!(
+            fill.sized,
+            [SizedMember {
+                entry: CatalogEntryKey {
+                    scope: scope.clone(),
+                    name: unsized_name.clone(),
+                },
+                member: "gguf::q4_0".to_owned(),
+                size_bytes: 9,
+            }]
+        );
+        assert_eq!(fill.failed, 2);
+        let size_of = |name: &CatalogName| {
+            let entries = store.entries()?;
+            let entry = entries
+                .get(&name.key())
+                .context("the entry must be stored")?;
+            Ok::<_, anyhow::Error>(entry.members.head().size_bytes())
+        };
+        assert_eq!(size_of(&unsized_name)?, (!dry_run).then_some(9));
+        assert_eq!(size_of(&oversized.name)?, None);
+        assert_eq!(size_of(&CatalogName::try_new("Sized")?)?, Some(1));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::dry_run(true)]
+    #[case::write(false)]
+    #[tokio::test]
+    async fn fix_sizes_restarts_once_after_the_page_cursor_is_renamed(
+        #[case] dry_run: bool,
+    ) -> anyhow::Result<()> {
+        let hub = model_hub().await?;
+        let client = client(&hub)?;
+        let store = Memory::default();
+        let scope = CatalogScope::Global;
+        let member = unsized_gguf("AcmeLM-VL-3B-GGUF", &commit('a'))?;
+        let gone = unsized_gguf("Gone-GGUF", &commit('a'))?;
+        let sized = member.clone().with_size_bytes(Some(9));
+        let limit = DRAIN_PAGE_SIZE.get();
+        let name = |index| CatalogName::try_new(format!("Model-{index:03}"));
+        let cursor = name(limit - 1)?;
+        let renamed = CatalogName::try_new(format!("{cursor}-renamed"))?;
+        let now = Timestamp::now();
+        for index in 0..=limit {
+            let fixture = match index {
+                0 => &member,
+                1 => &gone,
+                _ if index >= limit - 1 => &member,
+                _ => &sized,
+            };
+            let entry = new_entry(
+                &scope,
+                name(index)?,
+                None,
+                NonEmptyVec::try_new(vec![fixture.clone()])?,
+                now,
+                DescriptorEntryCreator::Operator,
+            )?;
+            store.create_entry(&entry).await?;
+        }
+
+        let pending_hub = hub.hold().await;
+        let rename_cursor = async {
+            hub.arrived().await;
+            let outcome = store.rename_entry(&scope, &cursor, &renamed).await;
+            drop(pending_hub);
+            outcome
+        };
+        let run = fill_member_sizes(&store, &client, [scope.clone()].into(), dry_run);
+        let (fill, renamed_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(run, rename_cursor)
+            })
+            .await?;
+        assert!(matches!(renamed_outcome?, RenameOutcome::Renamed { .. }));
+        let fill = fill?;
+        assert_eq!(fill.failed, 1);
+        let expected = [name(0)?, renamed, name(limit)?].map(|name| SizedMember {
+            entry: CatalogEntryKey {
+                scope: scope.clone(),
+                name,
+            },
+            member: "gguf::q4_0".to_owned(),
+            size_bytes: 9,
+        });
+        assert_eq!(fill.sized, expected);
+        for row in &fill.sized {
+            let stored = store
+                .get_entry(&row.entry.scope, &row.entry.name)
+                .await?
+                .context("the reported entry must exist")?;
+            assert_eq!(stored.members.head().size_bytes(), (!dry_run).then_some(9));
+        }
+        Ok(())
+    }
+
+    /// A system model names no files, so its entry reads nothing from the hub.
+    #[tokio::test]
+    async fn a_system_model_entry_pins_nothing() -> anyhow::Result<()> {
+        let hub = MockHub::start(HashMap::new()).await?;
+        let store = Memory::default();
+        let document = model_entry(
+            "apple-foundation",
+            &[("default", "{ type = 'apple_foundation_text' }")],
+        );
+        let created = create(
+            &store,
+            &client(&hub)?,
+            &CatalogScope::Global,
+            &document,
+            Timestamp::now(),
+            false,
+        )
+        .await?;
+        assert!(created.pins.is_empty());
+        assert_eq!(member_keys(&created.entry.members), "system::default");
+        assert_eq!(created.entry.members.head().size_bytes(), Some(0));
         Ok(())
     }
 

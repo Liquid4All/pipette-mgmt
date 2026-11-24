@@ -54,9 +54,9 @@ describe("the jump box", () => {
   });
 
   test.each([
-    ["a campaign's plan", [summary(PLAN, CAMPAIGN)], `/app/plans/${PLAN}/cells?q=${JOB}`],
-    ["a plan of no campaign", [summary(PLAN)], `/app/plans/${PLAN}/cells?q=${JOB}`],
-    ["the newest of several plans", [summary("plan-old", CAMPAIGN), summary(PLAN)], `/app/plans/${PLAN}/cells?q=${JOB}`],
+    ["a campaign's plan", [summary(PLAN, CAMPAIGN)], `/app/plans/${PLAN}/cells?q=${JOB}&sort=job`],
+    ["a plan of no campaign", [summary(PLAN)], `/app/plans/${PLAN}/cells?q=${JOB}&sort=job`],
+    ["the newest of several plans", [summary("plan-old", CAMPAIGN), summary(PLAN)], `/app/plans/${PLAN}/cells?q=${JOB}&sort=job`],
   ])("opens a job in %s, filtered to it", async (_, plans, address) => {
     expect(jobAddress(JOB, plans)).toBe(address);
     expect(await resolve(JOB, lookups({ [JOB]: plans }))).toBe(address);
@@ -64,7 +64,7 @@ describe("the jump box", () => {
 
   test("opens an unprefixed ID as the plan the reader reads, else as a job", async () => {
     expect(await resolve(BARE, lookups({}, [BARE]))).toBe(`/app/plans/${BARE}`);
-    expect(await resolve(BARE, lookups({ [BARE]: [summary(PLAN)] }))).toBe(`/app/plans/${PLAN}/cells?q=${BARE}`);
+    expect(await resolve(BARE, lookups({ [BARE]: [summary(PLAN)] }))).toBe(`/app/plans/${PLAN}/cells?q=${BARE}&sort=job`);
   });
 
   test("opens a readable plan without waiting for the job lookup", async () => {

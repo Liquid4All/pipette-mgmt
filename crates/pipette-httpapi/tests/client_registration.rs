@@ -32,9 +32,10 @@ use pipette_plan_types::{
 use pipette_web_testkit::{
     authed_get, body_json, create_user, grant, json_request, json_str, make_object_state,
     make_state, make_state_from_config, make_state_require_client_preauth,
-    make_state_with_auto_approve, raw_request, register_and_approve, register_pending,
-    registered_user, request_user_account, run_qm, seed_avail, seed_org, seeded_queue_state,
-    set_user_org, setup_benchmarks, signed_empty, signed_json, test_config, unauthed_post,
+    make_state_with_auto_approve, mint_user_preauth, raw_request, register_and_approve,
+    register_pending, register_user_key, registered_user, run_qm, seed_avail, seed_org,
+    seeded_queue_state, set_user_org, setup_benchmarks, signed_empty, signed_json, test_config,
+    unauthed_post,
 };
 
 async fn mint_stored_key(state: &AppState, params: ClientPreauthParams) -> anyhow::Result<String> {
@@ -936,34 +937,21 @@ async fn test_a_seeded_tag_routes_work_to_the_new_client() -> anyhow::Result<()>
     Ok(())
 }
 
-enum OwnerKind {
-    Org,
-    User,
-}
-
-async fn seed_owner(state: &AppState, kind: OwnerKind) -> anyhow::Result<ClientOwner> {
-    Ok(match kind {
-        OwnerKind::Org => ClientOwner::Org {
-            org_id: seed_org(state, "acme").await?.org_id,
-        },
-        OwnerKind::User => ClientOwner::User {
-            user_id: create_user(state, "owner@example.test").await?.user_id,
-        },
+async fn seed_owner(state: &AppState) -> anyhow::Result<ClientOwner> {
+    Ok(ClientOwner::Org {
+        org_id: seed_org(state, "acme").await?.org_id,
     })
 }
 
-/// A key naming an owner puts the device there at registration, for either
-/// owner kind: minting the key is the operator vouching for the device.
-#[rstest]
-#[case::org(OwnerKind::Org)]
-#[case::user(OwnerKind::User)]
+/// A key naming an owner puts the device there at registration: minting the
+/// key is the operator vouching for the device.
 #[tokio::test]
-async fn test_client_preauth_key_seeds_the_owner(#[case] kind: OwnerKind) -> anyhow::Result<()> {
+async fn test_client_preauth_key_seeds_the_owner() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
-    let owner = seed_owner(&state, kind).await?;
+    let owner = seed_owner(&state).await?;
     let mut p = key_params(ClientPreauthUsage::SingleUse);
     p.default_owner = Some(owner.clone());
     let token = mint_stored_key(&state, p).await?;
@@ -1012,7 +1000,7 @@ async fn test_a_registration_clears_a_leftover_owner_and_tags() -> anyhow::Resul
 
     let pk = fresh_pubkey()?;
     let id = ClientId::derive(&PublicKeyHex::try_new(pk.clone())?);
-    let leftover = seed_owner(&state, OwnerKind::Org).await?;
+    let leftover = seed_owner(&state).await?;
     state.org_store.set_ownership(&id, Some(leftover)).await?;
     let lab = Tag::try_new("lab")?;
     state.tag_store.add_client_tag(&id, &lab).await?;
@@ -1185,7 +1173,6 @@ async fn register_fresh(
 #[rstest]
 #[tokio::test]
 async fn test_client_preauth_key_naming_a_deleted_owner_is_refused(
-    #[values(OwnerKind::Org, OwnerKind::User)] kind: OwnerKind,
     #[values(ClientPreauthUsage::SingleUse, ClientPreauthUsage::MultiUse)]
     usage: ClientPreauthUsage,
 ) -> anyhow::Result<()> {
@@ -1193,14 +1180,11 @@ async fn test_client_preauth_key_naming_a_deleted_owner_is_refused(
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
-    let owner = seed_owner(&state, kind).await?;
+    let owner = seed_owner(&state).await?;
     let mut p = key_params(usage);
     p.default_owner = Some(owner.clone());
     let token = mint_stored_key(&state, p).await?;
-    match &owner {
-        ClientOwner::Org { org_id } => state.org_store.delete_org(org_id).await?,
-        ClientOwner::User { user_id } => state.user_store.delete_user(user_id).await?,
-    }
+    state.org_store.delete_org(owner.org_id()).await?;
 
     let retry = match usage {
         ClientPreauthUsage::SingleUse => "invalid pre-auth key",
@@ -2094,14 +2078,11 @@ async fn test_a_refused_client_preauth_key_leaves_the_keypair_unclaimed(
     );
 
     match next {
+        // The keypair is free to become a user key.
         NextRegistration::User => {
-            let resp =
-                request_user_account(&state, "owner@example.test", &signing_key, "laptop").await?;
-            assert_eq!(
-                resp.status(),
-                StatusCode::CREATED,
-                "the keypair is free to become a user key"
-            );
+            let owner = create_user(&state, "owner@example.test").await?;
+            let invite = mint_user_preauth(&state, &owner.user_id).await?;
+            register_user_key(&state, &invite, &signing_key, "laptop").await?;
         }
         NextRegistration::Client => {
             body["client_preauth_key"] = json!(token);
@@ -2289,42 +2270,24 @@ async fn test_require_client_preauth_key_outranks_auto_approve() -> anyhow::Resu
     Ok(())
 }
 
-/// One keyless registration, a device's when `n` is even and an account's when odd.
-async fn keyless_registration(
-    state: &AppState,
-    n: u32,
-) -> anyhow::Result<(PublicKeyHex, StatusCode)> {
-    let (public_key, resp) = keyless_registration_from(state, n, &[]).await?;
+/// One keyless device registration.
+async fn keyless_registration(state: &AppState) -> anyhow::Result<(PublicKeyHex, StatusCode)> {
+    let (public_key, resp) = keyless_registration_from(state, &[]).await?;
     Ok((public_key, resp.status()))
 }
 
 async fn keyless_registration_from(
     state: &AppState,
-    n: u32,
     headers: &[(&str, String)],
 ) -> anyhow::Result<(PublicKeyHex, axum::http::Response<axum::body::Body>)> {
     let public_key = PublicKeyHex::try_new(fresh_pubkey()?)?;
-    let (uri, body) = if n.is_multiple_of(2) {
-        (
-            "/clients/register",
-            json!({
-                "public_key": public_key.as_str(),
-                "organization": "TestOrg",
-                "client_details": "flood",
-                "contact_email": "flood@test.com"
-            }),
-        )
-    } else {
-        (
-            "/api/v1/users/register",
-            json!({
-                "public_key": public_key.as_str(),
-                "contact_email": format!("flood{n}@test.com"),
-                "key_details": "flood"
-            }),
-        )
-    };
-    let resp = json_request(state, "POST", uri, headers, &body).await?;
+    let body = json!({
+        "public_key": public_key.as_str(),
+        "organization": "TestOrg",
+        "client_details": "flood",
+        "contact_email": "flood@test.com"
+    });
+    let resp = json_request(state, "POST", "/clients/register", headers, &body).await?;
     Ok((public_key, resp))
 }
 
@@ -2335,21 +2298,14 @@ async fn keyless_registrations_past_the_ceiling_are_refused_but_a_preauth_key_is
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
 
-    anyhow::ensure!(
-        KEYLESS_REGISTRATIONS_PER_WINDOW.is_multiple_of(2),
-        "an even ceiling makes the two refused registrations a device then an account"
-    );
     let sent: Vec<(PublicKeyHex, StatusCode)> =
         futures::stream::iter(0..KEYLESS_REGISTRATIONS_PER_WINDOW + 2)
-            .then(|n| keyless_registration(&state, n))
+            .then(|_| keyless_registration(&state))
             .try_collect()
             .await?;
     let (admitted, refused) = sent
         .split_at_checked(usize::try_from(KEYLESS_REGISTRATIONS_PER_WINDOW)?)
         .context("every registration was sent")?;
-    let [(device_key, device), (account_key, account)] = refused else {
-        anyhow::bail!("expected two refused registrations, got {refused:?}");
-    };
     assert!(
         admitted
             .iter()
@@ -2357,34 +2313,29 @@ async fn keyless_registrations_past_the_ceiling_are_refused_but_a_preauth_key_is
         "{admitted:?}"
     );
     assert_eq!(
-        (*device, *account),
-        (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS)
+        refused
+            .iter()
+            .map(|(_, status)| *status)
+            .collect::<Vec<_>>(),
+        [StatusCode::TOO_MANY_REQUESTS; 2]
     );
-    assert!(
-        state
-            .client_store
-            .get_client(&ClientId::derive(device_key))
-            .await?
-            .is_none(),
+    let clients = &state.client_store;
+    let records: Vec<bool> = futures::stream::iter(refused)
+        .then(|(key, _)| async move {
+            anyhow::Ok(clients.get_client(&ClientId::derive(key)).await?.is_some())
+        })
+        .try_collect()
+        .await?;
+    assert_eq!(
+        records,
+        [false, false],
         "a refused device must not leave a client record"
     );
-    assert_eq!(
-        state
-            .user_store
-            .lookup_user_by_email(&format!(
-                "flood{}@test.com",
-                KEYLESS_REGISTRATIONS_PER_WINDOW + 1
-            ))
-            .await?,
-        None,
-        "a refused account must not claim its address"
-    );
     let key_index = &state.key_index_store;
-    let holders: Vec<Option<KeyHolderPrincipalId>> =
-        futures::stream::iter([device_key, account_key])
-            .then(|key| async move { key_index.holder_of_public_key(&digest_of(key)).await })
-            .try_collect()
-            .await?;
+    let holders: Vec<Option<KeyHolderPrincipalId>> = futures::stream::iter(refused)
+        .then(|(key, _)| async move { key_index.holder_of_public_key(&digest_of(key)).await })
+        .try_collect()
+        .await?;
     assert_eq!(
         holders,
         [None, None],
@@ -2420,7 +2371,7 @@ async fn one_client_past_its_share_is_refused_with_a_wait_but_others_are_not() -
     let state = &state;
     let admitted: Vec<StatusCode> = futures::stream::iter(0..KEYLESS_REGISTRATIONS_PER_CLIENT)
         .then(|n| async move {
-            let (_, resp) = keyless_registration_from(state, n, &from("203.0.113.7", n)).await?;
+            let (_, resp) = keyless_registration_from(state, &from("203.0.113.7", n)).await?;
             anyhow::Ok(resp.status())
         })
         .try_collect()
@@ -2431,7 +2382,7 @@ async fn one_client_past_its_share_is_refused_with_a_wait_but_others_are_not() -
     );
 
     let n = KEYLESS_REGISTRATIONS_PER_CLIENT;
-    let (public_key, resp) = keyless_registration_from(state, n, &from("203.0.113.7", n)).await?;
+    let (public_key, resp) = keyless_registration_from(state, &from("203.0.113.7", n)).await?;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let wait: u64 = resp
         .headers()
@@ -2449,7 +2400,7 @@ async fn one_client_past_its_share_is_refused_with_a_wait_but_others_are_not() -
         "a refused registration must not claim its keypair"
     );
 
-    let (_, resp) = keyless_registration_from(state, n, &from("198.51.100.1", n)).await?;
+    let (_, resp) = keyless_registration_from(state, &from("198.51.100.1", n)).await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     Ok(())
 }

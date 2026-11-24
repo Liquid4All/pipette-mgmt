@@ -30,9 +30,7 @@ use pipette_plan_types::{
 };
 use pipette_store::{CampaignGroupStore, CampaignInAnotherGroupError, STORAGE_CONCURRENCY};
 
-use crate::api_v1::campaigns::{
-    check_name, owner_grants, require, require_owner_files_plans, view,
-};
+use crate::api_v1::campaigns::{check_name, owner_grants, require, view};
 use crate::api_v1::plans::reads::JobWindow;
 use crate::audit::Audit;
 use crate::auth::{ActiveUser, Caller, user_org};
@@ -105,15 +103,7 @@ async fn for_record_write(
     audit
         .involve(state, [AuditTarget::from(group.owner.clone())])
         .await;
-    authority
-        .require_record_owner(
-            state,
-            caller.rights,
-            &group.owner,
-            group_id.as_str(),
-            ANOTHER_OWNER,
-        )
-        .await?;
+    authority.require_owner(&group.owner, group_id.as_str(), ANOTHER_OWNER)?;
     Ok(group)
 }
 
@@ -158,18 +148,17 @@ pub async fn create_campaign_group(
     let store = groups(&state)?;
     let authority = CampaignAuthority::resolve(&state, active.caller()).await?;
     check_name(&body.name)?;
-    let owner = body
-        .owner
-        .map_or_else(|| authority.own_owner(), CampaignOwner::from);
+    let owner = body.owner.map_or_else(
+        || authority.own_owner(),
+        |owner| Ok(CampaignOwner::from(owner)),
+    )?;
     require_destination(
         &state,
         &authority,
         &owner,
-        "you may only create campaign groups for yourself, your organization, or a member of \
-         the organization you administer",
+        "you may only create campaign groups for your organization",
     )
     .await?;
-    require_owner_files_plans(&state, &owner).await?;
     audit
         .involve(&state, [AuditTarget::from(owner.clone())])
         .await;
@@ -201,7 +190,6 @@ pub async fn list_campaign_groups(
     let OwnedPage { page, .. } = page_within_reach(
         &state.config,
         query,
-        &caller.user.user_id,
         |group: &CampaignGroup| reach.admits_owner(&group.owner),
         "campaign groups",
         |after, limit| async move { store.list_groups(after.as_ref(), limit).await },
@@ -574,6 +562,8 @@ fn member_preview(
         flagged: _,
         read: _,
         job_states: _,
+        pace: _,
+        last_filed_at: _,
         record: _,
     } = evaluation;
     let earliest_deadline = earliest_deadline.and_then(ExpiresAt::instant);
@@ -840,6 +830,12 @@ mod tests {
         async fn group_of(&self, _: &CampaignId) -> anyhow::Result<Option<CampaignGroupId>> {
             anyhow::bail!("group_of: not implemented by this fake")
         }
+        async fn group_and_member(
+            &self,
+            _: &CampaignId,
+        ) -> anyhow::Result<Option<(CampaignGroup, GroupMember)>> {
+            anyhow::bail!("group_and_member: not implemented by this fake")
+        }
         async fn list_policies(
             &self,
             _: &CampaignGroupId,
@@ -873,6 +869,14 @@ mod tests {
             _: &JobStateChanges,
         ) -> anyhow::Result<bool> {
             anyhow::bail!("set_policy_state: not implemented by this fake")
+        }
+        async fn clear_policy_state(
+            &self,
+            _: &CampaignGroupId,
+            _: &CampaignId,
+            _: &GroupPolicyState,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("clear_policy_state: not implemented by this fake")
         }
         async fn job_states(
             &self,

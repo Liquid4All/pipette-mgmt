@@ -20,4 +20,3 @@ read and not one to poll.
 
 | Status | When |
 |--------|------|
-| 404 | The organization is outside the caller's scope or does not exist |

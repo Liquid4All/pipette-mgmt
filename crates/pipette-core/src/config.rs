@@ -203,12 +203,6 @@ pub struct Config {
     /// registration stays open (governed only by `auto_approve`).
     #[serde(default)]
     pub require_client_preauth_key: bool,
-    /// When `true`, a user key's registration requires a valid user pre-auth
-    /// key; a keyless request gets `403`. Off by default, so a machine can ask
-    /// for an account and wait for an operator. Separate from the device switch:
-    /// a deployment may hand-mint operators yet let devices self-register.
-    #[serde(default)]
-    pub require_user_preauth_key: bool,
     /// When `true`, a signature over the bare `X-Timestamp` value is accepted
     /// besides one over the `v1` payload, logged at `warn` with the client id;
     /// once those lines stop appearing, set it `false`. A migration aid, not a
@@ -442,9 +436,12 @@ pub struct OfferRule {
     /// - `mlx_macos_pipette`
     /// - a runtime that the iOS app builds in: `llamacpp_ios_pipette`,
     ///   `mlx_ios_pipette`, or `onnx_genai_ios_pipette`
+    /// - `apple_foundation`, which has no flavor
     pub runtime_type: RuntimeType,
-    /// Known flavor of that runtime type.
-    pub flavor: String,
+    /// Known flavor of that runtime type. Omit it for a runtime type that has
+    /// no flavors.
+    #[serde(default)]
+    pub flavor: Option<String>,
     /// Flags that a device must hold. The list must not be empty.
     pub requires: BTreeSet<String>,
     /// Groups of flags of which a device must hold at least one. Defaults to empty.
@@ -462,38 +459,20 @@ pub struct PrecedenceDefaults {
 
 #[derive(Debug, thiserror::Error)]
 enum OfferRuleError {
-    #[error("offer rule {runtime_type} {flavor}: unsupported runtime type")]
-    Unsupported {
-        runtime_type: RuntimeType,
-        flavor: String,
-    },
-    #[error("offer rule {runtime_type} {flavor}: unknown flavor")]
-    UnknownFlavor {
-        runtime_type: RuntimeType,
-        flavor: String,
-    },
-    #[error("offer rule {runtime_type} {flavor}: non-canonical flag `{flag}`")]
-    Flag {
-        runtime_type: RuntimeType,
-        flavor: String,
-        flag: String,
-    },
-    #[error("offer rule {runtime_type} {flavor}: empty requires")]
-    EmptyRequires {
-        runtime_type: RuntimeType,
-        flavor: String,
-    },
-    #[error("offer rule {runtime_type} {flavor}: empty any_of group at index {index}")]
-    EmptyAnyOf {
-        runtime_type: RuntimeType,
-        flavor: String,
-        index: usize,
-    },
-    #[error("offer rule {runtime_type} {flavor}: duplicate rule")]
-    Duplicate {
-        runtime_type: RuntimeType,
-        flavor: String,
-    },
+    #[error("offer rule {rule}: unsupported runtime type")]
+    Unsupported { rule: String },
+    #[error("offer rule {rule}: unknown flavor")]
+    UnknownFlavor { rule: String },
+    #[error("offer rule {rule}: flavor required")]
+    MissingFlavor { rule: String },
+    #[error("offer rule {rule}: non-canonical flag `{flag}`")]
+    Flag { rule: String, flag: String },
+    #[error("offer rule {rule}: empty requires")]
+    EmptyRequires { rule: String },
+    #[error("offer rule {rule}: empty any_of group at index {index}")]
+    EmptyAnyOf { rule: String, index: usize },
+    #[error("offer rule {rule}: duplicate rule")]
+    Duplicate { rule: String },
     #[error("llamacpp precedence flavor `{flavor}` has no offer rule for llamacpp_cli_stock_tools")]
     PrecedenceNoRule { flavor: String },
     #[error("llamacpp precedence flavor `{flavor}` appears more than once")]
@@ -501,15 +480,17 @@ enum OfferRuleError {
 }
 
 impl DescriptorCatalogConfig {
-    /// The rule for a runtime flavor, if configured.
-    pub fn rule_for(&self, runtime_type: RuntimeType, flavor: &str) -> Option<&OfferRule> {
+    /// The rule for a runtime flavor, if configured. `flavor` is `None` for a
+    /// runtime type that has no flavors.
+    pub fn rule_for(&self, runtime_type: RuntimeType, flavor: Option<&str>) -> Option<&OfferRule> {
         self.offer_rules
             .iter()
-            .find(|rule| rule.runtime_type == runtime_type && rule.flavor == flavor)
+            .find(|rule| rule.runtime_type == runtime_type && rule.flavor.as_deref() == flavor)
     }
 
     /// The known flavors of `runtime_type`, or `None` if offer rules do not
-    /// support that runtime type.
+    /// support that runtime type. An empty list means that offer rules support
+    /// the runtime type and that it has no flavors.
     pub fn known_flavors(runtime_type: RuntimeType) -> Option<Vec<String>> {
         match runtime_type {
             RuntimeType::LlamacppCliStockTools => Some(
@@ -550,8 +531,8 @@ impl DescriptorCatalogConfig {
             | RuntimeType::UvSglang
             | RuntimeType::UvOpenvino
             | RuntimeType::UvOnnxGenai
-            | RuntimeType::AppleFoundation
             | RuntimeType::TrtEdgellm => None,
+            RuntimeType::AppleFoundation => Some(Vec::new()),
         }
     }
 
@@ -566,31 +547,30 @@ impl DescriptorCatalogConfig {
                 })
             })
             .flatten()
-            .filter(|(runtime_type, flavor)| self.rule_for(*runtime_type, flavor).is_none())
+            .filter(|(runtime_type, flavor)| self.rule_for(*runtime_type, Some(flavor)).is_none())
     }
 
     fn validate(&self) -> Result<(), OfferRuleError> {
         let mut seen = HashSet::new();
         for rule in &self.offer_rules {
-            let runtime_type = rule.runtime_type;
-            let flavor = rule.flavor.clone();
-            let Some(known) = Self::known_flavors(runtime_type) else {
-                return Err(OfferRuleError::Unsupported {
-                    runtime_type,
-                    flavor,
-                });
+            let label = || match &rule.flavor {
+                Some(flavor) => format!("{} {flavor}", rule.runtime_type),
+                None => rule.runtime_type.to_string(),
             };
-            if !known.contains(&flavor) {
-                return Err(OfferRuleError::UnknownFlavor {
-                    runtime_type,
-                    flavor,
-                });
+            let Some(known) = Self::known_flavors(rule.runtime_type) else {
+                return Err(OfferRuleError::Unsupported { rule: label() });
+            };
+            match &rule.flavor {
+                Some(flavor) if !known.contains(flavor) => {
+                    return Err(OfferRuleError::UnknownFlavor { rule: label() });
+                }
+                None if !known.is_empty() => {
+                    return Err(OfferRuleError::MissingFlavor { rule: label() });
+                }
+                _ => {}
             }
             if rule.requires.is_empty() {
-                return Err(OfferRuleError::EmptyRequires {
-                    runtime_type,
-                    flavor,
-                });
+                return Err(OfferRuleError::EmptyRequires { rule: label() });
             }
             if let Some(flag) = rule
                 .requires
@@ -599,23 +579,18 @@ impl DescriptorCatalogConfig {
                 .find(|flag| CapabilityFlag::try_new((*flag).clone()).is_err())
             {
                 return Err(OfferRuleError::Flag {
-                    runtime_type,
-                    flavor,
+                    rule: label(),
                     flag: flag.clone(),
                 });
             }
             if let Some(index) = rule.any_of.iter().position(BTreeSet::is_empty) {
                 return Err(OfferRuleError::EmptyAnyOf {
-                    runtime_type,
-                    flavor,
+                    rule: label(),
                     index,
                 });
             }
-            if !seen.insert((runtime_type, flavor.clone())) {
-                return Err(OfferRuleError::Duplicate {
-                    runtime_type,
-                    flavor,
-                });
+            if !seen.insert((rule.runtime_type, rule.flavor.clone())) {
+                return Err(OfferRuleError::Duplicate { rule: label() });
             }
         }
         let mut precedence = HashSet::new();
@@ -626,7 +601,7 @@ impl DescriptorCatalogConfig {
                 });
             }
             if self
-                .rule_for(RuntimeType::LlamacppCliStockTools, flavor)
+                .rule_for(RuntimeType::LlamacppCliStockTools, Some(flavor))
                 .is_none()
             {
                 return Err(OfferRuleError::PrecedenceNoRule {
@@ -705,7 +680,9 @@ pub struct ClerkConfig {
     pub jwt_template: String,
     /// The domains whose addresses may sign in through Clerk, matched exactly
     /// and case-insensitively. Empty admits any verified address. A provision
-    /// rule outside the list stops the server at startup.
+    /// rule outside the list stops the server at startup. A listed domain with
+    /// no provision rule gives each new address an organization of its own,
+    /// which it administers; under an empty list such an address is refused.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
     /// `[[clerk.provision]]` rules, one per domain.
@@ -1014,7 +991,6 @@ impl Default for Config {
             unverified_submissions: UnverifiedSubmissionsConfig::default(),
             auto_approve: AutoApproveConfig::default(),
             require_client_preauth_key: false,
-            require_user_preauth_key: false,
             accept_legacy_signatures: default_accept_legacy_signatures(),
             accept_v2_signatures: default_accept_v2_signatures(),
             authorities: Vec::new(),
@@ -1301,8 +1277,24 @@ backend = "local_fs"
         Some("offer rule mlx_macos_pipette macos-x64: unknown flavor")
     )]
     #[case::unsupported(
-        rule("apple_foundation", "macos-arm64", MACOS),
-        Some("offer rule apple_foundation macos-arm64: unsupported runtime type")
+        rule("uv_vllm", "macos-arm64", MACOS),
+        Some("offer rule uv_vllm macos-arm64: unsupported runtime type")
+    )]
+    #[case::flavorless(
+        "[[descriptor_catalog.offer_rules]]\nruntime_type = \"apple_foundation\"\nrequires = [\"os:ios\"]\n".to_owned(),
+        None
+    )]
+    #[case::flavorless_given_flavor(
+        rule("apple_foundation", "ios-arm64", IOS),
+        Some("offer rule apple_foundation ios-arm64: unknown flavor")
+    )]
+    #[case::missing_flavor(
+        "[[descriptor_catalog.offer_rules]]\nruntime_type = \"llamacpp_cli_stock_tools\"\nrequires = [\"os:macos\"]\n".to_owned(),
+        Some("offer rule llamacpp_cli_stock_tools: flavor required")
+    )]
+    #[case::flavorless_duplicate(
+        "[[descriptor_catalog.offer_rules]]\nruntime_type = \"apple_foundation\"\nrequires = [\"os:ios\"]\n".repeat(2),
+        Some("offer rule apple_foundation: duplicate rule")
     )]
     #[case::unknown_flavor(
         rule(LLAMA, "macos-riscv", MACOS),

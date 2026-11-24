@@ -78,7 +78,7 @@ export function renameBody(display_name: string): UpdateOrgRequest {
   return { display_name: name };
 }
 
-/** A handle as `OrgSlug` takes one, refused in the classic `create_org`'s words rather than the body parser's. */
+/** Validate a handle before submitting a new organization. */
 function orgSlug(typed: string): string {
   const slug = typed.trim().replace(/[A-Z]/g, (c) => c.toLowerCase());
   const refuse = (why: string) => new Error(`invalid handle: organization slug ${why}`);
@@ -90,6 +90,7 @@ function orgSlug(typed: string): string {
   if (bytes > 64) throw refuse(`"${slug}" is too long (${bytes} chars, max 64)`);
   const ch = [...slug].find((c) => !/[a-z0-9_-]/.test(c));
   if (ch !== undefined) throw refuse(`"${slug}" contains invalid character '${ch}'; allowed: [a-z0-9_-] (no '/')`);
+  if (slug === "global") throw refuse('"global" is reserved for the descriptor catalog');
   return slug;
 }
 

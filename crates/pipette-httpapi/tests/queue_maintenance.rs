@@ -2372,8 +2372,8 @@ async fn test_a_result_submitted_after_teardown_404s_and_writes_nothing() -> any
     Ok(())
 }
 
-/// A job recycled after teardown is retired again; the `cancelled` latch is
-/// neither revisited nor re-stamped.
+/// Teardown retires a job again if it returns without a membership marker.
+/// The run preserves the plan's `cancelled` status and terminal timestamp.
 #[tokio::test]
 async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2406,7 +2406,6 @@ async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
     assert_eq!(settled.status, PlanStatus::Cancelled);
     let stamped = settled.terminal_at;
 
-    // The lease recycler returns the job to `avail/` after teardown ran.
     seed_avail(
         state.todo_store.as_ref(),
         "job-back",
@@ -2414,6 +2413,7 @@ async fn test_teardown_redeletes_a_resurrected_job() -> anyhow::Result<()> {
         &expirable_body("job-back", &[&client]),
     )
     .await?;
+    assert!(members(state, &job).await?.is_empty());
     run_qm(state).await?;
 
     assert!(

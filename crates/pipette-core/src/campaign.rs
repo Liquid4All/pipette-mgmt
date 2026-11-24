@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use pipette_plan_types::{
     CampaignGroupId, CampaignGroupPolicy, CampaignId, CampaignState, JobId, Labels,
-    NonEmptyTrimmedString, PlanId, PolicyKind, PrincipalOwner,
+    NonEmptyTrimmedString, PlanId, PolicyDeferral, PolicyKind, PrincipalOwner,
 };
 
 use crate::types::Mint;
@@ -27,9 +27,7 @@ pub struct Campaign {
     /// index: a campaign is reached from a listing or a link, so the id is the
     /// handle.
     pub name: NonEmptyTrimmedString,
-    /// Who owns this, and therefore who may repoint it. Read as it stands, not
-    /// derived through the owner's membership: moving an account between
-    /// organizations must not hand its campaigns to a team's administrators.
+    /// The organization that owns this, and therefore who may repoint it.
     pub owner: CampaignOwner,
     /// The plan being executed; `None` only on a record from before a campaign
     /// was created with its first plan. Moved only by [`advance`](Self::advance),
@@ -259,6 +257,10 @@ pub struct GroupPolicyState {
     /// again.
     #[serde(default)]
     pub rules: u32,
+    /// The deferral from the last evaluation that updated this state; dropped
+    /// with `policies` once the group has no policy on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<PolicyDeferral>,
 }
 
 /// What the policy pass found of one job of a member's head under the member's
@@ -319,7 +321,7 @@ mod tests {
     use jiff::Timestamp;
     use rstest::rstest;
 
-    use pipette_plan_types::{OrgId, UserId};
+    use pipette_plan_types::OrgId;
 
     use super::*;
 
@@ -330,8 +332,8 @@ mod tests {
     fn a_new_campaign() -> anyhow::Result<NewCampaign> {
         Ok(NewCampaign::new(
             NonEmptyTrimmedString::try_new("Nightly LFM2 regression")?,
-            CampaignOwner::User {
-                user_id: UserId::mint(),
+            CampaignOwner::Org {
+                org_id: OrgId::mint(),
             },
         ))
     }
@@ -397,7 +399,7 @@ mod tests {
             campaign.current_plan_id, plan_id,
             "a hand-off keeps what the campaign is running"
         );
-        assert_eq!(campaign.owner.org_id(), Some(&org_id));
+        assert_eq!(campaign.owner.org_id(), &org_id);
         Ok(())
     }
 
@@ -512,14 +514,11 @@ mod tests {
             serde_json::json!({ "type": "org", "org_id": org_id.as_str() }),
         );
         assert_eq!(
-            serde_json::from_value::<CampaignOwner>(serde_json::json!({
-                "type": "user",
-                "user_id": "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
-            }))?
-            .user_id()
-            .map(UserId::as_str)
-            .map(str::to_string),
-            Some("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e".to_string()),
+            serde_json::from_value::<CampaignOwner>(
+                serde_json::json!({ "type": "org", "org_id": org_id.as_str() })
+            )?
+            .org_id(),
+            &org_id,
         );
         Ok(())
     }
@@ -553,8 +552,8 @@ mod tests {
         let record = Campaign {
             campaign_id: CampaignId::mint(),
             name: NonEmptyTrimmedString::try_new("Nightly")?,
-            owner: PrincipalOwner::User {
-                user_id: UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?,
+            owner: PrincipalOwner::Org {
+                org_id: OrgId::mint(),
             },
             current_plan_id: current_plan_id.map(PlanId::try_new).transpose()?,
             labels: serde_json::from_value(labels)?,

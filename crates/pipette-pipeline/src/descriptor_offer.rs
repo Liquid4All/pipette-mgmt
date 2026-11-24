@@ -101,8 +101,9 @@ pub fn coverage<'a>(
     if DescriptorCatalogConfig::known_flavors(runtime_type).is_none() {
         return Err(OfferError::Unsupported { runtime_type });
     }
-    let flavor = member.flavor().ok_or_else(no_rule)?;
-    config.rule_for(runtime_type, flavor).ok_or_else(no_rule)
+    config
+        .rule_for(runtime_type, member.flavor())
+        .ok_or_else(no_rule)
 }
 
 /// Return the first member, in the entry's stored order, that the rules offer
@@ -148,16 +149,18 @@ mod tests {
         DescriptorEntryState, DeviceProfile, NonEmptyTrimmedString, NonEmptyVec, PublicKeyHex,
     };
 
-    use self::Runtime::{AppleFoundation, IosLlamacpp, Llamacpp, Ovms};
+    use self::Runtime::{Apk, AppleFoundation, IosLlamacpp, Llamacpp, Ovms};
     use super::*;
 
     /// A member's runtime: llama.cpp or OVMS with a flavor, Apple Foundation,
-    /// desktop MLX, or the iOS app's llama.cpp at a build version.
+    /// desktop MLX, the Android app's llama.cpp, or the iOS app's llama.cpp at
+    /// a build version.
     #[derive(Debug, Clone, Copy)]
     enum Runtime {
         Llamacpp(&'static str),
         Ovms(&'static str),
         AppleFoundation,
+        Apk,
         IosLlamacpp(&'static str),
         MlxMacos,
     }
@@ -186,6 +189,11 @@ mod tests {
                 "source": { "type": "pip_requirements_text", "contents": "mlx-lm==0.31.3" }
             }),
             Runtime::AppleFoundation => json!({"type": "apple_foundation"}),
+            Runtime::Apk => json!({
+                "type": "llamacpp_apk_pipette",
+                "repository_url": "github.com/ggml-org/llama.cpp",
+                "repository_version": "b1", "flavor": "android-arm64-v8"
+            }),
             Runtime::IosLlamacpp(version) => json!({
                 "type": "llamacpp_ios_pipette",
                 "repository_url": "github.com/ggml-org/llama.cpp",
@@ -225,6 +233,7 @@ mod tests {
             public_key: PublicKeyHex::try_new("ab".repeat(32))?,
             organization: NonEmptyTrimmedString::try_new("lab")?,
             client_details: NonEmptyTrimmedString::try_new("rig")?,
+            name: None,
             contact_email: ContactEmail::try_new("ops@example.test")?,
             status: ClientStatus::Approved,
             registered_at: Timestamp::now(),
@@ -265,6 +274,9 @@ requires = ["os:macos", "runtime:mlx"]
 runtime_type = "llamacpp_ios_pipette"
 flavor = "ios-arm64"
 requires = ["os:ios"]
+[[offer_rules]]
+runtime_type = "apple_foundation"
+requires = ["os:ios"]
 "#,
         )?)
     }
@@ -273,7 +285,7 @@ requires = ["os:ios"]
     #[case::apple_silicon_mac(&[Llamacpp("macos-arm64"), Llamacpp("macos-x64")], ("macOS", Some("Apple M4")), Outcome::Resolved("macos-arm64"))]
     #[case::intel_mac(&[Llamacpp("macos-arm64"), Llamacpp("macos-x64")], ("macOS", None), Outcome::Resolved("macos-x64"))]
     #[case::linux_host_no_rule(&[Llamacpp("linux-x64-cpu"), Llamacpp("linux-arm64-cpu")], ("Linux", None), Outcome::Withheld(&["no offer rule for `llamacpp_cli_stock_tools` `linux-x64-cpu`", "no offer rule for `llamacpp_cli_stock_tools` `linux-arm64-cpu`"]))]
-    #[case::unsupported_runtime(&[AppleFoundation], ("macOS", None), Outcome::Withheld(&["no offer rules exist for runtime type `apple_foundation`"]))]
+    #[case::unsupported_runtime(&[Apk], ("Android", None), Outcome::Withheld(&["no offer rules exist for runtime type `llamacpp_apk_pipette`"]))]
     #[case::precedence_first_offered(&[Llamacpp("macos-x64"), Llamacpp("macos-arm64")], ("macOS", Some("Apple M4")), Outcome::Resolved("macos-x64"))]
     #[case::rule_not_met(&[Llamacpp("macos-arm64")], ("macOS", None), Outcome::Withheld(&["device does not meet the offer rule"]))]
     #[case::unruled_member_skipped(&[Llamacpp("linux-x64-cpu"), Llamacpp("macos-x64")], ("macOS", None), Outcome::Resolved("macos-x64"))]
@@ -325,7 +337,8 @@ requires = ["os:ios"]
     #[rstest]
     #[case::covered(Runtime::Llamacpp("macos-arm64"), Ok(()))]
     #[case::no_rule(Runtime::Llamacpp("linux-x64-rocm"), Err("no_rule"))]
-    #[case::unsupported(Runtime::AppleFoundation, Err("unsupported"))]
+    #[case::unsupported(Runtime::Apk, Err("unsupported"))]
+    #[case::flavorless(Runtime::AppleFoundation, Ok(()))]
     #[case::ios_app_runtime(Runtime::IosLlamacpp("b1"), Ok(()))]
     fn coverage_cases(
         #[case] runtime: Runtime,
@@ -398,6 +411,8 @@ requires = ["os:ios"]
     #[case::rule_not_met(IosLlamacpp("b2"), "macOS", &["b2"], Err("not_met"))]
     #[case::neither(IosLlamacpp("b2"), "macOS", &[], Err("not_met"))]
     #[case::stock_llamacpp_needs_no_build(Llamacpp("macos-x64"), "macOS", &[], Ok(()))]
+    #[case::apple_foundation_needs_no_build(AppleFoundation, "iOS", &[], Ok(()))]
+    #[case::apple_foundation_rule_not_met(AppleFoundation, "macOS", &[], Err("not_met"))]
     fn app_build_offer_cases(
         #[case] runtime: Runtime,
         #[case] os: &str,

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AuditEventId, CampaignGroupId, CampaignId, CatalogName, CatalogScope, ClientId,
-    DescriptorEntryCreator, JobId, OrgId, PlanId, PolicyKind, PrincipalOwner, UserId, UserKey,
-    UserKeyId, VaultResourceId, empty_as_none,
+    DescriptorEntryCreator, JobId, LogoUri, OrgId, PlanId, PolicyKind, PrincipalOwner, UserId,
+    UserKey, UserKeyId, VaultResourceId, empty_as_none,
 };
 
 /// Who acted.
@@ -123,6 +123,22 @@ pub enum AuditAction {
         member: String,
         digest: String,
     },
+    /// A family change on a model entry. The request or command has its own
+    /// audit event; this one records the stored name and the new override.
+    /// `family` is `None` when the entry goes back to the default family.
+    CatalogSetFamily {
+        scope: CatalogScope,
+        name: CatalogName,
+        family: Option<CatalogName>,
+    },
+    /// A logo change on a model family. The request or command has its own
+    /// audit event. This event records the family as the operator wrote it,
+    /// and the new logo. `logo_uri` is `None` when the family loses its logo.
+    CatalogSetFamilyLogo {
+        scope: CatalogScope,
+        family: CatalogName,
+        logo_uri: Option<LogoUri>,
+    },
     /// A move of an org entry to global scope. The command has its own audit
     /// event; this one records the organization, the stored name, and the
     /// creator of the org entry. The global entry has `operator` as its creator.
@@ -233,7 +249,6 @@ impl From<PrincipalOwner> for AuditTarget {
     fn from(owner: PrincipalOwner) -> Self {
         match owner {
             PrincipalOwner::Org { org_id } => Self::Org { org_id },
-            PrincipalOwner::User { user_id } => Self::User { user_id },
         }
     }
 }
@@ -341,6 +356,32 @@ mod tests {
             "name": "AcmeLM",
             "member": "gguf::q4_0",
             "digest": "sha256:abc"
+        })
+    )]
+    #[case::set_family(
+        AuditAction::CatalogSetFamily {
+            scope: CatalogScope::Global,
+            name: CatalogName::try_new("LFM2.5-1.2B")?,
+            family: Some(CatalogName::try_new("LFM")?),
+        },
+        json!({
+            "type": "catalog_set_family",
+            "scope": "global",
+            "name": "LFM2.5-1.2B",
+            "family": "LFM"
+        })
+    )]
+    #[case::set_family_logo(
+        AuditAction::CatalogSetFamilyLogo {
+            scope: CatalogScope::Global,
+            family: CatalogName::try_new("LFM2.5")?,
+            logo_uri: Some(LogoUri::try_new("https://pipette.liquid.ai/logos/lfm.svg")?),
+        },
+        json!({
+            "type": "catalog_set_family_logo",
+            "scope": "global",
+            "family": "LFM2.5",
+            "logo_uri": "https://pipette.liquid.ai/logos/lfm.svg"
         })
     )]
     #[case::move_to_global(

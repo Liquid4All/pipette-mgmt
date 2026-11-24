@@ -205,7 +205,8 @@ fn names_seed_rule(def: &BenchmarkDefinition) -> bool {
         | BenchmarkDefinition::AsrThroughput(_)
         | BenchmarkDefinition::AsrMaxMemory(_)
         | BenchmarkDefinition::DecisionLatency(_)
-        | BenchmarkDefinition::DecisionMaxMemory(_) => false,
+        | BenchmarkDefinition::DecisionMaxMemory(_)
+        | BenchmarkDefinition::Session(_) => false,
     }
 }
 

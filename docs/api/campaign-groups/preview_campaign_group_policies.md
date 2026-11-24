@@ -34,12 +34,13 @@ member order:
   `deadline_passed`. If the plan's document sets a deadline that has passed,
   the server refuses a re-run of the plan.
 - `checks`, one per check in the order `swap`, `spread`, `failed`,
-  `ttft_over_e2e`, `model_params`, `smaller_failed`: whether its policy is
-  `on`, and what that policy alone would do with its own settings, on or off.
-  Of the jobs it has `flagged`, it would `rerun`, mark failed (`marked`) or keep
-  (`kept`) each; a skipped job counts in `flagged` only. `model_params` flags
-  each job with a row in `missing_model_params`, and `smaller_failed` each job
-  in `smaller_failed`, and both keep it.
+  `ttft_over_e2e`, `model_params`, `smaller_failed`, `vault_resource`: whether
+  its policy is `on`, and what that policy alone would do with its own
+  settings, on or off. Of the jobs it has `flagged`, it would `rerun`, mark
+  failed (`marked`) or keep (`kept`) each; a skipped job counts in `flagged`
+  only. `model_params` flags each job with a row in `missing_model_params`,
+  `smaller_failed` each job in `smaller_failed`, and `vault_resource` each job
+  with rows whose source names a vault model or runtime, and each keeps it.
 - What the policies that are on would do together: `rerun_job_ids`,
   `marked_job_ids`, and `kept_job_count`, the answered jobs with rows they
   leave as they are, including those none of them flags. `skipped` maps each
@@ -67,7 +68,7 @@ member order:
 On a member that is not `evaluated` every count is 0 and every list is empty,
 except that an `unreadable`, `waiting_for_devices` or `refused` one keeps its
 `answered_job_count` and its deadline, and a `waiting_for_devices` or
-`refused` one its `model_params` and `smaller_failed` checks,
+`refused` one its `model_params`, `smaller_failed` and `vault_resource` checks,
 `missing_model_params` and `smaller_failed`.
 
 A check's attempts on a job are its runs in a row that it flags, following
@@ -80,7 +81,8 @@ others keep its result.
 An evaluated member costs one pipette-duckdb read over its plan's answered
 jobs, and one more for each step back along the re-run chains of its flagged
 jobs, up to 15; the model params check reads no more, and the smaller failed
-check reads the answered jobs' sources from the plan store. So does a plan
+and vault resource checks read the answered jobs' sources from the plan store,
+once for both. So does a plan
 with an eval cell, or one filed before plans recorded their benchmark types,
 to leave the eval's jobs out. A
 `waiting_for_devices` or `refused` member costs those first reads alone. Members are read one
@@ -93,15 +95,13 @@ device failures a caller without `read_clients` does not see, and the group
 must be in the caller's reach
 ([who may do what](../campaign-groups.md#who-may-do-what)). It lists only the
 members whose plans the caller reads: every member with `read_any_plans`, else
-the caller's own campaigns and its organization's. A caller that reads the
-group only through `manage_any_orgs`, or as the administrator of a disabled
-member, gets none of its members.
+its organization's campaigns. A caller that reads the group only through
+`manage_any_orgs` gets none of its members.
 
 ## Statuses
 
 | Status | When |
 |--------|------|
 | 200 | Each member's preview |
-| 400 | `group_id` is not a group id |
 | 403 | The group is outside the caller's reach ([who may do what](../campaign-groups.md#who-may-do-what)), or the caller holds no `read_plans` or no `read_clients` |
-| 404 | No such group, or the server has no `[database]` or no `[duckdb]` |
+| 404 | No such group, or the server has no `[duckdb]` |

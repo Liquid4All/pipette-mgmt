@@ -84,14 +84,12 @@ async fn a_service_account_is_granted_no_admin_name(
     Ok(())
 }
 
-/// Not created, released or retyped into none: it would be refused on every
-/// route.
+/// Not created or retyped into none: it would be refused on every route.
 #[rstest]
 #[case::create("POST", "/api/v1/users", json!({
     "contact_email": "ops+ci@example.test",
     "account_type": "service",
 }))]
-#[case::release("PUT", "/api/v1/users/{service}/org", json!({ "org_id": null }))]
 #[case::retype("PATCH", "/api/v1/users/{loner}", json!({ "account_type": "service" }))]
 #[tokio::test]
 async fn a_service_account_is_never_left_in_no_organization(
@@ -282,8 +280,9 @@ async fn a_service_account_files_into_its_organization_s_campaign() -> anyhow::R
     Ok(())
 }
 
+/// Its organization owns it, and only an administrator renames it.
 #[tokio::test]
-async fn a_service_account_administers_the_campaign_it_creates() -> anyhow::Result<()> {
+async fn a_service_account_creates_its_organization_s_campaign() -> anyhow::Result<()> {
     let (_dir, state) = state().await?;
     let org = seed_org(&state, "acme").await?;
     let service =
@@ -297,8 +296,8 @@ async fn a_service_account_administers_the_campaign_it_creates() -> anyhow::Resu
         .context("the campaign was created")?;
     assert_eq!(
         campaign.owner,
-        PrincipalOwner::User {
-            user_id: service.1.clone()
+        PrincipalOwner::Org {
+            org_id: org.org_id.clone()
         }
     );
 
@@ -310,31 +309,6 @@ async fn a_service_account_administers_the_campaign_it_creates() -> anyhow::Resu
         &json!({ "name": "Nightly, renamed" }),
     )
     .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_service_account_deletes_what_it_uploads() -> anyhow::Result<()> {
-    let (_dir, state) = state().await?;
-    let org = seed_org(&state, "acme").await?;
-    let service = service_account(&state, Some(&org.org_id), &[]).await?;
-
-    let sha256 = upload_vault_blob(&state, &service, service.1.as_str(), VAULT_GGUF).await?;
-    let resp = describe_vault_upload(&state, &service, &gguf_text_upload(None, &sha256)).await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let answer = body_json(resp).await?;
-    assert_eq!(
-        answer.pointer("/resources/0/owner"),
-        Some(&json!({ "type": "user", "user_id": service.1 }))
-    );
-    let resource_id = answer
-        .pointer("/resources/0/resource_id")
-        .and_then(Value::as_str)
-        .context("the answer names the resource")?;
-
-    let uri = format!("/api/v1/vault/resources/{resource_id}");
-    let resp = signed_empty(&state, &service, "DELETE", &uri).await?;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     Ok(())
 }

@@ -155,9 +155,7 @@ impl VaultStore for SqlVaultStore {
             .fetch_all("list_resources_of", || {
                 sqlx::query_as(
                     "SELECT resource_id, body FROM
-                       (SELECT resource_id, body,
-                               COALESCE(body::jsonb -> 'owner' ->> 'org_id',
-                                        body::jsonb -> 'owner' ->> 'user_id') AS owner_id
+                       (SELECT resource_id, body, body::jsonb -> 'owner' ->> 'org_id' AS owner_id
                         FROM vault) AS owned
                      WHERE owner_id = $1 OR owner_id IS NULL
                      ORDER BY resource_id",

@@ -73,7 +73,7 @@
   show();
 
   const record = $derived(page.data?.campaign ?? null);
-  const under = $derived(record && session.account ? ownerBranch(session.account, record.owner, session.known, CAMPAIGN_PAGES) : null);
+  const under = $derived(record ? ownerBranch(record.owner, session.known, CAMPAIGN_PAGES) : null);
   $effect(() => { here.under = under?.href ?? null; });
   const unchanged = $derived(!!page.data && sameDocument(text, page.data.read.document));
 

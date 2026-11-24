@@ -1,26 +1,27 @@
 //! Who may read a vault resource, who may administer one, and which devices may
-//! fetch its bytes. No permission names of its own: your own vault needs no
-//! grant, and an organization's follows the campaign rule.
+//! fetch its bytes. No permission names of its own: an organization's vault
+//! follows the campaign rule.
 
 use std::collections::BTreeSet;
 
 use pipette_core::user::User;
 use pipette_core::vault::{VaultOwner, VaultResource};
 use pipette_pipeline::org::owning_org;
-use pipette_plan_types::{ClientId, ClientOwner, OrgId, UserId, UserPermission, VaultPrincipalId};
+use pipette_plan_types::{ClientId, OrgId, UserPermission, VaultPrincipalId};
 
 use crate::auth::{Caller, UserRights, user_org};
+use crate::campaign_access::NO_ORGANIZATION;
 use crate::error::AppError;
 use crate::owner::HandOffScope;
 use crate::state::AppState;
 
-/// Which vault resources a caller may **read**. Never refuses: every active
-/// account reaches its own.
+/// Which vault resources a caller may **read**. Never refuses: an account in
+/// no organization reaches nothing.
 pub enum VaultReach {
     /// `manage_any_orgs`: every resource. Not `read_any_orgs`, the roster read.
     Any,
-    /// The caller's own, plus its organization's when it belongs to one.
-    Own { user: UserId, org: Option<OrgId> },
+    /// Its organization's, when it belongs to one.
+    Own { org: Option<OrgId> },
 }
 
 impl VaultReach {
@@ -43,7 +44,6 @@ impl VaultReach {
             return Ok(Self::Any);
         }
         Ok(Self::Own {
-            user: user.user_id.clone(),
             // Membership alone: a member reads the team's artifacts and does
             // not administer them, as with a campaign's record.
             org: user_org(state, &user.user_id).await?,
@@ -51,12 +51,9 @@ impl VaultReach {
     }
 
     pub fn admits(&self, owner: &VaultOwner) -> bool {
-        match (self, owner) {
-            (Self::Any, _) => true,
-            (Self::Own { user, .. }, VaultOwner::User { user_id }) => user_id == user,
-            (Self::Own { org, .. }, VaultOwner::Org { org_id }) => {
-                org.as_ref().is_some_and(|mine| mine == org_id)
-            }
+        match self {
+            Self::Any => true,
+            Self::Own { org } => org.as_ref() == Some(owner.org_id()),
         }
     }
 
@@ -80,8 +77,6 @@ impl VaultReach {
 /// independent facts like [`crate::campaign_access::CampaignAuthority`].
 #[derive(Clone)]
 pub struct VaultAuthority {
-    /// Its own resources are always its own, hence no `own` flag.
-    user_id: UserId,
     /// `manage_any_orgs`: every resource, whoever owns it.
     server: bool,
     /// `manage_orgs` **and** membership; `None` without a membership.
@@ -91,9 +86,6 @@ pub struct VaultAuthority {
 }
 
 impl HandOffScope for VaultAuthority {
-    fn user_id(&self) -> &UserId {
-        &self.user_id
-    }
     fn is_server(&self) -> bool {
         self.server
     }
@@ -106,14 +98,13 @@ impl HandOffScope for VaultAuthority {
 }
 
 impl VaultAuthority {
-    /// Resolve the authority. **Never refuses**: every active account
-    /// administers its own vault, so there is no set that reaches nothing.
+    /// Resolve the authority. **Never refuses**: an account that reaches
+    /// nothing is refused record by record.
     pub async fn resolve(state: &AppState, caller: Caller<'_>) -> Result<Self, AppError> {
         let user = caller.user;
         let rights = caller.rights;
         let member_of = user_org(state, &user.user_id).await?;
         Ok(Self {
-            user_id: user.user_id.clone(),
             server: rights.holds(UserPermission::ManageAnyOrgs),
             admin_of: rights
                 .holds(UserPermission::ManageOrgs)
@@ -123,31 +114,26 @@ impl VaultAuthority {
         })
     }
 
-    /// Whether this caller may delete a resource owned by `owner`. Uploading is
-    /// [`HandOffScope::may_hand_to`], which a member passes for its organization.
+    /// Whether this caller may delete a resource owned by `owner`: any member
+    /// of its organization, as it deleted the ones it owned itself. Uploading
+    /// is [`HandOffScope::may_hand_to`], which a member passes too.
     pub fn may_administer(&self, owner: &VaultOwner) -> bool {
-        if self.server {
-            return true;
-        }
-        match owner {
-            VaultOwner::User { user_id } => *user_id == self.user_id,
-            VaultOwner::Org { org_id } => self.admin_of.as_ref() == Some(org_id),
-        }
+        self.server || self.member_of.as_ref() == Some(owner.org_id())
     }
 
     /// Whether this caller may set the parameter counts of a model owned by
-    /// `owner`: an administrator's, so a personal file's stay the server's
-    /// where its delete is its owner's.
+    /// `owner`: an administrator's call, as before.
     pub fn may_set_model_params(&self, owner: &VaultOwner) -> bool {
-        self.server
-            || matches!(owner, VaultOwner::Org { org_id } if self.admin_of.as_ref() == Some(org_id))
+        self.server || self.admin_of.as_ref() == Some(owner.org_id())
     }
 
-    /// The owner a resource is registered under when the request names none.
-    pub fn own_owner(&self) -> VaultOwner {
-        VaultOwner::User {
-            user_id: self.user_id.clone(),
-        }
+    /// The owner a resource is registered under when the request names none:
+    /// the caller's organization, or a `400` for a caller in none.
+    pub fn own_owner(&self) -> Result<VaultOwner, AppError> {
+        self.member_of
+            .clone()
+            .map(|org_id| VaultOwner::Org { org_id })
+            .ok_or_else(|| AppError::BadRequest(NO_ORGANIZATION.into()))
     }
 
     /// A `403`, not a `404`: a resource id is a minted UUIDv7, so the true
@@ -161,50 +147,24 @@ impl VaultAuthority {
             owner = %resource.owner.label(),
             "refused: the vault resource is outside the caller's scope"
         );
-        Err(AppError::Forbidden(self.refusal(&resource.owner).into()))
-    }
-
-    /// Why a check refused `owner`: a member reads its organization's
-    /// resources, so it is told the grant it lacks rather than "another owner".
-    fn refusal(&self, owner: &VaultOwner) -> &'static str {
-        match owner {
-            VaultOwner::Org { org_id } if self.member_of.as_ref() == Some(org_id) => {
-                "deleting your organization's vault resources needs manage_orgs"
-            }
-            VaultOwner::Org { .. } | VaultOwner::User { .. } => {
-                "this vault resource belongs to another owner"
-            }
-        }
+        Err(AppError::Forbidden(
+            "this vault resource belongs to another owner".into(),
+        ))
     }
 }
 
 /// Whether `client` may fetch the bytes of a resource owned by `owner`: what
-/// its owner owns, never by user permission. A personal artifact stays personal
-/// when its owner joins a team; an unowned device reaches nothing.
+/// its owner owns, never by user permission. An unowned device reaches nothing.
 pub async fn client_may_fetch(
     state: &AppState,
     client_id: &ClientId,
     owner: &VaultOwner,
 ) -> Result<bool, AppError> {
-    Ok(match owner {
-        VaultOwner::User { user_id } => {
-            let device_owner = state
-                .org_store
-                .get_ownership(client_id)
-                .await
-                .map_err(|e| AppError::internal(e.context("failed to read the device's owner")))?;
-            matches!(device_owner, Some(ClientOwner::User { user_id: owner_id }) if &owner_id == user_id)
-        }
-        VaultOwner::Org { org_id } => {
-            owning_org(state.org_store.as_ref(), client_id)
-                .await
-                .map_err(|e| {
-                    AppError::internal(e.context("failed to resolve the device's organization"))
-                })?
-                .as_ref()
-                == Some(org_id)
-        }
-    })
+    Ok(owning_org(state.org_store.as_ref(), client_id)
+        .await
+        .map_err(|e| AppError::internal(e.context("failed to resolve the device's organization")))?
+        .as_ref()
+        == Some(owner.org_id()))
 }
 
 /// Whether `client_id` may fetch every vault resource a job body names. A
@@ -251,103 +211,62 @@ mod tests {
         VaultOwner::Org { org_id: id.clone() }
     }
 
-    fn user(id: &UserId) -> VaultOwner {
-        VaultOwner::User {
-            user_id: id.clone(),
-        }
-    }
-
-    /// The three rules, as a table against the owners they are not about.
+    /// The rules, as a table against the owners they are not about: a member
+    /// deletes its organization's resources, and only an administrator sets
+    /// their parameter counts.
     #[rstest]
-    // Holding nothing still owns its own and reaches nothing else; `resolve`
-    // gives a `manage_orgs` holder on no organization `admin_of: None` too.
-    #[case::plain(false, false, true, false, false)]
-    // An org admin administers the team's, and its own alongside.
-    #[case::org_admin(true, false, true, true, false)]
-    #[case::server(false, true, true, true, true)]
+    #[case::member(false, false, false, false)]
+    #[case::org_admin(true, false, true, false)]
+    #[case::server(false, true, true, true)]
     fn the_authority_rules_hold(
         #[case] admin: bool,
         #[case] server: bool,
-        #[case] reaches_own: bool,
-        #[case] reaches_org: bool,
+        #[case] sets_org_params: bool,
         #[case] reaches_stranger: bool,
     ) {
-        let me = UserId::mint();
         let my_org = OrgId::mint();
+        let stranger = org(&OrgId::mint());
         let authority = VaultAuthority {
-            user_id: me.clone(),
             server,
             admin_of: admin.then(|| my_org.clone()),
             member_of: Some(my_org.clone()),
         };
 
-        assert_eq!(authority.may_administer(&user(&me)), reaches_own);
-        assert_eq!(authority.may_administer(&org(&my_org)), reaches_org);
+        assert!(authority.may_administer(&org(&my_org)));
         assert_eq!(
-            authority.may_administer(&user(&UserId::mint())),
-            reaches_stranger,
-            "another account's artifact"
+            authority.may_set_model_params(&org(&my_org)),
+            sets_org_params
         );
         assert_eq!(
-            authority.may_administer(&org(&OrgId::mint())),
+            authority.may_administer(&stranger),
             reaches_stranger,
             "another organization's artifact"
         );
+        assert_eq!(authority.may_set_model_params(&stranger), reaches_stranger);
     }
 
     #[test]
-    fn a_refusal_names_the_grant_a_member_lacks() {
+    fn a_member_uploads_for_the_team_alone() {
         let my_org = OrgId::mint();
         let member = VaultAuthority {
-            user_id: UserId::mint(),
             server: false,
             admin_of: None,
             member_of: Some(my_org.clone()),
         };
-        assert!(member.refusal(&org(&my_org)).contains("needs manage_orgs"));
-        for stranger in [org(&OrgId::mint()), user(&UserId::mint())] {
-            assert_eq!(
-                member.refusal(&stranger),
-                "this vault resource belongs to another owner"
-            );
-        }
+        assert!(member.may_hand_to(&org(&my_org)));
+        assert!(!member.may_hand_to(&org(&OrgId::mint())));
     }
 
     #[test]
-    fn a_member_uploads_for_the_team_and_no_colleague() {
-        let me = UserId::mint();
-        let my_org = OrgId::mint();
-        let member = VaultAuthority {
-            user_id: me.clone(),
-            server: false,
-            admin_of: None,
-            member_of: Some(my_org.clone()),
-        };
-        assert!(member.may_hand_to(&org(&my_org), Some(&my_org)));
-        assert!(member.may_hand_to(&user(&me), Some(&my_org)));
-        assert!(!member.may_hand_to(&user(&UserId::mint()), Some(&my_org)));
-        let other = OrgId::mint();
-        assert!(!member.may_hand_to(&org(&other), Some(&other)));
-        assert!(!member.may_administer(&org(&my_org)));
-    }
-
-    #[test]
-    fn a_member_reads_the_team_s_and_no_colleague_s() {
-        let me = UserId::mint();
+    fn a_member_reads_the_team_s_alone() {
         let my_org = OrgId::mint();
         let member = VaultReach::Own {
-            user: me.clone(),
             org: Some(my_org.clone()),
         };
-        assert!(member.admits(&user(&me)));
         assert!(member.admits(&org(&my_org)));
-        assert!(!member.admits(&user(&UserId::mint())));
         assert!(!member.admits(&org(&OrgId::mint())));
 
-        let unaffiliated = VaultReach::Own {
-            user: me,
-            org: None,
-        };
+        let unaffiliated = VaultReach::Own { org: None };
         assert!(!unaffiliated.admits(&org(&my_org)));
         assert!(VaultReach::Any.admits(&org(&OrgId::mint())));
     }

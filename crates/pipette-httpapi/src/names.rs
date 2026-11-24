@@ -28,18 +28,11 @@ pub async fn owner_labels<'a>(
     let distinct: HashSet<PrincipalOwner> = owners.cloned().collect();
     stream::iter(distinct)
         .map(|owner| async move {
-            let read = match &owner {
-                PrincipalOwner::User { user_id } => state
-                    .user_store
-                    .get_user(user_id)
-                    .await
-                    .map(|user| user.map(|user| user.contact_email.to_string())),
-                PrincipalOwner::Org { org_id } => state
-                    .org_store
-                    .get_org(org_id)
-                    .await
-                    .map(|org| org.map(|org| org.display_name.to_string())),
-            };
+            let read = state
+                .org_store
+                .get_org(owner.org_id())
+                .await
+                .map(|org| org.map(|org| org.display_name.to_string()));
             named(owner.label(), read)
         })
         .buffer_unordered(STORAGE_CONCURRENCY)

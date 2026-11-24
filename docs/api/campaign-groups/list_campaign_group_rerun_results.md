@@ -51,9 +51,8 @@ It takes `read_plans` and `read_clients`, as the preview does, and the group
 must be in the caller's reach
 ([who may do what](../campaign-groups.md#who-may-do-what)). It lists only the
 rows of the members whose plans the caller reads: every member with
-`read_any_plans`, else the caller's own campaigns and its organization's. A
-caller that reads the group only through `manage_any_orgs`, or as the
-administrator of a disabled member, gets no row. A campaign that left the
+`read_any_plans`, else its organization's campaigns. A caller that reads the
+group only through `manage_any_orgs` gets no row. A campaign that left the
 group shows no row, and shows its rows again once it joins it again.
 
 ## Statuses
@@ -63,4 +62,3 @@ group shows no row, and shows its rows again once it joins it again.
 | 200 | The summary and the page |
 | 400 | `group_id` is not a group id, or a query value is not a number or a boolean |
 | 403 | The group is outside the caller's reach ([who may do what](../campaign-groups.md#who-may-do-what)), or the caller holds no `read_plans` or no `read_clients` |
-| 404 | No such group, or the server has no `[database]` |

@@ -20,12 +20,11 @@ use pipette_core::client::Client;
 use pipette_core::organization::{Organization, Ownership};
 use pipette_core::user::User;
 use pipette_pipeline::org;
-use pipette_pipeline::org::{DeviceScope, OrgRef, OrgRefError, RosterScope};
+use pipette_pipeline::org::{OrgRef, OrgRefError, RosterScope};
 use pipette_plan_types::{
     AssignClientsRequest, AssignedClient, AuditTarget, Changed, ClientId, ClientOwner, ClientView,
     ClientsAssigned, CreateOrgRequest, ListPage, NonEmptyTrimmedString, OrgId, OrgListQuery,
-    OrgSlug, OrgStatus, OrgUserRow, OrgView, UpdateOrgRequest, UserAccountType, UserId,
-    UserPermission,
+    OrgSlug, OrgStatus, OrgUserRow, OrgView, UpdateOrgRequest, UserId, UserPermission,
 };
 use pipette_store::SlugClaim;
 
@@ -35,16 +34,6 @@ use crate::auth::{ActiveUser, Caller, HumanUser, UserRights, user_org};
 use crate::error::AppError;
 use crate::extract::{ApiJson, ApiPath, ApiQuery, Parsed};
 use crate::state::AppState;
-
-/// Where a device is put down, as the scope check reads it. A user owner folds
-/// into that person's organization, which may be none: not the same as detaching.
-enum Destination {
-    Detach,
-    Org(Option<OrgId>),
-    /// An owner no record answers to, carrying the `404` a caller hears once
-    /// its scope admits the move.
-    Absent(AppError),
-}
 
 /// The fleet for a holder of `any`, otherwise the organization `user_id`
 /// belongs to: the one derivation every scope here shares.
@@ -263,6 +252,7 @@ pub async fn create(
     slug: OrgSlug,
     display_name: Option<NonEmptyTrimmedString>,
 ) -> Result<OrgView, AppError> {
+    slug.refuse_reserved()?;
     let display_name = match display_name {
         Some(name) => name,
         // Infallible in practice: a slug's invariant is `NonEmptyTrimmedString`'s.
@@ -480,21 +470,18 @@ pub async fn list_org_clients(
 }
 
 /// Whether `caller` administers the devices `org_id` holds, which is who reads
-/// their `contact_email`: every one rolls up to it.
+/// their `contact_email`.
 pub(crate) async fn administers_org(
     state: &AppState,
     caller: Caller<'_>,
     org_id: &OrgId,
 ) -> Result<bool, AppError> {
-    let owner = ClientOwner::Org {
-        org_id: org_id.clone(),
-    };
     let reach = device_reach(state, caller).await?;
-    crate::api_v1::clients::administers(state, reach.as_ref(), Some(&owner)).await
+    Ok(reach.is_some_and(|scope| scope.may_administer(Some(org_id))))
 }
 
-/// The devices the organization `reference` names owns, directly or through a
-/// member. Two grants: the rows are whole device records, beyond `read_orgs`.
+/// The devices the organization `reference` names owns. Two grants: the rows
+/// are whole device records, beyond `read_orgs`.
 pub async fn devices(
     state: &AppState,
     caller: Caller<'_>,
@@ -542,14 +529,15 @@ async fn inventory_org(
     require_in_scope(state, &scope, reference).await
 }
 
-/// Set or clear which organization `user_id` belongs to, as `caller`. Both ends
-/// resolve before the write, so a membership names a record that exists.
+/// Move `user_id` to `org_id`, as `caller`. Both ends resolve before the write,
+/// so a membership names a record that exists. Nothing clears one: an account
+/// always belongs to an organization, and disabling it takes it out of service.
 pub(crate) async fn assign_membership(
     state: &AppState,
     caller: &User,
     rights: &UserRights,
     user_id: &UserId,
-    org_id: Option<OrgId>,
+    org_id: OrgId,
 ) -> Result<Changed<OrgUserRow>, AppError> {
     rights.require(UserPermission::ManageOrgs)?;
     let scope = reach_of(
@@ -564,50 +552,27 @@ pub(crate) async fn assign_membership(
     // probed. Only an account the caller already administers moves: adopting
     // an unaffiliated one could take over a server admin.
     let (target, current) = crate::api_v1::users::in_scope(state, &scope, user_id).await?;
-    let org = match org_id {
-        Some(org_id) => Some(require_in_scope(state, &scope, &OrgRef::Id(org_id)).await?),
-        None => None,
-    };
-    match &org {
-        // Naming the organization it already belongs to adds nobody.
-        Some(org) if current.as_ref() != Some(&org.org_id) => refuse_disabled(org)?,
-        Some(_) => {}
-        None if target.account_type == UserAccountType::Service => {
-            return Err(AppError::BadRequest(
-                "a service account belongs to an organization; move it to another instead".into(),
-            ));
-        }
-        // Out of its organization a scoped caller administers nothing, itself
-        // included, so nobody could put it back.
-        None if target.user_id == caller.user_id && matches!(scope, RosterScope::Org(_)) => {
-            tracing::warn!(user_id = %target.user_id, "refused: a caller releasing itself from the organization it administers");
-            return Err(AppError::BadRequest(
-                "an account cannot release itself from the organization it administers".into(),
-            ));
-        }
-        None => {}
+    let org = require_in_scope(state, &scope, &OrgRef::Id(org_id)).await?;
+    // Naming the organization it already belongs to adds nobody.
+    if current.as_ref() != Some(&org.org_id) {
+        refuse_disabled(&org)?;
     }
     // A Clerk provision rule makes server admins members too, so scope alone does not guard them.
     crate::api_v1::users::within_rank(state, rights, &target).await?;
-    let org_id = org.map(|org| org.org_id);
     // Nothing is written for a no-op, so it cannot revert a move made since the read.
-    let changed = org_id != current;
+    let changed = current.as_ref() != Some(&org.org_id);
     if changed {
         state
             .org_store
-            .set_membership(user_id, org_id.clone())
+            .set_membership(user_id, Some(org.org_id.clone()))
             .await
             .map_err(|e| AppError::Internal(format!("failed to write the membership: {e:#}")))?;
-        tracing::info!(
-            user_id = %target.user_id,
-            org_id = org_id.as_ref().map(tracing::field::display),
-            "user organization set"
-        );
+        tracing::info!(user_id = %target.user_id, org_id = %org.org_id, "user organization set");
     }
     Ok(Changed {
         record: OrgUserRow {
             user: target.into(),
-            org_id,
+            org_id: Some(org.org_id),
         },
         changed,
     })
@@ -629,63 +594,17 @@ pub(crate) async fn assign_owner(
     // refuses before the owner the body names is looked up.
     let client = crate::api_v1::clients::in_scope(state, &scope, client_id).await?;
 
-    // A device a person owns fetches that person's vault, so a scoped caller names only itself.
-    let for_another = owner
-        .as_ref()
-        .and_then(ClientOwner::user_id)
-        .is_some_and(|user_id| user_id != &caller.user.user_id);
-    if for_another && scope != DeviceScope::Fleet {
-        tracing::warn!(%client_id, "refused: the device would go to another person");
-        return Err(AppError::Forbidden(
-            "only manage_any_clients may make a device another person's".into(),
-        ));
-    }
-
-    // `Detach` is kept apart from a user in no organization: that is a hand-over
-    // to someone outside any scoped caller's roster.
-    let to = match owner.as_ref() {
-        None => Destination::Detach,
-        Some(ClientOwner::Org { org_id }) => {
-            match org::require(&*state.org_store, &OrgRef::Id(org_id.clone())).await {
-                Ok(_) => Destination::Org(Some(org_id.clone())),
-                Err(missing @ org::OrgLookupError::NotFound(_)) => {
-                    Destination::Absent(missing.into())
-                }
-                Err(e @ org::OrgLookupError::Store(_)) => return Err(e.into()),
-            }
-        }
-        Some(ClientOwner::User { user_id }) => {
-            let exists = state
-                .user_store
-                .get_user(user_id)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to read the owner: {e:#}")))?
-                .is_some();
-            if exists {
-                Destination::Org(user_org(state, user_id).await?)
-            } else {
-                Destination::Absent(AppError::NotFound(format!("no user {user_id}")))
-            }
-        }
-    };
-
-    let allowed = match &to {
-        Destination::Detach => scope.may_assign_to(None),
-        // A user owner is a hand-over to that person's organization, and one
-        // belonging to none is outside every scoped caller's reach.
-        Destination::Org(org_id) => scope.may_hand_to(org_id.as_ref()),
-        // On no roster, so a scoped caller cannot tell it from a real owner
-        // outside its reach.
-        Destination::Absent(_) => scope.may_hand_to(None),
-    };
-    if !allowed {
+    // Scope first, so a scoped caller cannot tell a missing organization from
+    // one outside its reach.
+    let target = owner.as_ref().map(ClientOwner::org_id);
+    if !scope.may_assign_to(target) {
         tracing::warn!(%client_id, "refused: the move leaves the caller's scope");
         return Err(AppError::Forbidden(
             "this move is outside your organization".into(),
         ));
     }
-    if let Destination::Absent(missing) = to {
-        return Err(missing);
+    if let Some(org_id) = target {
+        org::require(&*state.org_store, &OrgRef::Id(org_id.clone())).await?;
     }
 
     // Nothing is written for a no-op, so it cannot revert a move made since the read.

@@ -28,10 +28,11 @@ use pipette_pipeline::{campaign_admin, variant_edit};
 use pipette_plan_types::{
     Answered, AuditTarget, BenchmarkId, CampaignAnswer, CampaignCreated, CampaignDocument,
     CampaignGroupId, CampaignId, CampaignPlanDocumentQuery, CampaignRevised, CampaignVariants,
-    CampaignView, Changed, CreateCampaignQuery, FleetDetail, JobId, NonEmptyTrimmedString,
-    PlanAnswer, PlanFiled, PlanId, RecalculateJobsRequest, RerunJobsQuery, RerunJobsRequest,
-    RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery, RevisionAnswer, RevisionBase,
-    SetCampaignOwnerRequest, UpdateCampaignRequest, UserPermission, VaultPrincipalId,
+    CampaignView, Changed, CreateCampaignQuery, FleetDetail, JobId, ModelReplacement,
+    NonEmptyTrimmedString, PlanAnswer, PlanFiled, PlanId, RecalculateJobsRequest, RerunJobsQuery,
+    RerunJobsRequest, RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery,
+    RevisionAnswer, RevisionBase, SetCampaignOwnerRequest, UpdateCampaignRequest, UserPermission,
+    VaultPrincipalId,
 };
 
 use crate::api_v1::plans::FilingScope;
@@ -52,6 +53,10 @@ pub(crate) const NAME_MAX_CHARS: usize = 4096;
 /// The most plans a revision inherits from: each costs a walk of its campaign's
 /// plans and a read of every job it holds.
 const INHERIT_FROM_MAX: usize = 32;
+
+/// The most `replace_model` pairs a revision takes: each side costs a Hub
+/// listing per pinned repository. The same bound as [`INHERIT_FROM_MAX`].
+const REPLACE_MODEL_MAX: usize = INHERIT_FROM_MAX;
 
 /// What a re-run or a recalculation takes of the head: jobs by id, or every
 /// job a whole-plan selector picks.
@@ -123,39 +128,8 @@ async fn for_record_write(
 ) -> Result<(CampaignAuthority, Campaign), AppError> {
     let authority = CampaignAuthority::resolve(state, caller).await?;
     let campaign = require(state, campaign_id).await?;
-    authority
-        .require_record(state, caller.rights, &campaign)
-        .await?;
+    authority.require(&campaign)?;
     Ok((authority, campaign))
-}
-
-/// Refuse an account owner without `submit_plans`, whoever hands the campaign
-/// over: without it the owner could neither run the campaign nor hand it back.
-pub(crate) async fn require_owner_files_plans(
-    state: &AppState,
-    owner: &CampaignOwner,
-) -> Result<(), AppError> {
-    let user_id = match owner {
-        CampaignOwner::User { user_id } => user_id,
-        // An organization's campaigns run under its members' grants.
-        CampaignOwner::Org { .. } => return Ok(()),
-    };
-    let owner_account = state
-        .user_store
-        .get_user(user_id)
-        .await
-        .map_err(|e| AppError::internal(e.context("failed to read the owner's account")))?
-        .ok_or_else(|| AppError::BadRequest(format!("no account {user_id}")))?;
-    if UserRights::of_account(state, &owner_account)
-        .await?
-        .holds(UserPermission::SubmitPlans)
-    {
-        return Ok(());
-    }
-    tracing::warn!(owner = %owner.label(), "refused: the owner holds no submit_plans");
-    Err(AppError::BadRequest(format!(
-        "a campaign's owner needs submit_plans, which {user_id} does not hold"
-    )))
 }
 
 /// Refuse a new owner outside the organization whose private benchmark or vault resource
@@ -216,11 +190,7 @@ async fn require_owner_holds_private_run(
     if run.held.is_empty() && run.vault.is_empty() {
         return Ok(());
     }
-    let destination = match owner {
-        CampaignOwner::Org { org_id } => Some(org_id.clone()),
-        CampaignOwner::User { user_id } => user_org(state, user_id).await?,
-    };
-    let outside = run.outside(destination.as_ref());
+    let outside = run.outside(Some(owner.org_id()));
     if outside.is_empty() {
         return Ok(());
     }
@@ -304,7 +274,7 @@ struct CampaignCreator {
 
 impl CampaignCreator {
     /// Takes `submit_plans` too, since creating a campaign files its first plan.
-    /// An absent `owner` is the caller.
+    /// An absent `owner` is the caller's organization.
     async fn authorize(
         state: &AppState,
         caller: Caller<'_>,
@@ -314,20 +284,21 @@ impl CampaignCreator {
         let user = caller.user;
         let authority = CampaignAuthority::resolve(state, caller).await?;
         check_name(&name)?;
-        let owner = owner.map_or_else(|| authority.own_owner(), CampaignOwner::from);
+        let owner = owner.map_or_else(
+            || authority.own_owner(),
+            |owner| Ok(CampaignOwner::from(owner)),
+        )?;
         // Checked **before** anything is written, so a refused owner files no plan.
         require_destination(
             state,
             &authority,
             &owner,
-            "you may only create campaigns for yourself, an organization you administer, \
-             or a member of it",
+            "you may only create campaigns for your organization",
         )
         .await?;
 
         let rights = caller.rights;
         rights.require(UserPermission::SubmitPlans)?;
-        require_owner_files_plans(state, &owner).await?;
         Ok(Self {
             user: user.clone(),
             new: NewCampaign::new(name, owner),
@@ -520,11 +491,9 @@ async fn hand_over(
         state,
         &authority,
         &owner,
-        "you may only hand a campaign to yourself, an organization you administer or belong to, \
-         or a member of the organization you administer",
+        "you may only hand a campaign to your organization",
     )
     .await?;
-    require_owner_files_plans(state, &owner).await?;
     if owner != campaign.owner {
         require_owner_holds_private_run(state, caller.rights, &campaign, &owner).await?;
     }
@@ -666,7 +635,9 @@ pub async fn edit_variants(
     let inherit_from = inheriting(&query.inherit_from.unwrap_or_default(), &add_from, &restore);
     let offer = offer(&state, caller, query.carry_earlier, &inherit_from)
         .await?
-        .across_limit(query.carry_across_limit);
+        .across_limit(query.carry_across_limit)
+        .inherit_failed(query.inherit_failed)
+        .replacing(replace_model(query.replace_model)?);
 
     // Read only now, so a refused caller costs no body.
     let stream = progress_stream::requested(request.headers());
@@ -744,7 +715,9 @@ pub async fn revise_document(
     let inherit_from = query.inherit_from.unwrap_or_default();
     let offer = offer(&state, caller, query.carry_earlier, &inherit_from)
         .await?
-        .across_limit(query.carry_across_limit);
+        .across_limit(query.carry_across_limit)
+        .inherit_failed(query.inherit_failed)
+        .replacing(replace_model(query.replace_model)?);
 
     // Read only now, so a refused caller costs no plan-sized body.
     let stream = progress_stream::requested(request.headers());
@@ -812,6 +785,17 @@ async fn offer(
         ));
     }
     Ok(offer)
+}
+
+fn replace_model(pairs: Option<Vec<ModelReplacement>>) -> Result<Vec<ModelReplacement>, AppError> {
+    let pairs = pairs.unwrap_or_default();
+    if pairs.len() > REPLACE_MODEL_MAX {
+        return Err(AppError::BadRequest(format!(
+            "replace_model names {} pairs; a revision takes at most {REPLACE_MODEL_MAX}",
+            pairs.len()
+        )));
+    }
+    Ok(pairs)
 }
 
 /// The `200` answer of a document revision that files nothing, as a rename to
@@ -1045,7 +1029,7 @@ impl CampaignReviser {
             return Ok(None);
         }
         let member_of = user_org(state, &caller.user.user_id).await?;
-        let authority = CampaignAuthority::of(caller.user, rights, member_of);
+        let authority = CampaignAuthority::of(rights, member_of);
         if !authority.may_run(&campaign.owner) {
             return Ok(None);
         }
@@ -1353,7 +1337,7 @@ impl Filer {
     async fn dry_run(
         &self,
         state: &AppState,
-        revision: Revision,
+        mut revision: Revision,
         note: Option<NonEmptyTrimmedString>,
     ) -> Result<RevisionDryRun, AppError> {
         // Filing the head's own document files nothing, so its dry run expands
@@ -1383,10 +1367,22 @@ impl Filer {
             .membership(state.plan_store.as_ref())
             .await
             .map_err(AppError::internal)?;
+        // Taken before the import rewrites a model with a token.
+        let revised = plan.jobs.clone();
         let DocumentDryRun {
             report,
             preview_bodies,
         } = crate::api_v1::plans::dry_run_plan(state, &self.scope, &membership.owner, note, plan)
+            .await?;
+        // After the checks, so only vault records the filer may name are read.
+        let membership = revision
+            .replace_models(
+                membership,
+                &revised,
+                state.vault_store.as_ref(),
+                self.scope.vault(),
+                &state.hf_imports.hub,
+            )
             .await?;
         let preview = revision
             .preview(
@@ -1395,7 +1391,6 @@ impl Filer {
                 state.plan_store.as_ref(),
                 state.todo_store.as_ref(),
                 state.submission_store.as_ref(),
-                state.org_store.as_ref(),
             )
             .await?;
         Ok(RevisionDryRun::new(report, preview))
@@ -1405,7 +1400,7 @@ impl Filer {
     async fn file(
         self,
         state: &AppState,
-        revision: Revision,
+        mut revision: Revision,
         note: Option<NonEmptyTrimmedString>,
         progress: Progress,
     ) -> Result<CampaignRevised, AppError> {
@@ -1428,6 +1423,7 @@ impl Filer {
             .membership(state.plan_store.as_ref())
             .await
             .map_err(AppError::internal)?;
+        let (revised, vault_scope) = (plan.jobs.clone(), scope.vault().clone());
         // The import runs before the writes that must complete, so a disconnect
         // during it files nothing. A stored document names imported models by
         // vault arm, so a re-run imports nothing.
@@ -1440,8 +1436,17 @@ impl Filer {
             plan,
             progress,
         )
-        .await?
-        .revising(revision.change());
+        .await?;
+        let membership = revision
+            .replace_models(
+                membership,
+                &revised,
+                state.vault_store.as_ref(),
+                &vault_scope,
+                &state.hf_imports.hub,
+            )
+            .await?;
+        let prepared = prepared.revising(revision.change());
         // Refuse the revision if the campaign changed owner or head during the
         // import, or the filer left the organization.
         let as_filer = Caller {
@@ -1475,7 +1480,7 @@ impl Filer {
             let revised = campaign_admin::complete_revision(
                 state.campaign_store.as_ref(),
                 state.plan_store.as_ref(),
-                revision,
+                revision.copying(report.replaced.clone()),
                 &report.plan_id,
                 &report.job_ids,
             )

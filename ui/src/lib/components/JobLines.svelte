@@ -19,7 +19,7 @@
     spreadOf, swapped, tierOf, type Column, type Context, type Line,
   } from "../jobs";
   import { offsetPaging } from "../pager";
-  import { here } from "../route.svelte";
+  import { here, redirect } from "../route.svelte";
   import { clientLink } from "../routes";
   import { PickedColumns } from "../picked.svelte";
   import { ColumnWidths, headerWidths } from "../widths.svelte";
@@ -145,6 +145,11 @@
   const widths = untrack(() => new ColumnWidths(`pipette.${kind}.columns.v2.widths`));
   let head = $state<HTMLTableRowElement>();
   const at = (offset: number) => link(sort, offset);
+  // An address that names no sort is replaced by one that names the table's own; the hash is kept, as the reader may
+  // have followed a link to it.
+  $effect(() => {
+    if (here.query.get("sort") !== sort) redirect(`${at(paging.offset)}${location.hash}`);
+  });
 
   // The lines listed, in the columns picked, as one file.
   function exportCsv() {

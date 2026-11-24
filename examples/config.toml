@@ -23,9 +23,9 @@ evals_server_url = "http://localhost:8080"
 # list_max_limit = 200
 # dataset_probe_max_age_secs = 180
 # require_client_preauth_key = false
-# require_user_preauth_key = false
 # accept_legacy_signatures = true
 # accept_v2_signatures = true
+# trusted_proxy_hops = 1
 # Default []: refuses every RFC 9421 signature. The local dev hosts, the Vite
 # proxy's included:
 authorities = ["localhost:3000", "127.0.0.1:3000", "localhost:5173", "127.0.0.1:5173"]
@@ -72,7 +72,7 @@ data_dir = "./sample_data"
 # endpoint = "https://s3.example.test"   # MinIO, R2 or another S3-compatible store
 # max_concurrent_requests = 32
 
-# Required: identities, keys and their claims. Use a separate private bucket on S3.
+# Required.
 [auth_storage]
 backend = "local_fs"
 data_dir = "./sample_data"

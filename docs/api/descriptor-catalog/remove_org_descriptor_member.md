@@ -37,7 +37,5 @@ and the digest of the removed member.
 | 200 | The API removed the member |
 | 400 | The body is invalid, or the key does not have the form for the descriptor kind of the entry |
 | 403 | The caller lacks catalog edit permission |
-| 404 | The organization is unreachable. |
-| 404 | The entry or specified member does not exist. |
-| 404 | The server has no database catalog. |
-| 409 | The entry is tombstoned. The entry is a stable or daily entry. The member is the last member of the entry. |
+| 404 | The entry or specified member does not exist |
+| 409 | The entry is tombstoned or is a stable or daily entry, or the member is its last member |

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -15,9 +15,9 @@ use pipette_httpapi::state::AppState;
 use pipette_hub_testkit::{MockFile, MockGate, MockHub, MockRepo};
 use pipette_pipeline::vault_check::descriptor_sha256;
 use pipette_plan_types::{
-    CatalogName, CatalogScope, DescriptorEntryKind as Kind, DescriptorEntryState as EntryState,
-    DeviceProfile, NonEmptyTrimmedString, NonEmptyVec, OrgId, PrincipalOwner, RunMark, Tag,
-    UserPermission, descriptor_digest,
+    CatalogName, CatalogScope, ClientId, DescriptorEntryKind as Kind,
+    DescriptorEntryState as EntryState, DeviceProfile, LogoUri, NonEmptyTrimmedString, NonEmptyVec,
+    OrgId, PrincipalOwner, RunMark, Tag, UserPermission, descriptor_digest,
 };
 use pipette_store::{AuditFilter, DescriptorCatalogStore, RunEvidenceRow};
 use pipette_store_testkit::{
@@ -57,13 +57,13 @@ async fn name_lookup_counts_approved_offers_and_supplies_plan_toml() -> anyhow::
     config.descriptor_catalog.offer_rules.extend([
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-            flavor: "macos-arm64".into(),
+            flavor: Some("macos-arm64".into()),
             requires: ["os:macos".to_owned(), "tag:ready".to_owned()].into(),
             any_of: Vec::new(),
         },
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-            flavor: "macos-x64".into(),
+            flavor: Some("macos-x64".into()),
             requires: ["os:macos".to_owned()].into(),
             any_of: Vec::new(),
         },
@@ -603,7 +603,7 @@ async fn short_list_selects_and_reports_every_withheld_member() -> anyhow::Resul
     config.descriptor_catalog.offer_rules.extend([
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-            flavor: "macos-arm64".into(),
+            flavor: Some("macos-arm64".into()),
             requires: [
                 "os:macos".to_owned(),
                 "chip:applem4".to_owned(),
@@ -615,7 +615,7 @@ async fn short_list_selects_and_reports_every_withheld_member() -> anyhow::Resul
         },
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-            flavor: "macos-x64".into(),
+            flavor: Some("macos-x64".into()),
             requires: ["os:macos".to_owned()].into(),
             any_of: Vec::new(),
         },
@@ -748,20 +748,109 @@ fn an_app_member(version: &str) -> anyhow::Result<pipette_plan_types::Descriptor
     )?)
 }
 
+fn add_ios_app_offer_rule(state: &mut AppState) {
+    let config = std::sync::Arc::make_mut(&mut state.config);
+    config.descriptor_catalog.offer_rules.push(OfferRule {
+        runtime_type: pipette_plan_types::RuntimeType::LlamacppIosPipette,
+        flavor: Some("ios-arm64".into()),
+        requires: ["os:ios".to_owned()].into(),
+        any_of: Vec::new(),
+    });
+}
+
+async fn register_ios_app_device(
+    state: &AppState,
+    status: ClientStatus,
+    build_flag: String,
+) -> anyhow::Result<(ed25519_dalek::SigningKey, ClientId)> {
+    let (key, client_id) = register_pending(state).await?;
+    let mut client = state
+        .client_store
+        .get_client(&client_id)
+        .await?
+        .context("registered client missing")?;
+    client.status = status;
+    client.device_profile.device_os_name = Some(NonEmptyTrimmedString::try_new("iOS")?);
+    client.capabilities.insert(build_flag);
+    state.client_store.put_client(&client).await?;
+    Ok((key, client_id))
+}
+
+/// A flavorless rule offers Apple Foundation to an iOS device, and that offer
+/// carries the system model that ships with the OS.
+#[tokio::test]
+async fn short_list_offers_apple_foundation_and_its_system_model() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    std::sync::Arc::make_mut(&mut sql.state.config)
+        .descriptor_catalog
+        .offer_rules
+        .push(OfferRule {
+            runtime_type: pipette_plan_types::RuntimeType::AppleFoundation,
+            flavor: None,
+            requires: ["os:ios".to_owned()].into(),
+            any_of: Vec::new(),
+        });
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let now = jiff::Timestamp::now();
+    store
+        .create_entry(&a_descriptor_entry(
+            "apple-foundation",
+            Kind::HandMade,
+            200,
+            pipette_plan_types::DescriptorMember::new(
+                serde_json::from_value(json!({"type": "apple_foundation"}))?,
+                now,
+            )?,
+        )?)
+        .await?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "apple-foundation-text",
+            Kind::HandMade,
+            100,
+            pipette_plan_types::DescriptorMember::new_model(
+                pipette_plan_types::Model::AppleFoundationText,
+                pipette_plan_types::QuantizationLabel::try_new("default")?,
+                now,
+            )?,
+        )?)
+        .await?;
+    let (_, client_id) = register_ios_app_device(
+        state,
+        ClientStatus::Approved,
+        "runtime:apple_foundation".to_owned(),
+    )
+    .await?;
+    let signer = registered_user(state, &[UserPermission::ReadClients]).await?;
+
+    let (status, body) = read(state, &signer, &format!("{BASE}/devices/{client_id}")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        field_of(&body["items"], "name"),
+        Some(vec![
+            json!("apple-foundation"),
+            json!("apple-foundation-text")
+        ]),
+        "{body}"
+    );
+    assert_eq!(
+        body["items"][1]["members"][0]["selector"],
+        "apple-foundation-text::system::default"
+    );
+    assert_eq!(body["withheld"]["member_count"], 0, "{body}");
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+    Ok(())
+}
+
 /// Each iOS app build is its own entry. A device that reports one build flag
 /// resolves that entry; the other entry withholds its member as `no_build`.
 #[tokio::test]
 async fn short_list_resolves_the_app_build_that_a_device_reports() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut sql = sql_state_or_skip!(dir.path());
-    let mut config = (*sql.state.config).clone();
-    config.descriptor_catalog.offer_rules.push(OfferRule {
-        runtime_type: pipette_plan_types::RuntimeType::LlamacppIosPipette,
-        flavor: "ios-arm64".into(),
-        requires: ["os:ios".to_owned()].into(),
-        any_of: Vec::new(),
-    });
-    sql.state.config = std::sync::Arc::new(config);
+    add_ios_app_offer_rule(&mut sql.state);
     let state = &sql.state;
     let store = store_of(state)?;
     let (reported, other) = (an_app_member("b2")?, an_app_member("b1")?);
@@ -782,16 +871,8 @@ async fn short_list_resolves_the_app_build_that_a_device_reports() -> anyhow::Re
     store
         .create_entry(&a_descriptor_entry("App-B1", Kind::HandMade, 100, other)?)
         .await?;
-    let (_, client_id) = register_pending(state).await?;
-    let mut client = state
-        .client_store
-        .get_client(&client_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("registered client missing"))?;
-    client.status = ClientStatus::Approved;
-    client.device_profile.device_os_name = Some(NonEmptyTrimmedString::try_new("iOS")?);
-    client.capabilities.insert(reported_flag);
-    state.client_store.put_client(&client).await?;
+    let (_, client_id) =
+        register_ios_app_device(state, ClientStatus::Approved, reported_flag).await?;
     let signer = registered_user(state, &[UserPermission::ReadClients]).await?;
 
     let (status, body) = read(state, &signer, &format!("{BASE}/devices/{client_id}")).await?;
@@ -828,6 +909,125 @@ async fn short_list_resolves_the_app_build_that_a_device_reports() -> anyhow::Re
     Ok(())
 }
 
+/// A device reads its own short list at `/clients/me/descriptor-catalog`. The
+/// global app build `App-B2` gives the device the `gguf_text` members that its
+/// runtime loads. Only an approved acme device can read `AcmeLM` and fetch the
+/// logo of its family.
+#[rstest]
+#[case::approved_acme_device(
+    "acme",
+    ClientStatus::Approved,
+    &["App-B2", "AcmeLM"],
+    &["AcmeLM::mlx::4bit"],
+)]
+#[case::approved_beta_device("beta", ClientStatus::Approved, &["App-B2"], &[])]
+#[case::pending_acme_device("acme", ClientStatus::Pending, &["App-B2"], &[])]
+#[tokio::test]
+async fn a_device_reads_its_own_short_list(
+    #[case] owner: &str,
+    #[case] status: ClientStatus,
+    #[case] expected_items: &[&str],
+    #[case] expected_withheld: &[&str],
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut sql = sql_state_or_skip!(dir.path());
+    add_ios_app_offer_rule(&mut sql.state);
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let beta = seed_org(state, "beta").await?.org_id;
+    let app = an_app_member("b2")?;
+    let app_flag = app
+        .app_build_flag()
+        .context("an iOS app runtime has a build flag")?;
+    store
+        .create_entry(&a_descriptor_entry("App-B2", Kind::HandMade, 200, app)?)
+        .await?;
+    let mut acme_model = a_model_entry_of(
+        "AcmeLM",
+        150,
+        &[
+            ("gguf_text", "AcmeLM-GGUF", "q4_0"),
+            ("mlx", "AcmeLM-MLX-4bit", "4bit"),
+        ],
+    )?;
+    acme_model.scope = CatalogScope::Org(acme.clone());
+    store.create_entry(&acme_model).await?;
+    let acme_logo = LogoUri::try_new("data:image/png;base64,QUNNRQ==")?;
+    store
+        .set_family_logo(
+            &acme_model.scope,
+            &CatalogName::try_new("AcmeLM")?,
+            Some(&acme_logo),
+            None,
+        )
+        .await?;
+    let (key, client_id) = register_ios_app_device(state, status, app_flag).await?;
+    let org = if owner == "acme" { &acme } else { &beta };
+    own_client_by_org(state, &client_id, org).await?;
+
+    let response = authed_get(state, &key, &client_id, "/clients/me/descriptor-catalog").await?;
+    let status = response.status();
+    let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
+    let body = body_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        cache_control.as_ref().and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    let expected: Vec<Value> = expected_items.iter().map(|name| json!(name)).collect();
+    assert_eq!(field_of(&body["items"], "name"), Some(expected), "{body}");
+    let withheld = &body["withheld"];
+    assert_eq!(withheld["entry_count"], 0, "{body}");
+    assert_eq!(withheld["member_count"], expected_withheld.len(), "{body}");
+    assert_eq!(
+        field_of(&withheld["members"], "selector"),
+        Some(
+            expected_withheld
+                .iter()
+                .map(|selector| json!(selector))
+                .collect()
+        ),
+        "{body}"
+    );
+    let acme_model = body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "AcmeLM"));
+    let logo_path = format!(
+        "/clients/me/descriptor-catalog/family-logos/{}",
+        acme_logo.sha256()
+    );
+    let logo = authed_get(state, &key, &client_id, &logo_path).await?;
+    let logo_status = logo.status();
+    let logo_cache = logo.headers().get(header::CACHE_CONTROL).cloned();
+    let logo_body = body_json(logo).await?;
+    assert_eq!(
+        logo_cache.as_ref().and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    if acme_model.is_some() {
+        assert_eq!(logo_status, StatusCode::OK, "{logo_body}");
+        crate::api_schema::assert_conforms("DescriptorFamilyLogo", &logo_body)?;
+        assert_eq!(
+            logo_body,
+            json!({"sha256": acme_logo.sha256(), "logo_uri": acme_logo.as_str()})
+        );
+    } else {
+        assert_eq!(logo_status, StatusCode::NOT_FOUND, "{logo_body}");
+    }
+    if let Some(model) = acme_model {
+        assert_eq!(model["family"], "AcmeLM", "{body}");
+        assert_eq!(model["family_logo_sha256"], acme_logo.sha256(), "{body}");
+        assert_eq!(
+            field_of(&model["members"], "selector"),
+            Some(vec![json!("AcmeLM::gguf::q4_0")]),
+            "{body}"
+        );
+    }
+    crate::api_schema::assert_conforms("DescriptorCatalogShortList", &body)?;
+    Ok(())
+}
+
 /// Desktop availability gates both regular and speculative MLX model entries.
 #[rstest]
 #[case::available("macOS", Some("arm64"), &["runtime:mlx"], true)]
@@ -845,7 +1045,7 @@ async fn short_list_requires_desktop_mlx_availability(
     let mut config = (*sql.state.config).clone();
     config.descriptor_catalog.offer_rules.push(OfferRule {
         runtime_type: pipette_plan_types::RuntimeType::MlxMacosPipette,
-        flavor: "macos-arm64".into(),
+        flavor: Some("macos-arm64".into()),
         requires: ["os:macos", "runtime:mlx"]
             .into_iter()
             .map(str::to_owned)
@@ -966,7 +1166,7 @@ async fn short_list_drains_every_store_page() -> anyhow::Result<()> {
     let mut config = (*sql.state.config).clone();
     config.descriptor_catalog.offer_rules.push(OfferRule {
         runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-        flavor: "macos-arm64".into(),
+        flavor: Some("macos-arm64".into()),
         requires: ["os:macos".to_owned()].into(),
         any_of: Vec::new(),
     });
@@ -1020,13 +1220,13 @@ async fn windows_device(
     config.descriptor_catalog.offer_rules.extend([
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-            flavor: "windows-x64-cpu".into(),
+            flavor: Some("windows-x64-cpu".into()),
             requires: ["os:windows".to_owned()].into(),
             any_of: Vec::new(),
         },
         OfferRule {
             runtime_type: pipette_plan_types::RuntimeType::Ovms,
-            flavor: "windows-x64".into(),
+            flavor: Some("windows-x64".into()),
             requires: ["os:windows".to_owned()].into(),
             any_of: Vec::new(),
         },
@@ -1152,9 +1352,17 @@ async fn short_list_offers_model_members_that_an_offered_runtime_loads(
             )?)
             .await?;
     }
-    store
-        .create_entry(&a_model_entry_of("AcmeLM-3B", 150, model_members)?)
-        .await?;
+    let mut entry = a_model_entry_of("AcmeLM-3B", 150, model_members)?;
+    entry.members = NonEmptyVec::try_new(
+        entry
+            .members
+            .into_inner()
+            .into_iter()
+            .enumerate()
+            .map(|(index, member)| member.with_size_bytes((index == 0).then_some(9_000)))
+            .collect(),
+    )?;
+    store.create_entry(&entry).await?;
     let (status, body) = read(state, &signer, &uri).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
     let expected_items = expected_items.iter().map(|name| json!(name)).collect();
@@ -1168,6 +1376,18 @@ async fn short_list_offers_model_members_that_an_offered_runtime_loads(
         .and_then(|items| items.iter().find(|item| item["name"] == "AcmeLM-3B"));
     if let Some(model) = model {
         assert_eq!(model["descriptor_kind"], "model");
+        assert_eq!(model["family"], "AcmeLM", "{body}");
+        assert!(body["items"][0].get("family").is_none(), "{body}");
+        assert_eq!(model["members"][0]["size_bytes"], 9_000, "{body}");
+        assert_eq!(
+            model["members"][1].get("size_bytes"),
+            Some(&Value::Null),
+            "{body}"
+        );
+        assert!(
+            body["items"][0]["members"][0].get("size_bytes").is_none(),
+            "{body}"
+        );
     }
     let offered = model
         .and_then(|model| field_of(&model["members"], "selector"))
@@ -1483,7 +1703,7 @@ async fn linux_device(
         .extend(
             ["linux-x64-cuda-13", "linux-x64-cpu"].map(|flavor| OfferRule {
                 runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-                flavor: flavor.into(),
+                flavor: Some(flavor.into()),
                 requires: ["os:linux".to_owned()].into(),
                 any_of: Vec::new(),
             }),
@@ -1642,20 +1862,25 @@ async fn name_lookup_gives_fleet_run_evidence_on_request() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn model_members_carry_their_parameter_counts() -> anyhow::Result<()> {
+async fn model_members_carry_their_parameter_counts_and_sizes() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let sql = sql_state_or_skip!(dir.path());
     let state = &sql.state;
-    store_of(state)?
-        .create_entry(&a_model_entry_of(
-            "AcmeLM-3B",
-            50,
-            &[
-                ("gguf_text", "AcmeLM-3B-GGUF", "q4_0"),
-                ("openvino", "AcmeLM-3B-ov", "int4"),
-            ],
-        )?)
-        .await?;
+    let mut entry = a_model_entry_of(
+        "AcmeLM-3B",
+        50,
+        &[
+            ("gguf_text", "AcmeLM-3B-GGUF", "q4_0"),
+            ("openvino", "AcmeLM-3B-ov", "int4"),
+        ],
+    )?;
+    let [gguf, openvino]: [_; 2] = entry
+        .members
+        .into_inner()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("two members"))?;
+    entry.members = NonEmptyVec::try_new(vec![gguf.with_size_bytes(Some(9_000)), openvino])?;
+    store_of(state)?.create_entry(&entry).await?;
     state
         .model_params_store
         .put_model_params(&pipette_store_testkit::a_model_params("acmelm-3b", 3100)?)
@@ -1679,8 +1904,14 @@ async fn model_members_carry_their_parameter_counts() -> anyhow::Result<()> {
             members[0]["parameters"],
             json!({"total_millions": 3100, "active_millions": 3100})
         );
+        assert_eq!(members[0]["size_bytes"], 9_000, "{members}");
         assert_eq!(members[1]["model_key"], "acmelm-3b-ov", "{members}");
         assert!(members[1].get("parameters").is_none(), "{members}");
+        assert_eq!(
+            members[1].get("size_bytes"),
+            Some(&Value::Null),
+            "{members}"
+        );
     }
     let (_, compact) = read(state, &signer, &format!("{BASE}?descriptor_kind=model")).await?;
     assert!(compact["items"][0].get("members").is_none(), "{compact}");
@@ -2199,6 +2430,7 @@ async fn a_model_entry_reads_with_its_member_keys() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::OK, "{full}");
     let row = &full["items"][0];
     assert_eq!(row["descriptor_kind"], "model");
+    assert_eq!(row["family"], "AcmeLM", "{full}");
     assert_eq!(row["descriptor_types"], json!(["gguf_text", "mlx"]));
     assert_eq!(
         row["member_summaries"],
@@ -2236,7 +2468,7 @@ async fn list_paging_members_and_states() -> anyhow::Result<()> {
     let mut config = (*sql.state.config).clone();
     config.descriptor_catalog.offer_rules.push(OfferRule {
         runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-        flavor: "macos-arm64".into(),
+        flavor: Some("macos-arm64".into()),
         requires: ["os:macos".to_owned()].into(),
         any_of: Vec::new(),
     });
@@ -2723,25 +2955,18 @@ async fn an_org_vault_runtime_names_rows_and_checks_each_owner() -> anyhow::Resu
             .map(|(path, body)| masked_refusal(state, &member, path, body, &runtime)),
     )
     .await?;
-    for owner in [
-        PrincipalOwner::Org { org_id: other },
-        PrincipalOwner::User {
-            user_id: member.1.clone(),
-        },
-    ] {
-        let foreign = vault_runtime_resource(state, owner).await?;
-        for ((path, body), unknown) in writes(&foreign).iter().zip(&unknown) {
-            assert_eq!(
-                &masked_refusal(state, &member, path, body, &foreign).await?,
-                unknown
-            );
-        }
-        let (path, body) = &writes(&foreign)[0];
+    let foreign = vault_runtime_resource(state, PrincipalOwner::Org { org_id: other }).await?;
+    for ((path, body), unknown) in writes(&foreign).iter().zip(&unknown) {
         assert_eq!(
-            masked_refusal(state, &admin, path, body, &foreign).await?,
-            unknown[0]
+            &masked_refusal(state, &member, path, body, &foreign).await?,
+            unknown
         );
     }
+    let (path, body) = &writes(&foreign)[0];
+    assert_eq!(
+        masked_refusal(state, &admin, path, body, &foreign).await?,
+        unknown[0]
+    );
     Ok(())
 }
 
@@ -2862,27 +3087,11 @@ async fn an_org_vault_model_names_its_plan_and_verified_result_alias() -> anyhow
     .await?;
     let other = seed_org(state, "other").await?.org_id;
     let foreign = vault_model_resource(state, &other, false).await?;
-    let personal = vault_model_resource(state, &org_id, false).await?;
-    let personal_id = pipette_pipeline::vault_check::named_resources(&personal)
-        .into_iter()
-        .next()
-        .context("model resource")?;
-    let mut record = state
-        .vault_store
-        .get_resource(&personal_id)
-        .await?
-        .context("model record")?;
-    record.owner = PrincipalOwner::User {
-        user_id: member.1.clone(),
-    };
-    state.vault_store.put_resource(&record).await?;
-    for model in [foreign, personal] {
-        let body = model_body("ForeignLM", "q4_0", model.clone());
-        assert_eq!(
-            masked_refusal(state, &member, &uri, &body, &model).await?,
-            unknown
-        );
-    }
+    let body = model_body("ForeignLM", "q4_0", foreign.clone());
+    assert_eq!(
+        masked_refusal(state, &member, &uri, &body, &foreign).await?,
+        unknown
+    );
     Ok(())
 }
 
@@ -3014,9 +3223,12 @@ async fn an_org_model_entry_appends_a_model_member(
     let Some((sql, uri, member)) = model_writer(dir.path(), &hub).await? else {
         return Ok(());
     };
-    let body = model_body("AcmeLM", "q4_0", gguf_model("Public-GGUF"));
+    let mut body = model_body("AcmeLM", "q4_0", gguf_model("Public-GGUF"));
+    body["family"] = json!("Acme");
     let response = signed_json(&sql.state, &member, "POST", &uri, &body).await?;
     assert_eq!(response.status(), StatusCode::CREATED);
+    super::api_schema::assert_conforms("CreateDescriptorEntryRequest", &body)?;
+    assert_eq!(body_json(response).await?["family"], "Acme");
     super::api_schema::assert_conforms("AddDescriptorMemberRequest", &member_body)?;
     let response = signed_json(
         &sql.state,
@@ -3044,6 +3256,7 @@ async fn an_org_model_entry_appends_a_model_member(
 #[rstest]
 #[case::both(json!({"name": "Fork", "runtimes": [runtime("b1", "macos-arm64")], "models": [{"quantization": "q4_0", "model": gguf_model("Public-GGUF")}]}))]
 #[case::neither(json!({"name": "Fork"}))]
+#[case::runtime_family(json!({"name": "Fork", "runtimes": [runtime("b1", "macos-arm64")], "family": "Fork"}))]
 #[tokio::test]
 async fn an_org_entry_has_one_kind_of_member(#[case] body: Value) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3082,6 +3295,30 @@ async fn a_model_member_joins_no_runtime_entry() -> anyhow::Result<()> {
     .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())
+}
+
+/// The audit actions that the log lists under `org`.
+async fn org_actions(
+    state: &AppState,
+    org: &OrgId,
+) -> anyhow::Result<Vec<pipette_plan_types::AuditAction>> {
+    Ok(state
+        .audit_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("audit store"))?
+        .list_events(
+            &AuditFilter {
+                org_id: Some(org.clone()),
+                ..Default::default()
+            },
+            None,
+            NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+        )
+        .await?
+        .items
+        .into_iter()
+        .map(|event| event.action)
+        .collect())
 }
 
 /// The `acme` org with a hand-made runtime entry `Fork`, a hand-made `Held`, a
@@ -3311,6 +3548,285 @@ async fn an_org_member_relabel_answers(
 }
 
 #[rstest]
+#[case::set("AcmeLM", json!({"family": "Acme"}), StatusCode::OK, Some("Acme"))]
+#[case::default("AcmeLM", json!({"family": null}), StatusCode::OK, None)]
+#[case::omitted_family("AcmeLM", json!({}), StatusCode::OK, Some("Previous"))]
+#[case::bad_family("AcmeLM", json!({"family": "-Acme"}), StatusCode::BAD_REQUEST, None)]
+#[case::unknown_field("AcmeLM", json!({"family": "Acme", "name": "x"}), StatusCode::BAD_REQUEST, None)]
+#[case::runtime_entry("Fork", json!({"family": "Acme"}), StatusCode::BAD_REQUEST, None)]
+#[case::missing("Missing", json!({"family": "Acme"}), StatusCode::NOT_FOUND, None)]
+#[case::tombstoned("DeadLM", json!({"family": "Acme"}), StatusCode::CONFLICT, None)]
+#[tokio::test]
+async fn an_org_family_change_answers(
+    #[case] name: &str,
+    #[case] body: Value,
+    #[case] status: StatusCode,
+    #[case] family: Option<&str>,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, base, member) = renamable_org(state).await?;
+    let uri = format!("{base}/{name}/family");
+    let scope = CatalogScope::Org(acme.clone());
+    let name = CatalogName::try_new(name)?;
+    let store = store_of(state)?;
+    let previous = CatalogName::try_new("Previous")?;
+    if body["family"].is_null() {
+        let outcome = store
+            .set_family(&scope, &name, Some(&previous), None)
+            .await?;
+        assert!(matches!(outcome, pipette_store::SetFamilyOutcome::Set(_)));
+    }
+    let reader = registered_user(state, &[]).await?;
+    set_user_org(state, &reader.1, Some(acme.clone())).await?;
+    let refused = signed_json(state, &reader, "POST", &uri, &body).await?;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let response = signed_json(state, &member, "POST", &uri, &body).await?;
+    assert_eq!(response.status(), status);
+    let changes: Vec<_> = org_actions(state, &acme)
+        .await?
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                action,
+                pipette_plan_types::AuditAction::CatalogSetFamily { .. }
+            )
+        })
+        .collect();
+    if status != StatusCode::OK {
+        assert!(changes.is_empty(), "{changes:?}");
+        return Ok(());
+    }
+    super::api_schema::assert_conforms("SetDescriptorEntryFamilyRequest", &body)?;
+    let entry = body_json(response).await?;
+    assert_eq!(entry["family"], family.unwrap_or("AcmeLM"), "{entry}");
+    if body.get("family").is_none() {
+        assert!(changes.is_empty(), "{changes:?}");
+        let stored = store
+            .get_entry(&scope, &name)
+            .await?
+            .context("the model entry")?;
+        assert_eq!(stored.family, Some(previous));
+        return Ok(());
+    }
+    assert_eq!(
+        changes,
+        [pipette_plan_types::AuditAction::CatalogSetFamily {
+            scope,
+            name,
+            family: family.map(CatalogName::try_new).transpose()?,
+        }]
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::set("AcmeLM", json!({"logo_uri": "https://pipette.liquid.ai/logos/acme.svg"}), StatusCode::OK, false)]
+#[case::other_case("acmelm", json!({"logo_uri": "https://pipette.liquid.ai/logos/acme.svg"}), StatusCode::OK, false)]
+#[case::data("AcmeLM", json!({"logo_uri": "data:image/svg+xml;base64,PHN2Zy8+"}), StatusCode::OK, false)]
+#[case::max_embedded("AcmeLM", {
+    let prefix = "data:image/webp;base64,";
+    let room = LogoUri::MAX_LEN - prefix.len();
+    json!({"logo_uri": format!("{prefix}{}", "a".repeat(room - room % 4))})
+}, StatusCode::OK, false)]
+#[case::max_hosted("AcmeLM", json!({"logo_uri": format!("{}{}", LogoUri::PREFIX, "a".repeat(LogoUri::MAX_LEN - LogoUri::PREFIX.len()))}), StatusCode::OK, false)]
+#[case::body_too_large("AcmeLM", json!({"logo_uri": "a".repeat(65 * 1024)}), StatusCode::PAYLOAD_TOO_LARGE, false)]
+#[case::data_jpeg("AcmeLM", json!({"logo_uri": "data:image/jpeg;base64,PHN2Zy8+"}), StatusCode::BAD_REQUEST, false)]
+#[case::removed("AcmeLM", json!({"logo_uri": null}), StatusCode::OK, true)]
+#[case::removed_unknown("Missing", json!({"logo_uri": null}), StatusCode::OK, false)]
+#[case::omitted("AcmeLM", json!({}), StatusCode::BAD_REQUEST, false)]
+#[case::unknown_field("AcmeLM", json!({"logo_uri": null, "scope": "global"}), StatusCode::BAD_REQUEST, false)]
+#[case::other_host("AcmeLM", json!({"logo_uri": "https://example.com/logos/acme.svg"}), StatusCode::BAD_REQUEST, false)]
+#[case::parent_dir("AcmeLM", json!({"logo_uri": "https://pipette.liquid.ai/logos/../acme.svg"}), StatusCode::BAD_REQUEST, false)]
+#[case::runtime_family("Fork", json!({"logo_uri": "https://pipette.liquid.ai/logos/fork.svg"}), StatusCode::NOT_FOUND, false)]
+#[case::tombstoned("DeadLM", json!({"logo_uri": "https://pipette.liquid.ai/logos/dead.svg"}), StatusCode::NOT_FOUND, false)]
+#[case::missing("Missing", json!({"logo_uri": "https://pipette.liquid.ai/logos/x.svg"}), StatusCode::NOT_FOUND, false)]
+#[tokio::test]
+async fn an_org_family_logo_change_answers(
+    #[case] family: &str,
+    #[case] body: Value,
+    #[case] status: StatusCode,
+    #[case] preset: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let (acme, _, member) = renamable_org(state).await?;
+    let uri = format!("/api/v1/orgs/{acme}/descriptor-families/{family}/logo");
+    let scope = CatalogScope::Org(acme.clone());
+    let store = store_of(state)?;
+    let family = CatalogName::try_new(family)?;
+    if preset {
+        let previous = LogoUri::try_new(format!("{}previous.svg", LogoUri::PREFIX))?;
+        store
+            .set_family_logo(&scope, &family, Some(&previous), None)
+            .await?;
+    }
+    let reader = registered_user(state, &[]).await?;
+    set_user_org(state, &reader.1, Some(acme.clone())).await?;
+    let refused = signed_json(state, &reader, "POST", &uri, &body).await?;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let response = signed_json(state, &member, "POST", &uri, &body).await?;
+    assert_eq!(response.status(), status);
+    let changes: Vec<_> = org_actions(state, &acme)
+        .await?
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                action,
+                pipette_plan_types::AuditAction::CatalogSetFamilyLogo { .. }
+            )
+        })
+        .collect();
+    if status != StatusCode::OK {
+        assert!(changes.is_empty(), "{changes:?}");
+        return Ok(());
+    }
+    super::api_schema::assert_conforms("SetDescriptorFamilyLogoRequest", &body)?;
+    let answer = body_json(response).await?;
+    super::api_schema::assert_conforms("DescriptorFamilyLogoView", &answer)?;
+    let logo_uri = body["logo_uri"]
+        .as_str()
+        .map(LogoUri::try_new)
+        .transpose()?;
+    assert_eq!(
+        answer,
+        json!({"scope": acme.as_str(), "family": family.as_str(), "logo_uri": body["logo_uri"]})
+    );
+    let stored: Vec<_> = store
+        .family_logos(std::slice::from_ref(&scope))
+        .await?
+        .into_iter()
+        .map(|logo| logo.sha256.to_string())
+        .collect();
+    assert_eq!(
+        stored,
+        Vec::from_iter(logo_uri.as_ref().map(LogoUri::sha256))
+    );
+    // A removal that found no logo changed nothing, so it records nothing.
+    let removed_nothing = logo_uri.is_none() && !preset;
+    let expected =
+        (!removed_nothing).then_some(pipette_plan_types::AuditAction::CatalogSetFamilyLogo {
+            scope,
+            family,
+            logo_uri,
+        });
+    assert_eq!(changes, Vec::from_iter(expected));
+    Ok(())
+}
+
+/// An entry reads the logo digest of its family from its own scope, or else
+/// the global logo of the family. A reader fetches a logo by its digest from
+/// a scope that it can read.
+#[tokio::test]
+async fn a_family_logo_reads_from_the_entry_scope_then_global() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let store = store_of(state)?;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let org = CatalogScope::Org(acme.clone());
+    let mut entries = [
+        a_model_entry_of("AcmeLM-3B", 50, &[("mlx", "AcmeLM-3B-MLX", "4bit")])?,
+        a_model_entry_of("AcmeLM-7B", 40, &[("mlx", "AcmeLM-7B-MLX", "4bit")])?,
+        a_model_entry_of("Other-1B", 30, &[("mlx", "Other-1B-MLX", "4bit")])?,
+    ];
+    entries[1].scope = org.clone();
+    entries[2].scope = org.clone();
+    for entry in &entries {
+        store.create_entry(entry).await?;
+    }
+    let logo = |file: &str| LogoUri::try_new(format!("{}{file}", LogoUri::PREFIX));
+    let set = |scope: &CatalogScope, family: &str, file: &str| {
+        let scope = scope.clone();
+        let family = family.to_owned();
+        let file = file.to_owned();
+        async move {
+            let outcome = store
+                .set_family_logo(
+                    &scope,
+                    &CatalogName::try_new(family)?,
+                    Some(&logo(&file)?),
+                    None,
+                )
+                .await?;
+            anyhow::ensure!(
+                matches!(outcome, pipette_store::SetFamilyLogoOutcome::Set(_)),
+                "{outcome:?}"
+            );
+            anyhow::Ok(())
+        }
+    };
+    set(&CatalogScope::Global, "acmelm", "global.svg").await?;
+    set(&org, "Other", "other.svg").await?;
+    let signer = registered_user(state, &[]).await?;
+    set_user_org(state, &signer.1, Some(acme.clone())).await?;
+    let logos = || async {
+        let (status, page) = read(state, &signer, BASE).await?;
+        anyhow::ensure!(status == StatusCode::OK, "{page}");
+        crate::api_schema::assert_conforms("DescriptorEntryListRow", &page["items"][0])?;
+        Ok(page["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| (row["name"].clone(), row["family_logo_sha256"].clone()))
+            .collect::<HashMap<_, _>>())
+    };
+    let uri = |file: &str| -> anyhow::Result<Value> { Ok(json!(logo(file)?.sha256())) };
+    assert_eq!(
+        logos().await?,
+        HashMap::from([
+            (json!("AcmeLM-3B"), uri("global.svg")?),
+            (json!("AcmeLM-7B"), uri("global.svg")?),
+            (json!("Other-1B"), uri("other.svg")?),
+        ])
+    );
+
+    set(&org, "AcmeLM", "acme.svg").await?;
+    assert_eq!(
+        logos().await?,
+        HashMap::from([
+            (json!("AcmeLM-3B"), uri("global.svg")?),
+            (json!("AcmeLM-7B"), uri("acme.svg")?),
+            (json!("Other-1B"), uri("other.svg")?),
+        ])
+    );
+
+    // A user outside acme fetches the global logo, but not the acme logo.
+    let outsider = registered_user(state, &[]).await?;
+    for (signer, file, expected) in [
+        (&signer, "acme.svg", StatusCode::OK),
+        (&signer, "global.svg", StatusCode::OK),
+        (&outsider, "global.svg", StatusCode::OK),
+        (&outsider, "acme.svg", StatusCode::NOT_FOUND),
+        (&signer, "unknown.svg", StatusCode::NOT_FOUND),
+    ] {
+        let path = format!("{BASE}/family-logos/{}", logo(file)?.sha256());
+        let response = signed_empty(state, signer, "GET", &path).await?;
+        let status = response.status();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
+        let body = body_json(response).await?;
+        assert_eq!(status, expected, "{file}: {body}");
+        if status == StatusCode::OK {
+            crate::api_schema::assert_conforms("DescriptorFamilyLogo", &body)?;
+            assert_eq!(body["logo_uri"], logo(file)?.as_str(), "{file}");
+        }
+    }
+    let (status, body) = read(state, &signer, &format!("{BASE}/family-logos/ABC")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    Ok(())
+}
+
+#[rstest]
 #[case::removed("AcmeLM", json!({"member": "gguf::q8_0"}), StatusCode::OK)]
 #[case::model_key_shape("AcmeLM", json!({"member": "q8_0"}), StatusCode::BAD_REQUEST)]
 #[case::unknown_field("AcmeLM", json!({"member": "gguf::q8_0", "scope": "global"}), StatusCode::BAD_REQUEST)]
@@ -3354,6 +3870,8 @@ async fn an_org_member_removal_answers(
         .filter_map(|event| match event.action {
             pipette_plan_types::AuditAction::CatalogRemoveMember { member, .. } => Some(member),
             pipette_plan_types::AuditAction::Http { .. }
+            | pipette_plan_types::AuditAction::CatalogSetFamily { .. }
+            | pipette_plan_types::AuditAction::CatalogSetFamilyLogo { .. }
             | pipette_plan_types::AuditAction::Cli { .. }
             | pipette_plan_types::AuditAction::CatalogRename { .. }
             | pipette_plan_types::AuditAction::CatalogMerge { .. }
@@ -3514,6 +4032,8 @@ async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow
             | pipette_plan_types::AuditAction::Cli { .. }
             | pipette_plan_types::AuditAction::CatalogMerge { .. }
             | pipette_plan_types::AuditAction::CatalogRemoveMember { .. }
+            | pipette_plan_types::AuditAction::CatalogSetFamily { .. }
+            | pipette_plan_types::AuditAction::CatalogSetFamilyLogo { .. }
             | pipette_plan_types::AuditAction::CatalogMoveToGlobal { .. }
             | pipette_plan_types::AuditAction::FirstClerkSignIn { .. }
             | pipette_plan_types::AuditAction::GroupPolicy { .. } => None,
@@ -3526,15 +4046,18 @@ async fn org_renames_and_relabels_are_gated_unshadow_and_are_audited() -> anyhow
     Ok(())
 }
 
-/// The bytes inside the `runtimes = [ … ]` array of a document from
-/// `submittable_document`, where a test writes a catalog name instead.
-fn runtime_array_span(document: &str) -> anyhow::Result<std::ops::Range<usize>> {
-    let start = document.find("runtimes = [").context("runtime array")? + "runtimes = [".len();
+/// The bytes inside an array of a document from `submittable_document`,
+/// where a test writes a catalog name or selector.
+fn array_span(document: &str, marker: &str) -> anyhow::Result<std::ops::Range<usize>> {
+    let start = document
+        .find(marker)
+        .with_context(|| format!("find array starting with {marker:?}"))?
+        + marker.len();
     let len = document
         .get(start..)
-        .context("runtime slice")?
+        .with_context(|| format!("read array starting with {marker:?}"))?
         .find(']')
-        .context("runtime end")?;
+        .with_context(|| format!("find end of array starting with {marker:?}"))?;
     Ok(start..start + len)
 }
 
@@ -3564,7 +4087,7 @@ async fn plan_names_are_stored_and_returned_without_resolving_again() -> anyhow:
     .await?;
     let (_, client) = register_and_approve(state).await?;
     let twin = submittable_document(&client, "named", 1);
-    let runtimes = runtime_array_span(&twin)?;
+    let runtimes = array_span(&twin, "runtimes = [")?;
     let mut text = twin.clone();
     text.replace_range(runtimes, "\"global/example::macos-arm64\"");
     let dry = post_plan_document(
@@ -3618,7 +4141,7 @@ async fn plan_names_are_stored_and_returned_without_resolving_again() -> anyhow:
         if offered {
             config.descriptor_catalog.offer_rules.push(OfferRule {
                 runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-                flavor: "macos-arm64".into(),
+                flavor: Some("macos-arm64".into()),
                 requires: ["os:linux".into()].into(),
                 any_of: Vec::new(),
             });
@@ -3659,7 +4182,7 @@ async fn plan_names_are_stored_and_returned_without_resolving_again() -> anyhow:
     let mut config = (*state.config).clone();
     config.descriptor_catalog.offer_rules.push(OfferRule {
         runtime_type: pipette_plan_types::RuntimeType::LlamacppCliStockTools,
-        flavor: "macos-arm64".into(),
+        flavor: Some("macos-arm64".into()),
         requires: [pipette_core::client::tag_flag(&tag)].into(),
         any_of: Vec::new(),
     });
@@ -3781,6 +4304,190 @@ async fn plan_names_are_stored_and_returned_without_resolving_again() -> anyhow:
     Ok(())
 }
 
+/// The server writes the model table and catalog comment when it files or
+/// edits a plan. This test also uses an organization's vault model.
+#[tokio::test]
+async fn model_selectors_are_stored_as_their_models() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    let store = store_of(state)?;
+    store
+        .create_entry(&a_descriptor_entry(
+            "example-model",
+            Kind::HandMade,
+            100,
+            a_model_member("gguf_text", "example-q4", "q4_0")?,
+        )?)
+        .await?;
+    let acme = seed_org(state, "acme").await?.org_id;
+    let signer = registered_user(
+        state,
+        &[
+            UserPermission::SubmitPlans,
+            UserPermission::ReadPlans,
+            UserPermission::ReadClients,
+            UserPermission::CancelPlans,
+        ],
+    )
+    .await?;
+    set_user_org(state, &signer.1, Some(acme.clone())).await?;
+    let vault_model = vault_model_resource(state, &acme, false).await?;
+    let now = jiff::Timestamp::now();
+    store
+        .create_entry(&pipette_plan_types::DescriptorEntry::new(
+            CatalogScope::Org(acme.clone()),
+            CatalogName::try_new("VaultLM")?,
+            Kind::HandMade,
+            EntryState::Active,
+            now,
+            now,
+            pipette_plan_types::DescriptorEntryCreator::Operator,
+            NonEmptyVec::try_new(vec![pipette_plan_types::DescriptorMember::new_model(
+                serde_json::from_value(vault_model)?,
+                pipette_plan_types::QuantizationLabel::try_new("q4_0")?,
+                now,
+            )?])?,
+        )?)
+        .await?;
+    let (_, client) = register_and_approve(state).await?;
+    let mut twin = submittable_document(&client, "models", 1);
+    let models = array_span(&twin, "models   = [")?;
+    twin.replace_range(
+        models.clone(),
+        "{ type = \"gguf_text\", source = \"huggingface\", org = \"acme\", repo_name = \"example-q4\", \
+         revision = \"0123456789abcdef0123456789abcdef01234567\", path = \"model.gguf\" }",
+    );
+    let mut text = submittable_document(&client, "models", 1);
+    text.replace_range(models, "\"example-model::gguf::q4_0\"");
+
+    let dry = body_json(
+        post_plan_document(
+            state,
+            &signer,
+            "/api/v1/campaigns?name=Models&dry_run=true",
+            &text,
+        )
+        .await?,
+    )
+    .await?;
+    let document = json_str(&dry, "document")?;
+    assert!(
+        document.contains("# catalog name at filing: global/example-model::gguf::q4_0"),
+        "{document}"
+    );
+    let twin_dry = body_json(
+        post_plan_document(
+            state,
+            &signer,
+            "/api/v1/campaigns?name=Twin&dry_run=true",
+            &twin,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(dry["bodies"], twin_dry["bodies"]);
+
+    let filed = post_plan_document(state, &signer, "/api/v1/campaigns?name=Models", &text).await?;
+    assert_eq!(filed.status(), StatusCode::CREATED);
+    let filed = body_json(filed).await?;
+    assert_eq!(filed["plan"]["document"], document);
+    let campaign_id = json_str(&filed, "campaign_id")?;
+    let plan_id = json_str(&filed["plan"], "plan_id")?;
+    let edit = text
+        .get(text.find("[[variants]]").context("variant block")?..)
+        .context("variant slice")?;
+    let edited = post_plan_document(
+        state,
+        &signer,
+        &format!("/api/v1/campaigns/{campaign_id}/variants?base_plan_id={plan_id}&dry_run=true"),
+        edit,
+    )
+    .await?;
+    assert_eq!(edited.status(), StatusCode::OK);
+    assert!(
+        json_str(&body_json(edited).await?, "document")?
+            .contains("# catalog name at filing: global/example-model::gguf::q4_0")
+    );
+
+    let vault = text.replace("example-model::gguf::q4_0", "VaultLM::gguf::q4_0");
+    let vault_dry = post_plan_document(
+        state,
+        &signer,
+        "/api/v1/campaigns?name=Vault&dry_run=true",
+        &vault,
+    )
+    .await?;
+    let status = vault_dry.status();
+    let vault_dry = body_json(vault_dry).await?;
+    assert_eq!(status, StatusCode::OK, "{vault_dry}");
+    let vault_document = json_str(&vault_dry, "document")?;
+    assert!(
+        vault_document.contains("# catalog name at filing: acme/VaultLM::gguf::q4_0")
+            && vault_document.contains("vault_url"),
+        "{vault_document}"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::incompatible_runtime(
+    r#"{ type = "apple_foundation" }"#,
+    "example-model::gguf::q4_0",
+    "model selector `example-model::gguf::q4_0` has no compatible runtime"
+)]
+#[case::incomplete_selector(
+    r#"{ type = "llamacpp_cli_stock_tools", source = "github_release", repository_url = "github.com/ggml-org/llama.cpp", repository_version = "b5000", flavor = "macos-arm64" }"#,
+    "example-model::gguf",
+    "Available members: gguf::q4_0"
+)]
+#[tokio::test]
+async fn invalid_model_selectors_are_refused(
+    #[case] runtime: &str,
+    #[case] selector: &str,
+    #[case] expected: &str,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sql = sql_state_or_skip!(dir.path());
+    let state = &sql.state;
+    store_of(state)?
+        .create_entry(&a_descriptor_entry(
+            "example-model",
+            Kind::HandMade,
+            100,
+            a_model_member("gguf_text", "example-q4", "q4_0")?,
+        )?)
+        .await?;
+    let signer = registered_user(state, &[UserPermission::SubmitPlans]).await?;
+    let text = format!(
+        r#"benchmarks = ["eval_test"]
+
+[[variants]]
+requires = ["os:macos"]
+runtimes = [{runtime}]
+models = [
+  "{selector}",
+]
+"#
+    );
+
+    let refusal = post_plan_document(state, &signer, "/api/v1/campaigns?name=Bad", &text).await?;
+    let status = refusal.status();
+    let refusal = body_json(refusal).await?.to_string();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert!(refusal.contains(expected), "{refusal}");
+
+    let verdict =
+        body_json(post_plan_document(state, &signer, "/api/v1/plans/validate", &text).await?)
+            .await?;
+    let issue = &verdict["issues"][0];
+    assert_eq!(issue["severity"], "error");
+    assert!(json_str(issue, "message")?.contains(expected), "{verdict}");
+    assert_eq!(issue["line"], 7, "{verdict}");
+    assert_eq!(issue["column"], 3, "{verdict}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn plan_names_use_the_owner_org_and_never_every_org() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3815,7 +4522,7 @@ async fn plan_names_use_the_owner_org_and_never_every_org() -> anyhow::Result<()
     set_user_org(state, &signer.1, Some(acme)).await?;
     let (_, client) = register_and_approve(state).await?;
     let twin = submittable_document(&client, "scope", 1);
-    let runtimes = runtime_array_span(&twin)?;
+    let runtimes = array_span(&twin, "runtimes = [")?;
     for (name, expected) in [
         ("example", Some("b6000")),
         ("global/example", Some("b5000")),

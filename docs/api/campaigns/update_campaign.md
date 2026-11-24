@@ -1,7 +1,8 @@
 # `PATCH /api/v1/campaigns/{campaign_id}`
 
 Renames the campaign, sets its labels, or locks, archives or reactivates it. Needs
-`submit_plans` for your own campaign, or `manage_orgs` for an organization's
+membership of the owning organization with `submit_plans` (a person's account)
+or `manage_orgs`, or `manage_any_orgs`
 ([who may do what](../campaigns.md#who-may-do-what)).
 
 `PATCH` takes `UpdateCampaignRequest` ([the OpenAPI document](../../httpapi.md#15-the-openapi-document)) and sets each field its body names and leaves the rest: `name`, and
@@ -49,5 +50,4 @@ again.
 | 200 | The campaign, and whether the write changed it |
 | 400 | `campaign_id` is not a campaign id; the body is not JSON, names another field, or carries an empty or overlong `name` or an unknown `state`, `locked` without a `state_note`, or a `state_note` without `locked`; or `labels` breaks a tag rule (the message names the key where there is one) |
 | 403 | The caller may not administer the record ([who may do what](../campaigns.md#who-may-do-what)) |
-| 404 | No such campaign |
 | 409 | Another write changed the campaign while this edit was made: nothing was written; send it again. Or the body archives a locked campaign |

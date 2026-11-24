@@ -150,8 +150,9 @@
     await act(() => (body ? amendPermissions(session.signer, id, body) : Promise.resolve()));
   }
 
-  async function move(event: SubmitEvent, org_id: string | null) {
+  async function move(event: SubmitEvent, org_id: string) {
     event.preventDefault();
+    if (!org_id) return;
     await act(() => setUserOrg(session.signer, id, { org_id }));
   }
 
@@ -330,7 +331,7 @@
       {@const kind = retype(shown.account_type, !!shown.awaits_sign_in, !!shown.campaign_scope)}
       <div class="settings">
         <SettingsSection title="General">
-          <!-- Disabling is the danger zone's; admitting and enabling are not. -->
+          <!-- Disabling is the danger zone's; enabling is not. -->
           {#if !step.danger}
             <SettingRow title="Standing" text={step.note}>
               {#snippet control(ids)}
@@ -361,22 +362,17 @@
               {/snippet}
             </SettingRow>
           {/if}
-          <SettingRow title="Organization" text={drawn.orgs.length ? "The organization the account belongs to."
-            : self ? "You cannot take your own account out of the organization you administer from here."
-            : "Taking the account out of your organization leaves it in none, where only a server admin reaches it: you no longer administer it afterwards."}>
+          <SettingRow title="Organization" text={drawn.orgs.length
+            ? "The organization the account belongs to. An account always belongs to one: disable it to take it out of service."
+            : "An account always belongs to an organization: disable it to take it out of service."}>
             {#snippet control(ids)}
               {#if drawn.orgs.length}
-                <form class="bar" onsubmit={(event) => move(event, moveTo || null)}>
+                <form class="bar" onsubmit={(event) => move(event, moveTo)}>
                   <select bind:value={moveTo} aria-label="organization" aria-describedby={ids.text}>
-                    <option value="">no organization</option>
+                    {#if !moveTo}<option value="" disabled>choose an organization</option>{/if}
                     {#each drawn.orgs as each (each.org_id)}<option value={each.org_id}>{choiceName(each, drawn.orgs)}</option>{/each}
                   </select>
-                  <button type="submit" aria-disabled={work.busy}>Move</button>
-                </form>
-              {:else if !self}
-                <form onsubmit={(event) => move(event, null)}>
-                  <button type="submit" aria-describedby={ids.text} aria-disabled={work.busy}>Remove from {
-                    (drawn.org ? orgName(drawn.org) : "the organization")}</button>
+                  <button type="submit" aria-disabled={work.busy || !moveTo}>Move</button>
                 </form>
               {/if}
             {/snippet}

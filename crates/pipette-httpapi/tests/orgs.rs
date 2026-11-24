@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use pipette_core::organization::{Membership, Organization, Ownership};
 use pipette_core::user_permission::UserPermissionGroup;
 use pipette_httpapi::state::AppState;
-use pipette_plan_types::{ClientId, ClientOwner, OrgId, OrgStatus, UserId, UserPermission};
+use pipette_plan_types::{
+    ClientId, ClientOwner, OrgId, OrgSlug, OrgStatus, UserId, UserPermission,
+};
 use pipette_store::{OrgStore, SlugClaim};
 use pipette_web_testkit::*;
 
@@ -182,10 +184,10 @@ async fn a_scoped_reader_sees_its_own_organization_only() -> anyhow::Result<()> 
         );
     }
 
-    // A reader belonging to no organization sees nothing at all.
+    // A reader on its own personal organization sees that one alone.
     let stray = registered_user(&state, &[UserPermission::ReadOrgs]).await?;
     let listed = body_json(signed_empty(&state, &stray, "GET", "/api/v1/orgs").await?).await?;
-    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(1));
     Ok(())
 }
 
@@ -279,7 +281,7 @@ async fn a_handle_names_one_organization() -> anyhow::Result<()> {
         json_str(&body, "error")?.contains(&org_id),
         "the refusal must name the holder: {body}"
     );
-    assert_eq!(state.org_store.list_orgs().await?.len(), 1);
+    assert_eq!(team_orgs(&state).await?.len(), 1);
     Ok(())
 }
 
@@ -312,11 +314,7 @@ async fn an_org_admin_cannot_create_an_organization(
         json_str(&body_json(resp).await?, "error")?,
         "user lacks the manage_any_orgs permission"
     );
-    assert_eq!(
-        state.org_store.list_orgs().await?.len(),
-        1,
-        "no record is written"
-    );
+    assert_eq!(team_orgs(&state).await?.len(), 1, "no record is written");
     assert!(
         state.org_store.lookup_org_by_slug("other").await?.is_none(),
         "no handle is claimed"
@@ -333,6 +331,7 @@ async fn an_org_admin_cannot_create_an_organization(
     "ORG_acme",
     "organization slug \"org_acme\" may not start with \"org_\""
 )]
+#[case::reserved(" GLOBAL ", "organization slug \"global\" is reserved")]
 #[tokio::test]
 async fn an_invalid_slug_is_refused_and_writes_nothing(
     #[case] slug: &str,
@@ -357,7 +356,17 @@ async fn an_invalid_slug_is_refused_and_writes_nothing(
         json_str(&body, "error")?.contains(error),
         "{slug:?}: {body}"
     );
-    assert!(state.org_store.list_orgs().await?.is_empty());
+    assert!(team_orgs(&state).await?.is_empty());
+    if let Ok(slug) = OrgSlug::try_new(slug) {
+        assert!(
+            state
+                .org_store
+                .lookup_org_by_slug(slug.as_str())
+                .await?
+                .is_none(),
+            "no handle is claimed"
+        );
+    }
     Ok(())
 }
 
@@ -382,7 +391,7 @@ async fn a_slug_is_at_most_64_characters() -> anyhow::Result<()> {
         json_str(&body, "error")?.contains("is too long (65 chars, max 64)"),
         "{body}"
     );
-    assert!(state.org_store.list_orgs().await?.is_empty());
+    assert!(team_orgs(&state).await?.is_empty());
 
     let longest = "a".repeat(64);
     let resp = signed_json(
@@ -784,8 +793,8 @@ async fn a_patch_to_the_stored_values_writes_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Naming the organization an account already belongs to, or clearing a
-/// membership it does not hold, answers `changed: false` and writes nothing.
+/// Naming the organization an account already belongs to answers
+/// `changed: false` and writes nothing.
 #[tokio::test]
 async fn a_membership_put_to_the_stored_org_writes_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -806,15 +815,20 @@ async fn a_membership_put_to_the_stored_org_writes_nothing() -> anyhow::Result<(
         [
             (json!({ "org_id": acme }), true, 1),
             (json!({ "org_id": acme }), false, 1),
-            (json!({ "org_id": null }), true, 2),
-            (json!({ "org_id": null }), false, 2),
         ],
     )
     .await?;
     answers
         .iter()
         .try_for_each(|answer| crate::api_schema::assert_conforms("ChangedOrgUserRow", answer))?;
-    assert_eq!(state.org_store.get_membership(&member.user_id).await?, None);
+    assert_eq!(
+        state
+            .org_store
+            .get_membership(&member.user_id)
+            .await?
+            .map(|id| id.to_string()),
+        Some(acme)
+    );
     Ok(())
 }
 
@@ -988,7 +1002,7 @@ async fn test_a_disabled_organization_still_scopes_its_members() -> anyhow::Resu
 }
 
 /// An org id is minted, so a membership naming one never created would never
-/// resolve. `null` clears it.
+/// resolve.
 #[tokio::test]
 async fn a_membership_names_an_organization_that_exists() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1014,7 +1028,7 @@ async fn a_membership_names_an_organization_that_exists() -> anyhow::Result<()> 
     crate::api_schema::assert_conforms("SetUserOrgRequest", &request)?;
     let resp = signed_json(&state, &manager, "PUT", &uri, &request).await?;
     assert_eq!(resp.status(), StatusCode::OK);
-    let mut placed = account.clone();
+    let mut placed = account;
     placed["org_id"] = json!(org_id);
     let body = body_json(resp).await?;
     crate::api_schema::assert_conforms("ChangedOrgUserRow", &body)?;
@@ -1036,27 +1050,13 @@ async fn a_membership_names_an_organization_that_exists() -> anyhow::Result<()> 
         json_str(&body["items"][0], "user_id")?,
         member.user_id.as_str()
     );
-
-    // `null` is a value this field takes, not an absent field.
-    let request = json!({ "org_id": null });
-    crate::api_schema::assert_conforms("SetUserOrgRequest", &request)?;
-    let resp = signed_json(&state, &manager, "PUT", &uri, &request).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    crate::api_schema::assert_conforms("ChangedOrgUserRow", &body)?;
-    assert_eq!(
-        changed_record(body)?,
-        (account, true),
-        "a clear omits org_id"
-    );
-    assert_eq!(state.org_store.get_membership(&member.user_id).await?, None);
     Ok(())
 }
 
-/// Only an explicit `null` clears a membership: `{}` or a misspelt `org_id` is
-/// a `400` and the account stays, as a scoped admin could not put it back.
+/// Nothing clears a membership: `{}`, a misspelt `org_id` or a `null` one is a
+/// `400` and the account stays in its organization.
 #[tokio::test]
-async fn a_membership_is_cleared_by_null_only() -> anyhow::Result<()> {
+async fn a_membership_is_never_cleared() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
@@ -1070,7 +1070,8 @@ async fn a_membership_is_cleared_by_null_only() -> anyhow::Result<()> {
     for (body, key) in [
         (json!({}), "org_id"),
         (json!({ "orgid": org_id }), "orgid"),
-        (json!({ "org_id": null, "owner": null }), "owner"),
+        (json!({ "org_id": null }), "org_id"),
+        (json!({ "org_id": org_id, "owner": null }), "owner"),
     ] {
         assert!(
             crate::api_schema::assert_conforms("SetUserOrgRequest", &body).is_err(),
@@ -1091,14 +1092,10 @@ async fn a_membership_is_cleared_by_null_only() -> anyhow::Result<()> {
             "a refused body leaves the membership alone: {body}"
         );
     }
-
-    let resp = signed_json(&state, &manager, "PUT", &uri, &json!({ "org_id": null })).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(state.org_store.get_membership(&member.user_id).await?, None);
     Ok(())
 }
 
-/// A `404` whether the body sets an organization or clears one.
+/// A `404`, and nothing written.
 #[tokio::test]
 async fn a_membership_names_an_account_that_exists() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1109,16 +1106,17 @@ async fn a_membership_names_an_account_that_exists() -> anyhow::Result<()> {
     let uri = "/api/v1/users/user_00000000-0000-0000-0000-000000000000/org";
 
     // The body organization is resolved first, so it names one that exists.
-    for body in [json!({ "org_id": org_id }), json!({ "org_id": null })] {
-        let resp = signed_json(&state, &manager, "PUT", uri, &body).await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{body}");
-        assert_eq!(
-            json_str(&body_json(resp).await?, "error")?,
-            "no such user",
-            "{body}"
-        );
-    }
-    assert!(state.org_store.list_memberships().await?.is_empty());
+    let resp = signed_json(&state, &manager, "PUT", uri, &json!({ "org_id": org_id })).await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_str(&body_json(resp).await?, "error")?, "no such user");
+    assert!(
+        state
+            .org_store
+            .list_memberships()
+            .await?
+            .iter()
+            .all(|membership| membership.org_id.to_string() != org_id)
+    );
     Ok(())
 }
 
@@ -1169,9 +1167,9 @@ async fn a_membership_path_that_is_not_a_user_id_is_a_400(
     let state = make_state(dir.path()).await?;
     let manager = manager(&state).await?;
     let uri = format!("/api/v1/users/{segment}/org");
-    let clear = json!({ "org_id": null });
+    let body = json!({ "org_id": "org_00000000-0000-0000-0000-000000000000" });
 
-    let resp = signed_json(&state, &manager, "PUT", &uri, &clear).await?;
+    let resp = signed_json(&state, &manager, "PUT", &uri, &body).await?;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
     let body = body_json(resp).await?;
     assert!(
@@ -1179,138 +1177,12 @@ async fn a_membership_path_that_is_not_a_user_id_is_a_400(
         "{uri}: {body}"
     );
 
-    let resp = json_request(&state, "PUT", &uri, &[], &clear).await?;
+    let resp = json_request(&state, "PUT", &uri, &[], &body).await?;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
     assert_eq!(
         json_str(&body_json(resp).await?, "error")?,
         "missing X-Client-Id header"
     );
-    Ok(())
-}
-
-/// The join stored once: moving the account moves the device, and the org-owned
-/// device stays put.
-#[tokio::test]
-async fn a_user_owned_device_follows_its_owners_organization() -> anyhow::Result<()> {
-    async fn owned(
-        state: &AppState,
-        signer: &UserSigner,
-        org: &str,
-    ) -> anyhow::Result<Vec<String>> {
-        let (key, user_id, key_id) = signer;
-        let uri = format!("/api/v1/orgs/{org}/clients");
-        let body = body_json(authed_user_get(state, key, user_id, key_id, &uri).await?).await?;
-        let mut ids: Vec<String> = body["items"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row["client_id"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .ok_or_else(|| anyhow::anyhow!("no rows: {body}"))?;
-        ids.sort();
-        Ok(ids)
-    }
-
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let manager = manager(&state).await?;
-    let acme = create_org(&state, &manager, "acme").await?;
-    let labs = create_org(&state, &manager, "labs").await?;
-
-    let member = create_user(&state, "member@example.test").await?;
-    join(&state, &member.user_id, &acme).await?;
-
-    let (_, rack) = register_and_approve(&state).await?;
-    let (_, laptop) = register_and_approve(&state).await?;
-    signed_json(
-        &state,
-        &manager,
-        "PUT",
-        &format!("/api/v1/clients/{rack}/owner"),
-        &json!({ "owner": { "type": "org", "org_id": acme } }),
-    )
-    .await?;
-    signed_json(
-        &state,
-        &manager,
-        "PUT",
-        &format!("/api/v1/clients/{laptop}/owner"),
-        &json!({ "owner": { "type": "user", "user_id": member.user_id } }),
-    )
-    .await?;
-
-    let mut both = vec![rack.to_string(), laptop.to_string()];
-    both.sort();
-    assert_eq!(owned(&state, &manager, &acme).await?, both);
-    assert_eq!(owned(&state, &manager, &labs).await?, Vec::<String>::new());
-
-    // The member moves. The laptop goes with them; the rack does not.
-    signed_json(
-        &state,
-        &manager,
-        "PUT",
-        &format!("/api/v1/users/{}/org", member.user_id),
-        &json!({ "org_id": labs }),
-    )
-    .await?;
-    assert_eq!(
-        owned(&state, &manager, &acme).await?,
-        vec![rack.to_string()]
-    );
-    assert_eq!(
-        owned(&state, &manager, &labs).await?,
-        vec![laptop.to_string()]
-    );
-    Ok(())
-}
-
-/// Each row's `owner` names the member a device came through, or the
-/// organization for one it owns directly.
-#[tokio::test]
-async fn the_inventory_names_the_member_a_device_came_through() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let manager = manager(&state).await?;
-    let acme = create_org(&state, &manager, "acme").await?;
-    let member = create_user(&state, "member@example.test").await?;
-    join(&state, &member.user_id, &acme).await?;
-
-    let (_, rack) = register_and_approve(&state).await?;
-    let (_, laptop) = register_and_approve(&state).await?;
-    let rack_owner = json!({ "type": "org", "org_id": acme });
-    let laptop_owner = json!({ "type": "user", "user_id": member.user_id });
-    for (client_id, owner) in [(&rack, &rack_owner), (&laptop, &laptop_owner)] {
-        let resp = signed_json(
-            &state,
-            &manager,
-            "PUT",
-            &format!("/api/v1/clients/{client_id}/owner"),
-            &json!({ "owner": owner }),
-        )
-        .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    let (key, user_id, key_id) = &manager;
-    let uri = format!("/api/v1/orgs/{acme}/clients");
-    let resp = authed_user_get(&state, key, user_id, key_id, &uri).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    let row = |client_id: &ClientId| {
-        body["items"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|row| row["client_id"] == json!(client_id.as_str()))
-            })
-            .ok_or_else(|| anyhow::anyhow!("the inventory lists {client_id}: {body}"))
-    };
-
-    assert_eq!(row(&rack)?["owner"], rack_owner);
-    assert_eq!(row(&laptop)?["owner"], laptop_owner);
     Ok(())
 }
 
@@ -1480,9 +1352,6 @@ async fn the_relations_answer_where_the_records_carried_them() -> anyhow::Result
 /// reference.
 #[rstest]
 #[case::missing_org(json!({ "type": "org", "org_id": "org_00000000-0000-0000-0000-000000000000" }))]
-#[case::missing_user(
-    json!({ "type": "user", "user_id": "user_00000000-0000-0000-0000-000000000000" })
-)]
 #[tokio::test]
 async fn an_ownership_names_a_record_that_exists(#[case] missing: Value) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1556,9 +1425,7 @@ async fn renaming_an_organization_that_does_not_exist_is_a_404() -> anyhow::Resu
         );
     }
 
-    let left: Vec<String> = state
-        .org_store
-        .list_orgs()
+    let left: Vec<String> = team_orgs(&state)
         .await?
         .into_iter()
         .map(|org| org.org_id.to_string())
@@ -1587,7 +1454,7 @@ async fn the_listing_counts_members_and_devices() -> anyhow::Result<()> {
         &manager,
         "PUT",
         &format!("/api/v1/clients/{client_id}/owner"),
-        &json!({ "owner": { "type": "user", "user_id": member.user_id } }),
+        &json!({ "owner": { "type": "org", "org_id": acme } }),
     )
     .await?;
 
@@ -1595,7 +1462,7 @@ async fn the_listing_counts_members_and_devices() -> anyhow::Result<()> {
     let body =
         body_json(authed_user_get(&state, key, user_id, key_id, "/api/v1/orgs").await?).await?;
     let rows = body["items"].as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3, "acme, labs and the manager's own");
     let acme_row = rows
         .iter()
         .find(|row| row["org_id"] == acme.as_str())
@@ -1678,7 +1545,8 @@ async fn the_listing_without_counts_lists_the_records_alone() -> anyhow::Result<
             .as_array()
             .map(|orgs| orgs.iter().map(|o| o["org_id"].clone()).collect::<Vec<_>>())
     };
-    assert_eq!(ids(&bare).map(|ids| ids.len()), Some(2), "{bare}");
+    // acme, labs and the manager's own.
+    assert_eq!(ids(&bare).map(|ids| ids.len()), Some(3), "{bare}");
     assert_eq!(
         ids(&bare),
         ids(&counted),
@@ -1800,10 +1668,7 @@ async fn test_the_fleet_narrows_to_owned_or_unclaimed_devices() -> anyhow::Resul
     let (_, loose) = register_and_approve(&state).await?;
     for (client_id, owner) in [
         (&rack, json!({ "type": "org", "org_id": acme })),
-        (
-            &laptop,
-            json!({ "type": "user", "user_id": member.user_id }),
-        ),
+        (&laptop, json!({ "type": "org", "org_id": acme })),
     ] {
         let uri = format!("/api/v1/clients/{client_id}/owner");
         let resp = signed_json(&state, &manager, "PUT", &uri, &json!({ "owner": owner })).await?;
@@ -1830,7 +1695,7 @@ async fn test_the_fleet_narrows_to_owned_or_unclaimed_devices() -> anyhow::Resul
 /// `org_id` takes the organization's roster read: `404` outside it, as
 /// `GET /api/v1/orgs/{org_id}/clients` answers.
 #[tokio::test]
-async fn test_the_fleet_narrows_to_my_devices_or_an_organizations() -> anyhow::Result<()> {
+async fn test_the_fleet_narrows_to_an_organizations_devices() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
@@ -1847,15 +1712,12 @@ async fn test_the_fleet_narrows_to_my_devices_or_an_organizations() -> anyhow::R
     let (_, rack) = register_and_approve(&state).await?;
     let (_, laptop) = register_and_approve(&state).await?;
     let (_, theirs) = register_and_approve(&state).await?;
-    let (_, kept) = register_and_approve(&state).await?;
     let (_, _loose) = register_and_approve(&state).await?;
-    // The fleet grant alone: `owner=mine` must not need a roster read.
     let fleet_only = registered_user(&state, &[UserPermission::ReadClients]).await?;
     for (client_id, owner) in [
         (&rack, json!({ "type": "org", "org_id": acme })),
-        (&laptop, json!({ "type": "user", "user_id": member.1 })),
+        (&laptop, json!({ "type": "org", "org_id": acme })),
         (&theirs, json!({ "type": "org", "org_id": rival })),
-        (&kept, json!({ "type": "user", "user_id": fleet_only.1 })),
     ] {
         let uri = format!("/api/v1/clients/{client_id}/owner");
         let resp = signed_json(&state, &manager, "PUT", &uri, &json!({ "owner": owner })).await?;
@@ -1864,19 +1726,6 @@ async fn test_the_fleet_narrows_to_my_devices_or_an_organizations() -> anyhow::R
 
     let mut acme_owns = vec![rack.to_string(), laptop.to_string()];
     acme_owns.sort();
-    assert_eq!(
-        narrowed_ids(&state, &member, "owner=mine").await?,
-        vec![laptop.to_string()]
-    );
-    assert_eq!(
-        narrowed_ids(&state, &manager, "owner=mine").await?,
-        Vec::<String>::new(),
-        "the manager owns nothing as a person"
-    );
-    assert_eq!(
-        narrowed_ids(&state, &fleet_only, "owner=mine").await?,
-        vec![kept.to_string()]
-    );
     assert_eq!(
         narrowed_ids(&state, &member, &format!("org_id={acme}")).await?,
         acme_owns
@@ -1955,10 +1804,10 @@ async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyh
     let acme = create_org(&state, &root, "acme").await?;
     let org_id = OrgId::try_new(acme.clone())?;
 
-    let mut applicant = create_user(&state, "applicant@example.test").await?;
-    applicant.status = pipette_plan_types::UserStatus::Pending;
-    state.user_store.put_user(&applicant).await?;
-    set_user_org(&state, &applicant.user_id, Some(org_id.clone())).await?;
+    let mut leaver = create_user(&state, "leaver@example.test").await?;
+    leaver.status = pipette_plan_types::UserStatus::Disabled;
+    state.user_store.put_user(&leaver).await?;
+    set_user_org(&state, &leaver.user_id, Some(org_id.clone())).await?;
     for _ in 0..6 {
         let (_key, client_id) = register_pending(&state).await?;
         own_client_by_org(&state, &client_id, &org_id).await?;
@@ -2002,7 +1851,6 @@ async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyh
         &[("name", "Team"), ("owner", acme.as_str())],
     )
     .await?;
-    created_campaign(&state, &author, &[("name", "Its author's own")]).await?;
     add_starved_snapshot(&state, &plan_id).await?;
 
     let (key, user_id, key_id) = &root;
@@ -2026,12 +1874,7 @@ async fn test_the_overview_answers_what_waits_and_the_latest_campaigns() -> anyh
     assert_eq!(json_str(body, "org_id")?, acme);
     assert_eq!(
         body["member_status_counts"],
-        json!({ "active": 1, "pending": 1 })
-    );
-    assert_eq!(body["pending_members"]["total"], 1, "{body}");
-    assert_eq!(
-        json_str(&body["pending_members"]["first"][0], "user_id")?,
-        applicant.user_id.as_str()
+        json!({ "active": 1, "disabled": 1 })
     );
     assert_eq!(
         body["client_status_counts"],

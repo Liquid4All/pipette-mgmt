@@ -34,11 +34,10 @@ person, never a service account.
 
 A row keyed by a vault resource id holds the counts of one private model, and
 is written by the administrators of the organization that owns the file:
-`manage_orgs` and membership, the line the vault's delete draws
+`manage_orgs` and membership, though any member deletes the file
 ([who may do what](vault.md#who-may-do-what)). Every other row is server-wide,
 since two organizations' plans share one result of a public model, and takes
-`manage_any_orgs`, which writes any row. So does the row of a file a person
-owns. A write outside that reach is a `403` with one message, whether the key is
+`manage_any_orgs`, which writes any row. A write outside that reach is a `403` with one message, whether the key is
 a name, another owner's file or no file.
 
 A vault model's record

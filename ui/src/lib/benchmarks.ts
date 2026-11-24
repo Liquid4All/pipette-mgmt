@@ -85,6 +85,7 @@ export function benchmarkTable(orgs: OrgRef[] | null): TableSpec<BenchmarkRow> {
     return org && orgs ? choiceName(org, orgs) : slug;
   };
   return {
+    sort: "benchmark_id",
     columns: [
       { key: "benchmark_id", label: "benchmark_id", raw: (row) => row.benchmark_id, href: (row) => row.href },
       ...(orgs ? [{ key: "organization", label: "organization", raw: (row: BenchmarkRow) => orgName(row.org) }] : []),

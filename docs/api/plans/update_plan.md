@@ -42,4 +42,3 @@ read, so a retried request replaces a note that another caller wrote after it.
 | 400 | `plan_id` is malformed, the body carries an unknown field, the trimmed note is over 4096 characters, or the note contains a NUL character |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | The caller lacks `submit_plans`, or reads the plan but may not change its note |
-| 404 | No such plan, or one the caller's scope does not admit, as on [`GET /api/v1/plans/{plan_id}`](get_plan.md#one-404-for-both) |

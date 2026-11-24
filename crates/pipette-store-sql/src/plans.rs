@@ -2,7 +2,7 @@
 //! spans ([`crate::plan_job_spans`]). A marker's expiry is the `ExpiresAt` display
 //! string. The store truncates it to the second, as it does for the object key.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
@@ -15,8 +15,8 @@ use sqlx::{FromRow, PgConnection};
 
 use pipette_core::plan::{PlanHeader, PlanManifest, PlanNotes, PlanSource, PlanSummary};
 use pipette_plan_types::{
-    Answered, CampaignGroupId, CampaignId, ExpiresAt, JobId, PlanId, PolicyKind, RestoredVariant,
-    RevisionChange,
+    Answered, CampaignGroupId, CampaignId, ExpiresAt, JobId, PlanId, PolicyKind, ReplacedModel,
+    RestoredVariant, RevisionChange,
 };
 use pipette_store::{
     CellResult, CellScope, ContentKeyCas, ContentKeyClaim, ContentKeyRecord, ContentKeyVersion,
@@ -74,19 +74,25 @@ impl SqlPlanStore {
             .db
             .fetch_all(op, || sqlx::query_as(sql).bind(ids.as_slice()))
             .await?;
-        Ok(rows
-            .into_iter()
-            .fold(Listing::default(), |mut listing, row| {
-                match parse(row) {
-                    (_, Ok(item)) => listing.items.push(item),
-                    (plan_id, Err(e)) => listing.unreadable.push(UnreadableObjectError {
-                        key: PLANS.report_key(&plan_id),
-                        reason: e.to_string(),
-                    }),
-                }
-                listing
-            }))
+        Ok(decode_plan_rows(rows, parse))
     }
+}
+
+fn decode_plan_rows<R, T, E: std::fmt::Display>(
+    rows: Vec<R>,
+    parse: impl Fn(R) -> (String, Result<T, E>),
+) -> Listing<T> {
+    rows.into_iter()
+        .fold(Listing::default(), |mut listing, row| {
+            match parse(row) {
+                (_, Ok(item)) => listing.items.push(item),
+                (plan_id, Err(e)) => listing.unreadable.push(UnreadableObjectError {
+                    key: PLANS.report_key(&plan_id),
+                    reason: e.to_string(),
+                }),
+            }
+            listing
+        })
 }
 
 /// A racing duplicate fails with a conflict, and its retry then finds the
@@ -413,18 +419,26 @@ enum StoredChange {
         carry_earlier: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_across_limit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inherit_failed: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         restored: Vec<StoredRestored>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace_model: Vec<ReplacedModel>,
     },
     Document {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_earlier: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         carry_across_limit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inherit_failed: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inherit_from: Vec<PlanId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace_model: Vec<ReplacedModel>,
     },
     Rerun {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,13 +479,16 @@ impl From<RevisionChange> for StoredChange {
                 added_variant_count,
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
                 restored,
+                replace_model,
             } => Self::Variants {
                 removed: removed_variant_count,
                 added: added_variant_count,
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
                 restored: restored
                     .into_iter()
@@ -480,15 +497,20 @@ impl From<RevisionChange> for StoredChange {
                         index: variant.variant_index,
                     })
                     .collect(),
+                replace_model,
             },
             RevisionChange::Document {
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
+                replace_model,
             } => Self::Document {
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
+                replace_model,
             },
             RevisionChange::Rerun {
                 answered,
@@ -523,13 +545,16 @@ impl From<StoredChange> for RevisionChange {
                 added,
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
                 restored,
+                replace_model,
             } => Self::Variants {
                 removed_variant_count: removed,
                 added_variant_count: added,
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
                 restored: restored
                     .into_iter()
@@ -538,15 +563,20 @@ impl From<StoredChange> for RevisionChange {
                         variant_index: variant.index,
                     })
                     .collect(),
+                replace_model,
             },
             StoredChange::Document {
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
+                replace_model,
             } => Self::Document {
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from,
+                replace_model,
             },
             StoredChange::Rerun {
                 answered,
@@ -943,6 +973,21 @@ impl PlanStore for SqlPlanStore {
         .await
     }
 
+    async fn list_open_plans(&self) -> anyhow::Result<PlanListing> {
+        let rows: Vec<PlanRow> = self
+            .db
+            .fetch_all("list_open_plans", || {
+                sqlx::query_as(concat!(
+                    plan_select!(),
+                    " WHERE p.status NOT IN ('complete', 'cancelled')"
+                ))
+            })
+            .await?;
+        Ok(decode_plan_rows(rows, |row| {
+            (row.columns.plan_id.clone(), assemble(row))
+        }))
+    }
+
     /// Reads the summary fields alone, so a summary does not hang on the rest
     /// of the manifest reading.
     async fn get_plan_summaries(&self, plan_ids: &[PlanId]) -> anyhow::Result<PlanSummaryListing> {
@@ -1291,6 +1336,53 @@ impl PlanStore for SqlPlanStore {
             })
             .await?;
         Ok(())
+    }
+
+    async fn cancelled_plan_jobs(
+        &self,
+        job_ids: &[JobId],
+    ) -> anyhow::Result<BTreeMap<PlanId, Vec<JobId>>> {
+        if job_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids: Vec<&str> = job_ids.iter().map(JobId::as_str).collect();
+        // Find the first cancelled plan at or after the span's start. If that
+        // plan falls outside the span, no later cancelled plan can be inside.
+        let rows: Vec<(String, String)> = self
+            .db
+            .fetch_all("cancelled_plan_jobs", || {
+                sqlx::query_as(
+                    "SELECT requested.job_id, owner.plan_id
+                     FROM (SELECT DISTINCT unnest($1::text[]) AS job_id) requested
+                     CROSS JOIN LATERAL (
+                         SELECT cancelled.plan_id
+                         FROM plan_job_spans j
+                         CROSS JOIN LATERAL (
+                             SELECT p.plan_id
+                             FROM plans p
+                             WHERE p.status = 'cancelled'
+                               AND coalesce(p.campaign_id, p.plan_id) = j.lineage
+                               AND p.plan_id >= j.from_plan
+                             ORDER BY p.plan_id
+                             LIMIT 1
+                         ) cancelled
+                         WHERE j.job_id = requested.job_id AND j.ordinal IS NOT NULL
+                           AND (j.to_plan IS NULL OR cancelled.plan_id < j.to_plan)
+                         ORDER BY j.lineage, j.from_plan
+                         LIMIT 1
+                     ) owner
+                     ORDER BY requested.job_id",
+                )
+                .bind(ids.as_slice())
+            })
+            .await?;
+        let mut by_plan: BTreeMap<PlanId, Vec<JobId>> = BTreeMap::new();
+        for (job_id, plan_id) in rows {
+            if let Some(plan_id) = plan_id_of(&plan_id, "cancelled plan") {
+                by_plan.entry(plan_id).or_default().push(job_id.parse()?);
+            }
+        }
+        Ok(by_plan)
     }
 
     async fn end_membership(
@@ -2281,7 +2373,9 @@ mod tests {
         let document = |carry_earlier, carry_across_limit| RevisionChange::Document {
             carry_earlier,
             carry_across_limit,
+            inherit_failed: false,
             inherit_from: Vec::new(),
+            replace_model: Vec::new(),
         };
         let rerun = |answered, job_count, marked_job_count| RevisionChange::Rerun {
             answered,
@@ -2302,8 +2396,10 @@ mod tests {
                     added_variant_count: 1,
                     carry_earlier: false,
                     carry_across_limit: false,
+                    inherit_failed: false,
                     inherit_from: Vec::new(),
                     restored: Vec::new(),
+                    replace_model: Vec::new(),
                 },
             ),
             (
@@ -2313,8 +2409,10 @@ mod tests {
                     added_variant_count: 3,
                     carry_earlier: true,
                     carry_across_limit: false,
+                    inherit_failed: false,
                     inherit_from: vec![PlanId::try_new("plan-a")?, PlanId::try_new("plan-b")?],
                     restored: Vec::new(),
+                    replace_model: Vec::new(),
                 },
             ),
             (
@@ -2324,8 +2422,10 @@ mod tests {
                     added_variant_count: 1,
                     carry_earlier: true,
                     carry_across_limit: true,
+                    inherit_failed: false,
                     inherit_from: Vec::new(),
                     restored: Vec::new(),
+                    replace_model: Vec::new(),
                 },
             ),
             (
@@ -2335,6 +2435,7 @@ mod tests {
                     added_variant_count: 2,
                     carry_earlier: false,
                     carry_across_limit: false,
+                    inherit_failed: false,
                     inherit_from: vec![PlanId::try_new("plan-a")?],
                     restored: vec![
                         RestoredVariant {
@@ -2346,9 +2447,24 @@ mod tests {
                             variant_index: 0,
                         },
                     ],
+                    replace_model: Vec::new(),
                 },
             ),
             (r#"{"kind":"document"}"#, document(false, false)),
+            (
+                r#"{"kind":"document","replace_model":[{"from":"a","to":"b","verified":false}]}"#,
+                RevisionChange::Document {
+                    carry_earlier: false,
+                    carry_across_limit: false,
+                    inherit_failed: false,
+                    inherit_from: Vec::new(),
+                    replace_model: vec![ReplacedModel {
+                        from: "a".into(),
+                        to: "b".into(),
+                        verified: false,
+                    }],
+                },
+            ),
             (
                 r#"{"kind":"document","carry_earlier":true}"#,
                 document(true, false),
@@ -2356,6 +2472,16 @@ mod tests {
             (
                 r#"{"kind":"document","carry_across_limit":true}"#,
                 document(false, true),
+            ),
+            (
+                r#"{"kind":"document","inherit_failed":true,"inherit_from":["plan-a"]}"#,
+                RevisionChange::Document {
+                    carry_earlier: false,
+                    carry_across_limit: false,
+                    inherit_failed: true,
+                    inherit_from: vec![PlanId::try_new("plan-a")?],
+                    replace_model: Vec::new(),
+                },
             ),
             (r#"{"kind":"rerun","jobs":1}"#, rerun(None, 1, 0)),
             (
@@ -2472,7 +2598,9 @@ mod tests {
             change: Some(RevisionChange::Document {
                 carry_earlier: true,
                 carry_across_limit: false,
+                inherit_failed: false,
                 inherit_from: Vec::new(),
+                replace_model: Vec::new(),
             }),
         };
         assert!(store.put_plan_notes(&plan_id, &filed).await?);
@@ -2615,6 +2743,87 @@ mod tests {
             &store, &todo, &plan_id, &job_ids,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_lookup_respects_span_membership_and_bounds() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let store = store(&test_db);
+        let campaign = CampaignId::mint();
+        let manifest = |id, status, job_ids| {
+            anyhow::Ok(PlanManifest {
+                campaign_id: Some(campaign.clone()),
+                job_ids,
+                content_keys: Default::default(),
+                rerun_of: Default::default(),
+                expired_jobs: Default::default(),
+                settled_jobs: Default::default(),
+                ..sample_manifest(plan(id), status, false)?
+            })
+        };
+        store
+            .put_plan(&manifest(1, PlanStatus::Active, vec![job(1)])?)
+            .await?;
+        // The cancelled revision ends job(1)'s span. A content-key-only span
+        // for job(3) does not make that job a member of the revision.
+        let mut first_cancelled = manifest(2, PlanStatus::Cancelled, vec![job(2)])?;
+        first_cancelled.content_keys.insert(job(3), "3".repeat(64));
+        store.put_plan(&first_cancelled).await?;
+        store
+            .put_plan(&manifest(3, PlanStatus::Cancelled, vec![job(2)])?)
+            .await?;
+
+        assert_eq!(
+            store
+                .cancelled_plan_jobs(&[job(1), job(2), job(3), job(2), job(4)])
+                .await?,
+            BTreeMap::from([(plan(2), vec![job(2)])])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_listing_skips_closed_rows_before_decoding() -> anyhow::Result<()> {
+        let test_db = crate::testing::test_db_or_skip!();
+        let store = store(&test_db);
+        let statuses = [
+            PlanStatus::Creating,
+            PlanStatus::Active,
+            PlanStatus::PendingClients,
+            PlanStatus::Cancelling,
+            PlanStatus::Complete,
+            PlanStatus::Cancelled,
+        ];
+        for (i, status) in statuses.into_iter().enumerate() {
+            let id = plan(i as u128 + 1);
+            store
+                .put_plan(&sample_manifest(id.clone(), status, false)?)
+                .await?;
+            if status.is_terminal() {
+                plant(
+                    test_db.db(),
+                    "UPDATE plans SET body = 'broken' WHERE plan_id = $1",
+                    &[id.as_str()],
+                )
+                .await?;
+            }
+        }
+
+        let listing = store.list_open_plans().await?;
+        assert!(listing.unreadable.is_empty());
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|plan| plan.status.label())
+                .collect::<HashSet<_>>(),
+            statuses
+                .into_iter()
+                .filter(|status| !status.is_terminal())
+                .map(PlanStatus::label)
+                .collect()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3695,7 +3904,7 @@ mod tests {
         let test_db = crate::testing::test_db_or_skip!();
         let (db, store) = (test_db.db(), store(&test_db));
         let scope = CellScope::Org(pipette_plan_types::OrgId::try_new("org_a")?);
-        let other = CellScope::User(pipette_plan_types::UserId::try_new("user_b")?);
+        let other = CellScope::Org(pipette_plan_types::OrgId::try_new("org_b")?);
         let jobs = [
             (1, "a", Some(("finished", Some(&["os:android"][..])))),
             (2, "a", Some(("failed", None))),

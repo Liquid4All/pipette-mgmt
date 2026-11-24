@@ -13,13 +13,15 @@ use pipette_core::benchmark::Benchmark;
 use pipette_core::plan::{PlanManifest, PlanSource};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
-    BenchmarkId, BenchmarkType, ImportAction, Model, PlannedImport, Sha256Error,
+    BenchmarkId, BenchmarkType, ImportAction, Model, ModelType, PlannedImport, Sha256Error,
+    VariantError,
 };
-use pipette_planner::{ExpandError, Expansion, PlanParseError};
+use pipette_planner::{ExpandError, Expansion, PlanParseError, SchedulerPlanError};
 use pipette_store::PlanStore;
 
 use crate::gated_import::DryRunImports;
 use crate::plan_ingestion::{IngestContext, IngestError, RejectionError, dry_run_jobs};
+use crate::plan_names::{PlanNameError, ResolvedName};
 use crate::submission::without_auth_tokens;
 
 /// A plan document after expansion: the job bodies, the source to store, and
@@ -27,7 +29,7 @@ use crate::submission::without_auth_tokens;
 #[derive(Debug)]
 pub struct ExpandedDocument {
     pub submitted_sha256: pipette_plan_types::Sha256,
-    pub resolved: Vec<crate::plan_names::ResolvedName>,
+    pub resolved: Vec<ResolvedName>,
     /// The job bodies, in the planner's order.
     pub jobs: Vec<Value>,
     /// The document as submitted, with its digest. Ingestion stores it through
@@ -45,7 +47,7 @@ pub struct ExpandedDocument {
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
     #[error(transparent)]
-    Names(#[from] crate::plan_names::PlanNameError),
+    Names(#[from] PlanNameError),
     /// The document is not a valid scheduler plan, or a `runtime_flags` entry
     /// sets a HuggingFace token variable to a value.
     #[error(transparent)]
@@ -83,6 +85,31 @@ impl DocumentError {
             Self::Stored(_) | Self::Digest(_) | Self::Join(_) => false,
         }
     }
+
+    /// Give an incompatible model type's diagnostic a selector and source
+    /// span when the variant contains a selector of that type.
+    pub(crate) fn with_model_selector(self, resolved: &[ResolvedName]) -> Self {
+        let Self::Parse(PlanParseError::Structure(SchedulerPlanError::Variant {
+            index,
+            error: VariantError::ModelHasNoCompatibleRuntime(model),
+        })) = &self
+        else {
+            return self;
+        };
+        let model_type = ModelType::of(model);
+        let Some(name) = resolved
+            .iter()
+            .find(|name| name.variant == *index && name.model_type == Some(model_type))
+        else {
+            return self;
+        };
+        PlanNameError::NoCompatibleRuntime {
+            variant: name.variant,
+            selector: name.selector.clone(),
+            span: name.span.clone(),
+        }
+        .into()
+    }
 }
 
 /// Each benchmark's type as `catalog` defines it.
@@ -116,9 +143,16 @@ pub async fn expand_named(
     note: Option<&str>,
     text: String,
 ) -> Result<ExpandedDocument, DocumentError> {
-    let named = Box::pin(crate::plan_names::resolve_names(ctx, owner, text)).await?;
+    let named = Box::pin(crate::plan_names::resolve_names(
+        ctx,
+        Some(owner.org_id()),
+        text,
+    ))
+    .await?;
     let types = benchmark_types(ctx.catalog);
-    let mut expanded = expand_document(ctx.max_jobs, types, note, named.text).await?;
+    let mut expanded = expand_document(ctx.max_jobs, types, note, named.text)
+        .await
+        .map_err(|e| e.with_model_selector(&named.resolved))?;
     expanded
         .plan_warnings
         .extend(named.warnings.into_iter().map(|warning| warning.message));
@@ -187,7 +221,7 @@ fn log_refusal(error: &DocumentError) {
         DocumentError::Parse(e) => {
             let reason = match e {
                 PlanParseError::Invalid(_) => "invalid",
-                PlanParseError::Structure(_) => "structure",
+                PlanParseError::Structure(_) | PlanParseError::RootSession { .. } => "structure",
                 PlanParseError::HfTokenEnv { .. } => "hf_token_env",
             };
             tracing::warn!(reason, "plan document rejected: parse failed");

@@ -48,8 +48,8 @@ use pipette_plan_types::{
 use pipette_plan_types::{
     AuditEvent, CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryCreator,
     DescriptorEntryKind, DescriptorEntryState, DescriptorKind, DescriptorMember,
-    DescriptorMemberKey, EntryError, ModelFormat, ModelType, NonEmptyVec, QuantizationLabel,
-    RunMark, RuntimeType,
+    DescriptorMemberKey, EntryError, FamilyLogo, FamilyLogoDigest, LogoUri, ModelFormat, ModelType,
+    NonEmptyVec, QuantizationLabel, RunMark, RuntimeType,
 };
 
 /// Where a job sits in the pipeline. The variant names are the wire strings
@@ -1288,6 +1288,12 @@ pub trait CampaignGroupStore: Send + Sync {
 
     async fn group_of(&self, campaign_id: &CampaignId) -> anyhow::Result<Option<CampaignGroupId>>;
 
+    /// The campaign's group and member state from the same membership read.
+    async fn group_and_member(
+        &self,
+        campaign_id: &CampaignId,
+    ) -> anyhow::Result<Option<(CampaignGroup, GroupMember)>>;
+
     /// The group's stored policies, at most one per kind, by kind name.
     async fn list_policies(
         &self,
@@ -1306,7 +1312,8 @@ pub trait CampaignGroupStore: Send + Sync {
         updated: &CampaignGroupPolicy,
     ) -> anyhow::Result<bool>;
 
-    /// Every group's stored policies that are on.
+    /// Every group's stored policies that are on, and the groups whose stored
+    /// policies are all off.
     async fn enabled_policies(&self) -> anyhow::Result<EnabledPolicies>;
 
     /// Each member of the group, in campaign id order, with its policy state.
@@ -1326,6 +1333,16 @@ pub trait CampaignGroupStore: Send + Sync {
         campaign_id: &CampaignId,
         state: &GroupPolicyState,
         job_states: &JobStateChanges,
+    ) -> anyhow::Result<bool>;
+
+    /// Write `state`, which keeps no policy, and delete the member's job states
+    /// without decoding them. `false`, writing nothing, when the campaign is not
+    /// a member of the group.
+    async fn clear_policy_state(
+        &self,
+        group_id: &CampaignGroupId,
+        campaign_id: &CampaignId,
+        state: &GroupPolicyState,
     ) -> anyhow::Result<bool>;
 
     /// The member's job states, in job id order. A row that does not decode
@@ -1383,6 +1400,9 @@ pub struct EnabledPolicies {
     /// that group. Keyed as [`CampaignGroupStore::list_policies`] names the
     /// row.
     pub unreadable: Vec<(CampaignGroupId, UnreadableObjectError)>,
+    /// The groups with stored policies, each one readable and none on, in
+    /// group id order: the groups the policy pass clears its members of.
+    pub off: Vec<CampaignGroupId>,
 }
 
 /// The job state rows a [`CampaignGroupStore::set_policy_state`] writes: `put`
@@ -1548,7 +1568,8 @@ impl AppendOutcome {
             | EntryError::GlobalVaultSource
             | EntryError::DescriptorInvalid(_)
             | EntryError::RuntimeBuildMismatch
-            | EntryError::RuntimeBuildInvalid(_)) => Err(error),
+            | EntryError::RuntimeBuildInvalid(_)
+            | EntryError::RuntimeFamily) => Err(error),
         }
     }
 }
@@ -1713,7 +1734,8 @@ pub fn move_to_global_outcome(
 
 /// Put the members of `source` after the members of `target`. A source member
 /// with the digest and the key of a target member is already in the target,
-/// so the merge skips it. The result passes
+/// so the merge skips it after filling any missing download size from the
+/// source. The result passes
 /// [`DescriptorEntry::validate_members`].
 fn merge_members(
     target: &NonEmptyVec<DescriptorMember>,
@@ -1721,12 +1743,23 @@ fn merge_members(
 ) -> Result<(NonEmptyVec<DescriptorMember>, MergedMembers), EntryError> {
     // This scans the target for each source member. If production merges make
     // the scan costly, index the target's digest and key pairs once.
-    let (skipped, moved): (Vec<_>, Vec<_>) = source.iter().cloned().partition(|member| {
-        target
-            .iter()
-            .any(|held| held.digest() == member.digest() && held.key() == member.key())
-    });
     let mut members = target.clone();
+    let mut moved = Vec::new();
+    let mut skipped = Vec::new();
+    for member in source.iter() {
+        match members
+            .iter_mut()
+            .find(|held| held.digest() == member.digest() && held.key() == member.key())
+        {
+            Some(held) => {
+                if held.size_bytes().is_none() && member.size_bytes().is_some() {
+                    *held = held.clone().with_size_bytes(member.size_bytes());
+                }
+                skipped.push(member.clone());
+            }
+            None => moved.push(member.clone()),
+        }
+    }
     members.extend(moved.iter().cloned());
     DescriptorEntry::validate_members(&members)?;
     DescriptorEntry::validate_runtime_build(&members)?;
@@ -1748,6 +1781,30 @@ pub enum RelabelOutcome {
     SameLabel,
     /// Another member with the same format holds the new label.
     LabelTaken,
+}
+
+/// The outcome of a family change on a model entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetFamilyOutcome {
+    /// The entry with the new family override, as it stood at the change.
+    Set(DescriptorEntry),
+    NoSuchEntry,
+    Tombstoned,
+    /// The entry holds runtime members, which have no family.
+    RuntimeEntry,
+}
+
+/// The outcome of a logo change on a model family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetFamilyLogoOutcome {
+    /// The family has this logo after the change.
+    Set(FamilyLogo),
+    /// The family has no logo after the change. The payload is the logo that
+    /// the change removed, or `None` if the family had no logo.
+    Cleared(Option<FamilyLogo>),
+    /// No live model entry in the scope has the family, so the store refused
+    /// to set a logo.
+    NoSuchFamily,
 }
 
 /// The outcome of a member removal from a hand-made entry. The other members
@@ -1989,6 +2046,39 @@ pub trait DescriptorCatalogStore: Send + Sync {
         from: &QuantizationLabel,
         to: &QuantizationLabel,
     ) -> anyhow::Result<RelabelOutcome>;
+    /// Set the family override of the model entry `name`, or clear it with
+    /// `None`. If an actor is supplied, record the change in the same
+    /// transaction. An audit write failure leaves the entry unchanged.
+    async fn set_family(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        family: Option<&CatalogName>,
+        actor: Option<&pipette_plan_types::AuditActor>,
+    ) -> anyhow::Result<SetFamilyOutcome>;
+    /// Set the logo of `family` in `scope`, or clear it with `None`. A new
+    /// logo needs a model entry in the scope that is not tombstoned and has
+    /// the family. Family comparison ignores case. If an actor is supplied,
+    /// record the change in the same transaction. A clear that finds no logo
+    /// records nothing. An audit write failure leaves the logo unchanged.
+    async fn set_family_logo(
+        &self,
+        scope: &CatalogScope,
+        family: &CatalogName,
+        logo_uri: Option<&LogoUri>,
+        actor: Option<&pipette_plan_types::AuditActor>,
+    ) -> anyhow::Result<SetFamilyLogoOutcome>;
+    /// The family logo digests of `scopes`.
+    async fn family_logos(&self, scopes: &[CatalogScope]) -> anyhow::Result<Vec<FamilyLogoDigest>>;
+    /// Every family logo, in any scope, whose [`LogoUri::sha256`] is `sha256`.
+    async fn family_logos_with_digest(&self, sha256: &Sha256) -> anyhow::Result<Vec<FamilyLogo>>;
+    /// A logo URI with this digest in one of `scopes`. Use `None` to search
+    /// every scope or an empty slice to search none.
+    async fn family_logo_uri_by_digest(
+        &self,
+        sha256: &Sha256,
+        scopes: Option<&[CatalogScope]>,
+    ) -> anyhow::Result<Option<LogoUri>>;
     /// Remove the member with `key` from the hand-made entry `name`.
     /// [`remove_outcome`] gives the result. The other members keep their
     /// positions. The check and the write are one atomic step.
@@ -2002,6 +2092,9 @@ pub trait DescriptorCatalogStore: Send + Sync {
     /// its members. [`move_to_global_outcome`] gives the result. The check,
     /// move, and audit event recording `actor` and the original creator are
     /// one atomic step. An audit write failure leaves the entry unchanged.
+    /// If global has no logo for the family of a model entry, the move copies
+    /// the organization's logo for that family to global. The organization
+    /// keeps its own logo.
     async fn move_entry_to_global(
         &self,
         org: &OrgId,
@@ -2029,6 +2122,17 @@ pub trait DescriptorCatalogStore: Send + Sync {
 
     /// Remove reserved names after the organization's live dependents are gone.
     async fn delete_tombstones_in_org(&self, org_id: &OrgId) -> anyhow::Result<()>;
+
+    /// Record the download size of the member with `digest` in the live entry
+    /// `name`. The write keeps a size that the member already has.
+    /// Return `true` if the write records the size.
+    async fn fill_member_size(
+        &self,
+        scope: &CatalogScope,
+        name: &CatalogName,
+        digest: &str,
+        size_bytes: u64,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Result of one catalog import or refresh run.
@@ -2507,6 +2611,29 @@ pub trait PlanStore: Send + Sync {
         limit: NonZeroUsize,
     ) -> anyhow::Result<PlanPage>;
 
+    /// All readable nonterminal manifests. A store with a status index can
+    /// leave closed rows unread.
+    async fn list_open_plans(&self) -> anyhow::Result<PlanListing> {
+        let filter = PlanFilter::default();
+        let mut listing = PlanListing::default();
+        let mut after = None;
+        loop {
+            let page = self
+                .list_matching_plans(&filter, after.as_ref(), DRAIN_PAGE_SIZE)
+                .await?;
+            listing.items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|plan| !plan.status.is_terminal()),
+            );
+            listing.unreadable.extend(page.unreadable);
+            match page.resume_after {
+                Some(cursor) => after = Some(cursor),
+                None => return Ok(listing),
+            }
+        }
+    }
+
     /// [`list_matching_plans`](Self::list_matching_plans) without per-job fields.
     async fn list_matching_plan_headers(
         &self,
@@ -2618,6 +2745,15 @@ pub trait PlanStore: Send + Sync {
     /// Propagates a read failure, as
     /// [`list_job_plan_markers`](Self::list_job_plan_markers) does.
     async fn list_all_job_plan_markers(&self) -> anyhow::Result<Vec<JobPlanMarker>>;
+
+    /// Find one cancelled plan that still lists each requested job. The
+    /// database maintains the reverse lookup used for markerless teardown.
+    async fn cancelled_plan_jobs(
+        &self,
+        _job_ids: &[JobId],
+    ) -> anyhow::Result<BTreeMap<PlanId, Vec<JobId>>> {
+        Ok(BTreeMap::new())
+    }
 
     /// Idempotent.
     async fn delete_job_plan_marker(
@@ -2858,21 +2994,17 @@ pub trait PlanStore: Send + Sync {
 pub const CELL_RESULTS_PER_CELL: usize = 32;
 
 /// Who may reuse the run of a minted job ([`PlanStore::put_job_cell`]): the
-/// organization of the owner of the campaign that minted it, or that owner
-/// alone if the owner is a user in no organization.
+/// organization that owns the campaign that minted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CellScope {
     Org(OrgId),
-    User(UserId),
 }
 
 impl CellScope {
-    /// The text that the index stores. The prefix keeps the two kinds of id
-    /// apart.
+    /// The text that the index stores.
     pub fn key(&self) -> String {
         match self {
             Self::Org(org_id) => format!("org:{}", org_id.as_str()),
-            Self::User(user_id) => format!("user:{}", user_id.as_str()),
         }
     }
 }

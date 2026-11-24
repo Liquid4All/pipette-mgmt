@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::campaigns::CampaignView;
 use crate::clients::{Client, ClientPermissionSet, ClientStatus};
-use crate::users::{User, UserStatus};
+use crate::users::UserStatus;
 use crate::{
     ClientId, ClientPreauthKey, ClientPreauthKeyId, NonEmptyTrimmedString, OrgId, OrgSlug, Tag,
     UserId,
@@ -83,8 +83,10 @@ pub struct OrgListQuery {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateOrgRequest {
-    /// The handle: `[a-z0-9_-]`, at most 64 characters, trimmed and folded to
-    /// lower case; never `org_`-prefixed, which spells an id.
+    /// Use at most 64 characters from `[a-zA-Z0-9_-]`. The server trims outer
+    /// whitespace and converts uppercase letters to lowercase. Do not start the
+    /// handle with `org_`, which identifies an organization ID. The descriptor
+    /// catalog reserves the handle `global` for its global scope.
     pub slug: OrgSlug,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<NonEmptyTrimmedString>,
@@ -207,8 +209,6 @@ pub struct OrgOverview {
     pub client_count: usize,
     /// The statuses present only.
     pub member_status_counts: BTreeMap<UserStatus, usize>,
-    /// Accounts waiting to be admitted.
-    pub pending_members: Highlights<User>,
     /// The statuses present only; `null` without `read_clients`.
     pub client_status_counts: Option<BTreeMap<ClientStatus, usize>>,
     /// Registrations waiting to be approved or rejected; `null` without

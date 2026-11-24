@@ -66,14 +66,16 @@ async fn test_the_registration_schema_agrees_with_its_route() -> anyhow::Result<
             .verifying_key()
             .as_bytes(),
     );
+    let user = pipette_web_testkit::create_user(&state, "invited@example.test").await?;
+    let token = pipette_web_testkit::mint_user_preauth(&state, &user.user_id).await?;
     let accepted = serde_json::json!({
         "public_key": public_key,
-        "contact_email": "asker@example.test",
+        "user_preauth_key": token,
         "key_details": "work laptop",
     });
     let missing = serde_json::json!({
         "public_key": public_key,
-        "contact_email": "asker@example.test",
+        "user_preauth_key": token,
     });
 
     assert!(assert_conforms("RegisterUserKeyRequest", &missing).is_err());

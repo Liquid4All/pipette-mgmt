@@ -11,7 +11,7 @@ import {
   type Reader,
 } from "../src/lib/catalog";
 import { relabelError, renameError, stateActions } from "../src/lib/catalog-entry";
-import { tableState, tableView } from "../src/lib/table";
+import { drawnColumns, tableState, tableView } from "../src/lib/table";
 
 const row = (name = "llamacpp-v0.7.0"): DescriptorEntryListRow => ({
   name, scope: "global", display_name: name, descriptor_kind: "runtime",
@@ -205,6 +205,29 @@ describe("the model catalog", () => {
     expect(view("scope=acme")).toEqual(["AcmeLM-4B"]);
   });
 
+  test("the model table shows each entry's family and filters by it", () => {
+    const table = modelCatalogTable(SCOPE);
+    expect(table.columns.map((column) => column.key)).toContain("family");
+    const entries = [{ ...modelRow("LFM2-1.2B"), family: "LFM" }, { ...modelRow("LFM2.5-1.2B"), family: "LFM" },
+                     { ...modelRow("Qwen3-4B"), family: "Qwen3" }];
+    const view = (query: string) => tableView(table,
+      tableState(table, new URLSearchParams(query)), entries).map((entry) => entry.name);
+    expect(view("family=LFM")).toEqual(["LFM2-1.2B", "LFM2.5-1.2B"]);
+  });
+
+  test("the model table has a family logo column that a reader turns on", () => {
+    const table = modelCatalogTable(SCOPE);
+    const drawn = (picks: Record<string, boolean> | null) => drawnColumns(table.columns, picks).map((c) => c.key);
+    expect(table.columns.map((column) => column.key)).toContain("family_logo");
+    expect(drawn(null)).not.toContain("family_logo");
+    expect(drawn({ family_logo: true })).toContain("family_logo");
+    const entries = [{ ...modelRow("Qwen3-4B"), family_logo_sha256: "b".repeat(64) }, modelRow("Other-1B"),
+                     { ...modelRow("LFM2-1.2B"), family_logo_sha256: "a".repeat(64) }];
+    const view = (query: string) => tableView(table,
+      tableState(table, new URLSearchParams(query)), entries).map((entry) => entry.name);
+    expect(view("sort=family_logo").slice(0, 2)).toEqual(["LFM2-1.2B", "Qwen3-4B"]);
+  });
+
   test("members sort by format, then by quantization, with numbers by size", () => {
     const rows = modelMemberRows([
       modelMember("mlx", "8bit", null), modelMember("gguf", "q8_0", null), modelMember("mlx", "16bit", null),
@@ -274,6 +297,18 @@ describe("a device's short list", () => {
     const sections = shortListSections(list);
     expect(sections.runtime.map((item) => item.name)).toEqual(["llamacpp-v0.7.0"]);
     expect(sections.model.map((item) => item.members.length)).toEqual([2]);
+  });
+
+  test("puts the newest runtime release first and the models in name order", () => {
+    const entry = (name: string, release_time: string, descriptor_kind: "runtime" | "model") =>
+      ({ name, scope: "global", display_name: name, release_time, descriptor_kind, members: [] });
+    const sections = shortListSections({ ...list, items: [
+      entry("rt-old", "2026-09-01T00:00:00Z", "runtime"), entry("Zeta", "2026-11-01T00:00:00Z", "model"),
+      entry("rt-new", "2026-11-01T00:00:00.5Z", "runtime"), entry("alpha", "2026-01-01T00:00:00Z", "model"),
+      entry("Beta", "2026-05-01T00:00:00Z", "model"),
+    ] });
+    expect(sections.runtime.map((item) => item.name)).toEqual(["rt-new", "rt-old"]);
+    expect(sections.model.map((item) => item.name)).toEqual(["alpha", "Beta", "Zeta"]);
   });
 
   test.each([

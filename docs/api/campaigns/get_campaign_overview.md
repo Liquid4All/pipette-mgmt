@@ -22,15 +22,20 @@ read as idle; `current_plan_id` is present exactly when the campaign runs a
 plan, read or not.
 
 `group` is the record of the [campaign group](../campaign-groups.md) the
-campaign is in, or `null` when it is in none, on a server without a
-`[database]`, and for a caller that may not read the group, such as a campaign
-reader.
+campaign is in, or `null` when it is in none and for a caller that may not read
+the group, such as a campaign reader.
+
+`policy_deferral` holds the counts of re-runs and marks that the group's
+policies deferred ([when a policy acts](../campaign-groups.md#when-a-policy-acts)).
+`until` is the earliest eligible time for the revision. The pass recalculates
+it when it evaluates the campaign, so it can move earlier as fewer jobs wait for
+devices. `policy_deferral` is `null` if the campaign has no deferred
+revision, `group` is `null`, or the group has no enabled policy that can file
+a revision.
 
 ## Statuses
 
 | Status | When |
 |--------|------|
 | 200 | The campaign, what the caller may do to it, and the plans it has run |
-| 400 | `campaign_id` is not a campaign id |
 | 403 | The campaign is outside the caller's scope |
-| 404 | No such campaign |

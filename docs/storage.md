@@ -37,8 +37,8 @@ the organizations whose log lists each event. The table `audit_event_records`
 holds the records that each event names, with the account or device that
 acted.
 
-The descriptor catalog uses `descriptor_entries` and `descriptor_members`.
-Only `[database]` keeps these tables.
+The descriptor catalog uses `descriptor_entries`, `descriptor_members` and
+`descriptor_family_logos`. Only `[database]` keeps these tables.
 
 Only `[database]` keeps the audit log. No object store keeps it. The server and the `pipette-mgmt`
 commands only append events and never edit them. `audit prune` deletes the
@@ -49,7 +49,9 @@ Campaign groups use five tables. `campaign_groups` holds each group's JSON body
 row for each member, keyed by `campaign_id`, so a campaign is in at most one
 group. The row's `policy_state` is the JSON that the policy pass of
 `queue-maintenance` keeps for the member, NULL until the pass first writes it,
-and it goes when the campaign leaves the group. `campaign_group_job_states`
+and it goes when the campaign leaves the group. The `deferred` field holds the
+counts of re-runs and marks that the pass deferred and the earliest eligible
+time for the next revision. `campaign_group_job_states`
 holds the pass's JSON state of each job of the member's plan it read, keyed
 by `campaign_id` and `job_id`: the checks that flag it and whether the pass is
 done with it. They go with the member row, and the pass writes them in one
@@ -494,6 +496,7 @@ Client logical key, a JSON object with these fields:
 | `public_key` | string | Hex-encoded Ed25519 public key |
 | `organization` | string | Free-text label the device sent about itself, not ownership (§3.2.4). Defaults to `"unknown"` for a record that predates the field. |
 | `client_details` | string | Freeform description |
+| `name` | string | An operator sets the name. The record omits the field when the device has no name. |
 | `contact_email` | string | Contact email for admin approval |
 | `status` | string | `pending` or `approved` |
 | `registered_at` | string | ISO 8601 registration time |
@@ -679,7 +682,7 @@ derived, handled by rebuilding the index from `users/`, not by a `v2/` segment
 
 Deleting an account removes the key. A rename is a delete and a create, never a
 blind overwrite of the record, or the old key keeps pointing at the account.
-An operator's create and a machine's own request for an account both claim
+An operator's create and a Clerk sign-in's provisioning both claim
 here, and each releases its claim when the writes it was made for fail. A claim
 stranded by a crash is cleared by an operator, never adopted automatically,
 because it is indistinguishable from an attempt still in flight.
@@ -828,7 +831,7 @@ fact has one place to be true:
 | Relation | Where it lives | Values |
 |---|---|---|
 | user belongs to organization | `user-orgs/{user_id}.json` | an `org_id`, or no record |
-| device belongs to organization | `client-owners/{client_id}.json` | `{type: "org"}`, `{type: "user"}`, or no record |
+| device belongs to organization | `client-owners/{client_id}.json` | `{type: "org"}`, or no record |
 
 **There is no reverse index, deliberately.** "Who belongs to this organization"
 and "what does it own" filter the two relation keyspaces. An index would be two
@@ -887,12 +890,13 @@ holds: recoverable by hand (`orgs release-claim <slug>`,
 { "user_id": "user_0195c3e2-…", "org_id": "org_0195c3e2-…" }
 ```
 
-**An account in no organization has no record**, a real state rather than a
-migration artifact. Written by an administrator assigning or creating an
-account, and by Clerk provisioning; never by an account naming an organization
-for itself. An assignment resolves the organization first, so a membership names
-a record that exists. Clearing it deletes the record, and so do the account's
-delete (§3.1.6) and `orgs delete --detach` (§3.2.5).
+**Every account has a record.** Written by an administrator assigning or
+creating an account, and by Clerk provisioning; never by an account naming an
+organization for itself. An account created with no organization named gets a
+new one of its own. An assignment resolves
+the organization first, so a membership names a record that exists. Nothing
+clears one but the account's delete (§3.1.6); `orgs delete` refuses while an
+account is a member (§3.2.5).
 
 #### 3.2.4. Ownership: `client-owners/{client_id}.json`
 
@@ -903,24 +907,13 @@ delete (§3.1.6) and `orgs delete --detach` (§3.2.5).
 }
 ```
 
-or, for a device somebody owns personally:
-
-```json
-{ "client_id": "ev1_…", "owner": { "type": "user", "user_id": "user_0195c3e2-…" } }
-```
-
-The tag is `type`. The same object is the `owner` on a campaign (§3.3) and on a
-vault record (§3.4).
+The tag is `type`, and `org` is its only value: only an organization owns
+things. The same object is the `owner` on a campaign (§3.3) and on a vault
+record (§3.4).
 
 **Distinct from the client record's `organization`**, which is free text the
 device sent about itself. An ownership points at a record. Merging them would
 reinterpret every stored label as a membership nobody approved.
-
-**Two owner kinds**, because a rack machine and somebody's laptop are different
-things. The organization a *user-owned* device rolls up to is **derived** from
-that owner's membership, not stored: moving an account moves its devices. A
-device owned by an account in no organization rolls up to none, a state and not
-an error.
 
 A fresh self-registration has no record. A registration with a pre-auth key that
 names an owner writes one before the client record; a registration without one
@@ -932,14 +925,13 @@ best-effort.
 
 `orgs delete` is **refused while anything still names the organization**: a
 membership, a directly owned device, an entry under `org-benchmarks/{org_id}/`,
-a campaign or vault record it owns, or an unexpired client pre-auth key whose
-`default_owner` it is. A private benchmark counts by its key, so an unreadable
+a live descriptor catalog entry, a campaign or vault record it owns, or an
+unexpired client pre-auth key whose `default_owner` it is. A private benchmark counts by its key, so an unreadable
 one counts too; left under a deleted id, it would still hold its benchmark id
-and dataset pin server-wide. `users delete` is refused the same way while the
-account owns a device, a campaign or a vault record. Both take `--detach` to
-clear the memberships and ownerships first; the rest is cleared one record at a
-time. The refusal exists because ids are minted: a stranded reference never
-resolves again, silently.
+and dataset pin server-wide. `--detach` clears the device ownerships first; a
+member is moved or deleted, and the rest is cleared one record at a time. The
+refusal exists because ids are minted: a stranded reference never resolves
+again, silently. An account owns nothing, so `users delete` refuses nothing.
 
 A relation can outlive its record when a create or a teardown fails partway;
 the refusals count it, and `--detach` clears it like any other.
@@ -991,9 +983,7 @@ by ingestion, so it always names a plan this campaign minted, though possibly
 one an older build deleted.
 
 `owner` is **required**: an unowned campaign is one no scoped caller could
-administer. It is read as it stands and **not derived through the owner's
-membership**, unlike a user-owned device: moving an account between
-organizations must not hand its personal campaigns to a team. A plan has no
+administer. It names an organization. A plan has no
 owner; its campaign does, so handing a campaign over rewrites this record and no
 plan. It also deletes the campaign's `campaign_group_members` row when its group
 has another owner ([§1.1](#11-where-records-live)).
@@ -1461,13 +1451,9 @@ lookup does not find a job that has no row; `db backfill-job-cells` writes the
 missing row. A row is write-once, and nothing deletes one.
 
 The column `scope` names who may reuse the run of the job. Ingestion writes it
-from the owner of the campaign that minted the job:
-
-- `org:<org_id>` for an organization, or for a user in that organization.
-- `user:<user_id>` for a user in no organization.
-
-The organization of a user is read when the job is minted. A row written before
-migration `0010`, or by `db backfill-job-cells`, has no scope.
+from the organization that owns the campaign that minted the job, as
+`org:<org_id>`. A row written before migration `0010`, or by
+`db backfill-job-cells`, has no scope.
 
 A lookup by cell digest and scope joins `job_cells` to `submission_outcomes`
 and `job_sources`. It gives each `finished` run that has `run_flags` and the
@@ -1533,6 +1519,21 @@ Migration `0017` lets an entry hold model members:
 
 A rollback of `0017` deletes every model entry and its members, then restores
 the `runtime_type` column. Back up model catalog data before the rollback.
+
+Migration `0050` adds `descriptor_family_logos`. Each row gives the logo of
+one model family in one scope. The key is the scope and the lowercase family,
+so two spellings of a family that differ only in case share one logo. The row
+keeps the family as the operator wrote it. The check of `0050` admits only a
+logo URI under `https://pipette.liquid.ai/logos/`. A rollback of `0050`
+deletes every family logo.
+
+Migration `0051` also admits a base64 data URI of a PNG, SVG or WebP image as
+a logo URI, up to 65,536 characters. It adds `logo_sha256`, the hex SHA-256 of
+the logo URI, as a stored generated column with an index. PostgreSQL
+computes the digest for existing logos and updates it when a writer changes
+the URI. A catalog read gives the digest, and a client fetches the logo with
+it. A rollback of `0051` deletes every data URI logo
+and every logo URI over 2,048 characters.
 
 Migration `0015` adds `catalog_import_runs`. The importer writes a `running`
 row before it contacts GitHub. It sets the result to `success` or `error` when
@@ -2072,7 +2073,8 @@ unlabelled. Rows stored before the scorer filled the label are given one by
 
 **Both read only the records the job names.** A descriptor is the device's
 text, so when it names a vault resource that the body of the job it ran (a
-copy's `rescored_from`) does not, the scorer reads no record for that
+copy's `rescored_from`, or a `replace_model` copy's own job) does not, the
+scorer reads no record for that
 submission: its rows take neither a label nor an alias, and keep the
 descriptors as reported. A job with no stored source, such as a
 `requeue-eval` copy, is judged by the first job up its `rescored_from` chain
@@ -2320,9 +2322,13 @@ written by a campaign recalculation
 [`requeue-eval`](cli.md#pipette-mgmt-requeue-eval). No device ran the new job,
 so its device, model and runtime columns repeat the named job's, and so do its
 `requested_*_flags`, except on copies `requeue-eval` wrote before it carried
-them. It names one level up: re-scoring A gives B pointing at A, and re-scoring
-B gives C pointing at B. Server-stamped. NULL on every row a device ran, and on
-copies written before the column existed.
+them. A revision's `replace_model` writes such a copy too, of a run of any
+benchmark, whose model columns name the model of the new cell; its record keeps
+the model the device reported in `replaced_model_descriptor`
+([plan-ingestion.md](plan-ingestion.md#carrying-a-campaigns-jobs-over)). It names
+one level up: re-scoring A gives B pointing at A, and re-scoring B gives C
+pointing at B. Server-stamped. NULL on every row a device ran, and on copies
+written before the column existed.
 
 ### `rerun_of`
 
@@ -2460,9 +2466,6 @@ none. That fallback is reported: in the `process-submissions` summary, by
 `pipette-mgmt models unresolved` across the warehouse, and by `pipette-mgmt
 models resolve` for names before any row exists
 ([cli.md](cli.md#pipette-mgmt-models-resolveunresolvedimport)).
-[`examples/model_params_mapping.toml`](../examples/model_params_mapping.toml)
-holds counts for the model families this project routinely benchmarks, in the
-form `models import` reads.
 
 ### Per-run metadata: `eval_metadata`
 

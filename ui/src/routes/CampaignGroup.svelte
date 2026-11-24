@@ -9,8 +9,8 @@
     setCampaignGroupPolicy, updateCampaignGroup,
   } from "../lib/api";
   import { auditAction } from "../lib/audit";
-  import { checkLines, groupTabs, groupsCrumb, mayAdminister, mayFile, previewLacks } from "../lib/campaign-groups";
-  import { CAMPAIGN_PAGES, labelScope } from "../lib/campaigns";
+  import { checkLines, groupTabs, groupsCrumb, mayFile, previewLacks } from "../lib/campaign-groups";
+  import { CAMPAIGN_PAGES, labelScope, mayLabel } from "../lib/campaigns";
   import CampaignGroupBody from "../lib/components/CampaignGroupBody.svelte";
   import CampaignRename from "../lib/components/CampaignRename.svelte";
   import DangerRow from "../lib/components/DangerRow.svelte";
@@ -60,8 +60,7 @@
     const [group, policies] = await Promise.all([
       campaignGroup(session.signer, id), campaignGroupPolicies(session.signer, id),
     ]);
-    // Another account's campaigns are read with everything in reach, which `memberOffers` narrows to the owner.
-    const scope = labelScope(reader, group.owner) ?? { kind: "all" as const };
+    const scope = labelScope(group.owner);
     // No `models`, which costs the server a plan document read per campaign; no `state`, so every state.
     const listed = await everyPage((cursor) =>
       campaigns(session.signer, ownedQuery(scope, [["plan", "true"]], cursor, ROUTE_PAGE_MAX)));
@@ -115,7 +114,7 @@
     await readPreview(true);
   };
 
-  const under = $derived(page.data ? ownerBranch(reader, page.data.group.owner, session.known, CAMPAIGN_PAGES) : null);
+  const under = $derived(page.data ? ownerBranch(page.data.group.owner, session.known, CAMPAIGN_PAGES) : null);
   const crumb = $derived(under && groupsCrumb(under));
   // Where the delete lands: the Groups tab that lists the group, else the listing it sits under.
   const landing = $derived(crumb?.href ?? under?.href ?? null);
@@ -124,11 +123,9 @@
     void here.path;
     here.under = under?.href ?? null;
   });
-  // The reader and the organizations the session holds are named without a roster read.
-  const names = $derived({ ...page.data?.names, ...Object.fromEntries([
-    ...session.known.flatMap((org) => (org ? [[org.org_id, orgName(org)]] : [])),
-    [reader.user_id, reader.contact_email],
-  ]) });
+  // The organizations the session holds are named without a roster read.
+  const names = $derived({ ...page.data?.names, ...Object.fromEntries(
+    session.known.flatMap((org) => (org ? [[org.org_id, orgName(org)]] : []))) });
 
   let from = "";
   const drop = async () => {
@@ -142,7 +139,7 @@
 
 <Loaded of={page}>
   {#snippet children({ group, policies, listed })}
-    {@const admin = mayAdminister(reader, group.owner)}
+    {@const admin = mayLabel(reader, group.owner)}
     <TabBar label="Campaign group" items={groupTabs(group.group_id, tab, admin)} />
     {#if tab === "campaigns"}
       <CampaignGroupBody {group} {listed} {reader} {names} listing={under?.href}

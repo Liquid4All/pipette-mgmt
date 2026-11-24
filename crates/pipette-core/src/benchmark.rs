@@ -88,6 +88,7 @@ pub fn measurement_fields(benchmark_type: BenchmarkType) -> &'static [&'static s
             "decision_latency_batch_ms",
             "decision_latency_batch_ms_stddev",
         ],
+        BenchmarkType::Session => &["session_duration"],
     }
 }
 
@@ -188,6 +189,7 @@ impl Benchmark {
             BenchmarkType::DecisionMaxMemory => {
                 BenchmarkDefinition::DecisionMaxMemory(strict(body)?)
             }
+            BenchmarkType::Session => BenchmarkDefinition::Session(strict(body)?),
         };
         Self::from_def(def)
     }
@@ -216,7 +218,8 @@ impl Benchmark {
             | BenchmarkDefinition::VlMaxMemory(_)
             | BenchmarkDefinition::VlSpecDecode(_)
             | BenchmarkDefinition::DecisionLatency(_)
-            | BenchmarkDefinition::DecisionMaxMemory(_) => false,
+            | BenchmarkDefinition::DecisionMaxMemory(_)
+            | BenchmarkDefinition::Session(_) => false,
         };
         if stamped {
             anyhow::bail!("unknown field `samples`");
@@ -241,7 +244,8 @@ impl Benchmark {
             | BenchmarkDefinition::VlMaxMemory(_)
             | BenchmarkDefinition::VlSpecDecode(_)
             | BenchmarkDefinition::DecisionLatency(_)
-            | BenchmarkDefinition::DecisionMaxMemory(_) => false,
+            | BenchmarkDefinition::DecisionMaxMemory(_)
+            | BenchmarkDefinition::Session(_) => false,
         };
         if rule_without_seed {
             anyhow::bail!(
@@ -296,7 +300,8 @@ impl Benchmark {
                 | BenchmarkDefinition::MaxMemoryUsage(_)
                 | BenchmarkDefinition::Eval(_)
                 | BenchmarkDefinition::VlThroughput(_)
-                | BenchmarkDefinition::VlMaxMemory(_) => Ok(()),
+                | BenchmarkDefinition::VlMaxMemory(_)
+                | BenchmarkDefinition::Session(_) => Ok(()),
             });
         checked.map_err(|e| anyhow::anyhow!("benchmark {}: {e}", def.benchmark_id()))?;
         Ok(Self { def, org_id: None })

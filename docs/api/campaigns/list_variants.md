@@ -13,7 +13,5 @@ where the edit would.
 | Status | When |
 |--------|------|
 | 200 | The plan the edit revises, and its variants |
-| 400 | `campaign_id` is not a campaign id |
 | 403 | The caller holds no campaign authority, the campaign is outside its scope, or it lacks the grants a [variant edit](edit_variants.md) names over the plan the campaign runs |
-| 404 | No such campaign |
 | 409 | The campaign runs no plan, or runs one with no stored document |

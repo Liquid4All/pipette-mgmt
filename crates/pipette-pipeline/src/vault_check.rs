@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use pipette_core::canonical_json::{canonicalize_str, sha256_hex};
 use pipette_core::vault::VaultOwner;
-use pipette_plan_types::{JobId, OrgId, UserId, VaultPath, VaultResourceId, is_vault_source};
+use pipette_plan_types::{JobId, OrgId, VaultPath, VaultResourceId, is_vault_source};
 use pipette_store::{Stores, UnreadableObjectError, VaultStore};
 
 use crate::plan_ingestion::JobRejectionError;
@@ -27,8 +27,8 @@ pub enum VaultCheckError {
 /// Whose vault resources a plan may name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultScope {
-    /// The filer's own, and its organization's when it belongs to one.
-    Own { user: UserId, org: Option<OrgId> },
+    /// The filer's organization's, when it belongs to one.
+    Own { org: Option<OrgId> },
     /// Only resources owned by this organization, for an org catalog member.
     Org(OrgId),
     /// Every principal's: the host CLI, and a user holding `submit_any_plans`.
@@ -37,12 +37,10 @@ pub enum VaultScope {
 
 impl VaultScope {
     pub(crate) fn admits(&self, owner: &VaultOwner) -> bool {
-        match (self, owner) {
-            (Self::Every, _) => true,
-            (Self::Own { user, .. }, VaultOwner::User { user_id }) => user_id == user,
-            (Self::Own { org, .. }, VaultOwner::Org { org_id }) => org.as_ref() == Some(org_id),
-            (Self::Org(own), VaultOwner::Org { org_id }) => own == org_id,
-            (Self::Org(_), VaultOwner::User { .. }) => false,
+        match self {
+            Self::Every => true,
+            Self::Own { org } => org.as_ref() == Some(owner.org_id()),
+            Self::Org(own) => own == owner.org_id(),
         }
     }
 }
@@ -489,16 +487,10 @@ mod tests {
         Ok(())
     }
 
-    /// The owner `label` names: an organization by its `org_` prefix, else an
-    /// account.
+    /// The organization `label` names, as an owner.
     fn owner_of(label: &str) -> anyhow::Result<VaultOwner> {
-        Ok(match label.split_once('_') {
-            Some(("org", _)) => VaultOwner::Org {
-                org_id: OrgId::try_new(label)?,
-            },
-            _ => VaultOwner::User {
-                user_id: UserId::try_new(label)?,
-            },
+        Ok(VaultOwner::Org {
+            org_id: OrgId::try_new(label)?,
         })
     }
 
@@ -703,7 +695,7 @@ mod tests {
     /// different one, and no record at all.
     #[rstest]
     #[case::matches("org_0195ab", "org_0195ab", None)]
-    #[case::another_principal("org_0195ab", "user_0195cd", Some("belongs to"))]
+    #[case::another_principal("org_0195ab", "org_0195cd", Some("belongs to"))]
     #[tokio::test]
     async fn a_reference_is_judged_against_the_record(
         #[case] owner: &str,
@@ -749,39 +741,40 @@ mod tests {
         Ok(())
     }
 
-    /// `Every` admits every owner. `Own` admits the filer and its organization,
-    /// and neither a colleague nor another organization.
+    /// `Every` admits every owner. `Own` admits the filer's organization, and
+    /// not another one.
     #[rstest]
-    #[case::every(None, [true, true, true, true])]
-    #[case::member_of_acme(Some(Some("org_0195aa")), [true, false, true, false])]
-    #[case::in_no_org(Some(None), [true, false, false, false])]
-    fn a_scope_admits_its_own_and_its_organization_s(
+    #[case::every(None, [true, true])]
+    #[case::member_of_acme(Some(Some("org_0195aa")), [true, false])]
+    #[case::in_no_org(Some(None), [false, false])]
+    fn a_scope_admits_its_organization_s(
         #[case] own: Option<Option<&str>>,
-        #[case] admits: [bool; 4],
+        #[case] admits: [bool; 2],
     ) -> anyhow::Result<()> {
         let scope = match own {
             None => VaultScope::Every,
             Some(org) => VaultScope::Own {
-                user: UserId::try_new("user_0195aa")?,
                 org: org.map(OrgId::try_new).transpose()?,
             },
         };
-        let owners = ["user_0195aa", "user_0195bb", "org_0195aa", "org_0195bb"];
-        for (label, want) in owners.into_iter().zip(admits) {
-            assert_eq!(
-                scope.admits(&owner_of(label)?),
-                want,
-                "{scope:?} on {label}"
-            );
-        }
-        Ok(())
+        ["org_0195aa", "org_0195bb"]
+            .into_iter()
+            .zip(admits)
+            .try_for_each(|(label, want)| {
+                assert_eq!(
+                    scope.admits(&owner_of(label)?),
+                    want,
+                    "{scope:?} on {label}"
+                );
+                anyhow::Ok(())
+            })
     }
 
     /// It is refused before anything else is judged, so the refusal never names
     /// its owner.
     #[rstest]
     #[case::names_the_owner(true, "org_0195ab", None)]
-    #[case::names_another_principal(true, "user_0195cd", None)]
+    #[case::names_another_principal(true, "org_0195cd", None)]
     #[case::unbacked(false, "org_0195ab", None)]
     #[case::pins_another_digest(true, "org_0195ab", Some("b".repeat(64)))]
     #[tokio::test]
@@ -796,7 +789,6 @@ mod tests {
             store_with("org_0195ab").await?
         };
         let scope = VaultScope::Own {
-            user: UserId::try_new("user_0195cd")?,
             org: Some(OrgId::try_new("org_0195ef")?),
         };
         let mut body = body(id.as_str(), principal);

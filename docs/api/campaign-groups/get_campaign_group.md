@@ -10,6 +10,4 @@ not read is left out.
 | Status | When |
 |--------|------|
 | 200 | The group and its members |
-| 400 | `group_id` is not a group id |
 | 403 | The group is outside the caller's reach ([who may do what](../campaign-groups.md#who-may-do-what)), or the caller holds neither `read_plans` nor `manage_orgs` |
-| 404 | No such group, or the server has no `[database]` |

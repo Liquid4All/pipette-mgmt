@@ -21,4 +21,3 @@ is the record alone.
 | 200 | The campaign |
 | 400 | `campaign_id` is not a campaign id, or a flag is not a boolean |
 | 403 | The campaign is outside the caller's reach ([who may do what](../campaigns.md#who-may-do-what)), or the caller holds neither `read_plans` nor `manage_orgs` |
-| 404 | No such campaign |

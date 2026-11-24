@@ -12,10 +12,9 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{UserPermission, UserStatus};
 use pipette_web_testkit::{
     authed_user_delete, authed_user_get, authed_user_post, body_json, create_user, json_str,
-    make_service_account, make_state, make_state_require_user_preauth,
-    make_state_with_legacy_signatures, mint_user_preauth, register_user_key, registered_user,
-    request_user_account, request_with_headers, seed_org, seed_org_named, set_user_org,
-    setup_benchmarks, unauthed_post, user_auth_headers, user_auth_headers_at,
+    make_service_account, make_state, make_state_with_legacy_signatures, mint_user_preauth,
+    register_user_key, registered_user, request_with_headers, seed_org, seed_org_named,
+    set_user_org, setup_benchmarks, unauthed_post, user_auth_headers, user_auth_headers_at,
 };
 
 // axum's `JsonRejection` text, which `ApiJson` passes through; an axum upgrade
@@ -66,6 +65,7 @@ async fn test_a_registered_key_authenticates() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_users_me_names_the_members_organization() -> anyhow::Result<()> {
     let (_dir, state, key, user_id, key_id) = user_state().await?;
+    set_user_org(&state, &user_id, None).await?;
 
     let body =
         body_json(authed_user_get(&state, &key, &user_id, &key_id, "/api/v1/users/me").await?)
@@ -723,41 +723,6 @@ async fn test_revoking_another_accounts_key_is_reported() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// It reaches `GET /api/v1/users/me` and nothing else until it is admitted.
-#[tokio::test]
-async fn test_a_pending_account_cannot_revoke_its_key() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let key = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "pending@example.test", &key, "laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = body_json(resp).await?;
-    let user_id = pipette_plan_types::UserId::try_new(json_str(&body, "user_id")?)?;
-    let key_id = pipette_plan_types::UserKeyId::try_new(json_str(&body, "key_id")?)?;
-
-    let resp = authed_user_delete(
-        &state,
-        &key,
-        &user_id,
-        &key_id,
-        &format!("/api/v1/users/me/keys/{key_id}"),
-    )
-    .await?;
-
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        json_str(&body_json(resp).await?, "error")?,
-        "user is pending an operator's approval"
-    );
-    assert_eq!(
-        state.user_store.list_user_keys(&user_id).await?.len(),
-        1,
-        "a refused revocation must leave the key registered"
-    );
-    let resp = authed_user_get(&state, &key, &user_id, &key_id, "/api/v1/users/me").await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    Ok(())
-}
-
 // ── one keypair, one principal ────────────────────────────────
 
 /// The partition bypass: a holder would collect `perform_work` on one principal
@@ -828,7 +793,6 @@ async fn test_two_accounts_cannot_share_a_keypair() -> anyhow::Result<()> {
 
 // ── registration ──────────────────────────────────────────────
 
-/// Reported `active`, which is how a caller tells it from the request path.
 #[tokio::test]
 async fn test_an_invited_registration_receipts_the_invited_account() -> anyhow::Result<()> {
     let (_dir, state) = empty_state().await?;
@@ -921,8 +885,7 @@ async fn test_key_details_is_bounded(
     Ok(())
 }
 
-/// It claims no address: the same request, well formed, is then a `201`, not
-/// a replay's `200`.
+/// It spends no invite: the same request, well formed, is then a `201`.
 #[rstest]
 #[case::public_key_not_hex(
     "public_key",
@@ -940,14 +903,10 @@ async fn test_key_details_is_bounded(
     Some(json!("   ")),
     "key_details: must be a non-empty string"
 )]
-#[case::invalid_contact_email(
-    "contact_email",
-    Some(json!("not-an-address")),
-    "contact_email: contact_email is not a valid email address"
-)]
-// The two `missing field` reasons are serde's wording, not the project's.
+// The `missing field` reasons are serde's wording, not the project's.
 #[case::no_public_key("public_key", None, "missing field `public_key`")]
 #[case::no_key_details("key_details", None, "missing field `key_details`")]
+#[case::no_preauth_key("user_preauth_key", None, "missing field `user_preauth_key`")]
 #[tokio::test]
 async fn test_a_register_field_that_does_not_read_is_a_400(
     #[case] field: &str,
@@ -955,10 +914,12 @@ async fn test_a_register_field_that_does_not_read_is_a_400(
     #[case] expected_reason: &str,
 ) -> anyhow::Result<()> {
     let (_dir, state) = empty_state().await?;
+    let user = create_user(&state, "invited@example.test").await?;
+    let token = mint_user_preauth(&state, &user.user_id).await?;
     let key = pipette_web_testkit::signing_key()?;
     let mut body = json!({
         "public_key": hex::encode(key.verifying_key().as_bytes()),
-        "contact_email": "asker@example.test",
+        "user_preauth_key": token,
         "key_details": "work laptop",
     });
     // `None` drops the field; `Some` overwrites its value.
@@ -977,21 +938,20 @@ async fn test_a_register_field_that_does_not_read_is_a_400(
     let error = json_str(&body_json(resp).await?, "error")?.to_string();
     assert!(error.starts_with(AXUM_JSON_DATA_ERROR), "{error}");
     assert!(error.contains(expected_reason), "{error}");
-    assert_eq!(
+    assert!(
         state
             .user_store
-            .lookup_user_by_email("asker@example.test")
-            .await?,
-        None,
-        "a refused body must claim no address"
+            .list_user_keys(&user.user_id)
+            .await?
+            .is_empty(),
+        "a refused body must register nothing"
     );
-    let resp = request_user_account(&state, "asker@example.test", &key, "work laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    register_user_key(&state, &token, &key, "work laptop").await?;
     Ok(())
 }
 
-/// In the error envelope, not axum's own `400` or `415`, and it claims no
-/// address.
+/// In the error envelope, not axum's own `400` or `415`, and it spends no
+/// invite.
 #[rstest]
 #[case::truncated(Some("application/json"), true, AXUM_JSON_SYNTAX_ERROR)]
 #[case::text_plain(Some("text/plain"), false, AXUM_JSON_CONTENT_TYPE_ERROR)]
@@ -1003,10 +963,12 @@ async fn test_a_register_body_not_read_as_json_is_a_400(
     #[case] expected_error: &str,
 ) -> anyhow::Result<()> {
     let (_dir, state) = empty_state().await?;
+    let user = create_user(&state, "invited@example.test").await?;
+    let token = mint_user_preauth(&state, &user.user_id).await?;
     let key = pipette_web_testkit::signing_key()?;
     let whole = serde_json::to_string(&json!({
         "public_key": hex::encode(key.verifying_key().as_bytes()),
-        "contact_email": "asker@example.test",
+        "user_preauth_key": token,
         "key_details": "work laptop",
     }))?;
     let body = if truncate {
@@ -1031,16 +993,15 @@ async fn test_a_register_body_not_read_as_json_is_a_400(
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = json_str(&body_json(resp).await?, "error")?.to_string();
     assert!(error.starts_with(expected_error), "{error}");
-    assert_eq!(
+    assert!(
         state
             .user_store
-            .lookup_user_by_email("asker@example.test")
-            .await?,
-        None,
-        "a refused body must claim no address"
+            .list_user_keys(&user.user_id)
+            .await?
+            .is_empty(),
+        "a refused body must register nothing"
     );
-    let resp = request_user_account(&state, "asker@example.test", &key, "work laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    register_user_key(&state, &token, &key, "work laptop").await?;
     Ok(())
 }
 
@@ -1165,120 +1126,32 @@ async fn test_the_user_routes_need_a_signature(
     Ok(())
 }
 
-// ── asking for an account ─────────────────────────────────────
+// ── no keyless request ────────────────────────────────────────
 
-/// The account exists at once and may do nothing until an operator admits it.
+/// An address in place of an invite asks for nothing: a `400`, and no account.
 #[tokio::test]
-async fn test_a_machine_can_request_an_account() -> anyhow::Result<()> {
+async fn test_an_address_in_place_of_an_invite_is_a_400() -> anyhow::Result<()> {
     let (_dir, state) = empty_state().await?;
     let key = pipette_web_testkit::signing_key()?;
 
-    let resp = request_user_account(&state, "asker@example.test", &key, "work laptop").await?;
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = body_json(resp).await?;
-    crate::api_schema::assert_conforms("UserKeyRegistered", &body)?;
-    assert_eq!(body["status"], "pending");
-    let user_id = pipette_plan_types::UserId::try_new(
-        body["user_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no user_id"))?,
-    )?;
-    let key_id = pipette_plan_types::UserKeyId::try_new(
-        body["key_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no key_id"))?,
-    )?;
-
-    // The address is folded: the record *is* the key it was claimed at.
-    let user = state
-        .user_store
-        .get_user(&user_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no record for the requested account"))?;
-    assert_eq!(user.status, UserStatus::Pending);
-    assert_eq!(user.contact_email.as_str(), "asker@example.test");
-    assert_eq!(
-        state
-            .user_store
-            .lookup_user_by_email("asker@example.test")
-            .await?,
-        Some(user_id.clone())
-    );
-
-    // Its own record is how it watches for the decision.
-    let resp = authed_user_get(&state, &key, &user_id, &key_id, "/api/v1/users/me").await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await?["status"], "pending");
-
-    let second = pipette_web_testkit::signing_key()?;
-    let resp = pipette_web_testkit::authed_user_post(
+    let resp = unauthed_post(
         &state,
-        &key,
-        &user_id,
-        &key_id,
-        "/api/v1/users/me/keys",
+        "/api/v1/users/register",
         &json!({
-            "public_key": hex::encode(second.verifying_key().as_bytes()),
-            "key_details": "a second laptop",
+            "public_key": hex::encode(key.verifying_key().as_bytes()),
+            "contact_email": "asker@example.test",
+            "key_details": "work laptop",
         }),
     )
     .await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // The same key, re-registering nothing, now reaches the routes it was
-    // refused.
-    pipette_web_testkit::set_user_status(&state, &user_id, UserStatus::Active).await?;
-    let resp = pipette_web_testkit::authed_user_post(
-        &state,
-        &key,
-        &user_id,
-        &key_id,
-        "/api/v1/users/me/keys",
-        &json!({
-            "public_key": hex::encode(second.verifying_key().as_bytes()),
-            "key_details": "a second laptop",
-        }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    Ok(())
-}
-
-/// Both, or neither, is a `400` before any key is spent or record written.
-#[rstest]
-#[case::neither(false, false)]
-#[case::both(true, true)]
-#[tokio::test]
-async fn test_an_invite_and_an_address_are_exclusive(
-    #[case] with_invite: bool,
-    #[case] with_address: bool,
-) -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let user = create_user(&state, "invited@example.test").await?;
-    let token = mint_user_preauth(&state, &user.user_id).await?;
-    let key = pipette_web_testkit::signing_key()?;
-
-    let mut body = json!({
-        "public_key": hex::encode(key.verifying_key().as_bytes()),
-        "key_details": "work laptop",
-    });
-    if with_invite {
-        body["user_preauth_key"] = json!(token);
-    }
-    if with_address {
-        body["contact_email"] = json!("asker@example.test");
-    }
-    let resp = unauthed_post(&state, "/api/v1/users/register", &body).await?;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let error = json_str(&body_json(resp).await?, "error")?.to_string();
+    assert!(error.starts_with(AXUM_JSON_DATA_ERROR), "{error}");
+    assert!(error.contains("unknown field `contact_email`"), "{error}");
     assert!(
-        state
-            .user_store
-            .list_user_keys(&user.user_id)
-            .await?
-            .is_empty(),
-        "a refused body must register nothing"
+        state.user_store.list_users().await?.is_empty(),
+        "a refused body must create no account"
     );
     assert_eq!(
         state
@@ -1288,171 +1161,6 @@ async fn test_an_invite_and_an_address_are_exclusive(
         None,
         "a refused body must claim no address"
     );
-    // The single-use invite was not spent: it still admits the machine.
-    register_user_key(&state, &token, &key, "work laptop").await?;
-    Ok(())
-}
-
-/// Admitting a second machine would have an operator approve a stranger's key
-/// on someone else's account.
-#[tokio::test]
-async fn test_an_address_admits_one_requested_account() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-
-    let first = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "shared@example.test", &first, "the laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let holder = pipette_plan_types::UserId::try_new(
-        body_json(resp).await?["user_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no user_id"))?,
-    )?;
-
-    let second = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "shared@example.test", &second, "someone else").await?;
-
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        state.user_store.list_user_keys(&holder).await?.len(),
-        1,
-        "the refused request must not land a key on the account holding the address"
-    );
-    Ok(())
-}
-
-/// The caller retrying a `201` it never saw reads its account, not a `409`.
-#[tokio::test]
-async fn test_asking_again_with_the_same_key_replays_the_account() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let key = pipette_web_testkit::signing_key()?;
-
-    let first =
-        body_json(request_user_account(&state, "again@example.test", &key, "laptop").await?)
-            .await?;
-    let again = request_user_account(&state, "again@example.test", &key, "laptop, again").await?;
-
-    assert_eq!(again.status(), StatusCode::OK);
-    let again = body_json(again).await?;
-    assert_eq!(again["user_id"], first["user_id"]);
-    assert_eq!(again["key_id"], first["key_id"]);
-    assert_eq!(again["status"], "pending");
-    Ok(())
-}
-
-/// A retry in another case replays; a stranger in another case meets the `409`.
-#[tokio::test]
-async fn test_a_requested_address_is_folded_to_lower_case() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let key = pipette_web_testkit::signing_key()?;
-
-    let resp = request_user_account(&state, "Asker@Example.test", &key, "work laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let first = body_json(resp).await?;
-    let user_id = pipette_plan_types::UserId::try_new(json_str(&first, "user_id")?)?;
-    let user = state
-        .user_store
-        .get_user(&user_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no record for the requested account"))?;
-    assert_eq!(user.contact_email.as_str(), "asker@example.test");
-    assert_eq!(
-        state
-            .user_store
-            .lookup_user_by_email("asker@example.test")
-            .await?,
-        Some(user_id)
-    );
-
-    let again = request_user_account(&state, "ASKER@example.TEST", &key, "work laptop").await?;
-    assert_eq!(again.status(), StatusCode::OK);
-    let again = body_json(again).await?;
-    assert_eq!(again["user_id"], first["user_id"]);
-    assert_eq!(again["key_id"], first["key_id"]);
-
-    let stranger = pipette_web_testkit::signing_key()?;
-    let resp =
-        request_user_account(&state, "asker@EXAMPLE.test", &stranger, "someone else").await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_str(&body_json(resp).await?, "error")?,
-        "an account already holds that address"
-    );
-    Ok(())
-}
-
-/// So the caller's next attempt, with a fresh keypair, is one round trip rather
-/// than an operator's problem.
-#[tokio::test]
-async fn test_a_refused_keypair_leaves_the_address_free() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let (client_key, _client_id) = pipette_web_testkit::register_and_approve(&state).await?;
-
-    let resp =
-        request_user_account(&state, "retry@example.test", &client_key, "that device").await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    let fresh = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "retry@example.test", &fresh, "a new keypair").await?;
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "the address claim must not outlive the registration it was made for"
-    );
-    Ok(())
-}
-
-/// An operator's to resolve: it looks like a request still in flight, so
-/// adopting it would take an address out from under one.
-#[tokio::test]
-async fn test_a_stranded_claim_is_not_adopted_by_a_request() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    // What a create or a request that died between its two writes leaves.
-    let stranded =
-        pipette_plan_types::UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?;
-    state
-        .user_store
-        .claim_user_email("stranded@example.test", &stranded)
-        .await?;
-
-    let key = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "stranded@example.test", &key, "work laptop").await?;
-
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        state
-            .user_store
-            .lookup_user_by_email("stranded@example.test")
-            .await?,
-        Some(stranded),
-        "the refused request must leave the claim where it found it"
-    );
-    Ok(())
-}
-
-/// The invited path goes on working, as with `require_client_preauth_key`.
-#[tokio::test]
-async fn test_requesting_an_account_can_be_closed_off() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state_require_user_preauth(dir.path()).await?;
-    let key = pipette_web_testkit::signing_key()?;
-
-    let resp = request_user_account(&state, "closed@example.test", &key, "work laptop").await?;
-
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        state
-            .user_store
-            .lookup_user_by_email("closed@example.test")
-            .await?,
-        None,
-        "a refused request must claim nothing"
-    );
-
-    let user = create_user(&state, "invited@example.test").await?;
-    let token = mint_user_preauth(&state, &user.user_id).await?;
-    register_user_key(&state, &token, &key, "work laptop").await?;
     Ok(())
 }
 
@@ -1484,15 +1192,10 @@ async fn test_revoking_a_key_frees_its_keypair() -> anyhow::Result<()> {
 
 // ── a key-only signature ──────────────────────────────────────
 
-/// Pending included: how a holder of nothing but the key learns its account.
+/// How a holder of nothing but the key learns its account.
 #[tokio::test]
 async fn test_users_me_names_the_account_a_key_only_signature_holds() -> anyhow::Result<()> {
-    let (_dir, state) = empty_state().await?;
-    let key = pipette_web_testkit::signing_key()?;
-    let resp = request_user_account(&state, "pending@example.test", &key, "laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let receipt = body_json(resp).await?;
-    let key_id = pipette_plan_types::UserKeyId::try_new(json_str(&receipt, "key_id")?)?;
+    let (_dir, state, key, user_id, key_id) = user_state().await?;
 
     let headers =
         pipette_web_testkit::user_key_only_headers(&key, &key_id, "GET", "/api/v1/users/me")?;
@@ -1501,8 +1204,8 @@ async fn test_users_me_names_the_account_a_key_only_signature_holds() -> anyhow:
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
     crate::api_schema::assert_conforms("OwnUserView", &body)?;
-    assert_eq!(body["user_id"], receipt["user_id"]);
-    assert_eq!(body["status"], json!("pending"));
+    assert_eq!(body["user_id"], json!(user_id.as_str()));
+    assert_eq!(body["status"], json!("active"));
     Ok(())
 }
 

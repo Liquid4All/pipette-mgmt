@@ -189,9 +189,9 @@ def agent_signer(match: str = "", sock: str | None = None) -> Signer:
     return Signer(public_key, sign)
 
 
-def signer_from_env(fallback: str | None = None) -> Signer:
-    """The signer PIPETTE_KEY names (see the module docstring); `fallback` when it is unset."""
-    source = os.environ.get("PIPETTE_KEY") or fallback
+def signer_from_env() -> Signer:
+    """The signer PIPETTE_KEY names (see the module docstring)."""
+    source = os.environ.get("PIPETTE_KEY")
     if not source:
         raise RuntimeError(
             "set PIPETTE_KEY to an op:// reference, agent[:<match>], or a key file"

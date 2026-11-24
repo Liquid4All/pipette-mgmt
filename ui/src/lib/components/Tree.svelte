@@ -4,7 +4,7 @@
   import { here } from "../route.svelte";
   import { match, orgLink, orgOf, pathOf } from "../routes";
   import { session } from "../session.svelte";
-  import { canonical, meLeaves, orgBranches, orgLeaves, serverLeaves, type Leaf } from "../tree";
+  import { ME_LEAVES, canonical, orgBranches, orgLeaves, serverLeaves, type Leaf } from "../tree";
   import type { OwnUserView } from "../api-types";
   import { latest } from "./guard";
 
@@ -48,7 +48,7 @@
 
 <nav class="tree" class:folded id="tree" aria-label="Console">
   <p class="branch">Me</p>
-  <ul>{@render leaves(meLeaves(reads))}</ul>
+  <ul>{@render leaves(ME_LEAVES)}</ul>
   {#if branches.length}
     <p class="branch">Organizations</p>
     <ul>

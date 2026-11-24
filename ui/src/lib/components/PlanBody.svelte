@@ -37,6 +37,7 @@
   /** The page size as the address gave it, which every link keeps. */
   const limit = $derived(offsetPaging(here.query).asked);
   const choices = $derived(jobChoices(lines, ctx, filters));
+  const unfiltered = $derived(jobChoices(lines, ctx, {}));
 </script>
 
 {#if work.error}<p class="err" role="alert">{work.error}</p>{/if}
@@ -47,7 +48,7 @@
     <button type="button" class="again" aria-disabled={work.busy}
             onclick={() => work.busy || work.attempt(onchange)}>{work.busy ? "Reading…" : "Read again"}</button></p>
 {/if}
-<CellFilters {filters} {choices} rows={drawn} link={(to) => cellsLink(base, to, limit)} />
+<CellFilters {filters} {choices} {unfiltered} rows={drawn} link={(to) => cellsLink(base, to, limit)} />
 <JobLines {base} {plan} {jobs} lines={kept} {ctx} kind="cells" columns={columnsOf(lines)} sort={filters.sort}
           link={(sort, offset) => cellsLink(base, { ...filters, sort }, limit, offset)}
           empty={filtered ? "No job matches these filters." : "This plan holds no jobs."} {onchange}>

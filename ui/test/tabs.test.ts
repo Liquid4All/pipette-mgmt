@@ -268,10 +268,10 @@ describe("the Reports tab's old address", () => {
 describe("a link into Cells", () => {
   test("narrows it to the choices given alone, a type by every benchmark id it holds", () => {
     expect(cellsWith(CAMPAIGN, { benchmark: ["decode_512", "decode_1024"], result: ["failed"] }))
-      .toBe("/app/campaigns/cmp_1/plans/plan-1/cells?result=failed&benchmark=decode_512&benchmark=decode_1024");
-    expect(cellsWith(PLAN, { result: ["failed"] })).toBe("/app/plans/plan-1/cells?result=failed");
-    expect(cellsWith(PLAN, {})).toBe("/app/plans/plan-1/cells");
+      .toBe("/app/campaigns/cmp_1/plans/plan-1/cells?result=failed&benchmark=decode_512&benchmark=decode_1024&sort=job");
+    expect(cellsWith(PLAN, { result: ["failed"] })).toBe("/app/plans/plan-1/cells?result=failed&sort=job");
+    expect(cellsWith(PLAN, {})).toBe("/app/plans/plan-1/cells?sort=job");
     expect(cellsWith(PLAN, { q: "gguf-text://repo=a/b&path=b-Q4_0.gguf", device: ["client-a"], issue: ["swap"] }))
-      .toBe("/app/plans/plan-1/cells?q=gguf-text%3A%2F%2Frepo%3Da%2Fb%26path%3Db-Q4_0.gguf&device=client-a&issue=swap");
+      .toBe("/app/plans/plan-1/cells?q=gguf-text%3A%2F%2Frepo%3Da%2Fb%26path%3Db-Q4_0.gguf&device=client-a&issue=swap&sort=job");
   });
 });

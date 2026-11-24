@@ -163,7 +163,9 @@ runtime = 1, variant 2 → 2 benchmarks × 1 model × 1 runtime = 2.
 
 A runtime can instead be a catalog name string, for example
 `runtimes = ["acme/example-build::macos-arm64"]`. Ingestion replaces the name
-with a runtime table before the planner runs (§6.2).
+with a runtime table before the planner runs (§6.2). A `models` array can
+contain a selector such as `Example-1::gguf::q4_0`. Ingestion replaces the
+selector with a model table.
 
 The planner copies three plan-level or variant-level fields into the envelope
 of each cell's body: the plan's `expires_at` when set, its `merge_duplicates`,
@@ -643,12 +645,36 @@ The server refuses the filing with `400` for a name that is one of these:
 - unavailable
 - not offered to every device that the variant admits
 
-Validation reports an error issue for each such name. A hidden entry is out of
+Validation reports the first such error. A hidden entry is out of
 the catalog listings, but its name still resolves; the plan gets a warning. A
-server without a descriptor catalog requires runtime tables.
+server without a descriptor catalog requires runtime and model tables.
+
+A `models` array can contain a model selector in place of a model table:
+`models = ["Example-1::gguf::q4_0"]`. The selector is complete: the name, the
+format and the quantization. Ingestion never selects a quantization, because
+the quantization changes the measurement. The selector resolves in the same
+scope as a runtime name. Use `global/Example-1::gguf::q4_0` to select the global
+entry when the organization has an entry with the same name. A model selector
+has no offer check.
+
+The server refuses the filing with `400` for a model selector that is one of
+these:
+
+- a bare name, or a name with only a format; the refusal lists the members
+- unknown, which includes a name or a quantization label from before a rename
+- tombstoned
+- a member with a vault resource that the filer cannot read
+- a runtime name
+- a member with no compatible runtime in its variant; the refusal gives the
+  selector
+
+The server also refuses a model selector in `runtimes`. The planner pairs each
+model with each runtime that can load it. A selector
+does not change this pairing.
 
 The server replaces each name with its descriptor and adds a comment, for
-example `# catalog name at filing: global/llamacpp-example::macos-arm64`.
+example `# catalog name at filing: global/llamacpp-example::macos-arm64`, or
+`# catalog name at filing: global/Example-1::gguf::q4_0` for a model.
 Other text stays byte for byte. Later revisions use the stored descriptors and
 do not resolve the names again. Name comments survive gated-model rewrites. A
 variant edit rewrites the whole document and can remove existing comments.
@@ -918,7 +944,8 @@ no match above. It then takes a finished job of the superseded plan for the same
 cell (the same body, eligibility and the attempt limit aside) whose run still
 answers it:
 
-- The record is a success. A failed run runs again.
+- The record is a success. A failed run runs again, unless `inherit_failed`
+  takes it (below).
 - The run answers under the cell's attempt limit (below).
 - With the routing flags left out of both bodies (`tag:` and `client_version:`
   flags the body's `required_flags` does not list, and the `clients` and
@@ -964,9 +991,9 @@ these holds:
   the cell ([below](#satisfying-a-cell-from-an-earlier-run)).
 
 Any other run runs again. A body with no limit runs under the default of its
-client, which the server does not know. A failed run runs again whatever the
-limits, a timeout included, and a queued job gives way to a new one under the
-new limit. Everywhere else the limit is part of the cell: in a first plan, in
+client, which the server does not know. Without `inherit_failed` (below), a
+failed run runs again whatever the limits, a timeout included, and a queued job
+gives way to a new one under the new limit. Everywhere else the limit is part of the cell: in a first plan, in
 the duplicate merge, in the job-cell index and in the reuse of an earlier run.
 
 A revision that changes the limit of a cell reads the run of every job of the
@@ -1027,6 +1054,37 @@ joins it. Either switch files the head's own document too, which otherwise files
 nothing. `carry_across_limit` alone does not: it changes no job of that
 document.
 
+**With `inherit_failed`, a failed run can answer a cell.** The run is one the
+superseded plan holds for other clauses or another limit, or a plan on offer's.
+It applies to a cell that drew nothing, or a queued job that no client runs,
+and that no finished run answers. The failure's record must say the cell would
+fail again:
+
+- A device's timeout (`client: attempt_timeout`), a skip after a smaller run's
+  timeout (`smaller_run_failed: attempt_timeout`), and a mark (`marked`) answer
+  a cell whose attempt limit is not above the run's: the same limit, none on
+  both sides, or both set and the cell's not higher. The run's limit is the one
+  it was requested with, or the one the superseded plan holds it under. A mark
+  is weighed as a timeout because the server does not know why a person or a
+  group policy filed it.
+- A device's out-of-memory, runtime error or device error, and a skip after a
+  smaller run's out-of-memory, answer any limit. Each struck before the run's
+  limit, so a longer limit would not change it, and a shorter one fails too.
+- Any other failure answers nothing: an expiry, a lost lease, a refusal by
+  every client or by none, a readiness wait, a harness error, or a device's
+  failure with no code.
+
+The failed run's device is not recorded, so only its clauses vouch for it
+(`matching::run_answers` with no flags): the cell's clauses must be the
+run's, or ask nothing that the run's did not require. A skip is taken only when
+the revision also holds the run its reason names. The revision takes the job
+itself, as it takes a finished one, and copies the plan's `rerun_of` link for
+it, so a mark stays a mark and a group policy reads the re-runs that the job's
+chain already spent. `carry_across_limit` does not widen any of this. The dry
+run counts those of other plans in `inherited_failed_job_count`, marks each
+body that would take a failed run in `held_jobs`, and the change records
+`inherit_failed`.
+
 Carrying ignores `merge_duplicates`. The flag keeps a plan off *other* plans'
 runs of a cell, and the superseded plan's run is the campaign's own. A plan
 named in `inherit_from` was asked for by name, so its runs are taken too. Where
@@ -1072,6 +1130,42 @@ success passes the check and then fails its copy. The filing then stops with
 the revision in `creating`, and no job of it is claimable. A copy is written
 before the plan is finalized, so a filing that fails later leaves its copies to
 be scored under jobs of a plan that maintenance tears down as stranded (§8).
+
+**A replaced model answers with a copy.** A document revision or a variant
+edit with `replace_model=<old>=<new>` resolves each side to the `spec.model`
+of the jobs on offer (the superseded plan's and the plans that `carry_earlier`
+or `inherit_from` offer) and of the revision's bodies whose model prints as it
+(`Model`'s `Display`). Each side must name one model, of one type, and the new
+one may hold no token. The server then compares the two file by file, in the
+order of the type's fields: a vault file by its record's `sha256`, a
+HuggingFace file by the LFS digest the Hub lists at a pinned commit, and a
+HuggingFace directory by the LFS digests of its files. Two vault archives that
+hash alike match. It refuses the pair with `400` when a file's two checksums
+are both read and differ, and files nothing. Any other file is taken on the
+filer's word: a local path or a URL, a revision that is not a commit, a commit
+the Hub refuses, as it refuses one a force-push squashed away, a file kept out
+of LFS, two archives that hash apart, an archive beside a Hub directory, or a
+vault record outside the filer's reach, so the answer says nothing of it. The
+pairs are resolved after the document's checks.
+`change.replace_model` records each pair with `verified`, `false` when some
+file was taken on trust.
+
+Each job that the draw by digest leaves, and each job of a plan on offer, whose
+body names an old model is indexed for a change of requirements under its body
+with the new model in place. So a cell of the new model can take its finished
+success by the rules
+above: the clauses, the attempt limit and `carry_across_limit` apply as they
+do to any other run, and a failed run answers nothing, nor a run whose record
+was pruned from `processed/`, since the copy needs it. A job taken this way is
+not held. The cell is minted as a fresh job that is never queued, holds no
+membership marker and joins nothing, and a copy of the run's record goes to
+`submissions/incoming/` as a recalculation's does, of any benchmark, under the
+fresh `job_id`, submitted now, naming the run in `rescored_from` and keeping
+its `run_submitted_at`. The copy names the cell's model in `model_descriptor`
+and keeps the device's in `replaced_model_descriptor`. The scorer derives the
+rows again from the copy, so a throughput row repeats the device's numbers and
+an eval is scored by the scorer that runs now. The job's cell is indexed, so a
+later plan of the scope can take the copy as an earlier run.
 
 **A mark answers the jobs it names.** A re-run's `fail`
 ([`POST /api/v1/campaigns/{campaign_id}/rerun`](api/campaigns/rerun_jobs.md))
@@ -1156,9 +1250,7 @@ running. Such a unit takes an earlier job of its cell if all of these hold:
 - No other unit of the plan holds the job. One run answers one unit.
 - The job has the scope of the campaign
   ([storage.md §4.4](storage.md#44-the-job-cell-index)). A campaign of an
-  organization, or of a user in an organization, takes a run from any campaign
-  of that organization or its users. A campaign of a user in no organization
-  takes only the runs of that user's own campaigns.
+  organization takes a run from any campaign of that organization.
 
 The unit takes the newest such job, by its UUIDv7 `job_id`. Ingestion sets no
 age limit on the run. It does not check that the client still exists. The cell
@@ -1221,8 +1313,9 @@ staged bodies into `queue_jobs`, so a reader never sees a partial body
 ([queue.md](queue.md#jobs)). There is no multi-object atomic write, so
 ingestion stages first and promotes second, gated by the manifest status:
 
-1. **Collect and check.** Resolve catalog names and rewrite their runtime
-   entries (§6.2), then expand the plan document (§6.1) and validate the
+1. **Collect and check.** Resolve catalog runtime names and model selectors.
+   Rewrite them as descriptor tables (§6.2), then expand the plan document
+   (§6.1) and validate the
    whole set (§6.2). Then run the import step (§6.2), and check the vault
    references of the rewritten bodies. Nothing but completed imports' vault
    records has been written. A dry run stops here

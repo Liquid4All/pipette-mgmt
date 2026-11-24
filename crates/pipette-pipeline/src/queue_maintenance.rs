@@ -23,9 +23,9 @@ use pipette_plan_types::{
 use pipette_store::decode_stats::{DecodeCounts, S3_DECODE};
 use pipette_store::http_stats::{HttpCounts, S3_HTTP};
 use pipette_store::{
-    AvailEntry, ClientStore, CreateOutcome, JobPlanMarker, PlanStore, RecycleResult, RedateResult,
-    ReindexJob, ReindexRequest, STORAGE_CONCURRENCY, SubmissionStore, TagStore, TodoStore,
-    drain_clients, drain_plans, warn_unreadable_clients,
+    AvailEntry, ClientStore, CreateOutcome, JobPlanMarker, PlanListing, PlanStore, RecycleResult,
+    RedateResult, ReindexJob, ReindexRequest, STORAGE_CONCURRENCY, SubmissionStore, TagStore,
+    TodoStore, UnreadableObjectError, drain_clients, warn_unreadable_clients,
 };
 
 use crate::submission::{UnrecordableJobError, record_system_failure};
@@ -67,13 +67,10 @@ pub async fn run(
     // so a plan read past `creating` cannot miss its jobs and latch `complete`.
     // Ahead of the recycle too, so the recycle's `leased/` listing stays next to `avail/`'s.
     let cancel_markers: HashSet<PlanId> = plans.list_cancel_markers().await?.into_iter().collect();
-    let plan_listing = drain_plans(plans, None).await?;
-    // No pass reconciles an unreadable manifest, so it is logged by name on
-    // every run until an operator removes it.
-    plan_listing.unreadable.iter().for_each(|bad| {
-        tracing::warn!(manifest = %bad.key, reason = %bad.reason, "queue-maintenance: unreadable plan manifest, skipped");
-    });
-    let mut manifests = plan_listing.items;
+    let mut plan_listing = plans.list_open_plans().await?;
+    warn_unreadable_manifests(&plan_listing.unreadable);
+    let early_ids = early_plan_ids(&plan_listing.items, &cancel_markers);
+    read_manifests(plans, &early_ids, &mut plan_listing).await?;
 
     let (leased_at_recycle, resolved_at_recycle, failed_items) =
         settle_expired_leases(todo, submissions, catalog, settings.lost_lease_limit, now).await?;
@@ -86,10 +83,32 @@ pub async fn run(
     // Teardown precedes every queue reader, so no pass indexes a doomed job.
     // One `job-plans/` listing per run, so a plan with many jobs costs none.
     let job_plan_markers = plans.list_all_job_plan_markers().await?;
+    let queued: HashSet<&JobId> = avail_keys
+        .iter()
+        .map(|a| &a.job_id)
+        .chain(leases.iter().map(|l| &l.job_id))
+        .collect();
+    let late_ids = unread_marker_plan_ids(&job_plan_markers, &queued, &plan_listing.items);
+    let early_count = plan_listing.items.len();
+    read_manifests(plans, &late_ids, &mut plan_listing).await?;
+    let manifests = &mut plan_listing.items;
+    // Open plans first seen here may have promoted jobs after the queue
+    // snapshot. Use them for marker collection after lifecycle and indexing.
+    let deferred: Vec<_> = manifests
+        .extract_if(early_count.., |plan| !plan.status.is_terminal())
+        .collect();
+    manifests.sort_by(|a, b| a.plan_id.cmp(&b.plan_id));
     let membership = plan_maintenance::Membership::new(job_plan_markers.clone());
+    let markerless: Vec<JobId> = queued
+        .into_iter()
+        .filter(|job_id| !membership.has_markers(job_id))
+        .cloned()
+        .collect();
+    let cancelled_jobs = plans.cancelled_plan_jobs(&markerless).await?;
     let teardown = plan_maintenance::tear_down_plans(
         plans,
-        &manifests,
+        manifests,
+        &cancelled_jobs,
         &cancel_markers,
         &membership,
         avail_keys,
@@ -107,7 +126,7 @@ pub async fn run(
         + plan_maintenance::record_member_lapses(
             plans,
             submissions,
-            &mut manifests,
+            manifests,
             &job_plan_markers,
             &cancel_markers,
             &teardown.endings.stranded,
@@ -119,16 +138,16 @@ pub async fn run(
     let (all_keys, expired_now, expiry_failures) =
         expire_overdue_jobs(todo, submissions, plans, catalog, teardown.avail, now).await?;
 
-    // A promoted job waits in avail/ until at least one of its plans leaves
-    // creating. Keep it out of the flagged read and the passes after it, so it
-    // keeps its reindex flag and the run reads its body only after its plan
-    // becomes active.
+    // A promoted job waits in avail/ until this run sees a committed plan
+    // that can authorize indexing. Withheld jobs keep their reindex flags.
     let index_candidates: HashSet<JobId> = all_keys
         .iter()
         .map(|key| key.job_id.clone())
         .chain(teardown.leased.iter().map(|lease| lease.job_id.clone()))
         .collect();
-    let withheld = uncommitted_jobs(&index_candidates, &job_plan_markers, &manifests);
+    let statuses: HashMap<&PlanId, PlanStatus> =
+        manifests.iter().map(|m| (&m.plan_id, m.status)).collect();
+    let withheld = uncommitted_jobs(&index_candidates, &job_plan_markers, &statuses);
     let listed: Vec<JobId> = all_keys
         .iter()
         .map(|key| key.job_id.clone())
@@ -209,8 +228,8 @@ pub async fn run(
         live_jobs = live_ids.len(),
         clients = clients.len(),
         workers = workers.len(),
-        // Every plan is kept, so this is what grows the run.
-        plans = manifests.len(),
+        plans_full = manifests.len() + deferred.len(),
+        plans_summary = 0,
         "queue-maintenance: eligible-index pass starting"
     );
 
@@ -291,7 +310,7 @@ pub async fn run(
         plans,
         todo,
         submissions,
-        &manifests,
+        manifests,
         &cancel_markers,
         &teardown.endings,
         &membership,
@@ -310,9 +329,16 @@ pub async fn run(
     .await?;
 
     let after_reconcile = PhaseMark::now();
+    manifests.extend(deferred);
+    // A job visible only during lease recycling is still live for collection.
+    // Read its plan here so it cannot influence teardown or reconciliation.
+    let live: HashSet<&JobId> = live_ids.iter().collect();
+    let mut gc_ids = unread_marker_plan_ids(&job_plan_markers, &live, manifests);
+    gc_ids.retain(|id| !early_ids.contains(id) && !late_ids.contains(id));
+    read_manifests(plans, &gc_ids, &mut plan_listing).await?;
     let index_gc = plan_maintenance::gc_plan_index(
         plans,
-        &manifests,
+        &plan_listing,
         &job_plan_markers,
         &live_ids,
         &prior_gc_candidates,
@@ -351,7 +377,10 @@ pub async fn run(
     ]
     .into_iter()
     .for_each(|(phase, earlier, later)| log_phase_work(phase, earlier, later));
-    let run_cpu = process_cpu_time()
+    let usage = self_usage();
+    let run_cpu = usage
+        .as_ref()
+        .and_then(process_cpu_time)
         .zip(at_start.cpu)
         .map(|(now, start)| now.since(start));
     // The candidate-set write, `tmp/` cleanup and the re-stamp are in no phase,
@@ -361,7 +390,9 @@ pub async fn run(
         queue_passes_ms = millis(after_queue_passes.at - at_start.at),
         reconcile_plans_ms = millis(after_reconcile.at - after_queue_passes.at),
         plan_index_gc_ms = millis(after_gc.at - after_reconcile.at),
-        plans = manifests.len(),
+        plans_full = plan_listing.items.len(),
+        plans_summary = 0,
+        peak_rss_kib = usage.as_ref().and_then(peak_rss_kib),
         plans_reconciled = reconciled.reconciled,
         count_jobs_probes = reconciled.probes,
         count_jobs_ms = millis(reconciled.count_jobs),
@@ -396,21 +427,73 @@ pub async fn run(
     Ok(())
 }
 
+fn warn_unreadable_manifests(unreadable: &[UnreadableObjectError]) {
+    unreadable.iter().for_each(|bad| {
+        tracing::warn!(manifest = %bad.key, reason = %bad.reason, "queue-maintenance: unreadable plan manifest, skipped");
+    });
+}
+
+/// Before listing the queue, read the remaining plans needed for cancellation
+/// and the predecessors that seed the open plans' settled outcomes.
+fn early_plan_ids(open: &[PlanManifest], cancel_markers: &HashSet<PlanId>) -> BTreeSet<PlanId> {
+    let read: HashSet<&PlanId> = open.iter().map(|plan| &plan.plan_id).collect();
+    open.iter()
+        .filter_map(|plan| plan.previous_plan_id.as_ref())
+        .chain(cancel_markers)
+        .filter(|id| !read.contains(*id))
+        .cloned()
+        .collect()
+}
+
+/// Find unread plans named by the membership markers of the given jobs.
+fn unread_marker_plan_ids(
+    markers: &[JobPlanMarker],
+    observed: &HashSet<&JobId>,
+    read: &[PlanManifest],
+) -> BTreeSet<PlanId> {
+    let read: HashSet<&PlanId> = read.iter().map(|m| &m.plan_id).collect();
+    markers
+        .iter()
+        .filter(|marker| observed.contains(&marker.job_id) && !read.contains(&marker.plan_id))
+        .map(|marker| marker.plan_id.clone())
+        .collect()
+}
+
+/// Append the manifests of `plan_ids` that still exist and report unreadable rows.
+async fn read_manifests(
+    plans: &dyn PlanStore,
+    plan_ids: &BTreeSet<PlanId>,
+    listing: &mut PlanListing,
+) -> anyhow::Result<()> {
+    let plan_ids: Vec<PlanId> = plan_ids.iter().cloned().collect();
+    let read = plans.get_plans(&plan_ids).await?;
+    warn_unreadable_manifests(&read.unreadable);
+    listing.items.extend(read.items);
+    listing.unreadable.extend(read.unreadable);
+    Ok(())
+}
+
 struct PhaseMark {
     at: Instant,
     http: HttpCounts,
     decode: DecodeCounts,
     cpu: Option<CpuTime>,
+    peak_rss_kib: Option<u64>,
 }
 
 impl PhaseMark {
     /// The S3 peak in flight starts a new window.
     fn now() -> Self {
+        let at = Instant::now();
+        let http = S3_HTTP.checkpoint();
+        let decode = S3_DECODE.checkpoint();
+        let usage = self_usage();
         Self {
-            at: Instant::now(),
-            http: S3_HTTP.checkpoint(),
-            decode: S3_DECODE.checkpoint(),
-            cpu: process_cpu_time(),
+            at,
+            http,
+            decode,
+            cpu: usage.as_ref().and_then(process_cpu_time),
+            peak_rss_kib: usage.as_ref().and_then(peak_rss_kib),
         }
     }
 }
@@ -439,6 +522,7 @@ fn log_phase_work(phase: &'static str, earlier: &PhaseMark, later: &PhaseMark) {
         decoded_bytes = decode.decoded_bytes,
         decode_ms = millis(decode.time),
         cpu_ms = cpu.map(|cpu| millis(cpu.user + cpu.system)),
+        peak_rss_kib = later.peak_rss_kib,
         "queue-maintenance: S3 and CPU work of a phase"
     );
 }
@@ -458,7 +542,7 @@ impl CpuTime {
     }
 }
 
-fn process_cpu_time() -> Option<CpuTime> {
+fn self_usage() -> Option<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: `getrusage` writes one whole `rusage`, and `usage` has room for one.
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -466,7 +550,22 @@ fn process_cpu_time() -> Option<CpuTime> {
         return None;
     }
     // SAFETY: `getrusage` returned 0, so it wrote the whole struct.
-    let usage = unsafe { usage.assume_init() };
+    Some(unsafe { usage.assume_init() })
+}
+
+/// Return the process's peak resident memory in kibibytes (KiB).
+/// On Linux, this value corresponds to `VmHWM`.
+fn peak_rss_kib(usage: &libc::rusage) -> Option<u64> {
+    let max_rss = u64::try_from(usage.ru_maxrss).ok()?;
+    // macOS reports bytes; Linux reports KiB.
+    Some(if cfg!(target_os = "macos") {
+        max_rss / 1024
+    } else {
+        max_rss
+    })
+}
+
+fn process_cpu_time(usage: &libc::rusage) -> Option<CpuTime> {
     let duration = |time: libc::timeval| {
         Some(
             Duration::from_secs(u64::try_from(time.tv_sec).ok()?)
@@ -1228,15 +1327,26 @@ pub async fn fail_larger_run(
         catalog,
         &QueueEntry::Avail(avail),
         body,
-        std::future::ready((
-            format!("not run: {benchmark_id} of this model failed with {code} in {smaller}"),
-            code,
-        )),
+        std::future::ready((smaller_run_reason(benchmark_id, code, smaller), code)),
         "smaller_run_failed",
         FailureSource::SmallerRunFailed,
         now,
     )
     .await
+}
+
+pub(crate) fn smaller_run_reason(
+    benchmark_id: &BenchmarkId,
+    code: FailureCode,
+    smaller: &JobId,
+) -> String {
+    format!("not run: {benchmark_id} of this model failed with {code} in {smaller}")
+}
+
+/// The smaller run that a [`smaller_run_reason`] names.
+pub(crate) fn smaller_run_of(reason: &str) -> Option<JobId> {
+    let (_, smaller) = reason.rsplit_once(" in ")?;
+    JobId::try_new(smaller).ok()
 }
 
 /// The body-cache key of a flagged job: its entry at the read.
@@ -1280,17 +1390,13 @@ async fn track_worker_changes(
     Ok(joined)
 }
 
-/// Jobs whose memberships all point at creating or missing plans. A job with
-/// no membership keeps its existing queue behavior.
+/// Jobs with membership markers but no readable, committed plan eligible
+/// to authorize indexing this run.
 fn uncommitted_jobs(
     jobs: &HashSet<JobId>,
     markers: &[JobPlanMarker],
-    manifests: &[PlanManifest],
+    statuses: &HashMap<&PlanId, PlanStatus>,
 ) -> HashSet<JobId> {
-    let statuses: HashMap<&PlanId, PlanStatus> = manifests
-        .iter()
-        .map(|plan| (&plan.plan_id, plan.status))
-        .collect();
     let committed: HashSet<&JobId> = markers
         .iter()
         .filter(|marker| {
@@ -1872,6 +1978,19 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_skip_names_its_smaller_run() -> anyhow::Result<()> {
+        let smaller = JobId::try_new("job-smaller")?;
+        let reason = smaller_run_reason(
+            &BenchmarkId::try_new("bench-1")?,
+            FailureCode::AttemptTimeout,
+            &smaller,
+        );
+        assert_eq!(smaller_run_of(&reason), Some(smaller));
+        assert_eq!(smaller_run_of("device rebooted"), None);
+        Ok(())
+    }
+
     fn settle_test_client(id: &str, pk_suffix: &str, chip: &str) -> anyhow::Result<Client> {
         // 64-char hex pubkey with a distinct 2-char suffix so clients differ.
         Ok(Client {
@@ -1881,6 +2000,7 @@ mod tests {
             ))?,
             organization: pipette_plan_types::NonEmptyTrimmedString::try_new("org")?,
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
             status: pipette_core::client::ClientStatus::Approved,
             registered_at: Timestamp::now(),
@@ -2984,19 +3104,88 @@ mod tests {
         Ok(())
     }
 
+    // ── plan selection ─────────────────────────────────────────────────────
+
+    fn plan(n: u128) -> PlanId {
+        PlanId::from_uuid(uuid::Uuid::from_u128(n))
+    }
+
+    fn open_plan(
+        plan_id: PlanId,
+        status: PlanStatus,
+        previous: Option<PlanId>,
+    ) -> anyhow::Result<PlanManifest> {
+        Ok(PlanManifest {
+            previous_plan_id: previous,
+            ..pipette_core::plan::sample_manifest(plan_id, status, false)?
+        })
+    }
+
+    #[test]
+    fn early_plan_ids_read_predecessors_and_cancel_marked_plans() -> anyhow::Result<()> {
+        let open = vec![
+            open_plan(plan(1), PlanStatus::Active, Some(plan(10)))?,
+            open_plan(plan(2), PlanStatus::Creating, Some(plan(1)))?,
+        ];
+        let cancel_markers = HashSet::from([plan(2), plan(3)]);
+
+        assert_eq!(
+            early_plan_ids(&open, &cancel_markers),
+            BTreeSet::from([plan(10), plan(3)]),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unread_marker_plan_ids_selects_the_plans_of_observed_jobs() -> anyhow::Result<()> {
+        let queued_job = JobId::from_uuid(uuid::Uuid::from_u128(100));
+        let gone_job = JobId::from_uuid(uuid::Uuid::from_u128(101));
+        let marker = |job_id: &JobId, plan_id: PlanId| JobPlanMarker {
+            job_id: job_id.clone(),
+            plan_id,
+            expires_at: ExpiresAt::Never,
+            written_at: Timestamp::UNIX_EPOCH,
+        };
+        let markers = vec![
+            marker(&queued_job, plan(1)),
+            marker(&queued_job, plan(2)),
+            marker(&gone_job, plan(3)),
+        ];
+        let read = vec![pipette_core::plan::sample_manifest(
+            plan(2),
+            PlanStatus::Active,
+            false,
+        )?];
+
+        assert_eq!(
+            unread_marker_plan_ids(&markers, &HashSet::from([&queued_job]), &read),
+            BTreeSet::from([plan(1)]),
+        );
+        Ok(())
+    }
+
     // ── run order ──────────────────────────────────────────────────────────
 
-    /// A [`PlanStore`] whose first manifest listing lets a staging ingest finish
-    /// first: its jobs promoted into `avail/` and its manifest written `active`.
-    struct IngestFinishesAtManifestListing {
+    struct IngestDuringMaintenance {
         inner: std::sync::Arc<dyn PlanStore>,
         todo: std::sync::Arc<dyn TodoStore>,
-        finished: std::sync::atomic::AtomicBool,
+        finish_after_queue_listing: bool,
         manifest: PlanManifest,
     }
 
+    impl IngestDuringMaintenance {
+        async fn promote(&self, jobs: &[JobId]) -> anyhow::Result<()> {
+            futures::future::try_join_all(
+                jobs.iter()
+                    .map(|job_id| self.todo.promote_avail(job_id, ExpiresAt::Never, None)),
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
-    impl PlanStore for IngestFinishesAtManifestListing {
+    impl PlanStore for IngestDuringMaintenance {
         async fn join_job(
             &self,
             job_id: &pipette_plan_types::JobId,
@@ -3012,20 +3201,24 @@ mod tests {
             after: Option<&PlanId>,
             limit: std::num::NonZeroUsize,
         ) -> anyhow::Result<pipette_store::PlanPage> {
-            if !self
-                .finished
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                futures::future::try_join_all(
-                    self.manifest
-                        .job_ids
-                        .iter()
-                        .map(|job_id| self.todo.promote_avail(job_id, ExpiresAt::Never, None)),
-                )
-                .await?;
-                self.inner.put_plan(&self.manifest).await?;
-            }
             self.inner.list_matching_plans(filter, after, limit).await
+        }
+        async fn list_open_plans(&self) -> anyhow::Result<PlanListing> {
+            if self.finish_after_queue_listing {
+                let listing = self.inner.list_open_plans().await?;
+                self.inner
+                    .put_plan(&PlanManifest {
+                        status: PlanStatus::Creating,
+                        ..self.manifest.clone()
+                    })
+                    .await?;
+                // The queue snapshot sees the first promoted job only.
+                self.promote(&self.manifest.job_ids[..1]).await?;
+                return Ok(listing);
+            }
+            self.promote(&self.manifest.job_ids).await?;
+            self.inner.put_plan(&self.manifest).await?;
+            self.inner.list_open_plans().await
         }
         async fn put_plan(&self, manifest: &PlanManifest) -> anyhow::Result<()> {
             self.inner.put_plan(manifest).await
@@ -3108,7 +3301,17 @@ mod tests {
             self.inner.list_job_plan_markers(job_id).await
         }
         async fn list_all_job_plan_markers(&self) -> anyhow::Result<Vec<JobPlanMarker>> {
+            if self.finish_after_queue_listing {
+                self.promote(&self.manifest.job_ids[1..]).await?;
+                self.inner.put_plan(&self.manifest).await?;
+            }
             self.inner.list_all_job_plan_markers().await
+        }
+        async fn cancelled_plan_jobs(
+            &self,
+            job_ids: &[JobId],
+        ) -> anyhow::Result<BTreeMap<PlanId, Vec<JobId>>> {
+            self.inner.cancelled_plan_jobs(job_ids).await
         }
         async fn delete_job_plan_marker(
             &self,
@@ -3182,11 +3385,133 @@ mod tests {
         }
     }
 
-    /// An ingest that finishes as the run lists the manifests leaves its plan
-    /// live: the run counts the new job outstanding, not gone, so the plan does
-    /// not latch `complete`.
+    #[rstest]
+    #[case::commits_before_queue_listing(false)]
+    #[case::commits_after_queue_listing(true)]
     #[tokio::test]
-    async fn a_plan_ingested_mid_run_is_not_latched_complete() -> anyhow::Result<()> {
+    async fn a_plan_ingested_mid_run_waits_for_a_complete_queue_snapshot(
+        #[case] finish_after_queue_listing: bool,
+    ) -> anyhow::Result<()> {
+        let Some(db) = TestDb::new().await? else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let stores = db.stores(pipette_store_fs::build_local_fs_stores(
+            &pipette_core::config::Config {
+                storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                auth_storage: StorageConfig::local_fs(dir.path().to_path_buf()),
+                ..pipette_core::config::Config::default()
+            },
+            pipette_store_testkit::no_queue(),
+        )?);
+        let jobs = [1, 2].map(|id| JobId::from_uuid(uuid::Uuid::from_u128(id)));
+        let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(2));
+        let creating = PlanManifest {
+            plan_id: plan_id.clone(),
+            status: PlanStatus::Creating,
+            created_at: Timestamp::now(),
+            submitted_by: None,
+            campaign_id: None,
+            previous_plan_id: None,
+            source_sha256: None,
+            submitted_sha256: None,
+            plan_warnings: Vec::new(),
+            benchmark_types: Default::default(),
+            job_ids: jobs.to_vec(),
+            content_keys: Default::default(),
+            rerun_of: Default::default(),
+            warnings: Vec::new(),
+            expired_jobs: BTreeMap::new(),
+            job_expiry: None,
+            settled_jobs: Default::default(),
+            progress_snapshot: None,
+            terminal_at: None,
+        };
+        if !finish_after_queue_listing {
+            stores.plans.put_plan(&creating).await?;
+        }
+        for job_id in &jobs {
+            stores
+                .plans
+                .write_job_plan_marker(job_id, &plan_id, ExpiresAt::Never)
+                .await?;
+            let body = serde_json::json!({"job_id": job_id.as_str(), "requires": ["os:macos"]});
+            stores.todo.write_tmp(job_id, &body).await?;
+        }
+        let plans = IngestDuringMaintenance {
+            inner: stores.plans.clone(),
+            todo: stores.todo.clone(),
+            finish_after_queue_listing,
+            manifest: PlanManifest {
+                status: PlanStatus::Active,
+                ..creating
+            },
+        };
+
+        let settings = || MaintenanceSettings {
+            tmp_max: Duration::from_secs(86_400),
+            plan_creating_max: Duration::from_secs(21_600),
+            lost_lease_limit: 3,
+        };
+        run(
+            &*stores.todo,
+            &*stores.clients,
+            &*stores.tags,
+            &*stores.submissions,
+            &plans,
+            &HashMap::new(),
+            settings(),
+        )
+        .await?;
+
+        if finish_after_queue_listing {
+            assert_eq!(stores.plans.get_plan(&plan_id).await?, Some(plans.manifest));
+            let flagged = stores.todo.jobs_needing_reindex(&jobs).await?;
+            assert_eq!(
+                flagged.jobs.len(),
+                jobs.len(),
+                "both jobs keep their reindex flags"
+            );
+            run(
+                &*stores.todo,
+                &*stores.clients,
+                &*stores.tags,
+                &*stores.submissions,
+                &*stores.plans,
+                &HashMap::new(),
+                settings(),
+            )
+            .await?;
+        }
+
+        let manifest = stores
+            .plans
+            .get_plan(&plan_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("the plan has no manifest"))?;
+        // No client is registered, so an outstanding job reads `pending_clients`.
+        assert_eq!(manifest.status, PlanStatus::PendingClients);
+        assert_eq!(manifest.terminal_at, None);
+        let counts = manifest
+            .progress_snapshot
+            .ok_or_else(|| anyhow::anyhow!("the run wrote no snapshot"))?
+            .counts;
+        assert_eq!((counts.available, counts.cancelled), (2, 0));
+        assert!(
+            stores
+                .todo
+                .jobs_needing_reindex(&jobs)
+                .await?
+                .jobs
+                .is_empty(),
+            "a run with a complete snapshot indexes both jobs"
+        );
+        Ok(())
+    }
+
+    /// The job's membership marker prompts a full read of the cancelled plan.
+    #[tokio::test]
+    async fn a_cancelled_plan_still_tears_down_a_queued_straggler() -> anyhow::Result<()> {
         let Some(db) = TestDb::new().await? else {
             return Ok(());
         };
@@ -3201,51 +3526,31 @@ mod tests {
         )?);
         let job_id = JobId::from_uuid(uuid::Uuid::from_u128(1));
         let plan_id = PlanId::from_uuid(uuid::Uuid::from_u128(2));
-        let creating = PlanManifest {
-            plan_id: plan_id.clone(),
-            status: PlanStatus::Creating,
-            created_at: Timestamp::now(),
-            submitted_by: None,
-            campaign_id: None,
-            previous_plan_id: None,
-            source_sha256: None,
-            submitted_sha256: None,
-            plan_warnings: Vec::new(),
-            benchmark_types: Default::default(),
+        let cancelled = PlanManifest {
             job_ids: vec![job_id.clone()],
             content_keys: Default::default(),
             rerun_of: Default::default(),
-            warnings: Vec::new(),
-            expired_jobs: BTreeMap::new(),
-            job_expiry: None,
-            settled_jobs: Default::default(),
-            progress_snapshot: None,
-            terminal_at: None,
+            terminal_at: Some(Timestamp::now()),
+            ..pipette_core::plan::sample_manifest(plan_id.clone(), PlanStatus::Cancelled, false)?
         };
-        // The ingest's state before its promote.
-        stores.plans.put_plan(&creating).await?;
+        stores.plans.put_plan(&cancelled).await?;
         stores
             .plans
             .write_job_plan_marker(&job_id, &plan_id, ExpiresAt::Never)
             .await?;
         let body = serde_json::json!({"job_id": job_id.as_str(), "requires": ["os:macos"]});
         stores.todo.write_tmp(&job_id, &body).await?;
-        let plans = IngestFinishesAtManifestListing {
-            inner: stores.plans.clone(),
-            todo: stores.todo.clone(),
-            finished: std::sync::atomic::AtomicBool::new(false),
-            manifest: PlanManifest {
-                status: PlanStatus::Active,
-                ..creating
-            },
-        };
+        stores
+            .todo
+            .promote_avail(&job_id, ExpiresAt::Never, None)
+            .await?;
 
         run(
             &*stores.todo,
             &*stores.clients,
             &*stores.tags,
             &*stores.submissions,
-            &plans,
+            &*stores.plans,
             &HashMap::new(),
             MaintenanceSettings {
                 tmp_max: Duration::from_secs(86_400),
@@ -3255,22 +3560,16 @@ mod tests {
         )
         .await?;
 
-        let manifest = stores
-            .plans
-            .get_plan(&plan_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("the plan has no manifest"))?;
-        // No client is registered, so an outstanding job reads `pending_clients`.
-        assert_eq!(manifest.status, PlanStatus::PendingClients);
-        assert_eq!(manifest.terminal_at, None);
-        let counts = manifest
-            .progress_snapshot
-            .ok_or_else(|| anyhow::anyhow!("the run wrote no snapshot"))?
-            .counts;
-        assert_eq!((counts.available, counts.cancelled), (1, 0));
         assert!(
-            stores.todo.get_avail_by_job(&job_id).await?.is_some(),
-            "the job stays claimable"
+            stores.todo.get_avail_by_job(&job_id).await?.is_none(),
+            "teardown retires the straggler"
+        );
+        assert!(
+            stores
+                .plans
+                .list_job_plan_markers(&job_id)
+                .await?
+                .is_empty()
         );
         Ok(())
     }

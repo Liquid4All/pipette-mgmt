@@ -19,7 +19,8 @@ use jiff::Timestamp;
 
 use pipette_core::user::{User, UserKey};
 use pipette_core::user_permission::{
-    Holder, StoredUserPermission, UserPermissionSet, effective, refused_for, stored_closure,
+    Holder, StoredUserPermission, UserPermissionGroup, UserPermissionSet, effective, refused_for,
+    stored_closure,
 };
 use pipette_core::user_preauth;
 use pipette_core::user_preauth::{UserPreauthKey, UserPreauthParams};
@@ -153,23 +154,6 @@ pub(crate) async fn within_rank(
     outranked(rights, &target.user_id, &held)
 }
 
-/// Whether `target` holds a server-wide name `rights` lacks: [`within_rank`]
-/// as an answer, for a rule that reads it without refusing.
-pub(crate) async fn outranks(
-    state: &AppState,
-    rights: &UserRights,
-    target: &User,
-) -> Result<bool, AppError> {
-    let held = stored_closure(
-        state
-            .user_store
-            .get_user_permissions(&target.user_id)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to read the permissions: {e:#}")))?,
-    );
-    Ok(!outranking(rights, &held).is_empty())
-}
-
 /// [`within_rank`] over a set already read.
 fn outranked(
     rights: &UserRights,
@@ -277,6 +261,22 @@ async fn within_campaign_reach(
         )));
     }
     Ok(())
+}
+
+/// Free the address a failed create claimed; best-effort, with the fix logged.
+async fn release_claim(state: &AppState, created: &User) {
+    if let Err(release) = state
+        .user_store
+        .release_user_email(created.contact_email.as_str())
+        .await
+    {
+        tracing::warn!(
+            user_id = %created.user_id,
+            error = %release,
+            "failed to release the address claim after a create failed; \
+             `users release-claim <email>` will clear it"
+        );
+    }
 }
 
 /// Its first sign-in lands in the account `own` made, so the address must be `own`'s.
@@ -667,7 +667,8 @@ impl AccountAdmin {
                     "a service account belongs to an organization: name its org_id".into(),
                 ));
             }
-            None => {}
+            // The account administers the organization it gets, a grant like any other.
+            None => self.within_ceiling(UserPermissionGroup::OrgAdmin.permissions())?,
         }
         // A service account has an organization by now.
         if let (Some(scope), Some(org_id)) = (&request.campaign_scope, &org_id) {
@@ -704,15 +705,29 @@ impl AccountAdmin {
             }
         }
 
+        // Every account belongs to one: with none named, it administers its own.
+        let (org_id, personal) = match org_id {
+            Some(org_id) => (org_id, None),
+            None => match pipette_pipeline::org::create_personal(&*state.org_store, &created, None)
+                .await
+            {
+                Ok(org) => (org.org_id.clone(), Some(org)),
+                Err(e) => {
+                    release_claim(state, &created).await;
+                    return Err(AppError::Internal(format!(
+                        "failed to create the account's organization: {e:#}"
+                    )));
+                }
+            },
+        };
+
         // The membership before the record: an account left outside its
         // organization is one its creator cannot reach.
         let written = async {
-            if let Some(org_id) = &org_id {
-                state
-                    .org_store
-                    .set_membership(&created.user_id, Some(org_id.clone()))
-                    .await?;
-            }
+            state
+                .org_store
+                .set_membership(&created.user_id, Some(org_id.clone()))
+                .await?;
             // Before the record, so an account that exists can be onboarded.
             state
                 .user_store
@@ -722,26 +737,16 @@ impl AccountAdmin {
         }
         .await;
         if let Err(e) = written {
-            if let Err(release) = state
-                .user_store
-                .release_user_email(created.contact_email.as_str())
-                .await
-            {
-                tracing::warn!(
-                    user_id = %created.user_id,
-                    error = %release,
-                    "failed to release the address claim after a create failed; \
-                     `users release-claim <email>` will clear it"
-                );
-            }
-            if org_id.is_some()
-                && let Err(delete) = state.org_store.delete_membership(&created.user_id).await
-            {
+            release_claim(state, &created).await;
+            if let Err(delete) = state.org_store.delete_membership(&created.user_id).await {
                 tracing::warn!(
                     user_id = %created.user_id,
                     error = %delete,
                     "failed to delete the membership after a create failed"
                 );
+            }
+            if let Some(org) = &personal {
+                pipette_pipeline::org::discard_personal(&*state.org_store, org).await;
             }
             if let Err(clear) = state
                 .user_store
@@ -761,7 +766,11 @@ impl AccountAdmin {
 
         // Only once the record exists: an object for an id no record answers
         // to is one a delete would never reach.
-        let set = UserPermissionSet::from_iter(permissions).normalized();
+        let mut set = UserPermissionSet::from_iter(permissions);
+        if personal.is_some() {
+            set.insert_all(UserPermissionGroup::OrgAdmin.permissions().iter().copied());
+        }
+        let set = set.normalized();
         if !set.is_empty() {
             state
                 .user_store
@@ -774,11 +783,11 @@ impl AccountAdmin {
 
         tracing::info!(
             user_id = %created.user_id,
-            org_id = org_id.as_ref().map(tracing::field::display),
+            %org_id,
             granted = ?set.names(),
             "user created"
         );
-        view(state, created, org_id).await
+        view(state, created, Some(org_id)).await
     }
 
     /// An account cannot take itself out of service, and a campaign reader

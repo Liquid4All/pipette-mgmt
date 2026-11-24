@@ -149,6 +149,7 @@ row, `value_stddev` is set where the client reported spread):
 | `vlm_eval` | `accuracy`, `headline_score` (the task's official headline, 0-1; its meaning varies by task) |
 | `asr_eval` | `wer` (ratio: summed edits over summed reference words; lower is better), or `error_rate` (ratio) for a task this build does not know |
 | `decision_latency` | `decision_latency` (ms), and `decision_throughput` (requests/sec) with more than one request in flight |
+| `session` | `session_duration` (s): the time from the start of the session to its end |
 
 `device` holds the row's device fields without the `device_` prefix.
 Unified-memory devices (phones, tablets, Apple Silicon) leave the GPU and NPU

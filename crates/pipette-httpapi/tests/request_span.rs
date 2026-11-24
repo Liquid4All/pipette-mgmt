@@ -24,7 +24,7 @@ use pipette_plan_types::UserPermission;
 use pipette_web_testkit::{
     VAULT_GGUF, auth_headers, authed_get, authed_get_with_headers, authed_post, authed_put_empty,
     body_json, capture_logs_at_level, created_campaign, grant_user, json_str, legacy_auth_headers,
-    make_state, make_state_with_legacy_signatures, register_and_approve,
+    make_state, make_state_with_legacy_signatures, org_of, register_and_approve,
     register_approve_and_grant, registered_user, seed_leased, seed_org, setup_benchmarks,
     sha256_hex, signed_empty, signed_json, submit_benchmark, upload_gguf_text, valid_submission,
 };
@@ -309,8 +309,11 @@ fn a_request_names_its_identifiers_as_span_fields(#[case] route: Route) -> anyho
                     }
 
                     Route::CampaignRenamed => {
-                        let signer =
-                            registered_user(&state, &[UserPermission::SubmitPlans]).await?;
+                        let signer = registered_user(
+                            &state,
+                            &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
+                        )
+                        .await?;
                         let (campaign_id, _) =
                             created_campaign(&state, &signer, &[("name", "Nightly")]).await?;
                         let resp = signed_json(
@@ -560,10 +563,11 @@ fn a_missing_vault_object_logs_the_record_and_its_key() -> anyhow::Result<()> {
 
             // Removed behind mgmt's back, as only something outside it can.
             let sha256 = sha256_hex(VAULT_GGUF);
+            let principal = org_of(&state, &owner.1).await?;
             std::fs::remove_file(
                 dir.path()
                     .join("vault-resources")
-                    .join(owner.1.as_str())
+                    .join(principal.as_str())
                     .join("blobs")
                     .join(&sha256),
             )?;
@@ -576,7 +580,7 @@ fn a_missing_vault_object_logs_the_record_and_its_key() -> anyhow::Result<()> {
             )
             .await?;
             let status = resp.status();
-            let object_key = format!("{}/blobs/{sha256}", owner.1);
+            let object_key = format!("{principal}/blobs/{sha256}");
             anyhow::Ok((status, body_json(resp).await?, resource_id, object_key))
         })
     })?;
@@ -610,6 +614,7 @@ fn a_user_grant_logs_the_names_it_granted() -> anyhow::Result<()> {
                 &[UserPermission::ManageAnyOrgs, UserPermission::ReadPlans],
             )
             .await?;
+            let acme = seed_org(&state, "acme").await?;
             let resp = signed_json(
                 &state,
                 &admin,
@@ -618,6 +623,7 @@ fn a_user_grant_logs_the_names_it_granted() -> anyhow::Result<()> {
                 &json!({
                     "contact_email": "new@example.test",
                     "permissions": ["read_plans"],
+                    "org_id": acme.org_id,
                 }),
             )
             .await?;

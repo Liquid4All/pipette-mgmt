@@ -62,31 +62,19 @@ async fn overview(
     )
     .await?
     .covers(Some(org_id));
-    let member_status_counts = [
-        UserStatus::Active,
-        UserStatus::Pending,
-        UserStatus::Disabled,
-    ]
-    .into_iter()
-    .map(|status| {
-        let count = members.iter().filter(|m| m.status == status).count();
-        (status, count)
-    })
-    .filter(|(_, count)| *count > 0)
-    .collect();
-    let pending_members = Highlights::of(
-        members
-            .into_iter()
-            .filter(|member| member.status == UserStatus::Pending)
-            .map(Into::into),
-        HIGHLIGHTS,
-    );
+    let member_status_counts = [UserStatus::Active, UserStatus::Disabled]
+        .into_iter()
+        .map(|status| {
+            let count = members.iter().filter(|m| m.status == status).count();
+            (status, count)
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
     Ok(OrgOverview {
         org: org.into(),
         member_count: counts.members,
         client_count: counts.clients,
         member_status_counts,
-        pending_members,
         client_status_counts,
         pending_clients,
         campaigns,

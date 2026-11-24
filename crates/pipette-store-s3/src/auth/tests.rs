@@ -49,6 +49,7 @@ pub(super) fn test_client(
         public_key: pipette_plan_types::PublicKeyHex::try_new(public_key)?,
         organization: pipette_plan_types::NonEmptyTrimmedString::try_new("test-org")?,
         client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("details")?,
+        name: None,
         contact_email: pipette_plan_types::ContactEmail::try_new("a@b.com")?,
         status: pipette_core::client::ClientStatus::Pending,
         registered_at: jiff::Timestamp::from_second(registered_at_secs)

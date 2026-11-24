@@ -3006,11 +3006,11 @@ async fn read_all(body: ArtifactBody) -> anyhow::Result<Vec<u8>> {
 }
 
 /// A record over [`VAULT_BLOB`], uploaded as a `gguf_text` model by a fresh
-/// account. Its blob is not written: that is the caller's.
+/// organization. Its blob is not written: that is the caller's.
 pub fn a_vault_resource() -> anyhow::Result<VaultResource> {
     vault_resource_for(
-        VaultOwner::User {
-            user_id: UserId::mint(),
+        VaultOwner::Org {
+            org_id: OrgId::mint(),
         },
         vault_blob_sha256()?,
         VAULT_BLOB.len() as u64,
@@ -3033,13 +3033,13 @@ pub fn a_vault_upload(
     )?)
 }
 
-/// The record of a llama.cpp build that a fresh account uploaded as
+/// The record of a llama.cpp build that a fresh organization uploaded as
 /// `acme llama.cpp build`.
 pub fn a_vault_runtime() -> anyhow::Result<VaultResource> {
     a_vault_upload(
         "acme llama.cpp build",
-        VaultOwner::User {
-            user_id: UserId::mint(),
+        VaultOwner::Org {
+            org_id: OrgId::mint(),
         },
         serde_json::json!({
             "type": "llamacpp_cli_stock_tools",
@@ -3054,13 +3054,13 @@ pub fn a_vault_runtime() -> anyhow::Result<VaultResource> {
     .context("an upload of one file makes one record")
 }
 
-/// The model and mmproj records of a `gguf_vision` model that a fresh account
-/// uploaded as `acme LFM2-VL-3B q4`.
+/// The model and mmproj records of a `gguf_vision` model that a fresh
+/// organization uploaded as `acme LFM2-VL-3B q4`.
 pub fn a_vision_upload() -> anyhow::Result<Vec<VaultResource>> {
     a_vault_upload(
         "acme LFM2-VL-3B q4",
-        VaultOwner::User {
-            user_id: UserId::mint(),
+        VaultOwner::Org {
+            org_id: OrgId::mint(),
         },
         serde_json::json!({
             "type": "gguf_vision",
@@ -3476,8 +3476,8 @@ pub async fn assert_vault_store_roundtrip(store: &dyn VaultStore) -> anyhow::Res
 /// The store digests the bytes as they stream and keys the blob by owner and
 /// digest; a body over the limit, or one that fails midway, writes nothing.
 pub async fn assert_vault_staged_write(store: &dyn VaultStore) -> anyhow::Result<()> {
-    let owner = VaultOwner::User {
-        user_id: UserId::mint(),
+    let owner = VaultOwner::Org {
+        org_id: OrgId::mint(),
     };
     let sha256 = vault_blob_sha256()?;
     let len = VAULT_BLOB.len() as u64;
@@ -3626,8 +3626,8 @@ pub async fn assert_vault_import_roundtrip(store: &dyn VaultStore) -> anyhow::Re
     let owner = VaultOwner::Org {
         org_id: OrgId::mint(),
     };
-    let other = VaultOwner::User {
-        user_id: UserId::mint(),
+    let other = VaultOwner::Org {
+        org_id: OrgId::mint(),
     };
     let import = vault_blob_sha256()?;
     let another = Sha256::try_new("b".repeat(64))?;
@@ -3942,8 +3942,8 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
     let plan_id = PlanId::from_uuid(uuid::Uuid::now_v7());
     let mut campaign = NewCampaign::new(
         NonEmptyTrimmedString::try_new("Nightly LFM2 regression")?,
-        CampaignOwner::User {
-            user_id: UserId::mint(),
+        CampaignOwner::Org {
+            org_id: OrgId::mint(),
         },
     )
     .around(plan_id.clone(), Timestamp::now());
@@ -3985,7 +3985,7 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
         .ok_or_else(|| anyhow::anyhow!("the campaign vanished between writes"))?;
     assert_eq!(read.campaign_id, campaign_id, "the identity never moves");
     assert_eq!(read.name.as_str(), "Nightly LFM2");
-    assert_eq!(read.owner.org_id(), Some(&org_id));
+    assert_eq!(read.owner.org_id(), &org_id);
     assert_eq!(read.labels, campaign.labels);
     assert_eq!(
         read.current_plan_id,
@@ -3998,8 +3998,8 @@ pub async fn assert_campaign_store_roundtrip(store: &dyn CampaignStore) -> anyho
         current_plan_id: None,
         ..NewCampaign::new(
             NonEmptyTrimmedString::try_new("Not started")?,
-            CampaignOwner::User {
-                user_id: UserId::mint(),
+            CampaignOwner::Org {
+                org_id: OrgId::mint(),
             },
         )
         .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now())
@@ -4069,8 +4069,8 @@ pub async fn assert_campaign_replace_is_conditional(
     }
     let campaign = NewCampaign::new(
         NonEmptyTrimmedString::try_new("Nightly")?,
-        CampaignOwner::User {
-            user_id: UserId::mint(),
+        CampaignOwner::Org {
+            org_id: OrgId::mint(),
         },
     )
     .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
@@ -4129,8 +4129,8 @@ pub async fn assert_racing_campaign_replaces_land_once(
     const RACERS: usize = 16;
     let campaign = NewCampaign::new(
         NonEmptyTrimmedString::try_new("Nightly")?,
-        CampaignOwner::User {
-            user_id: UserId::mint(),
+        CampaignOwner::Org {
+            org_id: OrgId::mint(),
         },
     )
     .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());
@@ -4806,6 +4806,7 @@ where
             public_key: PublicKeyHex::try_new(format!("{:02x}", nth).repeat(32))?,
             organization: NonEmptyTrimmedString::try_new("org")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("a@b.com")?,
             status: ClientStatus::Approved,
             registered_at: jiff::Timestamp::from_second(1_800_000_000 - i64::from(nth))
@@ -5090,10 +5091,11 @@ pub async fn assert_org_store_roundtrip(store: &dyn OrgStore) -> anyhow::Result<
         })
         .await?;
     assert_eq!(store.get_ownership(&rack).await?, Some(by_org));
-    let by_user = ClientOwner::User { user_id: bob };
     let handed_over = Ownership {
         client_id: rack.clone(),
-        owner: by_user,
+        owner: ClientOwner::Org {
+            org_id: org_id.clone(),
+        },
     };
     store.put_ownership(&handed_over).await?;
     assert_eq!(store.list_ownerships().await?, vec![handed_over]);
@@ -5279,7 +5281,7 @@ pub async fn assert_descriptor_catalog_model_contract(
     use pipette_store::{AppendOutcome, CreateEntryOutcome, DescriptorEntryFilter};
 
     let global = CatalogScope::Global;
-    let gguf = a_model_member("gguf_text", "AcmeLM-3B-GGUF", "q4_0")?;
+    let gguf = a_model_member("gguf_text", "AcmeLM-3B-GGUF", "q4_0")?.with_size_bytes(Some(9_000));
     let model = a_descriptor_entry("AcmeLM-3B", Kind::HandMade, 200, gguf.clone())?;
     let runtime = a_descriptor_entry(
         "llamacpp-b1",
@@ -5361,6 +5363,22 @@ pub async fn assert_descriptor_catalog_model_contract(
         .context("model entry after appends")?;
     assert_eq!(current.members.as_ref(), [gguf.clone(), mlx.clone()]);
     assert_eq!(current.descriptor_types(), ["gguf_text", "mlx"]);
+
+    // A size fills an unsized member once, and never replaces a recorded one.
+    for (member, filled) in [(&mlx, true), (&mlx, false), (&gguf, false)] {
+        assert_eq!(
+            store
+                .fill_member_size(&global, &model.name, member.digest(), 4_000)
+                .await?,
+            filled
+        );
+    }
+    let sized = store
+        .get_entry(&global, &model.name)
+        .await?
+        .context("model entry after sizing")?;
+    let sizes: Vec<_> = sized.members.iter().map(|m| m.size_bytes()).collect();
+    assert_eq!(sizes, [Some(9_000), Some(4_000)]);
 
     let mut stable = model.clone();
     stable.name = CatalogName::try_new("AcmeLM-3B-stable")?;
@@ -5509,6 +5527,11 @@ pub async fn assert_descriptor_catalog_rename_contract(
                 .await?;
         }
     }
+    assert!(
+        !store
+            .fill_member_size(&global, &dead_model.name, gguf.digest(), 4_000)
+            .await?
+    );
 
     let renames = [
         ("Missing", "Other", RenameOutcome::NoSuchEntry),
@@ -5727,6 +5750,294 @@ pub async fn assert_descriptor_catalog_rename_contract(
     Ok(())
 }
 
+/// Shared contract for [`pipette_store::DescriptorCatalogStore::set_family`].
+pub async fn assert_descriptor_catalog_family_contract(
+    store: &dyn pipette_store::DescriptorCatalogStore,
+) -> anyhow::Result<()> {
+    use pipette_plan_types::{
+        CatalogName, CatalogScope, DescriptorEntryKind as Kind, DescriptorEntryState as State,
+    };
+    use pipette_store::{
+        CreateEntryOutcome, DescriptorEntryFilter, RenameOutcome, SetFamilyOutcome,
+    };
+
+    let global = CatalogScope::Global;
+    let name = |s: &str| CatalogName::try_new(s);
+    let lfm = name("LFM")?;
+    let model = a_descriptor_entry(
+        "LFM2.5-1.2B",
+        Kind::HandMade,
+        300,
+        a_model_member("mlx", "LFM2.5-1.2B-MLX", "4bit")?,
+    )?
+    .with_family(Some(lfm.clone()))?;
+    let runtime = a_descriptor_entry(
+        "Fork",
+        Kind::HandMade,
+        200,
+        a_member("b1", "linux-x64-rocm")?,
+    )?;
+    let dead = a_descriptor_entry(
+        "Dead-1B",
+        Kind::HandMade,
+        100,
+        a_model_member("mlx", "Dead-1B-MLX", "4bit")?,
+    )?;
+    for entry in [&model, &runtime, &dead] {
+        assert_eq!(
+            store.create_entry(entry).await?,
+            CreateEntryOutcome::Created
+        );
+    }
+    store
+        .set_state(&global, &dead.name, State::Tombstoned)
+        .await?;
+    let read = || store.get_entry(&global, &model.name);
+    assert_eq!(read().await?, Some(model.clone()));
+    let listed = store
+        .list_entries(
+            &DescriptorEntryFilter {
+                scopes: [global.clone()].into(),
+                ..Default::default()
+            },
+            None,
+            std::num::NonZeroUsize::MIN.saturating_add(9),
+        )
+        .await?;
+    assert!(listed.items.contains(&model), "{:?}", listed.items);
+
+    for (family, shown) in [(None, "LFM2.5"), (Some(&lfm), "LFM")] {
+        let expected = model.clone().with_family(family.cloned())?;
+        assert_eq!(
+            store.set_family(&global, &model.name, family, None).await?,
+            SetFamilyOutcome::Set(expected.clone())
+        );
+        let stored = read().await?.context("the model entry")?;
+        assert_eq!(stored, expected);
+        assert_eq!(stored.family(), Some(shown));
+    }
+
+    // With no override, a rename gives the default family of the new name.
+    store.set_family(&global, &model.name, None, None).await?;
+    let renamed = name("LFM3-1B")?;
+    assert!(matches!(
+        store.rename_entry(&global, &model.name, &renamed).await?,
+        RenameOutcome::Renamed { .. }
+    ));
+    let stored = store
+        .get_entry(&global, &renamed)
+        .await?
+        .context("the renamed entry")?;
+    assert_eq!(stored.family(), Some("LFM3"));
+
+    let refusals = [
+        (&runtime.name, SetFamilyOutcome::RuntimeEntry),
+        (&dead.name, SetFamilyOutcome::Tombstoned),
+        (&model.name, SetFamilyOutcome::NoSuchEntry),
+    ];
+    for (target, outcome) in refusals {
+        assert_eq!(
+            store.set_family(&global, target, Some(&lfm), None).await?,
+            outcome,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        store.get_entry(&global, &runtime.name).await?,
+        Some(runtime)
+    );
+    Ok(())
+}
+
+/// Shared contract for [`pipette_store::DescriptorCatalogStore::set_family_logo`],
+/// [`pipette_store::DescriptorCatalogStore::family_logos`] and
+/// [`pipette_store::DescriptorCatalogStore::family_logos_with_digest`].
+pub async fn assert_descriptor_catalog_family_logo_contract(
+    store: &dyn pipette_store::DescriptorCatalogStore,
+) -> anyhow::Result<()> {
+    use pipette_plan_types::{
+        CatalogName, CatalogScope, DescriptorEntry, DescriptorEntryKind as Kind,
+        DescriptorEntryState as State, FamilyLogo, FamilyLogoDigest, LogoUri, OrgId, Sha256,
+    };
+    use pipette_store::{CreateEntryOutcome, SetFamilyLogoOutcome as Outcome};
+
+    let global = CatalogScope::Global;
+    let org = CatalogScope::Org(OrgId::try_new("org_a")?);
+    let name = |s: &str| CatalogName::try_new(s);
+    let uri = |file: &str| {
+        LogoUri::try_new(if file.starts_with("data:") {
+            file.to_owned()
+        } else {
+            format!("{}{file}", LogoUri::PREFIX)
+        })
+    };
+    let sha256 = |logo: &FamilyLogo| Sha256::try_new(logo.logo_uri.sha256());
+    let digests = |logos: &[&FamilyLogo]| -> anyhow::Result<Vec<FamilyLogoDigest>> {
+        logos
+            .iter()
+            .map(|logo| {
+                Ok(FamilyLogoDigest {
+                    scope: logo.scope.clone(),
+                    family: logo.family.clone(),
+                    sha256: sha256(logo)?,
+                })
+            })
+            .collect()
+    };
+    let logo = |scope: &CatalogScope, family: &str, file: &str| -> anyhow::Result<FamilyLogo> {
+        Ok(FamilyLogo {
+            scope: scope.clone(),
+            family: name(family)?,
+            logo_uri: uri(file)?,
+        })
+    };
+    let model = |entry: &str, release: i64| {
+        a_descriptor_entry(
+            entry,
+            Kind::HandMade,
+            release,
+            a_model_member("mlx", &format!("{entry}-MLX"), "4bit")?,
+        )
+    };
+    let lfm = model("LFM2.5-1.2B", 300)?;
+    let gemma = model("Gemma3-1B", 250)?.with_family(Some(name("Gemma")?))?;
+    let runtime = a_descriptor_entry(
+        "Fork",
+        Kind::HandMade,
+        200,
+        a_member("b1", "linux-x64-rocm")?,
+    )?;
+    let dead = model("Dead-1B", 100)?;
+    let acme = DescriptorEntry {
+        scope: org.clone(),
+        ..model("Acme-1B", 150)?
+    };
+    for entry in [&lfm, &gemma, &runtime, &dead, &acme] {
+        assert_eq!(
+            store.create_entry(entry).await?,
+            CreateEntryOutcome::Created
+        );
+    }
+    store
+        .set_state(&global, &dead.name, State::Tombstoned)
+        .await?;
+    let sorted = |mut logos: Vec<FamilyLogoDigest>| {
+        logos.sort_by_key(|logo| (logo.scope.sql_key().to_owned(), logo.family.key()));
+        logos
+    };
+
+    // A default family and an override both take a logo. A second write in
+    // another case replaces the first.
+    for (scope, family, file) in [
+        (&global, "lfm2.5", "old.svg"),
+        (&global, "LFM2.5", "lfm.svg"),
+        (&global, "gemma", "gemma.svg"),
+        (&org, "Acme", "data:image/png;base64,QUNNRQ=="),
+    ] {
+        let expected = logo(scope, family, file)?;
+        assert_eq!(
+            store
+                .set_family_logo(scope, &expected.family, Some(&expected.logo_uri), None)
+                .await?,
+            Outcome::Set(expected),
+            "{scope}/{family}"
+        );
+    }
+    let gemma_logo = logo(&global, "gemma", "gemma.svg")?;
+    let lfm_logo = logo(&global, "LFM2.5", "lfm.svg")?;
+    let acme_logo = logo(&org, "Acme", "data:image/png;base64,QUNNRQ==")?;
+    let global_logos = digests(&[&gemma_logo, &lfm_logo])?;
+    assert_eq!(
+        sorted(store.family_logos(&[global.clone(), org.clone()]).await?),
+        digests(&[&gemma_logo, &lfm_logo, &acme_logo])?
+    );
+
+    // A digest finds its logo in any scope, and an unknown digest finds none.
+    for found in [&gemma_logo, &acme_logo] {
+        assert_eq!(
+            store.family_logos_with_digest(&sha256(found)?).await?,
+            std::slice::from_ref(found)
+        );
+    }
+    let unknown = Sha256::try_new(uri("unknown.svg")?.sha256())?;
+    assert_eq!(store.family_logos_with_digest(&unknown).await?, []);
+    let acme_digest = sha256(&acme_logo)?;
+    assert_eq!(
+        store.family_logo_uri_by_digest(&acme_digest, None).await?,
+        Some(acme_logo.logo_uri.clone())
+    );
+    assert_eq!(
+        store
+            .family_logo_uri_by_digest(&acme_digest, Some(std::slice::from_ref(&org)))
+            .await?,
+        Some(acme_logo.logo_uri.clone())
+    );
+    assert_eq!(
+        store
+            .family_logo_uri_by_digest(&acme_digest, Some(std::slice::from_ref(&global)))
+            .await?,
+        None
+    );
+    assert_eq!(
+        store
+            .family_logo_uri_by_digest(&acme_digest, Some(&[]))
+            .await?,
+        None
+    );
+    assert_eq!(store.family_logo_uri_by_digest(&unknown, None).await?, None);
+    assert_eq!(
+        sorted(store.family_logos(std::slice::from_ref(&global)).await?),
+        global_logos
+    );
+
+    // The family of a runtime, a tombstoned entry, a replaced default family
+    // and another scope's family take no logo.
+    for (scope, family) in [
+        (&global, "Fork"),
+        (&global, "Dead"),
+        (&global, "Gemma3"),
+        (&global, "Acme"),
+        (&org, "LFM2.5"),
+    ] {
+        assert_eq!(
+            store
+                .set_family_logo(scope, &name(family)?, Some(&uri("x.svg")?), None)
+                .await?,
+            Outcome::NoSuchFamily,
+            "{scope}/{family}"
+        );
+    }
+
+    // A logo stays when the last entry of its family goes.
+    store
+        .set_state(&global, &gemma.name, State::Tombstoned)
+        .await?;
+    assert_eq!(
+        sorted(store.family_logos(std::slice::from_ref(&global)).await?),
+        global_logos
+    );
+
+    // A clear ignores case, and a second clear finds nothing to remove.
+    let lfm2_5 = name("lfm2.5")?;
+    assert_eq!(
+        store.set_family_logo(&global, &lfm2_5, None, None).await?,
+        Outcome::Cleared(Some(lfm_logo.clone()))
+    );
+    assert_eq!(
+        store.set_family_logo(&global, &lfm2_5, None, None).await?,
+        Outcome::Cleared(None)
+    );
+    assert_eq!(
+        sorted(store.family_logos(&[global, org]).await?),
+        digests(&[&gemma_logo, &acme_logo])?
+    );
+    assert_eq!(
+        store.family_logos_with_digest(&sha256(&lfm_logo)?).await?,
+        []
+    );
+    Ok(())
+}
+
 /// Shared contract for [`pipette_store::DescriptorCatalogStore::merge_entry`].
 pub async fn assert_descriptor_catalog_merge_contract(
     store: &dyn pipette_store::DescriptorCatalogStore,
@@ -5746,7 +6057,11 @@ pub async fn assert_descriptor_catalog_merge_contract(
     let rocm = a_member("b1", "linux-x64-rocm")?;
     let vulkan = a_member("b1", "linux-x64-vulkan")?;
     let q4_0 = a_model_member("gguf_text", "AcmeLM-GGUF", "q4_0")?;
-    let q8_0 = a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?;
+    let sized_q4_0 = q4_0.clone().with_size_bytes(Some(4));
+    let q6_k = a_model_member("gguf_text", "AcmeLM-Q6-GGUF", "q6_k")?.with_size_bytes(Some(6));
+    let source_q6_k = q6_k.clone().with_size_bytes(Some(60));
+    // The size must move with the member.
+    let q8_0 = a_model_member("gguf_text", "AcmeLM-Q8-GGUF", "q8_0")?.with_size_bytes(Some(8));
     let fork = hand_made("Fork", 200, rocm.clone())?;
     let other_build = hand_made("OtherBuild", 195, a_member("b2", "linux-x64-vulkan")?)?;
     let typo_vulkan = hand_made("Vulkn", 190, vulkan.clone())?;
@@ -5754,11 +6069,16 @@ pub async fn assert_descriptor_catalog_merge_contract(
         scope: org.clone(),
         ..typo_vulkan.clone()
     };
-    let model = hand_made("AcmeLM", 180, q4_0.clone())?;
+    let model = DescriptorEntry {
+        members: NonEmptyVec::try_new(vec![q4_0.clone(), q6_k.clone()])?,
+        ..hand_made("AcmeLM", 180, q4_0)?
+    }
+    .with_family(Some(name("Acme")?))?;
     let typo_model = DescriptorEntry {
-        members: NonEmptyVec::try_new(vec![q8_0.clone(), q4_0.clone()])?,
+        members: NonEmptyVec::try_new(vec![q8_0.clone(), sized_q4_0.clone(), source_q6_k.clone()])?,
         ..hand_made("AcmeLM-Typo", 170, q8_0.clone())?
-    };
+    }
+    .with_family(Some(name("OtherFamily")?))?;
     let clash = hand_made(
         "Clash",
         160,
@@ -5889,16 +6209,20 @@ pub async fn assert_descriptor_catalog_merge_contract(
         ]
     );
 
-    // A model merge skips the member that the target holds already.
+    // Duplicate members fill missing sizes and keep sizes already recorded.
     let MergeOutcome::Merged { entry, merge, .. } = store
         .merge_entry(&global, &typo_model.name, &model.name)
         .await?
     else {
         anyhow::bail!("AcmeLM-Typo must merge into AcmeLM");
     };
-    assert_eq!(&*entry.members, [q4_0.clone(), q8_0.clone()].as_slice());
+    assert_eq!(
+        entry.members.as_ref(),
+        [sized_q4_0.clone(), q6_k, q8_0.clone()]
+    );
     assert_eq!(merge.moved, vec![q8_0]);
-    assert_eq!(merge.skipped, vec![q4_0]);
+    assert_eq!(merge.skipped, vec![sized_q4_0, source_q6_k]);
+    assert_eq!(entry.family, model.family);
     assert_eq!(store.get_entry(&global, &model.name).await?, Some(entry));
 
     // The names of the merged entries are free.

@@ -16,4 +16,3 @@ may do nothing.
 | 200 | `ChangedClientPermissions`; `changed: false` means the device already held what was asked for |
 | 400 | No `permissions`, or a name a device cannot hold |
 | 403 | The caller does not hold `manage_clients`; the device is another organization's; or it is nobody's and the caller is scoped to one |
-| 404 | No such device |

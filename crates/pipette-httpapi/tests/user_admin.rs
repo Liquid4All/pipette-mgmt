@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anyhow::Context;
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -13,8 +14,8 @@ use pipette_core::user_permission::{UserPermissionGroup, UserPermissionSet};
 use pipette_core::user_preauth::{UserPreauthConsumeOutcome, UserPreauthKey, UserPreauthSecret};
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
-    NonEmptyTrimmedString, PublicKeyHex, UserAccountType, UserId, UserKeyId, UserPermission,
-    UserPreauthKeyId, UserStatus,
+    NonEmptyTrimmedString, OrgSlug, PublicKeyHex, UserAccountType, UserId, UserKeyId,
+    UserPermission, UserPreauthKeyId, UserStatus,
 };
 use pipette_store::{EmailClaim, UserPermissionMutation, UserStore};
 use pipette_web_testkit::*;
@@ -472,7 +473,6 @@ async fn a_read_orgs_member_writes_nothing_on_the_roster() -> anyhow::Result<()>
 
 /// Standing is settled before any grant, even the server-wide ones.
 #[rstest::rstest]
-#[case::pending(UserStatus::Pending, "user is pending an operator's approval")]
 #[case::disabled(UserStatus::Disabled, "user is disabled")]
 #[tokio::test]
 async fn an_account_out_of_good_standing_administers_nothing(
@@ -903,9 +903,9 @@ async fn a_disabled_organization_takes_no_new_members() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A release is one-way: the account is then out of reach.
+/// Its members stay in the organization: disabling, not a release, offboards one.
 #[tokio::test]
-async fn an_org_admin_places_and_releases_its_own_members() -> anyhow::Result<()> {
+async fn an_org_admin_places_but_never_releases_its_own_members() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
@@ -921,20 +921,16 @@ async fn an_org_admin_places_and_releases_its_own_members() -> anyhow::Result<()
     assert_eq!(body["changed"], false, "already a member: {body}");
 
     let resp = signed_json(&state, &lead, "PUT", &uri, &json!({ "org_id": null })).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    assert_eq!(body["user_id"], json!(member.as_str()));
-    assert!(body.get("org_id").is_none(), "released: {body}");
-    assert_eq!(body["changed"], true, "{body}");
-    assert!(
-        state.org_store.get_membership(&member).await?.is_none(),
-        "the membership is removed"
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        state
+            .org_store
+            .get_membership(&member)
+            .await?
+            .map(|org| org.to_string()),
+        Some(acme),
+        "the membership stays"
     );
-
-    let resp = signed_json(&state, &lead, "PUT", &uri, &json!({ "org_id": acme })).await?;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(json_str(&body_json(resp).await?, "error")?, "no such user");
-    assert!(state.org_store.get_membership(&member).await?.is_none());
     Ok(())
 }
 
@@ -1004,67 +1000,6 @@ async fn a_disabled_account_is_shut_out_until_it_is_restored() -> anyhow::Result
     Ok(())
 }
 
-/// A requested account belongs to no organization, so an org admin reads it as
-/// absent.
-#[tokio::test]
-async fn only_a_server_wide_admin_admits_a_requested_account() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    setup_benchmarks(dir.path())?;
-    let state = make_state(dir.path()).await?;
-    let (root, _acme, lead) = acme_with_admin(&state).await?;
-    let key = signing_key()?;
-    let resp = request_user_account(&state, "asker@example.test", &key, "work laptop").await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let asked = body_json(resp).await?;
-    let user_id = UserId::try_new(json_str(&asked, "user_id")?)?;
-    let key_id = UserKeyId::try_new(json_str(&asked, "key_id")?)?;
-    let uri = format!("/api/v1/users/{user_id}");
-    let admit = json!({ "status": "active" });
-
-    let resp = signed_json(&state, &lead, "PATCH", &uri, &admit).await?;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(json_str(&body_json(resp).await?, "error")?, "no such user");
-    let waiting = state
-        .user_store
-        .get_user(&user_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("the requested account was not written"))?;
-    assert_eq!(
-        waiting.status,
-        UserStatus::Pending,
-        "the org admin admitted nothing"
-    );
-
-    let resp = signed_json(&state, &root, "PATCH", &uri, &admit).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await?;
-    assert_eq!(body["status"], json!("active"));
-    assert!(
-        body.get("org_id").is_none(),
-        "admitting places it nowhere: {body}"
-    );
-
-    let second = signing_key()?;
-    let resp = authed_user_post(
-        &state,
-        &key,
-        &user_id,
-        &key_id,
-        "/api/v1/users/me/keys",
-        &json!({
-            "public_key": hex::encode(second.verifying_key().as_bytes()),
-            "key_details": "a second laptop",
-        }),
-    )
-    .await?;
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "the key that asked is admitted"
-    );
-    Ok(())
-}
-
 /// Nor may it create into an organization it names, which would seed a roster
 /// it is not on.
 #[tokio::test]
@@ -1075,6 +1010,7 @@ async fn an_unaffiliated_admin_has_nowhere_to_act() -> anyhow::Result<()> {
     let root = server_admin(&state).await?;
     let acme = create_org(&state, &root, "acme").await?;
     let stray = registered_user(&state, UserPermissionGroup::OrgAdmin.permissions()).await?;
+    set_user_org(&state, &stray.1, None).await?;
 
     for body in [
         json!({ "contact_email": "nobody@example.test" }),
@@ -1322,9 +1258,9 @@ async fn a_create_at_a_held_address_is_a_conflict(#[case] server_wide: bool) -> 
     Ok(())
 }
 
-/// Active, holding nothing, and no membership written.
+/// Active, in a new organization of its own, which it administers.
 #[tokio::test]
-async fn a_server_wide_create_without_an_organization_is_unaffiliated() -> anyhow::Result<()> {
+async fn a_server_wide_create_without_an_organization_gets_one_of_its_own() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     setup_benchmarks(dir.path())?;
     let state = make_state(dir.path()).await?;
@@ -1342,12 +1278,28 @@ async fn a_server_wide_create_without_an_organization_is_unaffiliated() -> anyho
     let body = body_json(resp).await?;
     assert_eq!(body["contact_email"], json!("loose@example.test"));
     assert_eq!(body["status"], json!("active"));
-    assert_eq!(body["permissions"], json!([]));
-    assert!(body.get("org_id").is_none(), "{body}");
     let created = UserId::try_new(json_str(&body, "user_id")?)?;
+    let org_id = state
+        .org_store
+        .get_membership(&created)
+        .await?
+        .context("a membership is written")?;
+    assert_eq!(body["org_id"], json!(org_id.as_str()), "{body}");
+    let org = state
+        .org_store
+        .get_org(&org_id)
+        .await?
+        .context("the organization exists")?;
+    assert_eq!(org.slug, OrgSlug::personal(&created)?);
+    assert_eq!(
+        org.display_name.as_str(),
+        "loose@example.test's personal org"
+    );
     assert!(
-        state.org_store.get_membership(&created).await?.is_none(),
-        "no membership is written"
+        body["permissions"]
+            .as_array()
+            .is_some_and(|names| names.contains(&json!("manage_orgs"))),
+        "it administers its organization: {body}"
     );
 
     let resp = signed_empty(&state, &root, "GET", &format!("/api/v1/users/{created}")).await?;
@@ -1357,6 +1309,41 @@ async fn a_server_wide_create_without_an_organization_is_unaffiliated() -> anyho
         body,
         "a read returns the record the create answered"
     );
+    Ok(())
+}
+
+/// The organization a create gives is a grant of `org_admin`, so the ceiling
+/// bounds it like any other: nothing is created.
+#[tokio::test]
+async fn a_create_without_an_organization_grants_no_more_than_the_caller_holds()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    setup_benchmarks(dir.path())?;
+    let state = make_state(dir.path()).await?;
+    let roster_only = registered_user(&state, &[UserPermission::ManageAnyOrgs]).await?;
+
+    let resp = signed_json(
+        &state,
+        &roster_only,
+        "POST",
+        "/api/v1/users",
+        &json!({ "contact_email": "loose@example.test" }),
+    )
+    .await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let error = json_str(&body_json(resp).await?, "error")?.to_string();
+    assert!(
+        error.starts_with("you cannot grant what you do not hold"),
+        "{error}"
+    );
+    assert!(
+        state
+            .user_store
+            .lookup_user_by_email("loose@example.test")
+            .await?
+            .is_none()
+    );
+    assert!(team_orgs(&state).await?.is_empty());
     Ok(())
 }
 
@@ -1802,13 +1789,12 @@ async fn the_record_says_what_the_reader_may_grant_and_revoke() -> anyhow::Resul
     Ok(())
 }
 
-/// By either permission write, an implying name, or leaving the organization;
-/// any other change to itself goes through.
+/// By either permission write or an implying name; any other change to itself
+/// goes through.
 #[rstest::rstest]
 #[case::amend(false, "PATCH", "permissions", json!({ "remove": ["manage_orgs"] }))]
 #[case::set(false, "PUT", "permissions", json!({ "permissions": ["read_plans"] }))]
 #[case::implied(true, "PATCH", "permissions", json!({ "remove": ["manage_any_orgs"] }))]
-#[case::release(false, "PUT", "org", json!({ "org_id": null }))]
 #[tokio::test]
 async fn an_account_keeps_its_own_administration(
     #[case] server_wide: bool,
@@ -1856,7 +1842,7 @@ fn lists(view: &serde_json::Value, field: &str, name: &str) -> bool {
         .is_some_and(|names| names.contains(&json!(name)))
 }
 
-/// As its routes would judge it; an account still pending reaches nothing.
+/// As its routes would judge it.
 #[tokio::test]
 async fn the_own_record_says_how_far_each_authority_reaches() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1948,12 +1934,6 @@ async fn the_own_record_says_how_far_each_authority_reaches() -> anyhow::Result<
     set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
     grant_user(&state, &member.1, &[UserPermission::EditAnyCatalog]).await?;
     assert_eq!(may(&member).await?["edit_catalog"], json!("every"));
-
-    set_user_status(&state, &lead.1, UserStatus::Pending).await?;
-    let pending = may(&lead).await?;
-    assert_eq!(pending["administer_roster"], json!("none"), "{pending}");
-    assert_eq!(pending["edit_catalog"], json!("none"), "{pending}");
-    assert_eq!(pending["grant"], json!([]), "{pending}");
     Ok(())
 }
 
@@ -3180,7 +3160,6 @@ async fn an_org_admin_changes_nothing_on_a_server_admin_in_its_organization() ->
 
     for (method, uri, body) in [
         ("PATCH", account.clone(), json!({ "status": "disabled" })),
-        ("PATCH", account.clone(), json!({ "status": "pending" })),
         (
             "PUT",
             format!("{account}/permissions"),
@@ -3202,7 +3181,6 @@ async fn an_org_admin_changes_nothing_on_a_server_admin_in_its_organization() ->
             format!("{account}/permissions"),
             json!({ "add": ["read_clients"] }),
         ),
-        ("PUT", format!("{account}/org"), json!({ "org_id": null })),
         ("PUT", format!("{account}/org"), json!({ "org_id": acme })),
         ("POST", format!("{account}/preauth-keys"), json!({})),
         (
@@ -3339,16 +3317,6 @@ async fn a_server_wide_admin_still_administers_a_server_admin_in_an_organization
         StatusCode::UNAUTHORIZED,
         "the key is revoked"
     );
-    let resp = signed_json(
-        &state,
-        &root,
-        "PUT",
-        &format!("{account}/org"),
-        &json!({ "org_id": null }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(state.org_store.get_membership(&boss.1).await?.is_none());
     Ok(())
 }
 
@@ -3376,7 +3344,6 @@ async fn an_org_admin_still_offboards_a_member_holding_names_it_lacks() -> anyho
             json!({ "permissions": [] }),
         ),
         ("PATCH", account.clone(), json!({ "status": "disabled" })),
-        ("PUT", format!("{account}/org"), json!({ "org_id": null })),
     ] {
         let resp = signed_json(&state, &lead, method, &uri, &body).await?;
         assert_eq!(resp.status(), StatusCode::OK, "{method} {uri} {body}");
@@ -3386,7 +3353,6 @@ async fn an_org_admin_still_offboards_a_member_holding_names_it_lacks() -> anyho
         state.user_store.get_user(&member).await?.map(|u| u.status),
         Some(UserStatus::Disabled)
     );
-    assert!(state.org_store.get_membership(&member).await?.is_none());
     Ok(())
 }
 

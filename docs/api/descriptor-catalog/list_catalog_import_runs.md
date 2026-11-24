@@ -2,7 +2,7 @@
 
 Read the newest catalog import and refresh runs. This read needs
 `read_clients`, the fleet-read permission, because an error summary can hold
-internal storage and upstream details. It requires the SQL `[database]` store. `limit` defaults to the
+internal storage and upstream details. `limit` defaults to the
 server's `list_default_limit` (normally 50). `limit` cannot exceed the server's
 `list_max_limit` (normally 200). Runs are ordered by `started_at` descending,
 then `id` descending. The route returns the newest N runs in one response.
@@ -36,4 +36,3 @@ succeeded. The catalog page warns when it is more than 36 hours old.
 | 200 | Recent runs and the last successful import time; `items` may be empty |
 | 400 | `limit` is zero or exceeds the server maximum |
 | 403 | The caller lacks `read_clients` |
-| 404 | The server has no SQL `[database]` store |

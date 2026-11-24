@@ -185,6 +185,7 @@ pub enum BenchmarkParams {
         questions: PositiveCount,
         batch_size: BatchSize,
     },
+    Session {},
 }
 
 impl BenchmarkParams {
@@ -204,6 +205,7 @@ impl BenchmarkParams {
             Self::AsrMaxMemory { .. } => BenchmarkType::AsrMaxMemory,
             Self::DecisionLatency { .. } => BenchmarkType::DecisionLatency,
             Self::DecisionMaxMemory { .. } => BenchmarkType::DecisionMaxMemory,
+            Self::Session {} => BenchmarkType::Session,
         }
     }
 
@@ -313,7 +315,8 @@ impl BenchmarkParams {
             Self::Eval { .. }
             | Self::VlmEval { .. }
             | Self::AsrEval { .. }
-            | Self::VlSpecDecode { .. } => Vec::new(),
+            | Self::VlSpecDecode { .. }
+            | Self::Session {} => Vec::new(),
         }
     }
 }
@@ -453,6 +456,7 @@ impl From<&BenchmarkDefinition> for BenchmarkParams {
                 questions: b.parameter_questions,
                 batch_size: b.parameter_batch_size,
             },
+            BenchmarkDefinition::Session(_) => Self::Session {},
         }
     }
 }

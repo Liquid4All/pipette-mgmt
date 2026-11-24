@@ -17,4 +17,3 @@ answers `changed: false`, so the write is safe to retry.
 | 200 | The group, and whether the rename changed it |
 | 400 | `group_id` is not a group id; the body is not JSON, names another field, or carries no `name` or an empty or overlong one |
 | 403 | The caller may not administer the group ([who may do what](../campaign-groups.md#who-may-do-what)) |
-| 404 | No such group, or the server has no `[database]` |

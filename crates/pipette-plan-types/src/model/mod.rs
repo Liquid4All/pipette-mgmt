@@ -1147,7 +1147,7 @@ clients = ["ev1_c"]"#,
         "type = \"gguf_vision\"\nsource = \"vault_url\"\nmodel = \"/vault/resources/vault_1/content\"\nmmproj = \"/vault/resources/vault_1/content\"\nprincipal_id = \"org_01936d\""
     )]
     #[case::gguf_vision_speculative(
-        "type = \"gguf_vision_speculative\"\nsource = \"vault_url\"\nmodel = \"/vault/resources/vault_1/content\"\nmmproj = \"/vault/resources/vault_1/content\"\ndraft = \"/vault/resources/vault_1/content\"\nprincipal_id = \"user_01936d\""
+        "type = \"gguf_vision_speculative\"\nsource = \"vault_url\"\nmodel = \"/vault/resources/vault_1/content\"\nmmproj = \"/vault/resources/vault_1/content\"\ndraft = \"/vault/resources/vault_1/content\"\nprincipal_id = \"org_01936d\""
     )]
     #[case::mlx(
         "type = \"mlx\"\nsource = \"vault_archive\"\nurl = \"/vault/resources/vault_1/content\"\nprincipal_id = \"org_01936d\""

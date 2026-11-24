@@ -90,7 +90,7 @@ async fn put_entry(
 /// A member reads its organization's catalog by belonging, and a fleet
 /// reader reads every one; only its administrators write to it, in good
 /// standing. An administrator of another organization, and an unaffiliated
-/// holder of the grant, find it absent on every verb; a pending account is
+/// holder of the grant, find it absent on every verb; a disabled account is
 /// refused everything.
 #[rstest]
 #[case::fleet_reader(&[UserPermission::ReadAnyOrgs], None, UserStatus::Active, StatusCode::OK, StatusCode::FORBIDDEN)]
@@ -98,7 +98,7 @@ async fn put_entry(
 #[case::scoped_reader_of_another_org(&[UserPermission::ReadOrgs], Some("labs"), UserStatus::Active, StatusCode::NOT_FOUND, StatusCode::FORBIDDEN)]
 #[case::admin_of_another_org(&[UserPermission::ManageOrgs], Some("labs"), UserStatus::Active, StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)]
 #[case::unaffiliated_admin(&[UserPermission::ManageOrgs], None, UserStatus::Active, StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)]
-#[case::pending_admin(&[UserPermission::ManageOrgs], Some("acme"), UserStatus::Pending, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN)]
+#[case::disabled_admin(&[UserPermission::ManageOrgs], Some("acme"), UserStatus::Disabled, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN)]
 #[tokio::test]
 async fn members_read_and_administrators_write(
     #[case] permissions: &[UserPermission],

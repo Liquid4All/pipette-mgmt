@@ -35,8 +35,7 @@ The caller needs `read_clients`; the server returns `403` without it. The
 evidence has `any_device` only, which is weaker evidence: `last_success_at`
 and `devices_with_success`. See
 [the short list](list_descriptor_catalog_for_device.md) for its meaning. The
-evidence never selects an entry. Without a `[database]`, `evidence` is
-absent.
+evidence never selects an entry.
 
 For example, `names=llamacpp-v0.7.0,global/my-fork` looks up a bare name
 and a global name.
@@ -47,4 +46,3 @@ and a global name.
 |--------|------|
 | 200 | Found entries and unknown names |
 | 400 | Names are missing, invalid, or more than 100 |
-| 404 | The server has no `[database]` catalog |

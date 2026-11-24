@@ -18,12 +18,11 @@ use pipette_core::client_permission;
 use pipette_core::client_permission::ClientPermissionSet;
 use pipette_pipeline::client_cli;
 use pipette_pipeline::client_cli::{CapabilityMatcher, CapabilityVocabulary};
-use pipette_pipeline::org;
-use pipette_pipeline::org::{DeviceScope, OrgRef};
+use pipette_pipeline::org::OrgRef;
 use pipette_plan_types::{
     Backlog, BacklogByCampaign, BacklogCampaign, CampaignId, CapabilityVocabularyQuery,
-    ClientDetail, ClientId, ClientListQuery, ClientListRow, ClientOwner, ClientView, FleetOwner,
-    OwnerLookupQuery, Tag, UserId,
+    ClientDetail, ClientId, ClientListQuery, ClientListRow, ClientOwner, ClientView,
+    OwnerLookupQuery, Tag,
 };
 use pipette_store::{CampaignBacklog, ClientStore, Page, STORAGE_CONCURRENCY};
 
@@ -43,6 +42,13 @@ pub async fn list_clients(
     ApiQuery(pairs): ApiQuery<Vec<(String, String)>>,
 ) -> Result<impl IntoResponse, AppError> {
     let caller = active.caller();
+    // The other owned listings refuse `owner=mine` too; read alone, it would be the whole fleet.
+    if pairs.iter().any(|(key, _)| key == "owner") {
+        return Err(AppError::BadRequest(
+            "owner is not a filter here: an organization owns every device; filter by org_id"
+                .into(),
+        ));
+    }
     let filters = FleetApiFilters::from_pairs(&pairs)?;
     Ok(Json(api_listing(&state, caller, query, filters).await?))
 }
@@ -83,29 +89,23 @@ async fn api_listing(
         .transpose()?;
     let limit = crate::list::list_limit(query.limit, &state.config)?;
     let after = crate::list::list_cursor(query.cursor, ClientId::try_new)?;
-    if query.owned.is_some() && (query.owner.is_some() || query.org_id.is_some()) {
+    if query.owned.is_some() && query.org_id.is_some() {
         return Err(AppError::BadRequest(
-            "`owned` cannot be combined with `owner` or `org_id`".into(),
-        ));
-    }
-    if query.owner.is_some() && query.org_id.is_some() {
-        return Err(AppError::BadRequest(
-            "`owner` and `org_id` cannot be combined".into(),
+            "`owned` cannot be combined with `org_id`".into(),
         ));
     }
     // One listing of the ownerships, not a read per record. Before any shortcut
     // below, so `org_id` is refused outside its roster.
-    let owned = match (query.owned, query.owner, &query.org_id) {
-        (Some(wanted), _, _) => Some((wanted, owned_ids(state).await?)),
-        (None, Some(FleetOwner::Mine), _) => Some((true, mine(state, user_id).await?)),
+    let owned = match (query.owned, &query.org_id) {
+        (Some(wanted), _) => Some((wanted, owned_ids(state).await?)),
         // The organization's roster read, 404 outside it, as `GET /api/v1/orgs/{org_id}/clients`.
-        (None, None, Some(org_id)) => {
+        (None, Some(org_id)) => {
             let (_, owners) =
                 crate::api_v1::orgs::device_owners(state, caller, &OrgRef::Id(org_id.clone()))
                     .await?;
             Some((true, owners.into_keys().collect()))
         }
-        (None, None, None) => None,
+        (None, None) => None,
     };
     let tagged = if filters.tags.is_empty() {
         None
@@ -233,15 +233,6 @@ async fn owned_page(
     })
 }
 
-/// Every device `user_id` owns as a person.
-async fn mine(state: &AppState, user_id: &UserId) -> Result<HashSet<ClientId>, AppError> {
-    Ok(org::devices_owned_by(&*state.org_store, user_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list the ownerships: {e:#}")))?
-        .into_iter()
-        .collect())
-}
-
 async fn fleet_views(
     state: &AppState,
     caller: Caller<'_>,
@@ -289,22 +280,11 @@ async fn fleet_views(
     .await
     .map_err(|e| AppError::Internal(format!("failed to read the owners: {e:#}")))?;
     let reach = crate::api_v1::clients::device_reach(state, caller).await?;
-    let administered: Vec<bool> =
-        stream::iter(owners.iter().cloned().map(|owner| {
-            let reach = reach.clone();
-            async move {
-                crate::api_v1::clients::administers(state, reach.as_ref(), owner.as_ref()).await
-            }
-        }))
-        .buffered(STORAGE_CONCURRENCY)
-        .try_collect()
-        .await?;
-
     Ok(rows
         .into_iter()
         .zip(owners)
-        .zip(administered)
-        .map(|(((client, permissions), owner), administered)| {
+        .map(|((client, permissions), owner)| {
+            let administered = crate::api_v1::clients::administers(reach.as_ref(), owner.as_ref());
             let derived_capabilities = normalized_flags(&client.device_profile);
             ClientListRow {
                 reindex_pending: reindexing.contains(&client.client_id),
@@ -392,28 +372,16 @@ async fn record(
         .backlog
         .as_ref()
         .map_or_else(Timestamp::now, |backlog| backlog.counted_at);
-    let (owning, reach, read, backlog_by_campaign) = futures::try_join!(
-        async {
-            org::owning_org(&*state.org_store, client_id)
-                .await
-                .map_err(|e| AppError::internal(e.context("failed to resolve the owner")))
-        },
-        crate::api_v1::clients::device_reach(state, caller),
-        crate::api_v1::users::read_reach(state, caller),
-        async { Ok(campaign_backlog(state, caller, client_id, counted_at).await) },
-    )?;
+    let (reach, backlog_by_campaign) =
+        futures::try_join!(crate::api_v1::clients::device_reach(state, caller), async {
+            Ok(campaign_backlog(state, caller, client_id, counted_at).await)
+        },)?;
     let may_administer = reach
         .as_ref()
-        .is_some_and(|scope| scope.may_administer(owning.as_ref()));
-    // The rollup is roster data the fleet grant does not read: it goes only to a
-    // reader of that roster or the administrator scoped to it.
-    let owning_org_id = owning.filter(|org_id| {
-        read.covers(Some(org_id)) || reach.as_ref() == Some(&DeviceScope::Org(org_id.clone()))
-    });
+        .is_some_and(|scope| scope.may_administer(row.owner.as_ref().map(ClientOwner::org_id)));
     Ok(ClientDetail {
         view: row.view(may_administer),
         may_administer,
-        owning_org_id,
         backlog_by_campaign,
     })
 }

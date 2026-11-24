@@ -433,9 +433,6 @@ async fn the_listing_is_the_keys_naming_the_organization() -> anyhow::Result<()>
         Some(ClientOwner::Org {
             org_id: rival.org_id.clone(),
         }),
-        Some(ClientOwner::User {
-            user_id: admin.1.clone(),
-        }),
         None,
     ] {
         let minted = pipette_core::client_preauth::mint(host_key(owner), jiff::Timestamp::now())?;

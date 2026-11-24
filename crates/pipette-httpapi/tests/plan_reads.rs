@@ -2200,7 +2200,6 @@ async fn test_a_malformed_plan_id_is_refused_at_the_boundary(
 // ── status is checked before permissions ────────────────────────────────────
 
 /// Seeded with the grant, so the refusal has to be about its standing.
-/// `GET /api/v1/users/me` is the one user route that admits it.
 #[rstest]
 #[case::list("/api/v1/plans")]
 #[case::status("/api/v1/plans/plan-0")]
@@ -2211,34 +2210,42 @@ async fn test_a_malformed_plan_id_is_refused_at_the_boundary(
 #[case::by_job("/api/v1/jobs/job-0/plans")]
 #[case::export("/api/v1/plans/plan-0/results.csv")]
 #[tokio::test]
-async fn test_a_pending_account_reads_no_plans(#[case] path: &str) -> anyhow::Result<()> {
+async fn test_a_disabled_account_reads_no_plans(#[case] path: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, _client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::ReadAnyPlans]).await?;
-    pipette_web_testkit::set_user_status(&state, &user_id, pipette_plan_types::UserStatus::Pending)
-        .await?;
+    pipette_web_testkit::set_user_status(
+        &state,
+        &user_id,
+        pipette_plan_types::UserStatus::Disabled,
+    )
+    .await?;
 
     let resp = authed_user_get(&state, &key, &user_id, &key_id, path).await?;
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "{path} admitted a pending account"
+        "{path} admitted a disabled account"
     );
     assert_eq!(
         body_json(resp).await?,
-        json!({"error": "user is pending an operator's approval"}),
-        "{path} refused a pending account for another reason"
+        json!({"error": "user is disabled"}),
+        "{path} refused a disabled account for another reason"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn test_a_pending_account_cannot_cancel_plans() -> anyhow::Result<()> {
+async fn test_a_disabled_account_cannot_cancel_plans() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _key, _client_id) = approved_client(dir.path()).await?;
     let (key, user_id, key_id) = registered_user(&state, &[UserPermission::CancelAnyPlans]).await?;
-    pipette_web_testkit::set_user_status(&state, &user_id, pipette_plan_types::UserStatus::Pending)
-        .await?;
+    pipette_web_testkit::set_user_status(
+        &state,
+        &user_id,
+        pipette_plan_types::UserStatus::Disabled,
+    )
+    .await?;
 
     let resp = pipette_web_testkit::authed_user_post(
         &state,

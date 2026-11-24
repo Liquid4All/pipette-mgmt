@@ -10,7 +10,7 @@ it, so naming an owner outside it gives an empty page rather than a `403`:
 
 | Query parameter | Meaning |
 |---|---|
-| `owner` | `mine` for the caller's own, `org` for organization-owned |
+| `owner` | `org` for organization-owned, which is every group; any other value is a `400` |
 | `org_id` | One organization's. Usable on its own |
 | `limit`, `cursor`, `order` | [Pagination](../../httpapi.md#13-pagination) |
 
@@ -21,4 +21,3 @@ it, so naming an owner outside it gives an empty page rather than a `403`:
 | 200 | A page of groups |
 | 400 | A malformed `owner`, `org_id`, `cursor` or `order`, or a `limit` outside the allowed range |
 | 403 | The caller holds neither `read_plans` nor `manage_orgs` |
-| 404 | The server has no `[database]` |

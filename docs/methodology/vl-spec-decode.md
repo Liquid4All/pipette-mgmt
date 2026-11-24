@@ -18,8 +18,11 @@ rows over the same corpus, one in each mode, compared as in §2.
 ## 2. Analysis outside the server
 
 The speedups and the identity check need two rows, and the server scores one at
-a time, so they are computed over the warehouse by whoever reads it. That makes
-this section the pairing rule: nothing else writes it down.
+a time, so they are computed over the warehouse by whoever reads it. This section
+is the pairing rule for that analysis. The console's `pairs()`
+(`ui/src/lib/report.ts`) pairs more loosely: the same model with speculation on
+and off, per client and benchmark, by medians, without the digest and turn
+checks below.
 
 ### Forming a pair
 

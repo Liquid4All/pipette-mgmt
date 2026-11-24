@@ -308,6 +308,8 @@ pub struct SuccessInput {
     pub decision_latency_request_ms_stddev: Option<NonNegativeMillis>,
     pub decision_latency_batch_ms: Option<PositiveMillis>,
     pub decision_latency_batch_ms_stddev: Option<NonNegativeMillis>,
+    /// For a `session` benchmark, this field holds the session duration in whole seconds.
+    pub session_duration: Option<u64>,
 
     // Not namespaced by benchmark type, so every type that serves a corpus
     // answers "which corpus did this row measure?" in one column.

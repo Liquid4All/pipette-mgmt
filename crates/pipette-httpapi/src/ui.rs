@@ -23,11 +23,12 @@ static INDEX: LazyLock<String> = LazyLock::new(|| {
 /// so a deploy changes the names rather than the files behind them.
 static ASSETS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
-/// The browser holds the signing key, so the page loads nothing from elsewhere
-/// and talks to no other origin.
+/// The browser holds the signing key, so the page talks to no other origin.
+/// It loads nothing from elsewhere except the family logos, which are under
+/// [`pipette_plan_types::LogoUri::PREFIX`].
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-                   connect-src 'self'; img-src 'self' data:; base-uri 'none'; \
-                   form-action 'none'; frame-ancestors 'none'";
+                   connect-src 'self'; img-src 'self' data: https://pipette.liquid.ai/logos/; \
+                   base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// [`CSP`] widened for ClerkJS, at a host that offers Clerk: its frontend API
 /// serves the script and answers it, and the script injects its own styles,
@@ -37,7 +38,8 @@ fn clerk_csp(frontend_api: &str) -> String {
     format!(
         "default-src 'self'; script-src 'self' {api} https://challenges.cloudflare.com; \
          style-src 'self' 'unsafe-inline'; connect-src 'self' {api}; \
-         img-src 'self' data: https://img.clerk.com; worker-src 'self' blob:; \
+         img-src 'self' data: https://img.clerk.com https://pipette.liquid.ai/logos/; \
+         worker-src 'self' blob:; \
          frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'; \
          frame-ancestors 'none'"
     )
@@ -137,5 +139,28 @@ fn content_type(name: &str) -> &'static str {
         Some("png") => "image/png",
         Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use pipette_plan_types::LogoUri;
+
+    use super::{CSP, clerk_csp};
+
+    #[rstest]
+    #[case::plain(CSP.to_owned())]
+    #[case::clerk(clerk_csp("clerk.example.com"))]
+    fn the_page_admits_family_logos(#[case] csp: String) {
+        let img_src = csp
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("img-src "));
+        assert!(
+            img_src.is_some_and(|sources| sources.split(' ').any(|s| s == LogoUri::PREFIX)),
+            "{csp}"
+        );
     }
 }

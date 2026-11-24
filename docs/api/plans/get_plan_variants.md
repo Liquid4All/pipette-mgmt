@@ -54,7 +54,6 @@ gets the TOML answer.
 | Status | When |
 |--------|------|
 | 200 | The `[[variants]]` blocks, as `application/toml; charset=utf-8`. With `Accept: application/json`, one block for each variant, as `PlanVariants` |
-| 400 | `plan_id` in the path contains characters outside `[A-Za-z0-9-]` |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | As for [the document](get_plan_document.md#statuses): no plan read grant, or no fleet read grant for a plan in scope that has a document |
 | 404 | As for [the document](get_plan_document.md#statuses): no such plan or one outside the scope, a plan with no document, or a collected one |

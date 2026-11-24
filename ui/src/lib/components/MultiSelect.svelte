@@ -54,7 +54,8 @@
   <details bind:open {@attach closing}>
     <summary class:set={chosen.length}>{named}</summary>
     <div class="menu" class:leftward bind:this={menu} role="group" aria-label={label}>
-      {#if searchable || options.length > 6}
+      <!-- Kept while it holds text, which still narrows options the other filters shrank. -->
+      {#if searchable || options.length > 6 || search}
         <input type="text" class="search" bind:value={search} placeholder="search" autocomplete="off"
                spellcheck="false" aria-label="search {label}" />
       {/if}

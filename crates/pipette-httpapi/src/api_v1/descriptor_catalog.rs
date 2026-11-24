@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use jiff::Timestamp;
 
 use pipette_core::{
@@ -22,13 +22,14 @@ use pipette_plan_types::{
     DescriptorCatalogQuery, DescriptorCatalogShortList, DescriptorCatalogShortListItem,
     DescriptorDigestNames, DescriptorDigestQuery, DescriptorEntry, DescriptorEntryAction,
     DescriptorEntryCreator, DescriptorEntryListRow, DescriptorEntryLookup, DescriptorEntryState,
-    DescriptorKind, DescriptorMember, DescriptorMemberCoverage, DescriptorMemberDescriptor,
-    DescriptorMemberEvidence, DescriptorMemberKey, DescriptorMemberParameters,
-    DescriptorMemberSummary, DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery,
-    DescriptorWithheldMember, DescriptorWithheldReasonCode, DescriptorWithheldReport, ListPage,
-    ModelKey, ModelType, OrgId, QualifiedCatalogName, RelabelDescriptorMemberRequest,
-    RemoveDescriptorMemberRequest, RenameDescriptorEntryRequest, Runtime, RuntimeType,
-    UserPermission, VaultEntry,
+    DescriptorFamilyLogo, DescriptorFamilyLogoView, DescriptorKind, DescriptorMember,
+    DescriptorMemberCoverage, DescriptorMemberDescriptor, DescriptorMemberEvidence,
+    DescriptorMemberKey, DescriptorMemberParameters, DescriptorMemberSummary, DescriptorMemberView,
+    DescriptorNameHit, DescriptorNameQuery, DescriptorWithheldMember, DescriptorWithheldReasonCode,
+    DescriptorWithheldReport, FamilyLogos, ListPage, ModelKey, ModelType, OrgId,
+    QualifiedCatalogName, RelabelDescriptorMemberRequest, RemoveDescriptorMemberRequest,
+    RenameDescriptorEntryRequest, Runtime, RuntimeType, SetDescriptorEntryFamilyRequest,
+    SetDescriptorFamilyLogoRequest, Sha256, UserPermission, VaultEntry,
 };
 use pipette_store::{
     CatalogEntryKey, ClientListing, DescriptorCatalogStore, DescriptorEntryFilter, RunEvidenceRow,
@@ -49,7 +50,7 @@ use crate::{
 const NEEDS_DATABASE: &str = "the descriptor catalog is kept only on a [database]";
 const BATCH_MAX: usize = 100;
 
-fn catalog(state: &AppState) -> Result<&dyn DescriptorCatalogStore, AppError> {
+pub(crate) fn catalog(state: &AppState) -> Result<&dyn DescriptorCatalogStore, AppError> {
     state
         .descriptor_catalog_store
         .as_deref()
@@ -121,10 +122,12 @@ fn row(
     include_members: bool,
     offer_counts: Option<&HashMap<String, usize>>,
     evidence: Option<&Evidence>,
-    parameters: &ParameterRows,
+    extras: &RowExtras,
 ) -> Result<DescriptorEntryListRow, AppError> {
     let descriptor_kind = entry.descriptor_kind();
     let descriptor_types = entry.descriptor_types();
+    let family = entry.family().map(str::to_owned);
+    let family_logo_sha256 = extras.logos.of(&entry).cloned();
     let member_summaries = entry
         .members
         .iter()
@@ -149,7 +152,7 @@ fn row(
                         member,
                         offer_counts,
                         evidence,
-                        parameters,
+                        &extras.parameters,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -169,7 +172,50 @@ fn row(
         member_count: entry.members.len(),
         member_summaries,
         members,
+        family,
+        family_logo_sha256,
     })
+}
+
+/// Display data that is read once for one answer.
+struct RowExtras {
+    parameters: ParameterRows,
+    logos: FamilyLogos,
+}
+
+impl RowExtras {
+    async fn read<'a>(
+        state: &AppState,
+        store: &dyn DescriptorCatalogStore,
+        entries: impl Iterator<Item = &'a DescriptorEntry> + Clone,
+    ) -> Self {
+        Self {
+            parameters: parameter_rows(state, entries.clone()).await,
+            logos: family_logos(store, entries).await,
+        }
+    }
+}
+
+/// Read the family logos for the scopes of the model entries in `entries`.
+/// The logos are for display only, so a failed read leaves every family
+/// without a logo and does not fail the answer.
+async fn family_logos<'a>(
+    store: &dyn DescriptorCatalogStore,
+    entries: impl Iterator<Item = &'a DescriptorEntry>,
+) -> FamilyLogos {
+    let scopes: Vec<CatalogScope> = entries
+        .filter(|entry| entry.descriptor_kind() == DescriptorKind::Model)
+        .map(|entry| entry.scope.clone())
+        .collect();
+    if scopes.is_empty() {
+        return FamilyLogos::default();
+    }
+    descriptor_catalog_admin::family_logos(store, scopes)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "family logos unreadable for catalog entries");
+            FamilyLogos::default()
+        })
 }
 
 /// The model parameter table's counts by key, read once for one answer.
@@ -346,8 +392,8 @@ async fn written_row(
 ) -> Result<DescriptorEntryListRow, AppError> {
     // The path can use different letter case from the name stored in the entry.
     shown.name = entry.name.clone();
-    let parameters = parameter_rows(state, std::iter::once(&entry)).await;
-    row(state, entry, shown, true, None, None, &parameters)
+    let extras = RowExtras::read(state, catalog(state)?, std::iter::once(&entry)).await;
+    row(state, entry, shown, true, None, None, &extras)
 }
 
 // POST /api/v1/orgs/{org_id}/descriptor-catalog
@@ -510,6 +556,64 @@ pub async fn remove_org_descriptor_member(
     Ok(Json(written_row(&state, removed.entry, shown).await?))
 }
 
+// POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/family
+pub async fn set_org_descriptor_entry_family(
+    State(state): State<AppState>,
+    active: ActiveUser,
+    ApiPath((Parsed(org_id), Parsed(name))): ApiPath<(Parsed<OrgId>, Parsed<CatalogName>)>,
+    ApiJson(body): ApiJson<SetDescriptorEntryFamilyRequest>,
+) -> Result<Json<DescriptorEntryListRow>, AppError> {
+    let caller = active.caller();
+    let scope = write_scope(&state, caller, org_id).await?;
+    let store = catalog(&state)?;
+    let shown = write_display_name(&state, store, caller, &scope, &name).await?;
+    let actor = AuditActor::User {
+        user_id: active.user.user_id.clone(),
+        key_id: active.key_id.clone(),
+    };
+    let entry = descriptor_catalog_admin::set_entry_family(
+        store,
+        &scope,
+        &name,
+        body.family.as_ref().map(Option::as_ref),
+        Some(&actor),
+        false,
+    )
+    .await
+    .map_err(write_error)?;
+    Ok(Json(written_row(&state, entry, shown).await?))
+}
+
+// POST /api/v1/orgs/{org_id}/descriptor-families/{family}/logo
+pub async fn set_org_descriptor_family_logo(
+    State(state): State<AppState>,
+    active: ActiveUser,
+    ApiPath((Parsed(org_id), Parsed(family))): ApiPath<(Parsed<OrgId>, Parsed<CatalogName>)>,
+    ApiJson(body): ApiJson<SetDescriptorFamilyLogoRequest>,
+) -> Result<Json<DescriptorFamilyLogoView>, AppError> {
+    let scope = write_scope(&state, active.caller(), org_id).await?;
+    let store = catalog(&state)?;
+    let actor = AuditActor::User {
+        user_id: active.user.user_id.clone(),
+        key_id: active.key_id.clone(),
+    };
+    descriptor_catalog_admin::set_family_logo(
+        store,
+        &scope,
+        &family,
+        body.logo_uri.as_ref(),
+        Some(&actor),
+        false,
+    )
+    .await
+    .map_err(write_error)?;
+    Ok(Json(DescriptorFamilyLogoView {
+        scope,
+        family,
+        logo_uri: body.logo_uri,
+    }))
+}
+
 // POST /api/v1/orgs/{org_id}/descriptor-catalog/{name}/state
 pub async fn change_org_descriptor_entry_state(
     State(state): State<AppState>,
@@ -599,6 +703,7 @@ fn member_view(
     let counts = model_key
         .as_ref()
         .and_then(|key| parameters.get(key).copied());
+    let size_bytes = member.model().map(|_| member.size_bytes());
     Ok(DescriptorMemberView {
         selector,
         member_key,
@@ -610,6 +715,7 @@ fn member_view(
         plan_toml,
         model_key,
         parameters: counts,
+        size_bytes,
         evidence: evidence.map(|evidence| evidence.of(member)),
     })
 }
@@ -773,22 +879,33 @@ pub async fn list_descriptor_catalog_for_device(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::NotFound("client not found".into()))?;
+    // The short list answers what the caller can name in a plan, so a holder
+    // of `edit_any_catalog` gets its own organization only.
+    let read = CatalogReadScope::own(user_org(&state, &user.caller().user.user_id).await?);
+    short_list(&state, store, &client, read).await.map(Json)
+}
+
+/// Use `client` to evaluate offers and `read` to determine which entries are visible.
+pub(crate) async fn short_list(
+    state: &AppState,
+    store: &dyn DescriptorCatalogStore,
+    client: &Client,
+    read: CatalogReadScope,
+) -> Result<DescriptorCatalogShortList, AppError> {
+    let client_id = &client.client_id;
     let tags = state
         .tag_store
-        .get_client_tags(&client_id)
+        .get_client_tags(client_id)
         .await
         .map_err(AppError::internal)?;
     let tags = FleetTags::new(tags.into_iter().map(|tag| (client_id.clone(), tag)));
     let config = &state.config.descriptor_catalog;
-    // The short list answers what the caller can name in a plan, so a holder
-    // of `edit_any_catalog` gets its own organization only.
-    let read = CatalogReadScope::own(user_org(&state, &user.caller().user.user_id).await?);
     let scopes = read
         .readable_scopes(state.org_store.as_ref())
         .await
         .map_err(AppError::internal)?;
     let (entries, unreadable) = short_list_entries(store, scopes.clone()).await?;
-    let view = name_view(&state, store, read.clone(), &scopes)
+    let view = name_view(state, store, read.clone(), &scopes)
         .await?
         .with_entries(&entries);
     let (runtime_entries, model_entries): (Vec<Shown>, Vec<Shown>) = entries
@@ -798,7 +915,8 @@ pub async fn list_descriptor_catalog_for_device(
             Some((entry, shown))
         })
         .partition(|(entry, _)| entry.descriptor_kind() == DescriptorKind::Runtime);
-    let parameters = parameter_rows(&state, model_entries.iter().map(|(entry, _)| entry)).await;
+    let parameters = parameter_rows(state, model_entries.iter().map(|(entry, _)| entry)).await;
+    let logos = family_logos(store, model_entries.iter().map(|(entry, _)| entry)).await;
     // Each offered entry with the members that it gives the device.
     let mut chosen: Vec<(&Shown, Vec<&DescriptorMember>)> = Vec::new();
     let mut withheld = Vec::new();
@@ -811,7 +929,7 @@ pub async fn list_descriptor_catalog_for_device(
         let (accepted, refused) = split_verdicts(
             shown,
             entry.members.iter().map(|member| {
-                let verdict = descriptor_offer::offer(config, member, &client, &tags);
+                let verdict = descriptor_offer::offer(config, member, client, &tags);
                 (member, verdict)
             }),
         );
@@ -821,7 +939,7 @@ pub async fn list_descriptor_catalog_for_device(
                 .filter_map(|member| member.runtime().cloned()),
         );
         withheld.extend(refused);
-        match descriptor_offer::resolve(entry, config, &client, &tags) {
+        match descriptor_offer::resolve(entry, config, client, &tags) {
             Resolution::Resolved(member) => chosen.push((shown, vec![member])),
             Resolution::Withheld(_) => withheld_entries += 1,
         }
@@ -850,7 +968,7 @@ pub async fn list_descriptor_catalog_for_device(
         .flat_map(|(_, members)| members.iter().flat_map(|m| evidence_digests(m)))
         .map(str::to_owned)
         .collect();
-    let evidence = Evidence::read(&state, digests, Some(client_id.clone())).await?;
+    let evidence = Evidence::read(state, digests, Some(client_id.clone())).await?;
     let items = chosen
         .iter()
         .map(|((entry, shown), members)| {
@@ -860,10 +978,12 @@ pub async fn list_descriptor_catalog_for_device(
                 display_name: shown.to_string(),
                 release_time: entry.release_time,
                 descriptor_kind: entry.descriptor_kind(),
+                family: entry.family().map(str::to_owned),
+                family_logo_sha256: logos.of(entry).cloned(),
                 members: members
                     .iter()
                     .map(|member| {
-                        member_view(&state, shown, member, None, evidence.as_ref(), &parameters)
+                        member_view(state, shown, member, None, evidence.as_ref(), &parameters)
                     })
                     .collect::<Result<Vec<_>, AppError>>()?,
             })
@@ -885,10 +1005,10 @@ pub async fn list_descriptor_catalog_for_device(
         unreadable,
         "listed descriptor catalog for device"
     );
-    Ok(Json(DescriptorCatalogShortList {
+    Ok(DescriptorCatalogShortList {
         page: ListPage::whole(items, unreadable),
         withheld,
-    }))
+    })
 }
 
 /// Parse each `type` value as a runtime type or a model type. A type must
@@ -1000,10 +1120,13 @@ pub async fn list_descriptor_catalog(
     .await?;
     let view = name_view(&state, store, read, &filter.scopes).await?;
     let include_members = query.members.unwrap_or(false);
-    let parameters = if include_members {
-        parameter_rows(&state, page.items.iter()).await
-    } else {
-        ParameterRows::new()
+    let extras = RowExtras {
+        parameters: if include_members {
+            parameter_rows(&state, page.items.iter()).await
+        } else {
+            ParameterRows::new()
+        },
+        logos: family_logos(store, page.items.iter()).await,
     };
     let items = page
         .items
@@ -1017,7 +1140,7 @@ pub async fn list_descriptor_catalog(
                 include_members,
                 None,
                 None,
-                &parameters,
+                &extras,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1077,7 +1200,7 @@ pub async fn lookup_descriptor_names(
     } else {
         None
     };
-    let parameters = parameter_rows(&state, entries.iter()).await;
+    let extras = RowExtras::read(&state, store, entries.iter()).await;
     let view = name_view(&state, store, read, entries.iter().map(|e| &e.scope)).await?;
     let entries = entries
         .into_iter()
@@ -1090,11 +1213,40 @@ pub async fn lookup_descriptor_names(
                 true,
                 counts.as_ref(),
                 evidence.as_ref(),
-                &parameters,
+                &extras,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(DescriptorEntryLookup { entries, unknown }))
+}
+
+/// Return the family logo with digest `sha256` from a readable scope.
+/// Return 404 if the caller cannot read any logo with that digest.
+pub(crate) async fn family_logo(
+    store: &dyn DescriptorCatalogStore,
+    read: &CatalogReadScope,
+    sha256: Sha256,
+) -> Result<Json<DescriptorFamilyLogo>, AppError> {
+    let scopes: Vec<_> = [CatalogScope::Global]
+        .into_iter()
+        .chain(read.own_org.clone().map(CatalogScope::Org))
+        .collect();
+    let logo_uri = store
+        .family_logo_uri_by_digest(&sha256, (!read.every_org).then_some(scopes.as_slice()))
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::NotFound("family logo not found".into()))?;
+    Ok(Json(DescriptorFamilyLogo { sha256, logo_uri }))
+}
+
+// GET /api/v1/descriptor-catalog/family-logos/{sha256}
+pub async fn get_descriptor_family_logo(
+    State(state): State<AppState>,
+    user: ActiveUser,
+    ApiPath(Parsed(sha256)): ApiPath<Parsed<Sha256>>,
+) -> Result<impl IntoResponse, AppError> {
+    let read = catalog_read_scope(&state, user.caller()).await?;
+    family_logo(catalog(&state)?, &read, sha256).await
 }
 
 /// Map exact member digests to ranked live names.

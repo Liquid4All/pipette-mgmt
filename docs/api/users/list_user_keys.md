@@ -12,4 +12,3 @@ in retiring a stolen key
 |--------|------|
 | 200 | The keys, oldest first |
 | 403 | The caller does not hold `manage_orgs` |
-| 404 | The account is outside the caller's scope or does not exist |

@@ -78,5 +78,5 @@ pub(crate) async fn may_tag(
         return Ok(false);
     }
     let member_of = user_org(state, &caller.user.user_id).await?;
-    Ok(CampaignAuthority::of(caller.user, caller.rights, member_of).may_run(&campaign.owner))
+    Ok(CampaignAuthority::of(caller.rights, member_of).may_run(&campaign.owner))
 }

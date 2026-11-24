@@ -98,6 +98,8 @@ fn route_of(event: &AuditEvent) -> (&str, &str, u16) {
         | AuditAction::CatalogRename { .. }
         | AuditAction::CatalogMerge { .. }
         | AuditAction::CatalogRemoveMember { .. }
+        | AuditAction::CatalogSetFamily { .. }
+        | AuditAction::CatalogSetFamilyLogo { .. }
         | AuditAction::CatalogMoveToGlobal { .. }
         | AuditAction::GroupPolicy { .. } => ("", "", 0),
     }
@@ -111,8 +113,8 @@ fn orgs(ids: &[&OrgId]) -> BTreeSet<OrgId> {
 fn sample(param: &str) -> &'static str {
     match param {
         "client_id" => "ev1_0123456789abcdef",
-        "user_id" | "principal_id" => "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
-        "org_id" => "org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
+        "user_id" => "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
+        "org_id" | "principal_id" => "org_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
         "campaign_id" => "campaign_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
         "plan_id" => "plan-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
         "job_id" => "job-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
@@ -200,7 +202,7 @@ async fn a_read_records_nothing() -> anyhow::Result<()> {
 }
 
 /// A create names the account that signed, its key, and the record it made,
-/// and the new organization's log lists it.
+/// and the logs of the new organization and of the caller's own list it.
 #[tokio::test]
 async fn a_create_names_its_caller_and_what_it_made() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -224,7 +226,8 @@ async fn a_create_names_its_caller_and_what_it_made() -> anyhow::Result<()> {
             org_id: org_id.clone()
         }])
     );
-    assert_eq!(event.org_ids, orgs(&[&org_id]));
+    let own = org_of(&state, &admin.1).await?;
+    assert_eq!(event.org_ids, orgs(&[&org_id, &own]));
     Ok(())
 }
 

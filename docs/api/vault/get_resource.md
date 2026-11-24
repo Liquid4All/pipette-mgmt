@@ -30,4 +30,3 @@ An account may ask for two more fields, which a device's read ignores:
 |--------|------|
 | 200 | The resource |
 | 403 | The resource is outside the caller's scope: it belongs to another owner |
-| 404 | No such resource |

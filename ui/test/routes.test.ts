@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
-  benchmarkLink, campaignGroupLink, campaignLink, campaignPlanLink, clientLink, href, inApp, legacyOwnerFilter, match,
+  benchmarkLink, campaignGroupLink, campaignLink, campaignPlanLink, clientLink, homePath, href, inApp, legacyOwnerFilter, match,
   matchIn, orgLink, pathOf, planLink, screenOf, table, userLink, vaultLink, type Route,
 } from "../src/lib/routes";
 
@@ -13,14 +13,14 @@ describe("routes", () => {
       { page: "account" }, { page: "account-keys" }, { page: "login-cli" }, { page: "orgs" }, { page: "server-users" }, { page: "server-devices" },
       { page: "server-catalog" }, { page: "server-catalog-entry", name: "My.Build-1" },
       { page: "server-model-params" }, { page: "server-audit" }, { page: "org-audit", org: "acme" },
-      { page: "vault-new" }, { page: "clients" }, { page: "me-devices" }, { page: "org-devices", org: "acme" },
+      { page: "vault-new" }, { page: "clients" }, { page: "org-devices", org: "acme" },
       { page: "client", client_id: "ev1_abc" }, { page: "users" }, { page: "user-new" },
       { page: "user", user_id: "user_1" }, { page: "user-plans", user_id: "user_1" },
       { page: "user-permissions", user_id: "user_1" }, { page: "user-keys", user_id: "user_1" }, { page: "user-preauth", user_id: "user_1" },
       { page: "user-settings", user_id: "user_1" }, { page: "org-members", org: "acme" }, { page: "org", org: "acme" },
       { page: "org-new" }, { page: "benchmarks" }, { page: "benchmark-new" },
       { page: "benchmark", org: "acme", benchmark_id: "eval_ifbench_2026.06.1" }, { page: "org-benchmarks", org: "acme" },
-      { page: "vault" }, { page: "vault-resource", resource_id: "vault_1" }, { page: "me-vault" },
+      { page: "vault" }, { page: "vault-resource", resource_id: "vault_1" },
       { page: "org-vault", org: "acme" }, { page: "plans" }, { page: "plan", plan_id: "plan-0195" },
       { page: "plan-cells", plan_id: "plan-0195" }, { page: "plan-results", plan_id: "plan-0195" },
       { page: "plan-analysis", plan_id: "plan-0195" },
@@ -38,8 +38,8 @@ describe("routes", () => {
       { page: "campaign-plan-revisions", campaign_id: "cmp_1", plan_id: "plan-1" },
       { page: "campaign-plan-settings", campaign_id: "cmp_1", plan_id: "plan-1" },
       { page: "campaign-document", campaign_id: "cmp_1" },
-      { page: "me-campaigns" }, { page: "org-campaigns", org: "acme" }, { page: "campaign-group", group_id: "group_1" },
-      { page: "me-campaign-groups" }, { page: "org-campaign-groups", org: "acme" },
+      { page: "home" }, { page: "org-campaigns", org: "acme" }, { page: "campaign-group", group_id: "group_1" },
+      { page: "org-campaign-groups", org: "acme" },
       { page: "campaign-group-policies", group_id: "group_1" }, { page: "campaign-group-activity", group_id: "group_1" },
       { page: "campaign-group-settings", group_id: "group_1" },
     ];
@@ -56,10 +56,13 @@ describe("routes", () => {
     expect(match("/app/server/catalog/My%20Build")).toEqual({ page: "server-catalog-entry", name: "My Build" });
   });
 
-  test("the app's root is an alias of the reader's campaigns", () => {
-    expect(match("/app/")).toEqual({ page: "me-campaigns" });
-    expect(match("/app")).toEqual({ page: "me-campaigns" });
-    expect(pathOf(match("/app/"))).toBe("/app/me/campaigns");
+  test("the app's root lands on the reader's organization's campaigns", () => {
+    expect([match("/app"), match("/app/")]).toEqual([{ page: "home" }, { page: "home" }]);
+    expect(match("/app/me/campaigns")).toEqual({ page: "missing", path: "/app/me/campaigns" });
+    expect(homePath({ org_id: "org_1", org_slug: "acme" })).toBe("/app/orgs/acme/campaigns");
+    expect(homePath({ org_id: "org_1", org_slug: "new" })).toBe("/app/orgs/org_1/campaigns");
+    expect(homePath({ org_id: "org_1" })).toBe("/app/orgs/org_1/campaigns");
+    expect(homePath({ org_id: null })).toBe("/app/campaigns");
   });
 
   test("an address with no page is missing, as typed", () => {
@@ -128,7 +131,6 @@ describe("routes", () => {
     expect(match("/app/vault/new")).toEqual({ page: "vault-new" });
     expect(match("/app/vault")).toEqual({ page: "vault" });
     expect(match("/app/vault/vault_1/")).toEqual({ page: "vault-resource", resource_id: "vault_1" });
-    expect(match("/app/me/vault")).toEqual({ page: "me-vault" });
     expect(match("/app/orgs/new/vault")).toEqual({ page: "org-vault", org: "new" });
     expect(drawn("/app/orgs/acme/vault?cursor=vault_9")).not.toBe("missing");
     expect(match("/app/vault/vault_1/content")).toEqual({ page: "missing", path: "/app/vault/vault_1/content" });
@@ -136,12 +138,13 @@ describe("routes", () => {
 
   test("an old owner filter lands on its branch, its limit kept", () => {
     const acme = { org_slug: "acme", org_id: "org_1" };
-    const pages = { mine: "me-vault", org: "org-vault", all: "vault" } as const;
+    const pages = { org: "org-vault", all: "vault" } as const;
     const filter = (search: string, reader: { org_id?: string | null; org_slug?: string | null } = acme) =>
       legacyOwnerFilter(new URLSearchParams(search), pages, reader);
     expect(filter("")).toBeNull();
     expect(filter("owner=&org_id=&limit=5")).toBeNull();
-    expect(filter("owner=mine&org_id=org_2&limit=5&offset=50")).toBe("/app/me/vault?limit=5");
+    expect(filter("owner=mine")).toBeNull();
+    expect(filter("org_id=org_2&limit=5&offset=50")).toBe("/app/orgs/org_2/vault?limit=5");
     expect(filter("org_id=org_2")).toBe("/app/orgs/org_2/vault");
     expect(filter("owner=org&org_id=org_2")).toBe("/app/orgs/org_2/vault");
     expect(filter("owner=org")).toBe("/app/orgs/acme/vault");
@@ -153,7 +156,6 @@ describe("routes", () => {
 
   test("the device listings and the device page are the app's", () => {
     expect(drawn("/app/clients?status=pending")).not.toBe("missing");
-    expect(drawn("/app/me/devices")).not.toBe("missing");
     expect(drawn("/app/orgs/acme/devices?status=pending#device-keys")).not.toBe("missing");
     expect(match("/app/orgs/org_1/devices/")).toEqual({ page: "org-devices", org: "org_1" });
     expect(match("/app/clients/ev1_x/")).toEqual({ page: "client", client_id: "ev1_x" });
@@ -174,7 +176,6 @@ describe("routes", () => {
     expect(match("/app/campaigns/new/")).toEqual({ page: "campaign-new" });
     expect(match("/app/orgs/acme/campaigns")).toEqual({ page: "org-campaigns", org: "acme" });
     expect(drawn("/app/campaigns/new?owner=org_1")).not.toBe("missing");
-    expect(drawn("/app/me/campaigns?limit=5")).not.toBe("missing");
     expect(match("/app/campaigns/cmp_1")).toEqual({ page: "campaign", campaign_id: "cmp_1" });
     expect(match("/app/campaigns/cmp_1/plans/plan-1/")).toEqual(
       { page: "campaign-plan", campaign_id: "cmp_1", plan_id: "plan-1" });

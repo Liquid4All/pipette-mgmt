@@ -164,7 +164,9 @@ fn keep_only_org(event: &mut AuditEvent, org_id: &OrgId) {
         AuditAction::FirstClerkSignIn { .. }
         | AuditAction::CatalogRename { .. }
         | AuditAction::CatalogMerge { .. }
-        | AuditAction::CatalogRemoveMember { .. } => {}
+        | AuditAction::CatalogRemoveMember { .. }
+        | AuditAction::CatalogSetFamily { .. }
+        | AuditAction::CatalogSetFamilyLogo { .. } => {}
         // The command lists the event under the organization that the action
         // names, so a listing under another organization never shows it.
         AuditAction::CatalogMoveToGlobal { .. } => {}

@@ -4,20 +4,22 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use futures::TryStreamExt;
 use futures::stream;
 use futures::stream::StreamExt;
+use jiff::Timestamp;
 
 use pipette_core::client::Client;
 use pipette_core::organization::{Membership, Organization, Ownership};
 use pipette_core::user::User;
 use pipette_plan_types::{
-    BenchmarkId, CampaignId, CatalogName, ClientId, ClientOwner, ClientPreauthKeyId, OrgId,
-    OrgSlug, PrincipalOwner, UserId, VaultResourceId,
+    BenchmarkId, CampaignId, CatalogName, ClientId, ClientOwner, ClientPreauthKeyId,
+    NonEmptyTrimmedString, OrgId, OrgSlug, PrincipalOwner, UserId, VaultResourceId,
 };
 use pipette_store::{
-    CampaignStore, CatalogStore, ClientStore, OrgStore, STORAGE_CONCURRENCY, UserStore, VaultStore,
-    drain_campaigns, drain_clients, warn_unreadable_clients,
+    CampaignStore, CatalogStore, ClientStore, OrgStore, STORAGE_CONCURRENCY, SlugClaim, UserStore,
+    VaultStore, drain_campaigns, drain_clients, warn_unreadable_clients,
 };
 
 /// An organization by minted id or by handle. The `org_` prefix decides, and a
@@ -93,6 +95,62 @@ pub async fn require(
         .ok_or_else(|| OrgLookupError::NotFound(reference.clone()))
 }
 
+/// The organization `user` gets when it joins none, named `name` or
+/// `<email>'s personal org`. Its slug comes from the account's id
+/// ([`OrgSlug::personal`]), so a re-run for the same account finds the
+/// organization the first run made.
+pub async fn create_personal(
+    orgs: &dyn OrgStore,
+    user: &User,
+    name: Option<NonEmptyTrimmedString>,
+) -> anyhow::Result<Organization> {
+    let display_name = match name {
+        Some(name) => name,
+        None => NonEmptyTrimmedString::try_new(format!(
+            "{}'s personal org",
+            user.contact_email.as_str()
+        ))?,
+    };
+    let org = Organization::new(
+        OrgSlug::personal(&user.user_id)?,
+        display_name,
+        Timestamp::now(),
+    );
+    if let SlugClaim::Taken(holder) = orgs.claim_org_slug(org.slug.as_str(), &org.org_id).await? {
+        return orgs.get_org(&holder).await?.with_context(|| {
+            format!(
+                "the slug {} is claimed by {holder}, which has no record; clear it with `orgs \
+                 release-claim {}`",
+                org.slug, org.slug
+            )
+        });
+    }
+    if let Err(e) = orgs.put_org(&org).await {
+        if let Err(release) = orgs.release_org_slug(org.slug.as_str()).await {
+            tracing::warn!(slug = %org.slug, error = %release,
+                "failed to release the slug after a personal organization failed; \
+                 `orgs release-claim <slug>` will clear it");
+        }
+        return Err(e.context("failed to write the personal organization"));
+    }
+    tracing::info!(org_id = %org.org_id, slug = %org.slug, "personal organization created");
+    Ok(org)
+}
+
+/// Remove an organization [`create_personal`] made that nobody joined.
+/// Best-effort: an empty organization left behind holds nothing.
+pub async fn discard_personal(orgs: &dyn OrgStore, org: &Organization) {
+    if let Err(e) = orgs.delete_org(&org.org_id).await {
+        tracing::warn!(org_id = %org.org_id, error = %e,
+            "failed to delete an unused personal organization");
+        return;
+    }
+    if let Err(e) = orgs.release_org_slug(org.slug.as_str()).await {
+        tracing::warn!(slug = %org.slug, error = %e,
+            "failed to release the handle of an unused personal organization");
+    }
+}
+
 /// Every account belonging to `org_id`, in the roster's creation order.
 pub async fn members(
     orgs: &dyn OrgStore,
@@ -118,37 +176,21 @@ async fn member_ids(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<HashS
         .collect())
 }
 
-/// Which organization owns `client_id`, following a user-owned device through
-/// its owner's membership: derived, so moving an account moves its devices.
+/// Which organization owns `client_id`, if any.
 pub async fn owning_org(
     orgs: &dyn OrgStore,
     client_id: &ClientId,
 ) -> anyhow::Result<Option<OrgId>> {
-    match orgs.get_ownership(client_id).await? {
-        None => Ok(None),
-        Some(owner) => org_of(orgs, &owner).await,
-    }
-}
-
-/// [`owning_org`] for an ownership already read.
-pub async fn org_of(orgs: &dyn OrgStore, owner: &ClientOwner) -> anyhow::Result<Option<OrgId>> {
-    match owner {
-        ClientOwner::Org { org_id } => Ok(Some(org_id.clone())),
-        ClientOwner::User { user_id } => orgs.get_membership(user_id).await,
-    }
+    Ok(orgs
+        .get_ownership(client_id)
+        .await?
+        .map(|owner| owner.org_id().clone()))
 }
 
 /// Whether `owner` still names a record. A pre-auth key's owner was resolved
 /// when the key was minted, and the key can outlive it.
-pub async fn owner_exists(
-    orgs: &dyn OrgStore,
-    users: &dyn UserStore,
-    owner: &ClientOwner,
-) -> anyhow::Result<bool> {
-    Ok(match owner {
-        ClientOwner::Org { org_id } => orgs.get_org(org_id).await?.is_some(),
-        ClientOwner::User { user_id } => users.get_user(user_id).await?.is_some(),
-    })
+pub async fn owner_exists(orgs: &dyn OrgStore, owner: &ClientOwner) -> anyhow::Result<bool> {
+    Ok(orgs.get_org(owner.org_id()).await?.is_some())
 }
 
 /// How many members and devices each organization holds.
@@ -170,12 +212,6 @@ pub fn tally(
         .map(|org| (org.org_id.clone(), OrgCounts::default()))
         .collect();
 
-    // Built once, so each user-owned device is a lookup, not a membership scan.
-    let org_of_user: HashMap<&UserId, &OrgId> = memberships
-        .iter()
-        .map(|membership| (&membership.user_id, &membership.org_id))
-        .collect();
-
     // The `get_mut` stays inside each closure: a `&mut` yielded out of one
     // would outlive the `FnMut` borrow.
     memberships.iter().for_each(|membership| {
@@ -184,43 +220,33 @@ pub fn tally(
         }
     });
 
-    ownerships
-        .iter()
-        .filter_map(|ownership| match &ownership.owner {
-            ClientOwner::Org { org_id } => Some(org_id),
-            ClientOwner::User { user_id } => org_of_user.get(user_id).copied(),
-        })
-        .for_each(|org_id| {
-            if let Some(entry) = counts.get_mut(org_id) {
-                entry.clients += 1;
-            }
-        });
+    ownerships.iter().for_each(|ownership| {
+        if let Some(entry) = counts.get_mut(ownership.owner.org_id()) {
+            entry.clients += 1;
+        }
+    });
 
     counts
 }
 
-/// The ownership behind every device `org_id` owns, directly or through a
-/// member, by device: [`owned_clients`] without the fleet read.
+/// The ownership behind every device `org_id` owns, by device:
+/// [`owned_clients`] without the fleet read.
 pub async fn ownerships_of(
     orgs: &dyn OrgStore,
     org_id: &OrgId,
 ) -> anyhow::Result<HashMap<ClientId, ClientOwner>> {
-    let members = member_ids(orgs, org_id).await?;
     Ok(orgs
         .list_ownerships()
         .await?
         .into_iter()
-        .filter(|ownership| match &ownership.owner {
-            ClientOwner::Org { org_id: owner } => owner == org_id,
-            ClientOwner::User { user_id } => members.contains(user_id),
-        })
+        .filter(|ownership| ownership.owner.org_id() == org_id)
         .map(|ownership| (ownership.client_id, ownership.owner))
         .collect())
 }
 
-/// Every device `org_id` owns, directly or through its members, with the
-/// ownership that puts it there. An unreadable client is warned about and
-/// skipped, so one corrupt record cannot hide the rest.
+/// Every device `org_id` owns, with the ownership that puts it there. An
+/// unreadable client is warned about and skipped, so one corrupt record
+/// cannot hide the rest.
 pub async fn owned_clients(
     clients: &dyn ClientStore,
     orgs: &dyn OrgStore,
@@ -240,49 +266,6 @@ pub async fn owned_clients(
         .collect())
 }
 
-/// Every device owned by `user_id`: with [`holdings_of`], what an account
-/// deletion has to answer for.
-pub async fn devices_owned_by(
-    orgs: &dyn OrgStore,
-    user_id: &UserId,
-) -> anyhow::Result<Vec<ClientId>> {
-    Ok(orgs
-        .list_ownerships()
-        .await?
-        .into_iter()
-        .filter(|ownership| ownership.owner.user_id() == Some(user_id))
-        .map(|ownership| ownership.client_id)
-        .collect())
-}
-
-/// Clear the ownership of every device `user_id` owns, so the account can be
-/// deleted without stranding one. Re-running finishes a partial pass.
-pub async fn detach_devices_of(
-    orgs: &dyn OrgStore,
-    user_id: &UserId,
-) -> anyhow::Result<Vec<ClientId>> {
-    let owned = devices_owned_by(orgs, user_id).await?;
-
-    stream::iter(owned.iter().map(|client_id| async move {
-        // Handed to someone else since the scan: not ours to clear.
-        let owner = orgs.get_ownership(client_id).await?;
-        if owner.as_ref().and_then(ClientOwner::user_id) != Some(user_id) {
-            return Ok(());
-        }
-        orgs.delete_ownership(client_id).await?;
-        tracing::debug!(%user_id, %client_id, "user device detached");
-        anyhow::Ok(())
-    }))
-    .buffer_unordered(STORAGE_CONCURRENCY)
-    .try_collect::<Vec<()>>()
-    .await?;
-
-    if !owned.is_empty() {
-        tracing::info!(%user_id, count = owned.len(), "user devices detached");
-    }
-    Ok(owned)
-}
-
 /// How far a caller's device authority reaches. A type, not a bool: an org
 /// admin's answer depends on the device and on where it is being moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,8 +283,8 @@ pub enum DeviceScope {
 }
 
 impl DeviceScope {
-    /// Whether this scope may administer a device that rolls up to `owning_org`.
-    /// `None` (unowned, or owned outside every organization) is no org's to take.
+    /// Whether this scope may administer a device `owning_org` owns. `None`
+    /// (unowned) is no org's to take.
     pub fn may_administer(&self, owning_org: Option<&OrgId>) -> bool {
         match self {
             Self::Fleet => true,
@@ -319,16 +302,6 @@ impl DeviceScope {
             // Detaching is inside the scope: it removes a device from this
             // organization, which is never a grab.
             Self::Org(scope) => target.is_none_or(|org_id| org_id == scope),
-        }
-    }
-
-    /// [`Self::may_assign_to`] for a **person** in `owner_org`, with `None` closed:
-    /// a user in no organization is an outsider, not a detach target.
-    pub fn may_hand_to(&self, owner_org: Option<&OrgId>) -> bool {
-        match self {
-            Self::Fleet => true,
-            Self::Unaffiliated => false,
-            Self::Org(scope) => owner_org.is_some_and(|org_id| org_id == scope),
         }
     }
 }
@@ -413,8 +386,7 @@ pub async fn holdings_of(
 pub struct Dependents {
     /// Accounts whose membership names it.
     pub members: Vec<UserId>,
-    /// Devices whose ownership names it **directly**; a member's device is
-    /// released by detaching the member.
+    /// Devices whose ownership names it.
     pub clients: Vec<ClientId>,
     /// Private benchmarks it keeps, whose ids and pins would outlive a delete
     /// under an id no org-scoped route resolves.
@@ -429,13 +401,15 @@ pub struct Dependents {
 
 impl Dependents {
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty() && self.clients.is_empty() && self.only_detachable()
+        self.clients.is_empty() && self.only_detachable()
     }
 
-    /// Whether everything here is something `--detach` clears: memberships and
-    /// direct ownerships.
+    /// Whether everything here is something `--detach` clears: direct device
+    /// ownerships. Members are never detached, as an account always belongs to
+    /// an organization.
     pub fn only_detachable(&self) -> bool {
-        self.benchmarks.is_empty()
+        self.members.is_empty()
+            && self.benchmarks.is_empty()
             && self.catalog_entries.is_empty()
             && self.held.is_empty()
             && self.preauth_keys.is_empty()
@@ -446,7 +420,7 @@ impl Dependents {
     pub fn describe(&self) -> String {
         let parts: Vec<String> = [
             (self.members.len(), "member(s)"),
-            (self.clients.len(), "directly-owned client(s)"),
+            (self.clients.len(), "owned client(s)"),
             (self.benchmarks.len(), "private benchmark(s)"),
             (self.catalog_entries.len(), "live catalog entry(s)"),
             (self.held.campaigns.len(), "campaign(s)"),
@@ -487,7 +461,7 @@ pub async fn dependents(
             .list_client_preauth_keys()
             .await?
             .into_iter()
-            .filter(|key| key.default_owner.as_ref().and_then(ClientOwner::org_id) == Some(org_id))
+            .filter(|key| key.default_owner.as_ref().map(ClientOwner::org_id) == Some(org_id))
             .filter(|key| !key.is_expired(now))
             .map(|key| key.key_id)
             .collect(),
@@ -495,17 +469,10 @@ pub async fn dependents(
     })
 }
 
-/// The memberships and ownerships naming `org_id`: what [`detach_all`] clears.
+/// The memberships and ownerships naming `org_id`.
 async fn references(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<Dependents> {
     let members = member_ids(orgs, org_id).await?.into_iter().collect();
-    let clients = orgs
-        .list_ownerships()
-        .await?
-        .into_iter()
-        .filter(|ownership| ownership.owner.org_id() == Some(org_id))
-        .map(|ownership| ownership.client_id)
-        .collect();
-
+    let clients = owned_client_ids(orgs, org_id).await?;
     Ok(Dependents {
         members,
         clients,
@@ -513,28 +480,26 @@ async fn references(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<Depen
     })
 }
 
-/// Clear every direct reference to `org_id` so the record can be deleted; its
-/// private benchmarks stay. Not atomic, but a re-run converges.
-pub async fn detach_all(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<Dependents> {
-    let found = references(orgs, org_id).await?;
+async fn owned_client_ids(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<Vec<ClientId>> {
+    Ok(orgs
+        .list_ownerships()
+        .await?
+        .into_iter()
+        .filter(|ownership| ownership.owner.org_id() == org_id)
+        .map(|ownership| ownership.client_id)
+        .collect())
+}
+
+/// Clear every device ownership naming `org_id` so the record can be deleted,
+/// and return the devices; its members and private benchmarks stay. Not
+/// atomic, but a re-run converges.
+pub async fn detach_devices(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<Vec<ClientId>> {
+    let clients = owned_client_ids(orgs, org_id).await?;
 
     // Concurrent: each relation costs a read and a delete.
-    stream::iter(found.members.iter().map(|user_id| async move {
-        // Reassigned since the scan: no longer this organization's reference.
-        if orgs.get_membership(user_id).await?.as_ref() != Some(org_id) {
-            return Ok(());
-        }
-        orgs.delete_membership(user_id).await?;
-        tracing::debug!(%org_id, %user_id, "organization member detached");
-        anyhow::Ok(())
-    }))
-    .buffer_unordered(STORAGE_CONCURRENCY)
-    .try_collect::<Vec<()>>()
-    .await?;
-
-    stream::iter(found.clients.iter().map(|client_id| async move {
+    stream::iter(clients.iter().map(|client_id| async move {
         let owner = orgs.get_ownership(client_id).await?;
-        if owner.as_ref().and_then(ClientOwner::org_id) != Some(org_id) {
+        if owner.as_ref().map(ClientOwner::org_id) != Some(org_id) {
             return Ok(());
         }
         orgs.delete_ownership(client_id).await?;
@@ -545,15 +510,10 @@ pub async fn detach_all(orgs: &dyn OrgStore, org_id: &OrgId) -> anyhow::Result<D
     .try_collect::<Vec<()>>()
     .await?;
 
-    if !found.is_empty() {
-        tracing::info!(
-            %org_id,
-            members = found.members.len(),
-            clients = found.clients.len(),
-            "organization members and devices detached"
-        );
+    if !clients.is_empty() {
+        tracing::info!(%org_id, clients = clients.len(), "organization devices detached");
     }
-    Ok(found)
+    Ok(clients)
 }
 
 #[cfg(test)]
@@ -667,6 +627,7 @@ mod tests {
             public_key: PublicKeyHex::try_new("ab".repeat(32))?,
             organization: NonEmptyTrimmedString::try_new("free text")?,
             client_details: NonEmptyTrimmedString::try_new("details")?,
+            name: None,
             contact_email: ContactEmail::try_new("device@example.com")?,
             status: pipette_core::client::ClientStatus::Approved,
             registered_at: Timestamp::now(),
@@ -759,80 +720,11 @@ mod tests {
         Ok(())
     }
 
-    /// A member's device follows the member's move rather than being pinned at
-    /// assignment time.
+    /// An unowned device is in no organization, which is not an error.
     #[tokio::test]
-    async fn owned_clients_include_members_devices_and_follow_a_move() -> anyhow::Result<()> {
+    async fn owning_org_is_the_owner() -> anyhow::Result<()> {
         let fixture = fixture()?;
         let acme = make_org(&fixture, "acme").await?;
-        let other = make_org(&fixture, "other").await?;
-        let member = make_user(&fixture, "member@example.com", Some(&acme.org_id)).await?;
-
-        let rack = make_client(
-            &fixture,
-            "ev1_rack",
-            Some(ClientOwner::Org {
-                org_id: acme.org_id.clone(),
-            }),
-        )
-        .await?;
-        let laptop = make_client(
-            &fixture,
-            "ev1_laptop",
-            Some(ClientOwner::User {
-                user_id: member.user_id.clone(),
-            }),
-        )
-        .await?;
-        make_client(&fixture, "ev1_unowned", None).await?;
-
-        let mut owned: Vec<ClientId> =
-            owned_clients(&*fixture.clients, &*fixture.orgs, &acme.org_id)
-                .await?
-                .into_iter()
-                .map(|(c, _)| c.client_id)
-                .collect();
-        owned.sort();
-        assert_eq!(
-            owned,
-            vec![laptop.client_id.clone(), rack.client_id.clone()]
-        );
-
-        // The member moves; their device moves with them and the rack does not.
-        fixture
-            .orgs
-            .put_membership(&Membership {
-                user_id: member.user_id.clone(),
-                org_id: other.org_id.clone(),
-            })
-            .await?;
-
-        assert_eq!(
-            owned_clients(&*fixture.clients, &*fixture.orgs, &acme.org_id)
-                .await?
-                .into_iter()
-                .map(|(c, _)| c.client_id)
-                .collect::<Vec<_>>(),
-            vec![rack.client_id]
-        );
-        assert_eq!(
-            owned_clients(&*fixture.clients, &*fixture.orgs, &other.org_id)
-                .await?
-                .into_iter()
-                .map(|(c, _)| c.client_id)
-                .collect::<Vec<_>>(),
-            vec![laptop.client_id]
-        );
-        Ok(())
-    }
-
-    /// The `None` for a member-less owner is not an error.
-    #[tokio::test]
-    async fn owning_org_follows_the_owner() -> anyhow::Result<()> {
-        let fixture = fixture()?;
-        let acme = make_org(&fixture, "acme").await?;
-        let member = make_user(&fixture, "member@example.com", Some(&acme.org_id)).await?;
-        let loner = make_user(&fixture, "loner@example.com", None).await?;
 
         let unowned = make_client(&fixture, "ev1_a", None).await?;
         let direct = make_client(
@@ -843,36 +735,11 @@ mod tests {
             }),
         )
         .await?;
-        let via_member = make_client(
-            &fixture,
-            "ev1_c",
-            Some(ClientOwner::User {
-                user_id: member.user_id,
-            }),
-        )
-        .await?;
-        let via_loner = make_client(
-            &fixture,
-            "ev1_d",
-            Some(ClientOwner::User {
-                user_id: loner.user_id,
-            }),
-        )
-        .await?;
 
         assert_eq!(owning_org(&*fixture.orgs, &unowned.client_id).await?, None);
         assert_eq!(
             owning_org(&*fixture.orgs, &direct.client_id).await?,
-            Some(acme.org_id.clone())
-        );
-        assert_eq!(
-            owning_org(&*fixture.orgs, &via_member.client_id).await?,
             Some(acme.org_id)
-        );
-        assert_eq!(
-            owning_org(&*fixture.orgs, &via_loner.client_id).await?,
-            None,
-            "an owner belonging to no organization leaves the device in none"
         );
         Ok(())
     }
@@ -888,8 +755,6 @@ mod tests {
         assert_eq!(scope.may_administer(None), expected);
         assert_eq!(scope.may_assign_to(Some(&other)), expected);
         assert_eq!(scope.may_assign_to(None), expected);
-        assert_eq!(scope.may_hand_to(Some(&other)), expected);
-        assert_eq!(scope.may_hand_to(None), expected);
     }
 
     #[test]
@@ -901,7 +766,7 @@ mod tests {
         assert!(scope.may_administer(Some(&mine)), "its own device");
         assert!(
             !scope.may_administer(None),
-            "an unowned device, or one an unaffiliated person owns, is the server's"
+            "an unowned device is the server's"
         );
         assert!(
             !scope.may_administer(Some(&theirs)),
@@ -917,76 +782,15 @@ mod tests {
             !scope.may_assign_to(Some(&theirs)),
             "a device may not be handed to another organization"
         );
-
-        assert!(scope.may_hand_to(Some(&mine)), "to one of its own members");
-        assert!(
-            !scope.may_hand_to(None),
-            "a person outside every organization is not a detach target"
-        );
-        assert!(!scope.may_hand_to(Some(&theirs)));
     }
 
-    /// Detaching leaves the device registered and unowned, where a fresh
-    /// self-registration sits.
-    #[tokio::test]
-    async fn an_owner_is_a_reference_an_account_deletion_would_strand() -> anyhow::Result<()> {
-        let fixture = fixture()?;
-        let acme = make_org(&fixture, "acme").await?;
-        let owner = make_user(&fixture, "owner@example.com", Some(&acme.org_id)).await?;
-        let laptop = make_client(
-            &fixture,
-            "ev1_laptop",
-            Some(ClientOwner::User {
-                user_id: owner.user_id.clone(),
-            }),
-        )
-        .await?;
-        // A device the organization owns directly is not this account's.
-        make_client(
-            &fixture,
-            "ev1_rack",
-            Some(ClientOwner::Org {
-                org_id: acme.org_id.clone(),
-            }),
-        )
-        .await?;
-
-        assert_eq!(
-            devices_owned_by(&*fixture.orgs, &owner.user_id).await?,
-            vec![laptop.client_id.clone()]
-        );
-
-        assert_eq!(
-            detach_devices_of(&*fixture.orgs, &owner.user_id).await?,
-            vec![laptop.client_id.clone()]
-        );
-        assert_eq!(
-            fixture.orgs.get_ownership(&laptop.client_id).await?,
-            None,
-            "the device survives its owner and becomes unowned"
-        );
-        assert!(
-            devices_owned_by(&*fixture.orgs, &owner.user_id)
-                .await?
-                .is_empty()
-        );
-        // Idempotent, so a partially failed teardown is finished by re-running.
-        assert!(
-            detach_devices_of(&*fixture.orgs, &owner.user_id)
-                .await?
-                .is_empty()
-        );
-        Ok(())
-    }
-
-    /// It also counts a member's device against the member's organization, and a
-    /// reference to a deleted organization nowhere.
+    /// A reference to a deleted organization is counted nowhere.
     #[tokio::test]
     async fn the_tally_agrees_with_the_per_organization_joins() -> anyhow::Result<()> {
         let fixture = fixture()?;
         let acme = make_org(&fixture, "acme").await?;
         let labs = make_org(&fixture, "labs").await?;
-        let member = make_user(&fixture, "member@example.com", Some(&acme.org_id)).await?;
+        make_user(&fixture, "member@example.com", Some(&acme.org_id)).await?;
         make_user(&fixture, "loner@example.com", None).await?;
         // Names an organization that no longer exists.
         let ghost = OrgId::mint();
@@ -997,14 +801,6 @@ mod tests {
             "ev1_rack",
             Some(ClientOwner::Org {
                 org_id: acme.org_id.clone(),
-            }),
-        )
-        .await?;
-        make_client(
-            &fixture,
-            "ev1_laptop",
-            Some(ClientOwner::User {
-                user_id: member.user_id,
             }),
         )
         .await?;
@@ -1020,7 +816,7 @@ mod tests {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("acme is tallied"))?;
         assert_eq!(acme_counts.members, 1);
-        assert_eq!(acme_counts.clients, 2, "the rack and the member's laptop");
+        assert_eq!(acme_counts.clients, 1, "the rack");
         assert_eq!(
             counts.get(&labs.org_id).copied(),
             Some(OrgCounts::default())
@@ -1046,8 +842,9 @@ mod tests {
         Ok(())
     }
 
+    /// Only the devices it owns: the member stays.
     #[tokio::test]
-    async fn detaching_clears_the_direct_references_only() -> anyhow::Result<()> {
+    async fn detaching_clears_the_owned_devices_only() -> anyhow::Result<()> {
         let fixture = fixture()?;
         let acme = make_org(&fixture, "acme").await?;
         let member = make_user(&fixture, "member@example.com", Some(&acme.org_id)).await?;
@@ -1059,38 +856,32 @@ mod tests {
             }),
         )
         .await?;
-        let laptop = make_client(
-            &fixture,
-            "ev1_laptop",
-            Some(ClientOwner::User {
-                user_id: member.user_id.clone(),
-            }),
-        )
-        .await?;
 
         let found = fixture.dependents(&acme.org_id).await?;
         assert_eq!(found.members, vec![member.user_id.clone()]);
-        assert_eq!(
-            found.clients,
-            vec![rack.client_id.clone()],
-            "a member's own device is not a direct reference"
-        );
+        assert_eq!(found.clients, vec![rack.client_id.clone()]);
         assert!(!found.is_empty());
+        assert!(!found.only_detachable(), "a member is never detached");
 
-        detach_all(&*fixture.orgs, &acme.org_id).await?;
-        assert!(fixture.dependents(&acme.org_id).await?.is_empty());
-        assert_eq!(fixture.orgs.get_membership(&member.user_id).await?, None);
-        assert_eq!(fixture.orgs.get_ownership(&rack.client_id).await?, None);
         assert_eq!(
-            fixture.orgs.get_ownership(&laptop.client_id).await?,
-            Some(ClientOwner::User {
-                user_id: member.user_id
-            }),
-            "the member's device keeps its owner; the membership is what moved"
+            detach_devices(&*fixture.orgs, &acme.org_id).await?,
+            vec![rack.client_id.clone()]
         );
+        let left = fixture.dependents(&acme.org_id).await?;
+        assert_eq!(left.members, vec![member.user_id.clone()]);
+        assert!(left.clients.is_empty());
+        assert_eq!(
+            fixture.orgs.get_membership(&member.user_id).await?,
+            Some(acme.org_id.clone())
+        );
+        assert_eq!(fixture.orgs.get_ownership(&rack.client_id).await?, None);
 
         // Idempotent: a second pass is a no-op, not an error.
-        assert!(detach_all(&*fixture.orgs, &acme.org_id).await?.is_empty());
+        assert!(
+            detach_devices(&*fixture.orgs, &acme.org_id)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1126,7 +917,11 @@ mod tests {
         assert!(!found.is_empty());
         assert!(found.describe().contains("1 private benchmark(s)"));
 
-        assert!(detach_all(&*fixture.orgs, &acme.org_id).await?.is_empty());
+        assert!(
+            detach_devices(&*fixture.orgs, &acme.org_id)
+                .await?
+                .is_empty()
+        );
         assert_eq!(
             fixture.dependents(&acme.org_id).await?.benchmarks,
             found.benchmarks
@@ -1198,7 +993,11 @@ mod tests {
             found.describe(),
             "1 campaign(s), 1 vault resource(s) and 1 client pre-auth key(s) still reference it"
         );
-        assert!(detach_all(&*fixture.orgs, &acme.org_id).await?.is_empty());
+        assert!(
+            detach_devices(&*fixture.orgs, &acme.org_id)
+                .await?
+                .is_empty()
+        );
         assert_eq!(fixture.dependents(&acme.org_id).await?, found);
 
         // Each kind refuses on its own.

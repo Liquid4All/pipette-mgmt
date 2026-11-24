@@ -13,7 +13,7 @@ use pipette_httpapi::state::AppState;
 use pipette_plan_types::{CampaignId, ClientId, PlanId, UserPermission};
 use pipette_web_testkit::{
     ONE_CELL_PLAN, UserSigner, add_starved_snapshot, approved_client, approved_object_client,
-    body_json, create_org, created_campaign, json_str, post_campaign, post_plan_document,
+    body_json, create_org, created_campaign, json_str, org_of, post_campaign, post_plan_document,
     put_idle_campaign, put_loose_plan, registered_user, set_user_org, signed_empty, submit_plan_as,
     user_address,
 };
@@ -436,8 +436,8 @@ async fn test_bad_source_omits_models_and_preserves_the_page(
 
 // ── GET /api/v1/campaigns?names=true ───────────────────────────────────────────────
 
-/// `names` names exactly the owners of the rows served: an organization by
-/// handle, an account by address, nobody for a filter outside the reach.
+/// `names` names exactly the owners of the rows served, each organization by
+/// its display name, and nobody for a filter outside the reach.
 #[tokio::test]
 async fn test_names_name_the_owners_served() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -464,20 +464,25 @@ async fn test_names_name_the_owners_served() -> anyhow::Result<()> {
     )
     .await?;
     created_campaign(&state, &stranger, &[("name", "Theirs")]).await?;
-    let member_address = user_address(&state, &member.1).await?;
+    let theirs = org_of(&state, &stranger.1).await?;
+    let theirs_name = format!(
+        "{}'s personal org",
+        user_address(&state, &stranger.1).await?
+    );
 
     let body = listed(&state, &admin, "/api/v1/campaigns?names=true&order=newest").await?;
     assert_eq!(
         body["names"],
-        json!({
-            member.1.as_str(): member_address,
-            stranger.1.as_str(): user_address(&state, &stranger.1).await?,
-            acme.as_str(): "acme",
-        })
+        json!({ theirs.as_str(): theirs_name, acme.as_str(): "acme" })
     );
 
-    let body = listed(&state, &member, "/api/v1/campaigns?names=true&owner=mine").await?;
-    assert_eq!(body["names"], json!({ member.1.as_str(): member_address }));
+    let body = listed(
+        &state,
+        &member,
+        &format!("/api/v1/campaigns?names=true&org_id={acme}"),
+    )
+    .await?;
+    assert_eq!(body["names"], json!({ acme.as_str(): "acme" }));
     let body = listed(
         &state,
         &member,
@@ -536,7 +541,7 @@ async fn test_plan_id_finds_its_campaign_through_any_revision() -> anyhow::Resul
     let loose = put_loose_plan(&state, key, user_id, key_id, &client_id, "loose", 1).await?;
 
     let uris = [&first, &head].into_iter().flat_map(|plan_id| {
-        ["", "&plan=true&names=true&order=newest", "&owner=mine"]
+        ["", "&plan=true&names=true&order=newest", "&owner=org"]
             .map(|extra| format!("/api/v1/campaigns?plan_id={plan_id}{extra}"))
     });
     let (state, reader, campaign) = (&state, &reader, campaign_id.as_str());
@@ -564,7 +569,10 @@ async fn test_plan_id_finds_its_campaign_through_any_revision() -> anyhow::Resul
         [
             format!("plan_id={theirs}"),
             format!("plan_id={loose}"),
-            format!("plan_id={first}&owner=org"),
+            format!(
+                "plan_id={first}&org_id={}",
+                org_of(state, &stranger.1).await?
+            ),
         ]
         .map(anyhow::Ok),
     )
@@ -628,7 +636,9 @@ async fn test_the_campaign_read_takes_the_listing_s_flags() -> anyhow::Result<()
     .await?;
     let (campaign_id, head) = running(&state, &reader, &client_id, "running").await?;
     let idle = put_idle_campaign(&state, &reader.1, "Idle").await?;
-    let names = json!({ reader.1.as_str(): user_address(&state, &reader.1).await? });
+    let own = org_of(&state, &reader.1).await?;
+    let own_name = format!("{}'s personal org", user_address(&state, &reader.1).await?);
+    let names = json!({ own.as_str(): own_name });
     let uri = format!("/api/v1/campaigns/{campaign_id}");
     let stored = record(&state, &campaign_id).await?;
 

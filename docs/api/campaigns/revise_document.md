@@ -26,13 +26,12 @@ runs the steps of a variant edit, with the body as the revised document:
 3. Cancels the replaced plan, whose teardown retires the jobs the new document
    no longer describes.
 
-The body is stored as it is sent, comments and layout included. A model in the
-document can carry an `auth_token`. The route then imports the model for the
-campaign's owner, as [`POST …/plans`](file_plan.md) does, and
-stores the document with the vault arm in place of the model
-([the request body of a filing](../campaigns.md#request-body)). The server does not store such a document as
-the caller sent it. The server keeps the digest of the sent text instead, so
-the rules below match such a document by that digest.
+The body is stored after the catalog-name and gated-model rewrites of
+[the request body of a filing](../campaigns.md#request-body); a model with an
+`auth_token` is imported for the campaign's owner, as
+[`POST …/plans`](file_plan.md) does. When either rewrite changes the text, the
+server keeps the digest of the sent text, so the rules below match such a
+document by that digest.
 [`GET /api/v1/campaigns/{campaign_id}/document`](read_document.md)
 reads the document to start from.
 
@@ -58,6 +57,8 @@ runs is `409`. A dry run off such a plan is `409` too.
 | `dry_run` | no | `true` expands the document, and files nothing |
 | `carry_earlier`, `inherit_from` | no | As on a [variant edit](edit_variants.md). With either, the plan's own document files a revision rather than nothing |
 | `carry_across_limit` | no | As on a [variant edit](edit_variants.md). It changes no job of the plan's own document, so that document still files nothing |
+| `inherit_failed` | no | As on a [variant edit](edit_variants.md). Alone, like `carry_across_limit`, it leaves the plan's own document filing nothing |
+| `replace_model` | no | As on a [variant edit](edit_variants.md). Alone, it does not file the plan's own document |
 
 Responds `201 Created` with the body of a [variant edit](edit_variants.md):
 what became of the replaced
@@ -91,15 +92,15 @@ The route also answers the errors every filing answers
 |--------|------|
 | 200 | A dry run; the campaign record with `"changed": false` for a document that files nothing or a retry that landed; or the progress stream for `Accept: application/x-ndjson` |
 | 201 | The revision is filed, the campaign moved onto it, and the replaced plan cancelled |
-| 400 | The document is refused for a reason [the filing errors](../campaigns.md#errors) list. The query string omits `base_plan_id` or gives an invalid plan id. This route rejects `add_from`, `restore`, and other unsupported parameters. Use a variant edit for `add_from` or `restore`. Or `inherit_from` names more than 32 plans. Or a job body holds an `auth_token` that the import does not remove, or HuggingFace refuses the import of a job's model, for a reason that [the filing errors](../campaigns.md#errors) list |
+| 400 | The document is refused for a reason [the filing errors](../campaigns.md#errors) list. The query string omits `base_plan_id` or gives an invalid plan id. This route rejects `add_from`, `restore`, and other unsupported parameters. Use a variant edit for `add_from` or `restore`. Or `inherit_from` names more than 32 plans. Or `replace_model` is refused as on a [variant edit](edit_variants.md). Or a job body holds an `auth_token` that the import does not remove, or HuggingFace refuses the import of a job's model, for a reason that [the filing errors](../campaigns.md#errors) list |
 | 401 | Missing or invalid auth headers, or a device signed ([filing errors](../campaigns.md#errors)) |
 | 403 | As for a [variant edit](edit_variants.md) |
 | 404 | No such campaign, also when a delete removed it during an import. Or an `inherit_from` plan is not there, or is not one the caller can read; the message names it. Nothing is filed |
 | 409 | The campaign is [locked or archived](update_campaign.md): unlock or unarchive it first; nothing is filed, dry runs included. Or the campaign runs a plan other than `base_plan_id`, and not as a retry that landed, runs no plan, or runs one with no stored document: nothing is filed. Or another revision moved the campaign, or a delete removed it, while this one was filed: this revision does not become the head, and the server cancels it. Or the campaign changed its owner or its current plan during the import: nothing is filed |
 | 413 | The body is over `plan_body_limit_bytes` ([request size limits](../../httpapi.md#12-request-size-limits)) |
 | 415 | The `Content-Type` is not `application/toml` |
-| 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe |
-| 502 | HuggingFace failed during an import, as [the filing errors](../campaigns.md#errors) describe |
+| 429 | Every import permit is held, or HuggingFace limits the requests of the token, as [the filing errors](../campaigns.md#errors) describe. Or HuggingFace limits the listing that `replace_model` reads |
+| 502 | HuggingFace failed during an import, as [the filing errors](../campaigns.md#errors) describe, or during the listing that `replace_model` reads |
 
 A `runtimes` entry can be a catalog name.
 [Catalog names](../campaigns.md#catalog-names) describes how the server resolves

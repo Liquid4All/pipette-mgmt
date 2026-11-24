@@ -633,6 +633,18 @@ export type AuditAction =
       type: "catalog_remove_member";
     }
   | {
+      family: string | null;
+      name: string;
+      scope: string;
+      type: "catalog_set_family";
+    }
+  | {
+      family: string;
+      logo_uri: string | null;
+      scope: string;
+      type: "catalog_set_family_logo";
+    }
+  | {
       name: string;
       org_id: string;
       original_created_by: string;
@@ -653,7 +665,8 @@ export type AuditAction =
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PolicyKind".
  */
-export type PolicyKind = "swap" | "spread" | "failed" | "ttft_over_e2e" | "model_params" | "smaller_failed";
+export type PolicyKind =
+  "swap" | "spread" | "failed" | "ttft_over_e2e" | "model_params" | "smaller_failed" | "vault_resource";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "AuditActor".
@@ -1263,6 +1276,21 @@ export type BenchmarkFlags =
     }
   | {
       attempt_timeout_seconds?: number | null;
+      benchmark_type: "vl_throughput";
+      http_timeout_seconds?: number | null;
+      model_type: "openvino";
+      readiness?: ReadinessOverrides | null;
+      runtime_type: "uv_openvino";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
+      benchmark_type: "vl_max_memory";
+      http_timeout_seconds?: number | null;
+      model_type: "openvino";
+      runtime_type: "uv_openvino";
+    }
+  | {
+      attempt_timeout_seconds?: number | null;
       benchmark_type: "max_memory_usage";
       model_type: "mlx";
       runtime_type: "mlx_macos_pipette";
@@ -1412,20 +1440,8 @@ export type BenchmarkType =
   | "asr_throughput"
   | "asr_max_memory"
   | "decision_latency"
-  | "decision_max_memory";
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "PrincipalOwner".
- */
-export type PrincipalOwner =
-  | {
-      org_id: string;
-      type: "org";
-    }
-  | {
-      type: "user";
-      user_id: string;
-    };
+  | "decision_max_memory"
+  | "session";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "RevisionChange".
@@ -1435,15 +1451,19 @@ export type RevisionChange =
       added_variant_count: number;
       carry_across_limit?: boolean;
       carry_earlier?: boolean;
+      inherit_failed?: boolean;
       inherit_from?: string[];
       removed_variant_count: number;
+      replace_model?: ReplacedModel[];
       restored?: RestoredVariant[];
       type: "variants";
     }
   | {
       carry_across_limit?: boolean;
       carry_earlier?: boolean;
+      inherit_failed?: boolean;
       inherit_from?: string[];
+      replace_model?: ReplacedModel[];
       type: "document";
     }
   | {
@@ -1559,7 +1579,7 @@ export type UserAccountType = "human" | "service";
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "UserStatus".
  */
-export type UserStatus = ("active" | "disabled") | "pending";
+export type UserStatus = "active" | "disabled";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "OrgStatus".
@@ -1575,19 +1595,6 @@ export type UserPermissionSet = string[];
  * via the `definition` "ClientStatus".
  */
 export type ClientStatus = "pending" | "approved";
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "ClientOwner".
- */
-export type ClientOwner =
-  | {
-      org_id: string;
-      type: "org";
-    }
-  | {
-      type: "user";
-      user_id: string;
-    };
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "ClientPermissionSet".
@@ -1631,7 +1638,7 @@ export type DescriptorMemberKey =
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "ModelFormat".
  */
-export type ModelFormat = "gguf" | "mlx" | "core_ai" | "torch" | "openvino" | "onnx";
+export type ModelFormat = "gguf" | "mlx" | "core_ai" | "torch" | "openvino" | "onnx" | "system";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "DescriptorWithheldReasonCode".
@@ -2563,6 +2570,24 @@ export type RuntimeFlags =
       runtime_type: "uv_openvino";
     }
   | {
+      benchmark_type: "vl_throughput";
+      device?: string | null;
+      generate_hint?: OpenvinoGenerateHint | null;
+      max_prompt_len?: number | null;
+      min_response_len?: number | null;
+      model_type: "openvino";
+      runtime_type: "uv_openvino";
+    }
+  | {
+      benchmark_type: "vl_max_memory";
+      device?: string | null;
+      generate_hint?: OpenvinoGenerateHint | null;
+      max_prompt_len?: number | null;
+      min_response_len?: number | null;
+      model_type: "openvino";
+      runtime_type: "uv_openvino";
+    }
+  | {
       benchmark_type: "prefill_throughput";
       device?: string | null;
       generate_hint?: OpenvinoGenerateHint | null;
@@ -2710,7 +2735,7 @@ export type Reach = ("none" | "every") | "own" | "listed";
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "OwnerType".
  */
-export type OwnerType = "org" | "user";
+export type OwnerType = "org";
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PlannedImport".
@@ -3075,6 +3100,14 @@ export interface CampaignCreated {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PrincipalOwner".
+ */
+export interface PrincipalOwner {
+  org_id: string;
+  type: "org";
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "PlanFiled".
  */
 export interface PlanFiled {
@@ -3090,6 +3123,15 @@ export interface PlanFiled {
   plan_id: string;
   plan_warnings?: string[];
   warnings: Warning[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ReplacedModel".
+ */
+export interface ReplacedModel {
+  from: string;
+  to: string;
+  verified: boolean;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3404,6 +3446,7 @@ export interface CampaignRevised {
   plan: PlanFiled;
   previous_plan_id: string;
   recalculated_job_count: number;
+  replaced_job_count: number;
   rerun_job_count: number;
 }
 /**
@@ -3613,6 +3656,7 @@ export interface Client {
   device_os_name?: string | null;
   device_os_version?: string | null;
   device_ram_bytes?: number | null;
+  name?: string | null;
   organization: string;
   public_key: string;
   registered_at: string;
@@ -3644,15 +3688,23 @@ export interface ClientDetail {
   device_ram_bytes?: number | null;
   last_seen_at: string | null;
   may_administer: boolean;
+  name?: string | null;
   organization: string;
   owner?: ClientOwner | null;
-  owning_org_id?: string | null;
   permissions: ClientPermissionSet;
   public_key: string;
   registered_at: string;
   reindex_pending: boolean;
   status: ClientStatus;
   tags: string[];
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "ClientOwner".
+ */
+export interface ClientOwner {
+  org_id: string;
+  type: "org";
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3686,6 +3738,7 @@ export interface ClientListRow {
   device_os_version?: string | null;
   device_ram_bytes?: number | null;
   last_seen_at: string | null;
+  name?: string | null;
   organization: string;
   owner?: ClientOwner | null;
   permissions: ClientPermissionSet;
@@ -3777,6 +3830,7 @@ export interface CreateCampaignGroupRequest {
  * via the `definition` "CreateDescriptorEntryRequest".
  */
 export interface CreateDescriptorEntryRequest {
+  family?: string | null;
   /**
    * @minItems 1
    */
@@ -3851,6 +3905,8 @@ export interface DescriptorCatalogShortList {
 export interface DescriptorCatalogShortListItem {
   descriptor_kind: DescriptorKind;
   display_name: string;
+  family?: string | null;
+  family_logo_sha256?: string | null;
   members: DescriptorMemberView[];
   name: string;
   release_time: string;
@@ -3872,6 +3928,7 @@ export interface DescriptorMemberView {
   parameters?: DescriptorMemberParameters | null;
   plan_toml: string;
   selector: string;
+  size_bytes?: number | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -3950,6 +4007,7 @@ export interface DescriptorDisplay {
 export interface DescriptorEntry {
   created_at: string;
   created_by: string;
+  family?: string | null;
   kind: DescriptorEntryKind;
   /**
    * @minItems 1
@@ -3970,6 +4028,8 @@ export interface DescriptorEntryListRow {
   descriptor_kind: DescriptorKind;
   descriptor_types: string[];
   display_name: string;
+  family?: string | null;
+  family_logo_sha256?: string | null;
   kind: DescriptorEntryKind;
   member_count: number;
   member_summaries: DescriptorMemberSummary[];
@@ -4007,6 +4067,23 @@ export interface DescriptorEntryLookup {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "DescriptorFamilyLogo".
+ */
+export interface DescriptorFamilyLogo {
+  logo_uri: string;
+  sha256: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "DescriptorFamilyLogoView".
+ */
+export interface DescriptorFamilyLogoView {
+  family: string;
+  logo_uri: string | null;
+  scope: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "DeviceTimeTotal".
  */
 export interface DeviceTimeTotal {
@@ -4035,6 +4112,7 @@ export interface FirstClerkSignIn {
  */
 export interface HeldJob {
   body_index: number;
+  failed?: boolean;
   job_id: string;
   plan_id: string;
 }
@@ -4254,9 +4332,19 @@ export interface NamedCampaignOverview {
     [k: string]: string;
   } | null;
   owner: PrincipalOwner;
+  policy_deferral: PolicyDeferral | null;
   state?: CampaignState;
   state_note?: string | null;
   updated_at: string;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "PolicyDeferral".
+ */
+export interface PolicyDeferral {
+  marked_job_count: number;
+  rerun_job_count: number;
+  until: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -4519,34 +4607,14 @@ export interface OrgOverview {
   may_delete: boolean;
   member_count: number;
   member_status_counts: {
-    [k: string]: number;
+    active?: number;
+    disabled?: number;
   };
   org_id: string;
   pending_clients: ClientHighlights | null;
-  pending_members: UserHighlights;
   slug: string;
   status: OrgStatus;
   vault_resource_count: number | null;
-}
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "UserHighlights".
- */
-export interface UserHighlights {
-  first: User[];
-  total: number;
-}
-/**
- * This interface was referenced by `ApiSchema`'s JSON-Schema
- * via the `definition` "User".
- */
-export interface User {
-  account_type: UserAccountType & string;
-  campaign_scope?: string[] | null;
-  contact_email: string;
-  created_at: string;
-  status: UserStatus;
-  user_id: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -4700,6 +4768,7 @@ export interface RecalculateJobsRequest {
  */
 export interface RegisterClerkUserKeyRequest {
   key_details: string;
+  org_name?: string | null;
   public_key: string;
 }
 /**
@@ -4707,10 +4776,9 @@ export interface RegisterClerkUserKeyRequest {
  * via the `definition` "RegisterUserKeyRequest".
  */
 export interface RegisterUserKeyRequest {
-  contact_email?: string | null;
   key_details: string;
   public_key: string;
-  user_preauth_key?: string | null;
+  user_preauth_key: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -4766,12 +4834,16 @@ export interface RevisionDryRun {
   dropped_job_ids: string[];
   held_jobs: HeldJob[];
   imports: PlannedImport[];
+  inherited_failed_job_count: number;
   inherited_job_count: number;
   marked_job_ids: string[];
   new_job_count: number;
   plan_warnings: string[];
   recalculated_job_count: number;
   repeated_variants: number[];
+  replaced_job_count: number;
+  replaced_jobs: HeldJob[];
+  replaced_models: ReplacedModel[];
   requirements_rerun_job_count: number;
   rerun_job_ids: string[];
   restored_job_count: number;
@@ -4804,10 +4876,24 @@ export interface SetClientOwnerRequest {
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "SetDescriptorEntryFamilyRequest".
+ */
+export interface SetDescriptorEntryFamilyRequest {
+  family?: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "SetDescriptorFamilyLogoRequest".
+ */
+export interface SetDescriptorFamilyLogoRequest {
+  logo_uri: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
  * via the `definition` "SetUserOrgRequest".
  */
 export interface SetUserOrgRequest {
-  org_id: string | null;
+  org_id: string;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema
@@ -4834,6 +4920,16 @@ export interface UpdateCampaignRequest {
   name?: string | null;
   state?: CampaignState | null;
   state_note?: string | null;
+}
+/**
+ * This interface was referenced by `ApiSchema`'s JSON-Schema
+ * via the `definition` "UpdateClientRequest".
+ */
+export interface UpdateClientRequest {
+  client_details?: string | null;
+  contact_email?: string | null;
+  name?: string | null;
+  organization?: string | null;
 }
 /**
  * This interface was referenced by `ApiSchema`'s JSON-Schema

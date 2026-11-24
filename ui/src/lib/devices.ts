@@ -2,7 +2,7 @@
 // (`clients.html`'s `#device-keys`): where the page sits, what its forms send,
 // and the wording they draw.
 
-import { ME, SERVER, orgTrail, type Crumb } from "./crumbs";
+import { SERVER, orgTrail, type Crumb } from "./crumbs";
 import type { DeviceBranch } from "./fleet";
 import { handle } from "./format";
 import type { OrgRef } from "./orgs";
@@ -16,15 +16,13 @@ import type {
 
 /**
  * The branch a device's page sits under, as the classic `device_branch` decided it:
- * the server's for a device nobody owns, the reader's for one it owns, an
- * organization's the tree draws for a reader of its roster, else the fleet.
- * `owning` is the organization `owning_org_id` names, when the tree holds it.
+ * the server's for a device nobody owns, an organization's the tree draws for a
+ * reader of its roster, else the fleet.
+ * `owning` is the organization that owns the device, when the tree holds it.
  */
 export function deviceBranch(record: ClientDetail, account: OwnUserView, owning: OrgRef | null): DeviceBranch {
-  const owner = record.owner;
-  if (!owner) return { kind: "server" };
-  if (owner.type === "user" && owner.user_id === account.user_id) return { kind: "me" };
-  if (owning && owning.org_id === record.owning_org_id && reaches(account, account.may.read_roster, owning.org_id)) {
+  if (!record.owner) return { kind: "server" };
+  if (owning && owning.org_id === record.owner.org_id && reaches(account, account.may.read_roster, owning.org_id)) {
     return { kind: "org", ...owning, count: null };
   }
   return { kind: "all" };
@@ -34,7 +32,6 @@ export function deviceBranch(record: ClientDetail, account: OwnUserView, owning:
 export function listingPath(branch: DeviceBranch): string {
   switch (branch.kind) {
     case "all": return pathOf({ page: "clients" });
-    case "me": return pathOf({ page: "me-devices" });
     case "org": return pathOf({ page: "org-devices", org: handle(branch) });
     case "server": return pathOf({ page: "server-devices" });
   }
@@ -42,11 +39,11 @@ export function listingPath(branch: DeviceBranch): string {
 
 /**
  * Whether the page names the owner: for a reader whose roster read covers the
- * organization the device rolls up to, as `GET /api/v1/clients/{client_id}` gives its `owning_org_id`, so
+ * organization that owns the device, so
  * no other asks `GET /api/v1/users` or `GET /api/v1/orgs` a question it is refused.
  */
 export function namesOwner(record: ClientDetail, account: OwnUserView): boolean {
-  return reaches(account, account.may.read_roster, record.owning_org_id);
+  return reaches(account, account.may.read_roster, record.owner?.org_id);
 }
 
 /** The back link's words for a branch's listing. */
@@ -54,13 +51,13 @@ export function listingName(branch: DeviceBranch): string {
   switch (branch.kind) {
     case "all": return "Fleet";
     case "server": return "Unclaimed devices";
-    case "me": case "org": return "Devices";
+    case "org": return "Devices";
   }
 }
 
 /** The trail of a device's page: its branch's section, then its listing. */
 export function deviceTrail(branch: DeviceBranch): readonly Crumb[] {
-  const section = branch.kind === "me" ? ME : branch.kind === "server" ? SERVER
+  const section = branch.kind === "server" ? SERVER
     : branch.kind === "org" ? orgTrail(branch) : [];
   return [...section, { label: listingName(branch), href: listingPath(branch) }];
 }

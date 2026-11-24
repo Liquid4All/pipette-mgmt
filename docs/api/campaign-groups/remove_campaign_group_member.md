@@ -12,4 +12,3 @@ a member.
 | 204 | The campaign is not a member, whether or not it was before |
 | 400 | `group_id` is not a group id, or `campaign_id` not a campaign id |
 | 403 | The caller may not file into the group owner's campaigns ([who may do what](../campaign-groups.md#who-may-do-what)) |
-| 404 | No such group, or the server has no `[database]` |

@@ -96,6 +96,9 @@ describe("the organization forms", () => {
     expect(() => createBody("a".repeat(65), "")).toThrow(`is too long (65 chars, max 64)`);
     expect(() => createBody("   ", "Acme")).toThrow("invalid handle: organization slug must not be empty");
     expect(createBody("a".repeat(64), "")).toEqual({ slug: "a".repeat(64) });
+    expect(() => createBody(" GLOBAL ", "")).toThrow(
+      'invalid handle: organization slug "global" is reserved for the descriptor catalog');
+    expect(createBody("globals", "")).toEqual({ slug: "globals" });
   });
 
   test("the create form is manage_any_orgs's", () => {

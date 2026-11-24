@@ -13,15 +13,14 @@ files as `{filename, sha256}`:
 ```
 
 `name` is what a plan entry carries as its `custom_label`; nothing keys on it.
-`owner`, the principal the files were uploaded for, defaults to the caller. A
+`owner`, the organization the files were uploaded for, defaults to the
+caller's organization; a caller in none gets a `400` asking it to name one. A
 member may name its organization, as for a campaign
-([`POST /api/v1/campaigns`](../campaigns/create_campaign.md)); an
-organization's administrator may also name a member of it; anyone may name
-themselves; `manage_any_orgs` may name anybody. A record named for a member is
-that member's alone, out of the uploading administrator's reach
+([`POST /api/v1/campaigns`](../campaigns/create_campaign.md));
+`manage_any_orgs` may name any organization
 ([who may do what](../vault.md#who-may-do-what)). Scope is checked before
 existence, so a caller that may not upload there never learns whether the
-account exists.
+organization exists.
 
 Which files each `type` takes, and in what format, is
 [`GET /api/v1/vault/types`](types.md). A `filename` is one path segment
@@ -52,5 +51,5 @@ A refusal writes no record.
 | Status | When |
 |--------|------|
 | 201 | The resources are recorded |
-| 400 | The body does not parse; a file is not uploaded for the owner; a file is not what its field needs; or `owner` names an account or organization that does not exist |
+| 400 | The body does not parse; a file is not uploaded for the owner; a file is not what its field needs; `owner` names an organization that does not exist; or `owner` is omitted by a caller in no organization |
 | 403 | The owner is outside the caller's scope |

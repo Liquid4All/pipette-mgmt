@@ -17,9 +17,23 @@ values.
 - `type`: runtime types or model types.
 - `prefix`: a case-insensitive name prefix.
 
-Every row includes `scope`, `display_name`, `descriptor_types`,
-`member_count`, and `member_summaries`. `descriptor_types` lists the types of the entry's members.
+Every row includes `name`, `scope`, `display_name`, `kind`, `state`,
+`release_time`, `created_at`, `created_by`, `descriptor_kind`,
+`descriptor_types`, `member_count`, and `member_summaries`.
+
+`created_at` is the time that the entry was made. `created_by` is the creator
+of the entry:
+
+- `operator`: an operator made a global entry with the host command-line
+  interface (CLI), or moved an organization entry to global scope.
+- `importer:llamacpp`: the llama.cpp importer made a global entry.
+- `account:<user_id>`: an account made an organization entry.
+
+`descriptor_types` lists the types of the entry's members.
 A runtime entry has one type, and a model entry has one type for each format.
+A model entry row also gives its `family`. If the family has a logo, the row
+gives the digest of the logo in `family_logo_sha256`. Get the logo with
+[`GET /api/v1/descriptor-catalog/family-logos/{sha256}`](get_descriptor_family_logo.md).
 
 A member summary gives the member's key and full selector. A runtime member
 also gives its offer-rule coverage. A model member has no offer rules. Set
@@ -41,4 +55,4 @@ For example, `prefix=llamacpp` can find `llamacpp-v0.7.0` and
 |--------|------|
 | 200 | A page of entries, with `next_cursor` if more entries remain |
 | 400 | A filter, limit, or cursor is invalid |
-| 404 | The server has no `[database]` catalog, or `scope` names an organization that the caller cannot read |
+| 404 | `scope` names an organization that the caller cannot read |

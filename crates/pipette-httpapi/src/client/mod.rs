@@ -3,6 +3,7 @@
 pub mod benchmarks;
 pub mod clients;
 pub mod datasets;
+pub mod descriptor_catalog;
 pub mod jobs;
 pub mod plans;
 pub mod vault;

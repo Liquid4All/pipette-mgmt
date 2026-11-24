@@ -47,8 +47,8 @@ pub use labels::{LabelError, Labels};
 mod principal;
 pub use principal::{
     ClientId, ContactEmail, ContactEmailError, OrgId, OrgSlug, OrgSlugError, PrincipalIdError,
-    PublicKeyHex, PublicKeyHexError, Tag, TagError, UserId, UserKeyId, VaultPrincipalId,
-    VaultResourceId,
+    PublicKeyHex, PublicKeyHexError, ReservedOrgSlugError, Tag, TagError, UserId, UserKeyId,
+    VaultPrincipalId, VaultResourceId,
 };
 
 mod permissions;
@@ -133,13 +133,15 @@ pub use descriptor_catalog::{
     CatalogName, CatalogParseError, CatalogQualifier, CatalogScope, DescriptorDisplay,
     DescriptorEntry, DescriptorEntryCreator, DescriptorEntryKind, DescriptorEntryState,
     DescriptorKind, DescriptorMember, DescriptorMemberDescriptor, DescriptorMemberKey, EntryError,
-    MemberError, ModelFormat, QualifiedCatalogName, QualifiedNameError, QuantizationLabel,
-    QuantizationLabelError, hf_repos, hf_repos_mut,
+    FamilyLogo, FamilyLogoDigest, FamilyLogos, LogoUri, MemberError, ModelFormat,
+    QualifiedCatalogName, QualifiedNameError, QuantizationLabel, QuantizationLabelError, hf_repos,
+    hf_repos_mut,
 };
 pub use descriptor_catalog_write::{
     AddDescriptorMemberRequest, ChangeDescriptorEntryStateRequest, CreateDescriptorEntryRequest,
     DescriptorEntryAction, ModelMemberRequest, RelabelDescriptorMemberRequest,
-    RemoveDescriptorMemberRequest, RenameDescriptorEntryRequest,
+    RemoveDescriptorMemberRequest, RenameDescriptorEntryRequest, SetDescriptorEntryFamilyRequest,
+    SetDescriptorFamilyLogoRequest,
 };
 
 mod vault_artifact;
@@ -176,9 +178,10 @@ pub use benchmark::{
     MaxContextError, MaxMemoryUsageBenchmark, MinP, MinPError, NumBeams, NumBeamsError,
     PrefillThroughputBenchmark, PresencePenalty, PresencePenaltyError, RecipeRepo, RepeatPenalty,
     RepeatPenaltyError, SamplingSeed, SamplingSeedError, SamplingTemperature,
-    SamplingTemperatureError, SeedRule, Thinking, TopK, TopKError, TopP, TopPError,
-    VlMaxMemoryBenchmark, VlSpecDecodeBenchmark, VlThroughputBenchmark, VlmEvalBenchmark,
-    VlmEvalRecipe, VlmEvalRecipeError, VlmEvalRecipeModel, VlmEvalTask, VlmPromptProfile,
+    SamplingTemperatureError, SeedRule, SessionBenchmark, Thinking, TopK, TopKError, TopP,
+    TopPError, VlMaxMemoryBenchmark, VlSpecDecodeBenchmark, VlThroughputBenchmark,
+    VlmEvalBenchmark, VlmEvalRecipe, VlmEvalRecipeError, VlmEvalRecipeModel, VlmEvalTask,
+    VlmPromptProfile,
 };
 
 // The schemas the `schemars` derive cannot write, and the flag enums' transform.
@@ -204,7 +207,7 @@ pub use cell::{
     ReasoningEffort, RunSpecError, RuntimeFlagRef, RuntimeFlags, RuntimeFlagsError,
     TrtEdgellmGgufVision, VariantError, VlMaxMemoryLlamacppCliStockToolsGgufVision,
     VlSpecDecodeLlamacppCliStockTools, VlThroughputLlamacppCliStockToolsGgufVision,
-    VlmEvalLlamacppCliStockToolsGgufVision, benchmark_type_of, is_compatible,
+    VlUvOpenvinoOpenvino, VlmEvalLlamacppCliStockToolsGgufVision, benchmark_type_of, is_compatible,
     resolve_benchmark_flags, resolve_benchmarks, resolve_model_flags, resolve_runtime_flags,
     resolve_speculation, runnable_pairs_of, runnable_type_pairs_of, validate_variant_flag_cells,
 };
@@ -269,11 +272,11 @@ mod descriptor_catalog_view;
 pub use descriptor_catalog_view::{
     AnyClientRunEvidence, ClientRunEvidence, DescriptorCatalogQuery, DescriptorCatalogShortList,
     DescriptorCatalogShortListItem, DescriptorDigestNames, DescriptorDigestQuery,
-    DescriptorEntryListRow, DescriptorEntryLookup, DescriptorMemberCoverage,
-    DescriptorMemberEvidence, DescriptorMemberParameters, DescriptorMemberSummary,
-    DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery, DescriptorWithheldMember,
-    DescriptorWithheldReasonCode, DescriptorWithheldReport, MemberSelector, RequestedCatalogName,
-    RunMark, SelectorError,
+    DescriptorEntryListRow, DescriptorEntryLookup, DescriptorFamilyLogo, DescriptorFamilyLogoView,
+    DescriptorMemberCoverage, DescriptorMemberEvidence, DescriptorMemberParameters,
+    DescriptorMemberSummary, DescriptorMemberView, DescriptorNameHit, DescriptorNameQuery,
+    DescriptorWithheldMember, DescriptorWithheldReasonCode, DescriptorWithheldReport,
+    MemberSelector, RequestedCatalogName, RunMark, SelectorError,
 };
 
 mod catalog_import_run;
@@ -308,12 +311,12 @@ pub use policy_kind::PolicyKind;
 mod plans;
 pub use plans::{
     Answered, CachedArtifacts, CancelOutcome, ClaimAnswer, ClaimRequest, ClaimedJob, Counts,
-    DocumentState, ImportAction, IngestEvent, IssueSeverity, JobExpiry, JobPlans, PlanAnswer,
-    PlanCancelRequested, PlanDryRun, PlanFiled, PlanIssue, PlanJobs, PlanJobsQuery, PlanListQuery,
-    PlanReadQuery, PlanStatus, PlanSummary, PlanValidation, PlanVariants, PlanView, PlannedImport,
-    ProgressSnapshot, RequestedScope, RestoredVariant, RestoredVariantError, RevisionChange,
-    StarvedClauses, StarvedGroup, UndecodableClaim, UpdatePlanRequest, Warning, WarningKind,
-    unmatched_warning,
+    DocumentState, ImportAction, IngestEvent, IssueSeverity, JobExpiry, JobPlans, ModelReplacement,
+    ModelReplacementError, PlanAnswer, PlanCancelRequested, PlanDryRun, PlanFiled, PlanIssue,
+    PlanJobs, PlanJobsQuery, PlanListQuery, PlanReadQuery, PlanStatus, PlanSummary, PlanValidation,
+    PlanVariants, PlanView, PlannedImport, ProgressSnapshot, ReplacedModel, RequestedScope,
+    RestoredVariant, RestoredVariantError, RevisionChange, StarvedClauses, StarvedGroup,
+    UndecodableClaim, UpdatePlanRequest, Warning, WarningKind, unmatched_warning,
 };
 
 mod campaigns;
@@ -322,9 +325,10 @@ pub use campaigns::{
     CampaignOverview, CampaignOverviewQuery, CampaignPlanDocumentQuery, CampaignPlanRow,
     CampaignPlans, CampaignReadQuery, CampaignRevised, CampaignState, CampaignVariants,
     CampaignView, CreateCampaignQuery, CreatePlanTagRequest, DeviceTimeTotal, HeldJob, PlanTag,
-    PlanTags, PolicyCheck, RecalculateJobsRequest, RerunJobsQuery, RerunJobsRequest,
-    RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery, Revised, RevisionAnswer,
-    RevisionBase, RevisionDryRun, RevisionPreview, SetCampaignOwnerRequest, UpdateCampaignRequest,
+    PlanTags, PolicyCheck, PolicyDeferral, RecalculateJobsRequest, RerunJobsQuery,
+    RerunJobsRequest, RevertCampaignQuery, RevertCampaignRequest, ReviseCampaignQuery, Revised,
+    RevisionAnswer, RevisionBase, RevisionDryRun, RevisionPreview, SetCampaignOwnerRequest,
+    UpdateCampaignRequest,
 };
 
 mod campaign_groups;
@@ -344,8 +348,8 @@ pub use clients::{
     CapabilityVocabularyQuery, Client, ClientApproved, ClientDetail, ClientListQuery,
     ClientListRow, ClientPermissionSet, ClientPermissions, ClientPreauthKey, ClientPrivateKey,
     ClientRecord, ClientRegistered, ClientStatus, ClientView, DeviceProfile, DeviceProfileFields,
-    FleetOwner, Refused, RegisterClient, SetClientOwnerRequest, SetClientPermissionsRequest,
-    UpdateClient, UpdateClientRequest,
+    Refused, RegisterClient, SetClientOwnerRequest, SetClientPermissionsRequest, UpdateClient,
+    UpdateClientRequest,
 };
 
 mod model_params;

@@ -12,7 +12,8 @@ pub use upload::{
 };
 
 use nutype::nutype;
-use serde::{Deserialize, Serialize};
+use serde::ser::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
 use crate::benchmark::declared_benchmark_params;
@@ -458,6 +459,9 @@ pub enum BenchmarkResultData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decision_latency_batch_ms_stddev: Option<f64>,
     },
+    /// The session duration in whole seconds. Keep this variant last so that
+    /// another result with an extra `session_duration` keeps its original type.
+    Session { session_duration: u64 },
 }
 
 impl BenchmarkResultData {
@@ -478,6 +482,7 @@ impl BenchmarkResultData {
             Self::VlSpecDecode { .. } => BenchmarkType::VlSpecDecode,
             Self::AsrThroughput { .. } => BenchmarkType::AsrThroughput,
             Self::DecisionLatency { .. } => BenchmarkType::DecisionLatency,
+            Self::Session { .. } => BenchmarkType::Session,
         }
     }
 }
@@ -487,6 +492,7 @@ impl BenchmarkResultData {
 /// Flattens five types and [`declared_benchmark_params`]: every field name
 /// across them must be unique, or deserialization silently breaks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(remote = "Self")]
 pub struct BenchmarkSubmissionPayload {
     pub benchmark_id: String,
     /// What the client ran, which the server checks against its catalog. Wire
@@ -513,12 +519,12 @@ pub struct BenchmarkSubmissionPayload {
     pub memory: MemoryObservation,
     /// Canonical JSON of the run's `pipette_plan_types::Model`, the lossless
     /// model coordinate; the server re-canonicalizes and stores it opaquely.
-    /// Defaults to empty so an older on-disk payload still loads;
-    /// `submit_pending_result` refuses to send one.
+    /// A session has no model descriptor. Older on-disk payloads can omit it.
     #[serde(default)]
     pub model_descriptor: String,
-    /// Canonical JSON of the run's `pipette_plan_types::Runtime`, the lossless
-    /// runtime and build identity; load knobs ship as `runtime_flags`.
+    /// Canonical JSON of the run's `pipette_plan_types::Runtime` preserves the
+    /// runtime and build identity. The payload stores load options in
+    /// `runtime_flags`. A session has no runtime descriptor.
     #[serde(default)]
     pub runtime_descriptor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +603,39 @@ pub struct BenchmarkSubmissionPayload {
     pub submitted_at: String,
     #[serde(flatten)]
     pub result: BenchmarkResultData,
+}
+
+impl Serialize for BenchmarkSubmissionPayload {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(transparent)]
+        struct Wire<'a>(
+            #[serde(with = "BenchmarkSubmissionPayload")] &'a BenchmarkSubmissionPayload,
+        );
+
+        // Ordinary results send empty descriptors so intake can reject them.
+        if !matches!(self.result, BenchmarkResultData::Session { .. }) {
+            return Wire(self).serialize(serializer);
+        }
+        let serde_json::Value::Object(mut fields) =
+            serde_json::to_value(Wire(self)).map_err(S::Error::custom)?
+        else {
+            return Err(S::Error::custom("a submission payload must be an object"));
+        };
+        if self.model_descriptor.is_empty() {
+            fields.remove("model_descriptor");
+        }
+        if self.runtime_descriptor.is_empty() {
+            fields.remove("runtime_descriptor");
+        }
+        fields.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BenchmarkSubmissionPayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BenchmarkSubmissionPayload::deserialize(deserializer)
+    }
 }
 
 #[cfg(test)]
@@ -922,11 +961,28 @@ mod tests {
         decision_latency_request_ms: 1.0, decision_latency_request_ms_stddev: None,
         decision_latency_batch_ms: None, decision_latency_batch_ms_stddev: None,
     }, BenchmarkType::DecisionLatency)]
+    #[case::session(BenchmarkResultData::Session { session_duration: 90 }, BenchmarkType::Session)]
     fn benchmark_type_matches_the_variant(
         #[case] data: BenchmarkResultData,
         #[case] expected: BenchmarkType,
-    ) {
+    ) -> anyhow::Result<()> {
         assert_eq!(data.benchmark_type(), expected);
+        // The enum is untagged: each body reads back as its own variant, and a
+        // body of another kind keeps its kind with a `session_duration` added.
+        let body = serde_json::to_value(&data)?;
+        assert_eq!(
+            serde_json::from_value::<BenchmarkResultData>(body.clone())?,
+            data
+        );
+        let mut with_duration = body;
+        if let Some(fields) = with_duration.as_object_mut() {
+            fields.insert("session_duration".into(), 90.into());
+        }
+        assert_eq!(
+            serde_json::from_value::<BenchmarkResultData>(with_duration)?,
+            data
+        );
+        Ok(())
     }
 
     // The struct serializes to the JSON and the JSON parses back: `stop_reason`
@@ -1062,7 +1118,8 @@ mod tests {
             | BenchmarkResultData::VlThroughput { .. }
             | BenchmarkResultData::AsrThroughput { .. }
             | BenchmarkResultData::VlSpecDecode { .. }
-            | BenchmarkResultData::DecisionLatency { .. }) => {
+            | BenchmarkResultData::DecisionLatency { .. }
+            | BenchmarkResultData::Session { .. }) => {
                 anyhow::bail!("expected MaxMemoryUsage, got {other:?}")
             }
         }
@@ -1123,6 +1180,56 @@ mod tests {
                 decode_time_ms_stddev: None,
             },
         }
+    }
+
+    #[test]
+    fn a_session_payload_leaves_out_its_empty_descriptors() -> anyhow::Result<()> {
+        let payload = BenchmarkSubmissionPayload {
+            benchmark_id: "session".to_string(),
+            model_descriptor: String::new(),
+            runtime_descriptor: String::new(),
+            result: BenchmarkResultData::Session {
+                session_duration: 90,
+            },
+            ..sample_payload()
+        };
+        let value = serde_json::to_value(&payload)?;
+        assert_eq!(value.get("model_descriptor"), None);
+        assert_eq!(value.get("runtime_descriptor"), None);
+        assert_eq!(value["session_duration"], 90);
+        let input = crate::SuccessInput::try_from(&payload)?;
+        assert_eq!(input.model_descriptor, None);
+        assert_eq!(input.runtime_descriptor, None);
+        assert_eq!(input.session_duration, Some(90));
+        assert_eq!(
+            serde_json::from_value::<BenchmarkSubmissionPayload>(value)?,
+            payload
+        );
+        let malformed = BenchmarkSubmissionPayload {
+            runtime_descriptor: RT_DESC.to_owned(),
+            ..payload
+        };
+        let body = serde_json::to_string(&malformed)?;
+        let input: crate::SuccessInput = serde_json::from_str(&body)?;
+        assert_eq!(input.model_descriptor, None);
+        assert_eq!(input.runtime_descriptor.as_deref(), Some(RT_DESC));
+        Ok(())
+    }
+
+    #[test]
+    fn an_ordinary_payload_preserves_empty_descriptors() -> anyhow::Result<()> {
+        let payload = BenchmarkSubmissionPayload {
+            model_descriptor: String::new(),
+            runtime_descriptor: String::new(),
+            ..sample_payload()
+        };
+        let value = serde_json::to_value(&payload)?;
+        assert_eq!(value["model_descriptor"], "");
+        assert_eq!(value["runtime_descriptor"], "");
+        let input = crate::SuccessInput::try_from(&payload)?;
+        assert_eq!(input.model_descriptor.as_deref(), Some(""));
+        assert_eq!(input.runtime_descriptor.as_deref(), Some(""));
+        Ok(())
     }
 
     #[test]

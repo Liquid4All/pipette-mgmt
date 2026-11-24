@@ -107,7 +107,7 @@ pub use runtime_flags::{
     PrefillThroughputUvOpenvinoOpenvino, RuntimeFlagRef, RuntimeFlags, RuntimeFlagsError,
     TrtEdgellmGgufVision, VlMaxMemoryLlamacppCliStockToolsGgufVision,
     VlSpecDecodeLlamacppCliStockTools, VlThroughputLlamacppCliStockToolsGgufVision,
-    VlmEvalLlamacppCliStockToolsGgufVision, resolve_speculation,
+    VlUvOpenvinoOpenvino, VlmEvalLlamacppCliStockToolsGgufVision, resolve_speculation,
 };
 
 use std::collections::HashSet;

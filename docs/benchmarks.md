@@ -36,6 +36,7 @@ The ASR entries are not among them: they live in the deployment's catalog
 | [ASR Eval (Error Rate)](#212-asr-eval-error-rate) | Audio | Transcription word error rate on an Open ASR Leaderboard (English) or FLEURS test set |
 | [Decision Latency](#213-decision-latency) | Decision | Wall time of one request to a decision model: typed questions over a state, answered with no generated token |
 | [Decision Peak Memory](#214-decision-peak-memory) | Decision | Peak host, GPU, and NPU memory for the decision latency workload |
+| [Session](#215-session) | None | How long a user held exclusive remote access to one device |
 
 **Text** benchmarks (2.1–2.4) use synthetic text-only prompts.
 **VL** benchmarks (2.6–2.7) use a synthetic image alongside a text prompt and
@@ -57,6 +58,7 @@ format (see [The input clip](#the-input-clip)) and require a model with an audio
 encoder.
 **Decision** benchmarks (2.13–2.14) send a synthetic state (text, images, or
 both) to a decision model and generate no token.
+**Session** (2.15) runs no model and no runtime. A plan cannot name it.
 
 ### 1.1. Private benchmarks
 
@@ -78,8 +80,7 @@ parameter_max_tokens = 4096
 **Who is served them.** `GET /benchmarks` and `GET /benchmarks/{benchmark_id}`
 (and their `/api/v2` twins) serve the public catalog to everyone, and to a request
 **signed by a principal of the organization** its own entries as well: an
-approved client the organization holds, directly or through a member who owns
-it, or an active user who belongs to it
+approved client the organization owns, or an active user who belongs to it
 ([httpapi.md §2.5](httpapi.md#25-get-benchmarks)). To
 everyone else, an unsigned request included, the entry does not exist: it is
 absent from the listing and its id is a `404`. `GET /datasets/{benchmark_id}`
@@ -161,9 +162,9 @@ reports is refused.
 
 This is a deliberate choice over routing by organization. The claim path trusts
 eligibility rows without re-running the matcher, and they are rebuilt when a
-device's profile changes or an operator reindexes, never when its owner or its
-owner's organization does. Eligibility rows keyed on membership would go stale in both
-directions, where the fetch reads membership on each request. The cost is
+device's profile changes or an operator reindexes, never when its owner does.
+Eligibility rows keyed on ownership would go stale in both directions, where
+the fetch reads ownership on each request. The cost is
 disclosure of the job body (its model, runtime and benchmark id) to an outsider
 that claims it; the definition and the corpus stay private.
 
@@ -806,6 +807,9 @@ compression strategies.
 | `parameter_text_tokens` | integer | Number of text tokens in the prompt (0 = image-only) |
 | `parameter_decode_tokens` | integer | Number of tokens to generate |
 | `parameter_num_images` | integer | Images packed into one prompt (default 1; `>1` emulates multi-frame / video) |
+
+The example ids spell out each axis: `text<N>` text tokens, `decode<N>` decode
+tokens (a `vl_max_memory` id without it decodes one) and `img<N>` images.
 
 **Multiple images (`parameter_num_images`).** `num_images` copies of the
 synthetic image are attached as separate parts of a single user message, so the
@@ -1860,12 +1864,10 @@ passage to exactly `parameter_text_tokens` under the model's own tokenizer.
 
 #### The deployment's ladder
 
-The ASR entries are not in [`examples/benchmarks/`](../examples/benchmarks/):
-they live in the deployment's catalog, which the deployment syncs to the
-server's benchmarks prefix. A local server seeded from `examples/` serves no ASR
-entry until one is added to its `{data_dir}/benchmarks/`. That catalog runs
-every clip length with and without text, as VL's ladder runs `text0` and
-`text1024`:
+The ASR entries are in neither [`examples/benchmarks/`](../examples/benchmarks/)
+nor the deployment's catalog yet, so a server serves none until one is added to
+its benchmarks prefix. The ladder runs every clip length with and without text,
+as VL's ladder runs `text0` and `text1024`:
 
 | | Values |
 |---|---|
@@ -2681,6 +2683,43 @@ resident size.
 | `max_npu_usage` | `max_npu_bytes` | bytes (row omitted when null) |
 
 The parameters are recorded in the same columns as Decision Latency's.
+
+---
+
+### 2.15. Session
+
+A session gives one user exclusive, time-limited remote access to one device.
+A session runs no model or runtime.
+
+#### Parameters
+
+None. The job `spec` holds the session parameters, not the catalog entry.
+
+```toml
+benchmark_type = "session"
+```
+
+#### Rules
+
+- A plan document cannot name a session. The planner refuses the document.
+- Only the public catalog holds a session entry. An organization cannot keep a
+  private one.
+
+#### Submission fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_duration` | integer | The session duration in whole seconds, from 0 to 16,777,216 inclusive |
+
+A session submission omits model and runtime fields, including
+`model_descriptor` and `runtime_descriptor`. The server rejects a session
+submission that supplies these fields.
+
+#### Derived metrics
+
+| Metric | Formula | Unit |
+|--------|---------|------|
+| `session_duration` | `session_duration` | s |
 
 ---
 

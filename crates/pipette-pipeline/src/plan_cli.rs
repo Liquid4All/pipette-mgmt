@@ -838,6 +838,7 @@ mod tests {
     use pipette_plan_types::BenchmarkId;
     use pipette_plan_types::FleetDetail;
     use pipette_plan_types::JobId;
+    use pipette_plan_types::OrgId;
     use pipette_store_fs::build_local_fs_stores;
 
     use super::*;
@@ -967,7 +968,7 @@ runtimes = [{{ type = "mlx_macos_pipette", version = "0.31.3", flavor = "macos-a
             PlanInput::Document(path),
             note,
             None,
-            CampaignMembership::for_test(UserId::try_new("user_test")?),
+            CampaignMembership::for_test(OrgId::try_new("org_test")?),
         )
         .await
     }
@@ -1207,8 +1208,8 @@ runtimes = [{ type = "llamacpp_cli_stock_tools", source = "github_release", repo
             CREATING_MAX_AGE,
         );
 
-        let owner = VaultOwner::User {
-            user_id: UserId::try_new("user_smoke")?,
+        let owner = VaultOwner::Org {
+            org_id: OrgId::try_new("org_smoke")?,
         };
         let report = dry_run_document(&ctx, &owner, &path, Some("smoke".to_string()))
             .await?
@@ -1262,8 +1263,8 @@ runtime_flags = [
 ]
 "#
         );
-        let owner = VaultOwner::User {
-            user_id: UserId::try_new("user_smoke")?,
+        let owner = VaultOwner::Org {
+            org_id: OrgId::try_new("org_smoke")?,
         };
         let dry_run = dry_run_text(&ctx, &owner, &document, None).await;
         match refusal {
@@ -1608,6 +1609,7 @@ runtime_flags = [
             )?,
             organization: pipette_plan_types::NonEmptyTrimmedString::try_new("lab")?,
             client_details: pipette_plan_types::NonEmptyTrimmedString::try_new("rig")?,
+            name: None,
             contact_email: pipette_plan_types::ContactEmail::try_new("ops@example.com")?,
             status: ClientStatus::Approved,
             registered_at: "2026-01-01T00:00:00Z".parse()?,
@@ -1647,7 +1649,7 @@ runtime_flags = [
                 note: None,
                 change: None,
                 submitted_by: None,
-                membership: CampaignMembership::for_test(UserId::try_new("user_test")?),
+                membership: CampaignMembership::for_test(OrgId::try_new("org_test")?),
                 jobs,
                 source: None,
                 plan_warnings: Vec::new(),

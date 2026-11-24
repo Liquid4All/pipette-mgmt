@@ -37,7 +37,7 @@ export const rosterRows = (rows: UserView[], branch: RosterBranch): UserView[] =
     .filter((row) => branch.kind === "all" || (branch.kind === "server" ? !row.org_id : row.org_id === branch.org_id))
     .sort((a, b) => textOrder(a.contact_email, b.contact_email));
 
-const STATUSES: UserStatus[] = ["active", "pending", "disabled"];
+const STATUSES: UserStatus[] = ["active", "disabled"];
 const ACCOUNT_TYPES: UserAccountType[] = ["human", "service"];
 
 /** The roster's columns and filters; `orgOf` names an organization where the branch lists every one. */
@@ -45,6 +45,7 @@ export function rosterTable(branch: RosterBranch, orgOf: (org_id: string) => str
   const org = (row: UserView) => (row.org_id ? orgOf(row.org_id) ?? row.org_id : null);
   const all = branch.kind === "all";
   return {
+    sort: "created_at",
     columns: [
       { key: "user_id", label: "user_id", raw: (row) => row.user_id, href: (row) => userLink(row.user_id) },
       { key: "contact_email", label: "contact_email", raw: (row) => row.contact_email },
@@ -168,9 +169,6 @@ export function amendment(choices: PermissionChoice[], ticked: ReadonlySet<UserP
 export function standing(status: UserStatus, self: boolean):
   { note: string; to: UserStatus | null; label: string; danger: boolean } {
   switch (status) {
-    case "pending":
-      return { note: "This account asked for itself and waits for an administrator to admit it.",
-               to: "active", label: "Admit this account", danger: false };
     case "disabled":
       return { note: "Disabled: every request from it is refused, and its record stands.",
                to: "active", label: "Enable this account", danger: false };
@@ -275,6 +273,7 @@ export function scopeChoices(listed: { campaign_id: string; name: string }[], na
 
 /** An account's registered keys: their columns and the text box over their ids and details. */
 export const USER_KEY_TABLE: TableSpec<UserKey> = {
+  sort: "added_at",
   columns: [
     { key: "key_id", label: "key_id", raw: (key) => key.key_id, as: "id" },
     { key: "key_details", label: "key_details", raw: (key) => key.key_details },

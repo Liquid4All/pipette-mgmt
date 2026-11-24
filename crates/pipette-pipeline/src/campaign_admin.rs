@@ -16,16 +16,19 @@ use pipette_core::plan::{PlanManifest, SettledOutcome};
 use pipette_core::vault::VaultOwner;
 use pipette_plan_types::{
     Answered, BenchmarkId, BenchmarkType, CampaignGroupId, CampaignId, CampaignState,
-    ClientRunSpec, CreatePlanTagRequest, FailureSource, JobId, NonEmptyTrimmedString, PlanId,
-    PlanStatus, PlanTag, PolicyKind, RestoredVariant, RevisionChange, UserId,
+    ClientRunSpec, CreatePlanTagRequest, FailureSource, JobId, ModelReplacement,
+    NonEmptyTrimmedString, PlanId, PlanStatus, PlanTag, PolicyKind, ReplacedModel, RestoredVariant,
+    RevisionChange, UserId,
 };
 use pipette_store::{
-    CampaignGroupStore, CampaignStore, Listing, OrgStore, PLAN_JOB_CONCURRENCY, PlanFilter,
-    PlanStore, PlanTagStore, Stores, SubmissionStore, TodoStore,
+    CampaignGroupStore, CampaignStore, Listing, PLAN_JOB_CONCURRENCY, PlanFilter, PlanStore,
+    PlanTagStore, Stores, SubmissionStore, TodoStore, VaultStore,
 };
 
 use crate::campaign_chain;
 use crate::content_key::{content_digest, legacy_content_digest};
+use crate::hf_import::HubClient;
+use crate::model_replacement::{self, ReplaceModelError};
 use crate::org;
 use crate::org::OrgRef;
 use crate::plan_cli;
@@ -38,6 +41,7 @@ use crate::plan_ingestion::{
 };
 use crate::variant_edit;
 use crate::variant_edit::{VariantEdit, VariantEditError};
+use crate::vault_check::VaultScope;
 
 /// What a filed revision did to the plan it replaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -54,8 +58,10 @@ pub struct Revised {
     /// The superseded plan's jobs whose completions the new plan scores again
     /// as new jobs.
     pub recalculated_job_count: usize,
+    /// Runs the new plan copies under a `replace_model` model.
+    pub replaced_job_count: usize,
     /// The superseded plan's jobs that the new plan neither holds, runs again,
-    /// scores again nor marks failed.
+    /// scores again, copies nor marks failed.
     pub dropped_job_count: usize,
     /// `false` when the superseded plan had already ended, or was already
     /// being cancelled.
@@ -70,6 +76,7 @@ impl From<Revised> for pipette_plan_types::Revised {
             rerun_job_count: revised.rerun_job_count,
             marked_job_count: revised.marked_job_count,
             recalculated_job_count: revised.recalculated_job_count,
+            replaced_job_count: revised.replaced_job_count,
             dropped_job_count: revised.dropped_job_count,
             cancel_requested: revised.cancel_requested,
         }
@@ -82,15 +89,10 @@ impl From<Revised> for pipette_plan_types::Revised {
 pub enum CampaignAdminError {
     #[error("no campaign {0}")]
     NotFound(CampaignId),
-    #[error("no account {0}")]
-    NoSuchUser(UserId),
     #[error("no organization {0}")]
     NoSuchOrg(OrgRef),
     #[error("no plan {0}")]
     NoSuchPlan(PlanId),
-    /// Worded for neither surface: the CLI's flags are not the route's fields.
-    #[error("name an owner: an account or an organization")]
-    NoOwnerNamed,
     /// The route staged a revision, but could not read its campaign before
     /// writing the new head. The campaign has not advanced to this plan.
     #[error("plan {plan_id} was filed into {campaign_id}, but the campaign could not be read")]
@@ -342,29 +344,15 @@ pub async fn leave_group(
     Ok(Some(group_id))
 }
 
-/// Resolve the `--user` / `--org` pair into the one owner a campaign must have.
-/// Both resolve against their roster, so an owner always names a real record.
+/// Resolve `--org` into the owner a campaign must have, against the roster, so
+/// an owner always names a real record.
 pub async fn owner(
     stores: &Stores,
-    user: Option<UserId>,
-    org: Option<OrgRef>,
+    reference: OrgRef,
 ) -> Result<CampaignOwner, CampaignAdminError> {
-    match (user, org) {
-        (Some(user_id), None) => {
-            if stores.users.get_user(&user_id).await?.is_none() {
-                return Err(CampaignAdminError::NoSuchUser(user_id));
-            }
-            Ok(CampaignOwner::User { user_id })
-        }
-        (None, Some(reference)) => {
-            let found = org::resolve(&*stores.orgs, &reference).await?;
-            let org = found.ok_or(CampaignAdminError::NoSuchOrg(reference))?;
-            Ok(CampaignOwner::Org { org_id: org.org_id })
-        }
-        // Neither named, or both; the CLI's `conflicts_with` refuses both
-        // before here, so one refusal serves.
-        _ => Err(CampaignAdminError::NoOwnerNamed),
-    }
+    let found = org::resolve(&*stores.orgs, &reference).await?;
+    let org = found.ok_or(CampaignAdminError::NoSuchOrg(reference))?;
+    Ok(CampaignOwner::Org { org_id: org.org_id })
 }
 
 /// Write the campaign `new` stands for, running `plan_id`: the plan just filed
@@ -889,6 +877,7 @@ impl Head {
             fail: BTreeMap::new(),
             offer: Offer::default(),
             group: None,
+            copied: Vec::new(),
         })
     }
 
@@ -912,6 +901,7 @@ impl Head {
             fail: BTreeMap::new(),
             offer: Offer::default(),
             group: None,
+            copied: Vec::new(),
         })
     }
 
@@ -970,6 +960,7 @@ impl Head {
             fail: BTreeMap::new(),
             offer,
             group: None,
+            copied: Vec::new(),
         })
     }
 
@@ -1233,6 +1224,7 @@ impl Head {
             fail,
             offer: Offer::default(),
             group: None,
+            copied: Vec::new(),
         }
     }
 }
@@ -1447,6 +1439,8 @@ pub struct Revision {
     /// The campaign group whose policies file a re-run, and those policies
     /// ([`Self::by_group`]); `None` when a person files it.
     group: Option<(CampaignGroupId, Vec<PolicyKind>)>,
+    /// The jobs whose runs the filed plan copied ([`Self::copying`]).
+    copied: Vec<JobId>,
 }
 
 /// The plans beside the head whose finished runs a revision offers to the cells
@@ -1460,12 +1454,18 @@ pub struct Offer {
     /// whose attempt limit it is not known to have passed
     /// (`carry_across_limit`).
     across_limit: bool,
+    /// Whether a failed run of the head or of an offered plan answers a cell
+    /// that no finished run answers (`inherit_failed`).
+    failed: bool,
     /// Plans named to inherit from, of any campaign (`inherit_from`), in the
     /// order offered.
     plans: Vec<PlanManifest>,
     /// The plans each named plan's campaign filed after it, whose re-runs and
     /// lapses give up a named plan's job too.
     later: Vec<PlanManifest>,
+    replace: Vec<ModelReplacement>,
+    /// Those pairs as [`Revision::replace_models`] resolved them.
+    replaced: Vec<ReplacedModel>,
 }
 
 /// `inherit_from`, then each plan of `add_from` and of `restore` that it does
@@ -1510,10 +1510,15 @@ impl Offer {
         }
         Ok(Self {
             earlier,
-            across_limit: false,
             plans: named,
             later,
+            ..Self::default()
         })
+    }
+
+    /// `replace_model`, as the filer asked.
+    pub fn replacing(self, replace: Vec<ModelReplacement>) -> Self {
+        Self { replace, ..self }
     }
 
     /// Let a finished run of the head or of an offered plan answer its cell
@@ -1524,6 +1529,12 @@ impl Offer {
             across_limit,
             ..self
         }
+    }
+
+    /// Let a failed run of the head or of an offered plan answer a cell that
+    /// no finished run answers (`inherit_failed`).
+    pub fn inherit_failed(self, failed: bool) -> Self {
+        Self { failed, ..self }
     }
 
     /// The named plans, which a surface checks the caller may read.
@@ -1601,8 +1612,8 @@ impl Offer {
         Ok(variants)
     }
 
-    /// Whether no plan is on offer. `across_limit` does not count: by itself
-    /// it changes no job of the head's own document.
+    /// Whether no plan is on offer. `across_limit` and `failed` do not count:
+    /// by themselves they change no job of the head's own document.
     fn is_empty(&self) -> bool {
         !self.earlier && self.plans.is_empty()
     }
@@ -1678,6 +1689,7 @@ impl Revision {
     pub fn change(&self) -> RevisionChange {
         let carry_earlier = self.offer.earlier;
         let carry_across_limit = self.offer.across_limit;
+        let inherit_failed = self.offer.failed;
         let inherit_from = || {
             self.offer
                 .plans
@@ -1695,13 +1707,17 @@ impl Revision {
                 added_variant_count: *added,
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from: inherit_from(),
                 restored: restored.clone(),
+                replace_model: self.offer.replaced.clone(),
             },
             Change::Document => RevisionChange::Document {
                 carry_earlier,
                 carry_across_limit,
+                inherit_failed,
                 inherit_from: inherit_from(),
+                replace_model: self.offer.replaced.clone(),
             },
             Change::Rerun(answered) => {
                 let (group_id, policies) = self.group.clone().unzip();
@@ -1727,6 +1743,40 @@ impl Revision {
     /// `offer` names, as it takes one of the head's.
     pub fn carrying(self, offer: Offer) -> Self {
         Self { offer, ..self }
+    }
+
+    /// Let `membership` copy the runs `replace_model` allows; `revised` is the
+    /// revision's bodies.
+    pub async fn replace_models(
+        &mut self,
+        membership: CampaignMembership,
+        revised: &[serde_json::Value],
+        vault: &dyn VaultStore,
+        scope: &VaultScope,
+        hub: &HubClient,
+    ) -> Result<CampaignMembership, ReplaceModelError> {
+        if self.offer.replace.is_empty() {
+            return Ok(membership);
+        }
+        let resolved = model_replacement::resolve(
+            &self.offer.replace,
+            membership.carry.bodies(),
+            revised,
+            vault,
+            scope,
+            hub,
+        )
+        .await?;
+        self.offer.replaced = resolved.replaced;
+        Ok(CampaignMembership {
+            carry: membership.carry.replacing(resolved.models),
+            ..membership
+        })
+    }
+
+    /// [`IngestReport::replaced`] of the filed plan.
+    pub fn copying(self, copied: Vec<JobId>) -> Self {
+        Self { copied, ..self }
     }
 
     /// Name the campaign group whose `policies` file this re-run, as
@@ -1780,7 +1830,6 @@ impl Revision {
         plans: &dyn PlanStore,
         todo: &dyn TodoStore,
         submissions: &dyn SubmissionStore,
-        orgs: &dyn OrgStore,
     ) -> Result<RevisionPreview, crate::plan_ingestion::IngestError> {
         let CarryDraw {
             carried,
@@ -1788,8 +1837,10 @@ impl Revision {
             requirements_rerun,
             satisfied,
             offered,
+            failed,
             held,
-        } = draw_carry(membership, bodies, plans, todo, submissions, orgs).await?;
+            replaced,
+        } = draw_carry(membership, bodies, plans, todo, submissions).await?;
         let named: HashSet<&PlanId> = self
             .offer
             .plans
@@ -1805,6 +1856,7 @@ impl Revision {
             .chain(&self.rerun)
             .chain(&self.recalculate)
             .chain(self.fail.keys())
+            .chain(replaced.iter().map(|copy| &copy.job_id))
             .collect();
         Ok(RevisionPreview {
             unchanged: false,
@@ -1814,9 +1866,14 @@ impl Revision {
             satisfied_job_count: satisfied,
             restored_job_count: offered.len() - inherited,
             inherited_job_count: inherited,
+            inherited_failed_job_count: failed
+                .iter()
+                .filter(|job_id| offered.contains_key(*job_id))
+                .count(),
             rerun_job_ids: self.rerun.iter().cloned().collect(),
             marked_job_ids: self.fail.keys().cloned().collect(),
             recalculated_job_count: self.recalculate.len(),
+            replaced_job_count: replaced.len(),
             dropped_job_ids: self
                 .previous
                 .job_ids
@@ -1825,6 +1882,8 @@ impl Revision {
                 .cloned()
                 .collect(),
             held_jobs: held,
+            replaced_models: self.offer.replaced.clone(),
+            replaced_jobs: replaced,
             repeated_variants: variant_edit::repeated_variants(&self.document)
                 .map_err(|e| crate::plan_ingestion::IngestError::Other(e.into()))?,
         })
@@ -1937,7 +1996,8 @@ impl Revision {
             .with_sources(bodies)
             .with_held_for(held_for)
             .with_offered(offered, listed, excluded_runs)
-            .across_limit(self.offer.across_limit);
+            .across_limit(self.offer.across_limit)
+            .inherit_failed(self.offer.failed);
         Ok(membership)
     }
 
@@ -1982,18 +2042,16 @@ impl Revision {
             .flat_map(|manifest| manifest.expired_jobs.keys())
             .collect();
         let mut seen: HashSet<&JobId> = self.previous.job_ids.iter().collect();
-        let job_ids: Vec<(PlanId, JobId)> = offering
+        let job_ids: Vec<(PlanId, JobId, Option<JobId>)> = offering
             .iter()
-            .flat_map(|manifest| {
-                manifest
-                    .job_ids
-                    .iter()
-                    .map(|job_id| (&manifest.plan_id, job_id))
-            })
+            .flat_map(|manifest| manifest.job_ids.iter().map(|job_id| (*manifest, job_id)))
             .filter(|(_, job_id)| {
                 !rerun.contains(job_id) && !lapsed.contains(job_id) && seen.insert(job_id)
             })
-            .map(|(plan_id, job_id)| (plan_id.clone(), job_id.clone()))
+            .map(|(manifest, job_id)| {
+                let rerun_of = manifest.rerun_of.get(job_id).cloned();
+                (manifest.plan_id.clone(), job_id.clone(), rerun_of)
+            })
             .collect();
         let listed = offering
             .iter()
@@ -2010,12 +2068,13 @@ impl Revision {
             );
         // `buffered`, so the jobs keep the chain's order.
         let sources: Vec<Option<Offered>> = futures::stream::iter(job_ids)
-            .map(|(plan_id, job_id)| async move {
+            .map(|(plan_id, job_id, rerun_of)| async move {
                 let source = plans.get_job_source(&job_id).await?;
                 anyhow::Ok(source.map(|body| Offered {
                     plan_id,
                     job_id,
                     body,
+                    rerun_of,
                 }))
             })
             .buffered(PLAN_JOB_CONCURRENCY)
@@ -2150,10 +2209,12 @@ pub struct RevisionPreview {
     /// Cells that an earlier finished run answers, which the revision would
     /// hold that run for and not queue.
     pub satisfied_job_count: usize,
-    /// Finished jobs of the campaign's earlier plans the revision would hold.
+    /// Jobs of the campaign's earlier plans the revision would hold.
     pub restored_job_count: usize,
-    /// Finished jobs of the `inherit_from` plans the revision would hold.
+    /// Jobs of the `inherit_from` plans the revision would hold.
     pub inherited_job_count: usize,
+    /// Failed runs among the two counts above (`inherit_failed`).
+    pub inherited_failed_job_count: usize,
     /// That plan's jobs the revision would run again, as named or as
     /// `answered` picks them.
     pub rerun_job_ids: Vec<JobId>,
@@ -2161,11 +2222,17 @@ pub struct RevisionPreview {
     /// still queued or running too, unless another plan holds it.
     pub marked_job_ids: Vec<JobId>,
     pub recalculated_job_count: usize,
+    /// Finished runs the revision would copy under a `replace_model` model.
+    pub replaced_job_count: usize,
     /// That plan's jobs the revision would neither hold, run again, score
-    /// again nor mark failed, so it would stop them.
+    /// again, copy nor mark failed, so it would stop them.
     pub dropped_job_ids: Vec<JobId>,
     /// Each body that would hold an existing job, and the plan it comes from.
     pub held_jobs: Vec<pipette_plan_types::HeldJob>,
+    /// Each body that would take a copy, and the plan and job it copies.
+    pub replaced_jobs: Vec<pipette_plan_types::HeldJob>,
+    /// The `replace_model` pairs, and whether every checksum was compared.
+    pub replaced_models: Vec<ReplacedModel>,
     /// The revised document's variants that repeat an earlier one.
     pub repeated_variants: Vec<usize>,
 }
@@ -2180,9 +2247,13 @@ impl From<RevisionPreview> for pipette_plan_types::RevisionPreview {
             satisfied_job_count: preview.satisfied_job_count,
             restored_job_count: preview.restored_job_count,
             inherited_job_count: preview.inherited_job_count,
+            inherited_failed_job_count: preview.inherited_failed_job_count,
             rerun_job_ids: preview.rerun_job_ids,
             marked_job_ids: preview.marked_job_ids,
             recalculated_job_count: preview.recalculated_job_count,
+            replaced_job_count: preview.replaced_job_count,
+            replaced_jobs: preview.replaced_jobs,
+            replaced_models: preview.replaced_models,
             dropped_job_ids: preview.dropped_job_ids,
             held_jobs: preview.held_jobs,
             repeated_variants: preview.repeated_variants,
@@ -2200,11 +2271,15 @@ impl RevisionPreview {
             satisfied_job_count: 0,
             restored_job_count: 0,
             inherited_job_count: 0,
+            inherited_failed_job_count: 0,
             rerun_job_ids: Vec::new(),
             marked_job_ids: Vec::new(),
             recalculated_job_count: 0,
+            replaced_job_count: 0,
             dropped_job_ids: Vec::new(),
             held_jobs: Vec::new(),
+            replaced_jobs: Vec::new(),
+            replaced_models: Vec::new(),
             repeated_variants: Vec::new(),
         }
     }
@@ -2240,6 +2315,7 @@ pub async fn complete_revision(
         rerun,
         recalculate,
         fail,
+        copied,
         ..
     } = revision;
     advance(campaigns, plans, &campaign, plan_id.clone()).await?;
@@ -2265,14 +2341,24 @@ pub async fn complete_revision(
     let rerun_job_count = rerun.len();
     let marked_job_count = fail.len();
     let recalculated_job_count = recalculate.len();
+    let copied_from_previous = previous
+        .job_ids
+        .iter()
+        .filter(|job_id| copied.contains(job_id))
+        .count();
     let revised = Revised {
         superseded: previous.plan_id,
         carried_job_count,
         rerun_job_count,
         marked_job_count,
         recalculated_job_count,
+        replaced_job_count: copied.len(),
         dropped_job_count: previous.job_ids.len().saturating_sub(
-            carried_job_count + rerun_job_count + marked_job_count + recalculated_job_count,
+            carried_job_count
+                + rerun_job_count
+                + marked_job_count
+                + recalculated_job_count
+                + copied_from_previous,
         ),
         cancel_requested,
     };
@@ -2287,6 +2373,8 @@ pub async fn complete_revision(
         marked_job_ids = ?fail.keys().collect::<Vec<_>>(),
         recalculated_job_count,
         recalculated_job_ids = ?recalculate,
+        replaced_job_count = revised.replaced_job_count,
+        replaced_job_ids = ?copied,
         dropped_job_count = revised.dropped_job_count,
         cancel_requested,
         change = %change,
@@ -2601,7 +2689,6 @@ async fn dry_run_revision(
             &*stores.plans,
             &*stores.todo,
             &*stores.submissions,
-            &*stores.orgs,
         )
         .await
         .map_err(anyhow::Error::new)?;
@@ -2616,9 +2703,8 @@ mod tests {
     use anyhow::Context;
 
     use pipette_core::organization::Organization;
-    use pipette_core::user::User;
     use pipette_plan_types::{
-        CampaignState, ContactEmail, ExpiresAt, NonEmptyTrimmedString, OrgSlug,
+        CampaignState, ContactEmail, ExpiresAt, NonEmptyTrimmedString, OrgId, OrgSlug,
     };
     use pipette_store::{ContentKeyCas, ContentKeyClaim, ContentKeyRecord, ContentKeyVersion};
     use pipette_store_fs::build_local_fs_stores;
@@ -2627,16 +2713,6 @@ mod tests {
     use crate::campaign_chain::CHAIN_MAX;
     use crate::hf_import::HfImports;
     use crate::plan_ingestion::{IngestError, ModelCheck, RejectionError};
-
-    /// Which arm of [`owner`] a case expects. Named so a failure reports the
-    /// arm rather than a boolean pair.
-    #[derive(Debug, Clone, Copy)]
-    enum Expect {
-        User,
-        Org,
-        NoSuchUser,
-        NoSuchOrg,
-    }
 
     async fn stores() -> anyhow::Result<(tempfile::TempDir, Stores)> {
         let dir = tempfile::tempdir()?;
@@ -2671,8 +2747,8 @@ mod tests {
     fn a_new_campaign(name: &str) -> anyhow::Result<NewCampaign> {
         Ok(NewCampaign::new(
             NonEmptyTrimmedString::try_new(name)?,
-            CampaignOwner::User {
-                user_id: UserId::try_new("user_nightly")?,
+            CampaignOwner::Org {
+                org_id: OrgId::try_new("org_nightly")?,
             },
         ))
     }
@@ -3312,23 +3388,14 @@ mod tests {
         Ok(())
     }
 
-    /// Every arm of [`owner`], including the two the CLI's `conflicts_with`
-    /// keeps it from reaching.
+    /// [`owner`] answers an organization the roster holds, and refuses one it
+    /// does not.
     #[rstest::rstest]
-    // (name, user, org, expected)
-    #[case::a_user_the_roster_holds("known", false, Expect::User)]
-    #[case::a_user_the_roster_does_not_hold("user_missing", false, Expect::NoSuchUser)]
-    #[case::an_organization_the_roster_holds("", true, Expect::Org)]
-    #[case::an_organization_the_roster_does_not_hold("", false, Expect::NoSuchOrg)]
+    #[case::an_organization_the_roster_holds(true)]
+    #[case::an_organization_the_roster_does_not_hold(false)]
     #[tokio::test]
-    async fn owner_answers_each_way_a_pair_can_name_one(
-        #[case] user: &str,
-        #[case] org_exists: bool,
-        #[case] expected: Expect,
-    ) -> anyhow::Result<()> {
+    async fn owner_resolves_the_named_organization(#[case] org_exists: bool) -> anyhow::Result<()> {
         let (_dir, stores) = stores().await?;
-        let known = User::try_new(ContactEmail::try_new("op@example.test")?, Timestamp::now())?;
-        stores.users.put_user(&known).await?;
         let org = Organization::new(
             OrgSlug::try_new("acme")?,
             NonEmptyTrimmedString::try_new("Acme")?,
@@ -3342,56 +3409,18 @@ mod tests {
             stores.orgs.put_org(&org).await?;
         }
 
-        let (user_arg, org_arg) = match expected {
-            Expect::User => (Some(known.user_id.clone()), None),
-            Expect::NoSuchUser => (Some(UserId::try_new(user)?), None),
-            Expect::Org | Expect::NoSuchOrg => {
-                (None, Some(OrgRef::Slug(OrgSlug::try_new("acme")?)))
-            }
-        };
-        let outcome = owner(&stores, user_arg, org_arg).await;
+        let outcome = owner(&stores, OrgRef::Slug(OrgSlug::try_new("acme")?)).await;
 
-        match expected {
-            Expect::User => assert_eq!(
-                outcome.ok(),
-                Some(CampaignOwner::User {
-                    user_id: known.user_id.clone()
-                })
-            ),
-            Expect::Org => assert_eq!(
+        if org_exists {
+            assert_eq!(
                 outcome.ok(),
                 Some(CampaignOwner::Org {
                     org_id: org.org_id.clone()
                 })
-            ),
-            Expect::NoSuchUser => {
-                assert!(matches!(outcome, Err(CampaignAdminError::NoSuchUser(_))))
-            }
-            Expect::NoSuchOrg => assert!(matches!(outcome, Err(CampaignAdminError::NoSuchOrg(_)))),
-        }
-        Ok(())
-    }
-
-    #[rstest::rstest]
-    #[case::neither(false)]
-    #[case::both(true)]
-    #[tokio::test]
-    async fn owner_refuses_a_pair_that_names_no_single_owner(
-        #[case] both: bool,
-    ) -> anyhow::Result<()> {
-        let (_dir, stores) = stores().await?;
-        let (user, org) = if both {
-            (
-                Some(UserId::try_new("user_known")?),
-                Some(OrgRef::Slug(OrgSlug::try_new("acme")?)),
-            )
+            );
         } else {
-            (None, None)
-        };
-
-        let outcome = owner(&stores, user, org).await;
-
-        assert!(matches!(outcome, Err(CampaignAdminError::NoOwnerNamed)));
+            assert!(matches!(outcome, Err(CampaignAdminError::NoSuchOrg(_))));
+        }
         Ok(())
     }
 
@@ -4054,7 +4083,7 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             .context("the job source was written")?;
         assert_eq!(stored["spec"]["model"]["source"], "vault_url", "{stored}");
         assert_eq!(
-            stored["spec"]["model"]["principal_id"], "user_nightly",
+            stored["spec"]["model"]["principal_id"], "org_nightly",
             "{stored}"
         );
         assert!(!stored.to_string().contains("SECRET"), "{stored}");
@@ -4064,8 +4093,8 @@ runtimes = [{{ type = "llamacpp_cli_stock_tools", source = "github_release", rep
             .into_iter()
             .map(|record| record.owner)
             .collect();
-        let nightly = VaultOwner::User {
-            user_id: UserId::try_new("user_nightly")?,
+        let nightly = VaultOwner::Org {
+            org_id: OrgId::try_new("org_nightly")?,
         };
         assert!(
             !owners.is_empty() && owners.iter().all(|owner| *owner == nightly),
@@ -4250,6 +4279,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 0,
                 marked_job_count: 0,
                 recalculated_job_count: 0,
+                replaced_job_count: 0,
                 dropped_job_count: 1,
                 cancel_requested: true,
             }
@@ -4355,6 +4385,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 0,
                 marked_job_count: 0,
                 recalculated_job_count: 0,
+                replaced_job_count: 0,
                 dropped_job_count: 1,
                 cancel_requested: true,
             }
@@ -5126,7 +5157,9 @@ benchmarks = ["decode_throughput_512_100"]
             Some(RevisionChange::Document {
                 carry_earlier: false,
                 carry_across_limit: true,
+                inherit_failed: false,
                 inherit_from: Vec::new(),
+                replace_model: Vec::new(),
             })
         );
 
@@ -5267,8 +5300,10 @@ benchmarks = ["decode_throughput_512_100"]
                     added_variant_count: 0,
                     carry_earlier: true,
                     carry_across_limit: false,
+                    inherit_failed: false,
                     inherit_from: vec![first.plan_id],
                     restored: Vec::new(),
+                    replace_model: Vec::new(),
                 })
             )
         );
@@ -5673,6 +5708,346 @@ benchmarks = ["decode_throughput_512_100"]
         Ok(())
     }
 
+    /// A failure record for each of `job_ids`, written with `source`, `code`
+    /// and `reason`.
+    async fn fail_with(
+        stores: &Stores,
+        job_ids: &[JobId],
+        source: FailureSource,
+        code: pipette_plan_types::FailureCode,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        futures::stream::iter(job_ids)
+            .map(anyhow::Ok)
+            .try_for_each(|job_id| async move {
+                let record = serde_json::json!({
+                    "job_id": job_id.as_str(),
+                    "message_type": "failure",
+                    "failure_source": source,
+                    "failure_code": code,
+                    "failure_reason": reason,
+                });
+                stores.submissions.write_processed(job_id, &record).await?;
+                stores.todo.delete_avail_by_job(job_id).await
+            })
+            .await
+    }
+
+    /// With `inherit_failed`, a cell that no finished run answers takes a
+    /// named plan's failed run where the cell would fail the same way: a
+    /// timeout or a mark under a limit not below the cell's, an out-of-memory
+    /// under any limit. A failure that says nothing of the cell, and every
+    /// failure without the option, leaves the cell to run.
+    #[rstest::rstest]
+    #[case::a_timeout_under_a_longer_limit(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::AttemptTimeout,
+        600,
+        180,
+        true
+    )]
+    #[case::a_timeout_under_a_shorter_limit(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::AttemptTimeout,
+        180,
+        600,
+        false
+    )]
+    #[case::out_of_memory_under_a_shorter_limit(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::OutOfMemory,
+        180,
+        600,
+        true
+    )]
+    #[case::a_mark_under_the_same_limit(
+        FailureSource::Marked,
+        pipette_plan_types::FailureCode::Unspecified,
+        180,
+        180,
+        true
+    )]
+    #[case::a_mark_under_a_shorter_limit(
+        FailureSource::Marked,
+        pipette_plan_types::FailureCode::Unspecified,
+        180,
+        600,
+        false
+    )]
+    #[case::a_readiness_wait(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::DeviceNotReady,
+        180,
+        180,
+        false
+    )]
+    #[case::a_lost_lease(
+        FailureSource::LeaseLost,
+        pipette_plan_types::FailureCode::Unspecified,
+        180,
+        180,
+        false
+    )]
+    #[case::a_runtime_error_under_a_shorter_limit(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::RuntimeError,
+        180,
+        600,
+        true
+    )]
+    #[case::a_device_error_under_a_shorter_limit(
+        FailureSource::Client,
+        pipette_plan_types::FailureCode::DeviceError,
+        180,
+        600,
+        true
+    )]
+    #[tokio::test]
+    async fn inheriting_failed_takes_a_failure_the_cell_would_repeat(
+        #[case] source: FailureSource,
+        #[case] code: pipette_plan_types::FailureCode,
+        #[case] run_limit: u64,
+        #[case] cell_limit: u64,
+        #[case] taken: bool,
+    ) -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let limited = limited_to(dir.path(), run_limit)?;
+        let (_, donor) = donor_of(&stores, dir.path(), "donor", &limited).await?;
+        let ran = queued_requiring(&stores, &donor, "os:macos").await?;
+        fail_with(&stores, &ran, source, code, "failed").await?;
+        let document = limited_to(dir.path(), cell_limit)?;
+
+        let offer = inheriting(&stores, &donor.plan_id).await?;
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer).await?;
+        assert_eq!(
+            (preview.inherited_job_count, preview.new_job_count),
+            (0, ran.len())
+        );
+        let offer = inheriting(&stores, &donor.plan_id)
+            .await?
+            .inherit_failed(true);
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer.clone()).await?;
+        let copied = if taken { ran.len() } else { 0 };
+        assert_eq!(
+            (
+                preview.inherited_job_count,
+                preview.inherited_failed_job_count,
+                preview.new_job_count
+            ),
+            (copied, copied, ran.len() - copied)
+        );
+        let marked = preview.held_jobs.iter().filter(|held| held.failed).count();
+        assert_eq!(marked, copied);
+        // `carry_across_limit` widens finished runs only.
+        let across = preview_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &document,
+            offer.clone().across_limit(true),
+        )
+        .await?;
+        assert_eq!(across.inherited_failed_job_count, copied);
+        let second = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("inheriting files a revision")?;
+        assert_eq!(
+            ran.iter().all(|job_id| held(&second).contains(job_id)),
+            taken
+        );
+        Ok(())
+    }
+
+    /// The head's own failure under another limit answers too: an
+    /// out-of-memory with no limit answers the cell once it sets one, and the
+    /// dry run marks the body that takes it. Without the option the cell runs
+    /// again.
+    #[tokio::test]
+    async fn inheriting_failed_keeps_the_heads_own_failure() -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &first, "os:macos").await?;
+        fail_with(
+            &stores,
+            &ran,
+            FailureSource::Client,
+            pipette_plan_types::FailureCode::OutOfMemory,
+            "failed",
+        )
+        .await?;
+        let document = limited_to(dir.path(), 180)?;
+
+        let preview = preview_offering(
+            &stores,
+            &campaign,
+            &first.plan_id,
+            &document,
+            Offer::default(),
+        )
+        .await?;
+        assert_eq!(preview.requirements_rerun_job_count, ran.len());
+        let offer = Offer::default().inherit_failed(true);
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer.clone()).await?;
+        assert_eq!(
+            (
+                preview.requirements_rerun_job_count,
+                preview.inherited_failed_job_count
+            ),
+            (0, 0)
+        );
+        let marked: BTreeSet<JobId> = preview
+            .held_jobs
+            .iter()
+            .filter(|held| held.failed)
+            .map(|held| held.job_id.clone())
+            .collect();
+        assert_eq!(marked, ran.iter().cloned().collect());
+        let second = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("the revision files")?;
+        assert!(ran.iter().all(|job_id| held(&second).contains(job_id)));
+        Ok(())
+    }
+
+    /// A skip goes only with the failure it names: the revision takes a
+    /// smaller run's failure and the skip that followed it, and leaves to run
+    /// a skip whose cause it does not take. A skip after an out-of-memory
+    /// answers a longer limit, as the out-of-memory does.
+    #[rstest::rstest]
+    #[case::with_its_cause(
+        pipette_plan_types::FailureCode::AttemptTimeout,
+        pipette_plan_types::FailureCode::AttemptTimeout,
+        600,
+        180,
+        2
+    )]
+    #[case::without_its_cause(
+        pipette_plan_types::FailureCode::DeviceNotReady,
+        pipette_plan_types::FailureCode::AttemptTimeout,
+        600,
+        180,
+        0
+    )]
+    #[case::after_out_of_memory_under_a_shorter_limit(
+        pipette_plan_types::FailureCode::OutOfMemory,
+        pipette_plan_types::FailureCode::OutOfMemory,
+        180,
+        600,
+        2
+    )]
+    #[tokio::test]
+    async fn inheriting_failed_takes_a_skip_with_its_cause(
+        #[case] cause: pipette_plan_types::FailureCode,
+        #[case] skip_code: pipette_plan_types::FailureCode,
+        #[case] run_limit: u64,
+        #[case] cell_limit: u64,
+        #[case] copied: usize,
+    ) -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let limited = limited_to(dir.path(), run_limit)?;
+        let (_, donor) = donor_of(&stores, dir.path(), "donor", &limited).await?;
+        let ran = queued_requiring(&stores, &donor, "os:macos").await?;
+        let [smaller, larger] = <[JobId; 2]>::try_from(ran)
+            .map_err(|ran| anyhow::anyhow!("two macOS jobs, got {ran:?}"))?;
+        fail_with(
+            &stores,
+            std::slice::from_ref(&smaller),
+            FailureSource::Client,
+            cause,
+            "failed",
+        )
+        .await?;
+        let skipped = crate::queue_maintenance::smaller_run_reason(
+            &BenchmarkId::try_new("decode")?,
+            skip_code,
+            &smaller,
+        );
+        fail_with(
+            &stores,
+            &[larger],
+            FailureSource::SmallerRunFailed,
+            skip_code,
+            &skipped,
+        )
+        .await?;
+        let document = limited_to(dir.path(), cell_limit)?;
+        let offer = inheriting(&stores, &donor.plan_id)
+            .await?
+            .inherit_failed(true);
+
+        let preview =
+            preview_offering(&stores, &campaign, &first.plan_id, &document, offer).await?;
+
+        assert_eq!(
+            (preview.inherited_failed_job_count, preview.new_job_count),
+            (copied, 2 - copied)
+        );
+        Ok(())
+    }
+
+    /// A copied mark keeps naming the run it marked failed, so the new plan
+    /// holds it as a mark: a group policy walks its chain, and a re-run of the
+    /// failed jobs leaves it out. The change records the option.
+    #[tokio::test]
+    async fn inheriting_failed_takes_a_mark_with_the_run_it_marked() -> anyhow::Result<()> {
+        let (dir, stores, _db) = sql_stores().await?.context("PostgreSQL required")?;
+        let (campaign, first) = created(&stores, dir.path()).await?;
+        let (donor, donated) = donor(&stores, dir.path()).await?;
+        let ran = queued_requiring(&stores, &donated, "os:macos").await?;
+        finish_on_build(&stores, &ran, None).await?;
+        let fail = ran
+            .iter()
+            .map(|job_id| anyhow::Ok((job_id.clone(), NonEmptyTrimmedString::try_new("swap")?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let revision = Head::read(&*stores.plans, donor, None)
+            .await?
+            .rerun(&*stores.plans, &*stores.submissions, BTreeSet::new(), fail)
+            .await?;
+        let (marked, _) =
+            file_cli_revision(&stores, settings(ModelCheck::none()), revision, None).await?;
+        let marks = stores
+            .plans
+            .get_plan(&marked.plan_id)
+            .await?
+            .context("the marked plan")?
+            .rerun_of;
+        assert_eq!(marks.len(), ran.len());
+        let document = routed_to(dir.path(), "lab-boston")?;
+        let offer = inheriting(&stores, &marked.plan_id)
+            .await?
+            .inherit_failed(true);
+
+        let second = revise_offering(&stores, &campaign, &first.plan_id, &document, offer)
+            .await?
+            .context("inheriting files a revision")?;
+
+        let manifest = stores
+            .plans
+            .get_plan(&second.plan_id)
+            .await?
+            .context("the revision")?;
+        let copied: BTreeMap<JobId, JobId> = manifest
+            .rerun_of
+            .into_iter()
+            .filter(|(job_id, _)| marks.contains_key(job_id))
+            .collect();
+        assert_eq!(copied, marks);
+        let notes = stores.plans.get_plan_notes(&second.plan_id).await?;
+        assert!(matches!(
+            notes.change,
+            Some(RevisionChange::Document {
+                inherit_failed: true,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
     /// Named plans offer their runs in the order named: a cell takes the first
     /// run that succeeded, past a named plan whose run failed.
     #[tokio::test]
@@ -5973,8 +6348,10 @@ benchmarks = ["decode_throughput_512_100"]
                 added_variant_count: 1,
                 carry_earlier: false,
                 carry_across_limit: false,
+                inherit_failed: false,
                 inherit_from: vec![first.plan_id],
                 restored: restore.to_vec(),
+                replace_model: Vec::new(),
             })
         );
         Ok(())
@@ -6389,8 +6766,8 @@ benchmarks = ["decode_throughput_512_100"]
         let report = file_revision(&stores, &revision).await?;
 
         let handed = Campaign {
-            owner: CampaignOwner::User {
-                user_id: UserId::try_new("user_heir")?,
+            owner: CampaignOwner::Org {
+                org_id: OrgId::try_new("org_heir")?,
             },
             ..require(&*stores.campaigns, &campaign.campaign_id).await?
         };
@@ -6455,8 +6832,8 @@ benchmarks = ["decode_throughput_512_100"]
             NonEmptyTrimmedString::try_new("nightly-eu")?,
             NonEmptyTrimmedString::try_new("nightly-us")?,
         );
-        let heir = CampaignOwner::User {
-            user_id: UserId::try_new("user_heir")?,
+        let heir = CampaignOwner::Org {
+            org_id: OrgId::try_new("org_heir")?,
         };
         let writes = std::sync::atomic::AtomicUsize::new(0);
         // Renames, then `between` as the last rival write.
@@ -6632,6 +7009,7 @@ benchmarks = ["decode_throughput_512_100"]
             )?,
             organization: NonEmptyTrimmedString::try_new("lab")?,
             client_details: NonEmptyTrimmedString::try_new("mac mini")?,
+            name: None,
             contact_email: ContactEmail::try_new("lab@example.test")?,
             status: pipette_core::client::ClientStatus::Approved,
             registered_at: Timestamp::now(),
@@ -6834,6 +7212,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 1,
                 marked_job_count: 0,
                 recalculated_job_count: 0,
+                replaced_job_count: 0,
                 dropped_job_count: 0,
                 cancel_requested: true,
             }
@@ -7280,6 +7659,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 1,
                 marked_job_count: 1,
                 recalculated_job_count: 0,
+                replaced_job_count: 0,
                 dropped_job_count: 0,
                 cancel_requested: true,
             }
@@ -7877,6 +8257,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 1,
                 marked_job_count: 0,
                 recalculated_job_count: 0,
+                replaced_job_count: 0,
                 dropped_job_count: 0,
                 cancel_requested: true,
             }
@@ -8071,6 +8452,7 @@ benchmarks = ["decode_throughput_512_100"]
                 rerun_job_count: 0,
                 marked_job_count: 0,
                 recalculated_job_count: 1,
+                replaced_job_count: 0,
                 dropped_job_count: 0,
                 cancel_requested: true,
             }

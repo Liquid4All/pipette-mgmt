@@ -75,6 +75,8 @@ pub fn app_responses(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::DescriptorCatalogShortList>();
     generator.subschema_for::<crate::DescriptorEntryLookup>();
     generator.subschema_for::<crate::DescriptorDigestNames>();
+    generator.subschema_for::<crate::DescriptorFamilyLogo>();
+    generator.subschema_for::<crate::DescriptorFamilyLogoView>();
     generator.subschema_for::<crate::CatalogImportRuns>();
     generator.subschema_for::<crate::ModelParams>();
     generator.subschema_for::<crate::Changed<crate::ModelParams>>();
@@ -84,6 +86,8 @@ pub fn app_responses(generator: &mut SchemaGenerator) {
 /// a default is optional there.
 pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::CreateDescriptorEntryRequest>();
+    generator.subschema_for::<crate::SetDescriptorEntryFamilyRequest>();
+    generator.subschema_for::<crate::SetDescriptorFamilyLogoRequest>();
     generator.subschema_for::<crate::AddDescriptorMemberRequest>();
     generator.subschema_for::<crate::ChangeDescriptorEntryStateRequest>();
     generator.subschema_for::<crate::RenameDescriptorEntryRequest>();
@@ -95,6 +99,7 @@ pub fn app_requests(generator: &mut SchemaGenerator) {
     generator.subschema_for::<crate::SetClientOwnerRequest>();
     generator.subschema_for::<UploadVaultResourcesRequest>();
     generator.subschema_for::<crate::AmendClientPermissionsRequest>();
+    generator.subschema_for::<crate::UpdateClientRequest>();
     generator.subschema_for::<crate::MintClientPreauthRequest>();
     generator.subschema_for::<crate::CreateUserRequest>();
     generator.subschema_for::<crate::UpdateUserRequest>();

@@ -204,6 +204,10 @@ const OPERATIONS: &[Doc] = &[
         "descriptor-catalog/lookup_descriptor_digests.md"
     ),
     doc!(
+        "get_descriptor_family_logo",
+        "descriptor-catalog/get_descriptor_family_logo.md"
+    ),
+    doc!(
         "create_org_descriptor_entry",
         "descriptor-catalog/create_org_descriptor_entry.md"
     ),
@@ -222,6 +226,14 @@ const OPERATIONS: &[Doc] = &[
     doc!(
         "remove_org_descriptor_member",
         "descriptor-catalog/remove_org_descriptor_member.md"
+    ),
+    doc!(
+        "set_org_descriptor_entry_family",
+        "descriptor-catalog/set_org_descriptor_entry_family.md"
+    ),
+    doc!(
+        "set_org_descriptor_family_logo",
+        "descriptor-catalog/set_org_descriptor_family_logo.md"
     ),
     doc!(
         "change_org_descriptor_entry_state",
@@ -1150,6 +1162,28 @@ mod tests {
             })
             .collect();
         anyhow::ensure!(undeclared.is_empty(), "{undeclared:#?}");
+        Ok(())
+    }
+
+    /// The document takes the first row of a status, so a second row would be lost.
+    #[test]
+    fn test_each_status_has_one_row() -> anyhow::Result<()> {
+        let repeated: Vec<String> = OPERATIONS
+            .iter()
+            .flat_map(|(_, path, text)| {
+                parse(path, text)
+                    .statuses
+                    .into_iter()
+                    .fold(BTreeMap::<u16, usize>::new(), |mut rows, (status, _)| {
+                        *rows.entry(status).or_default() += 1;
+                        rows
+                    })
+                    .into_iter()
+                    .filter(|(_, rows)| *rows > 1)
+                    .map(move |(status, rows)| format!("{path}: {rows} rows for {status}"))
+            })
+            .collect();
+        anyhow::ensure!(repeated.is_empty(), "{repeated:#?}");
         Ok(())
     }
 }

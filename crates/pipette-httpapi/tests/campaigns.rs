@@ -17,7 +17,7 @@ use pipette_core::campaign::{Campaign, CampaignOwner};
 use pipette_core::types::Mint;
 use pipette_httpapi::state::AppState;
 use pipette_plan_types::{
-    CampaignId, JobId, PlanId, PlanStatus, UserId, UserPermission, UserStatus,
+    CampaignId, JobId, OrgId, PlanId, PlanStatus, UserPermission, UserStatus,
 };
 use pipette_store::{CampaignPage, CampaignStore, PlanStore};
 use pipette_web_testkit::*;
@@ -40,8 +40,18 @@ async fn server_admin(state: &AppState) -> anyhow::Result<UserSigner> {
     .await
 }
 
-/// An ordinary operator: files and reads its own work, administers nobody.
+/// An operator on the organization it made for itself: files plans there and
+/// administers its campaigns.
 async fn operator(state: &AppState) -> anyhow::Result<UserSigner> {
+    registered_user(
+        state,
+        &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
+    )
+    .await
+}
+
+/// An ordinary member: files plans and administers nothing.
+async fn member_operator(state: &AppState) -> anyhow::Result<UserSigner> {
     registered_user(state, &[UserPermission::SubmitPlans]).await
 }
 
@@ -208,7 +218,10 @@ async fn creating_a_campaign_files_its_first_plan() -> anyhow::Result<()> {
     let body = body_json(resp).await?;
     let campaign_id = json_str(&body, "campaign_id")?.to_string();
     assert_eq!(body["name"], json!("Nightly LFM2"));
-    assert_eq!(body["owner"]["user_id"], json!(owner.1.as_str()));
+    assert_eq!(
+        body["owner"]["org_id"],
+        json!(org_of(&state, &owner.1).await?.as_str())
+    );
     assert_eq!(body["plan"]["note"], json!("nightly-1"));
     assert_eq!(body["plan"]["job_count"], json!(1));
     let plan_id = PlanId::try_new(json_str(&body["plan"], "plan_id")?)?;
@@ -308,49 +321,33 @@ async fn creating_a_campaign_takes_submit_plans() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whom an out-of-scope create names as the owner.
-#[derive(Clone, Copy, Debug)]
-enum ForeignOwner {
-    AnotherAccount,
-    AnOrganizationTheCallerIsNotOn,
-}
-
-/// A create naming an owner outside the caller's scope is refused before the
+/// A create naming an organization the caller is not on is refused before the
 /// plan is filed. The caller holds `submit_plans` and the document is valid, so
 /// only the owner check stands between the request and a staged plan.
-#[rstest]
-#[case::another_account(ForeignOwner::AnotherAccount)]
-#[case::an_organization_the_caller_is_not_on(ForeignOwner::AnOrganizationTheCallerIsNotOn)]
 #[tokio::test]
-async fn creating_for_an_owner_out_of_scope_files_nothing(
-    #[case] foreign: ForeignOwner,
-) -> anyhow::Result<()> {
+async fn creating_for_an_owner_out_of_scope_files_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let admin = server_admin(&state).await?;
     let caller = operator(&state).await?;
-    let owner = match foreign {
-        ForeignOwner::AnotherAccount => operator(&state).await?.1.to_string(),
-        ForeignOwner::AnOrganizationTheCallerIsNotOn => create_org(&state, &admin, "acme").await?,
-    };
+    let owner = create_org(&state, &admin, "acme").await?;
 
     let resp = post_campaign(&state, &caller, &[("name", "Theirs"), ("owner", &owner)]).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{foreign:?}");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(stored_campaigns(&state).await?, 0);
     assert_nothing_staged(&state).await
 }
 
 /// A member holding `submit_plans` without `manage_orgs` creates its
-/// organization's campaign and files into it, as a colleague does. Its record
-/// is the organization's administrators': the creator renames nothing.
+/// organization's campaign, files into it as a colleague does, and renames it.
 #[tokio::test]
-async fn a_member_files_into_its_teams_campaign_and_does_not_administer_it() -> anyhow::Result<()> {
+async fn a_member_files_into_its_teams_campaign_and_administers_it() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let admin = server_admin(&state).await?;
     let acme = create_org(&state, &admin, "acme").await?;
-    let member = operator(&state).await?;
-    let colleague = operator(&state).await?;
+    let member = member_operator(&state).await?;
+    let colleague = member_operator(&state).await?;
     for signer in [&member, &colleague] {
         set_user_org(&state, &signer.1, Some(acme.parse()?)).await?;
     }
@@ -375,16 +372,8 @@ async fn a_member_files_into_its_teams_campaign_and_does_not_administer_it() -> 
         );
     }
 
-    let resp = rename(&state, &member, &campaign_id, "Renamed").await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let error = body_json(resp).await?;
-    assert!(json_str(&error, "error")?.contains("needs manage_orgs"));
-    // Nor does it take the team's campaign for itself.
-    let to_self = json!({ "type": "user", "user_id": member.1.as_str() });
-    assert_eq!(
-        hand_over(&state, &member, &campaign_id, to_self).await?,
-        StatusCode::FORBIDDEN
-    );
+    let resp = rename(&state, &colleague, &campaign_id, "Renamed").await?;
+    assert_eq!(resp.status(), StatusCode::OK);
 
     // An account on no organization, or on another, files nothing into it.
     let stranger = operator(&state).await?;
@@ -395,49 +384,6 @@ async fn a_member_files_into_its_teams_campaign_and_does_not_administer_it() -> 
         let resp = post_plan_document(&state, signer, &uri, ONE_CELL_PLAN).await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
-    Ok(())
-}
-
-/// Creating a campaign for an account without `submit_plans` is refused, whoever
-/// creates it, and files nothing; granting it lets the create through.
-#[tokio::test]
-async fn creating_for_an_account_without_submit_plans_files_nothing() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let admin = server_admin(&state).await?;
-    let acme = create_org(&state, &admin, "acme").await?;
-    let team_lead = registered_user(
-        &state,
-        &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
-    )
-    .await?;
-    let member = registered_user(&state, &[UserPermission::ReadPlans]).await?;
-    for signer in [&team_lead, &member] {
-        set_user_org(&state, &signer.1, Some(acme.parse()?)).await?;
-    }
-    let params = [("name", "Handed down"), ("owner", member.1.as_str())];
-
-    for caller in [&team_lead, &admin] {
-        let resp = post_campaign(&state, caller, &params).await?;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let error = json_str(&body_json(resp).await?, "error")?.to_string();
-        assert!(error.contains("owner needs submit_plans"), "{error}");
-    }
-    assert_eq!(stored_campaigns(&state).await?, 0);
-    assert_nothing_staged(&state).await?;
-
-    grant_user(
-        &state,
-        &member.1,
-        &[UserPermission::ReadPlans, UserPermission::SubmitPlans],
-    )
-    .await?;
-    let resp = post_campaign(&state, &team_lead, &params).await?;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(
-        body_json(resp).await?["owner"]["user_id"],
-        json!(member.1.as_str())
-    );
     Ok(())
 }
 
@@ -749,15 +695,14 @@ async fn a_rename_never_undoes_a_head_move() -> anyhow::Result<()> {
 async fn a_hand_over_that_meets_a_head_move_writes_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = seeded_state(dir.path()).await?;
-    let (_admin, team_admin, acme, campaign_id) = a_team_campaign(&state).await?;
-    let member = operator(&state).await?;
-    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
+    let (admin, _team_admin, _acme, campaign_id) = a_team_campaign(&state).await?;
+    let rival = create_org(&state, &admin, "rival").await?;
     let before = stored_campaign(&state, &campaign_id).await?;
     state.campaign_store = with_head_move(state.campaign_store.clone());
-    let to_member = json!({ "type": "user", "user_id": member.1 });
+    let to_rival = json!({ "type": "org", "org_id": rival });
 
     assert_eq!(
-        hand_over(&state, &team_admin, &campaign_id, to_member.clone()).await?,
+        hand_over(&state, &admin, &campaign_id, to_rival.clone()).await?,
         StatusCode::CONFLICT
     );
     let stored = stored_campaign(&state, &campaign_id).await?;
@@ -765,14 +710,14 @@ async fn a_hand_over_that_meets_a_head_move_writes_nothing() -> anyhow::Result<(
     assert_ne!(stored.current_plan_id, before.current_plan_id);
 
     assert_eq!(
-        hand_over(&state, &team_admin, &campaign_id, to_member).await?,
+        hand_over(&state, &admin, &campaign_id, to_rival).await?,
         StatusCode::OK
     );
     let stored = stored_campaign(&state, &campaign_id).await?;
     assert_eq!(
         stored.owner,
-        CampaignOwner::User {
-            user_id: member.1.clone()
+        CampaignOwner::Org {
+            org_id: rival.parse()?
         }
     );
     Ok(())
@@ -1097,8 +1042,8 @@ async fn the_plan_fixture_files_an_active_plan_into_a_campaign_of_its_own() -> a
             .context("the campaign is stored")?;
         assert_eq!(
             campaign.owner,
-            CampaignOwner::User {
-                user_id: user_id.clone()
+            CampaignOwner::Org {
+                org_id: org_of(&state, &user_id).await?
             }
         );
         assert_eq!(plan.submitted_by.as_ref(), Some(&user_id));
@@ -1357,15 +1302,17 @@ async fn a_stranger_cannot_write_someone_elses_campaign(
         OwnerWrite::HandOff => ("PUT", "/owner"),
     };
     let uri = format!("/api/v1/campaigns/{campaign_id}{suffix}");
-    // The hand-off names each caller as the destination, so the only thing
-    // separating the two runs is whether the campaign was theirs to begin with.
-    let body = |signer: &UserSigner| match write {
+    // The hand-off names each caller's organization as the destination, so the
+    // only thing separating the two runs is whether the campaign was theirs.
+    let body = |org_id: &OrgId| match write {
         OwnerWrite::Rename => json!({ "name": "Taken over" }),
         OwnerWrite::EmptyPatch => json!({}),
-        OwnerWrite::HandOff => json!({ "owner": { "type": "user", "user_id": signer.1 } }),
+        OwnerWrite::HandOff => json!({ "owner": { "type": "org", "org_id": org_id } }),
     };
+    let stranger_org = org_of(&state, &stranger.1).await?;
+    let owner_org = org_of(&state, &owner.1).await?;
 
-    let resp = signed_json(&state, &stranger, method, &uri, &body(&stranger)).await?;
+    let resp = signed_json(&state, &stranger, method, &uri, &body(&stranger_org)).await?;
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
@@ -1374,7 +1321,7 @@ async fn a_stranger_cannot_write_someone_elses_campaign(
 
     // The owner is admitted through the same route, so the refusal is about
     // ownership and not about the request.
-    let resp = signed_json(&state, &owner, method, &uri, &body(&owner)).await?;
+    let resp = signed_json(&state, &owner, method, &uri, &body(&owner_org)).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     Ok(())
 }
@@ -1393,7 +1340,7 @@ async fn a_hand_off_naming_no_owner_is_refused() -> anyhow::Result<()> {
     for body in [
         json!({ "owner": null }),
         json!({}),
-        json!({ "onwer": { "type": "user", "user_id": owner.1 } }),
+        json!({ "onwer": { "type": "org", "org_id": org_of(&state, &owner.1).await? } }),
     ] {
         let resp = signed_json(&state, &owner, "PUT", &uri, &body).await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
@@ -1459,7 +1406,7 @@ fn the_create() -> CampaignWrite {
 
 /// Every write addressed to `campaign_id`, each with a body its owner `owner`
 /// could send: `base` is the plan the campaign runs and `job` a job of it.
-fn writes_to(campaign_id: &str, base: &PlanId, job: &str, owner: &UserId) -> Vec<CampaignWrite> {
+fn writes_to(campaign_id: &str, base: &PlanId, job: &str, owner: &OrgId) -> Vec<CampaignWrite> {
     let at = |suffix: &str| format!("/api/v1/campaigns/{campaign_id}{suffix}");
     let as_json = |body: Value| Some(("application/json", body.to_string()));
     let as_toml = |body: &str| Some(("application/toml", body.to_string()));
@@ -1477,7 +1424,7 @@ fn writes_to(campaign_id: &str, base: &PlanId, job: &str, owner: &UserId) -> Vec
         CampaignWrite {
             method: "PUT",
             uri: at("/owner"),
-            body: as_json(json!({ "owner": { "type": "user", "user_id": owner } })),
+            body: as_json(json!({ "owner": { "type": "org", "org_id": owner } })),
         },
         CampaignWrite {
             method: "POST",
@@ -1566,7 +1513,7 @@ async fn a_write_to_an_unminted_campaign_answers_by_the_callers_authority(
         &an_unminted_campaign(),
         &a_plan_id(),
         "job-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e",
-        &signer.1,
+        &org_of(&state, &signer.1).await?,
     );
 
     for write in &writes {
@@ -1592,11 +1539,11 @@ async fn a_write_to_an_unminted_campaign_answers_by_the_callers_authority(
     assert_nothing_staged(&state).await
 }
 
-/// Belonging to the organization is not administering it; its administrator is,
-/// another organization's is not, and the server reaches every one. The member,
-/// who reads the campaign, is told the grant it lacks.
+/// A member holding `submit_plans` and its administrator administer the
+/// organization's campaign, another organization's administrator does not,
+/// and the server reaches every one.
 #[rstest]
-#[case::a_member_of_the_owning_org(Actor::Member, StatusCode::FORBIDDEN, Some("needs manage_orgs"))]
+#[case::a_member_of_the_owning_org(Actor::Member, StatusCode::OK, None)]
 #[case::its_own_administrator(Actor::OrgAdmin, StatusCode::OK, None)]
 #[case::another_orgs_administrator(Actor::RivalAdmin, StatusCode::FORBIDDEN, Some("another owner"))]
 #[case::a_server_admin(Actor::ServerAdmin, StatusCode::OK, None)]
@@ -1616,7 +1563,7 @@ async fn an_org_campaign_answers_the_scoped_authority_rule(
 
     let caller = match actor {
         Actor::Member => {
-            let member = operator(&state).await?;
+            let member = member_operator(&state).await?;
             set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
             member
         }
@@ -1655,7 +1602,7 @@ async fn a_member_reads_the_campaign_it_may_not_administer() -> anyhow::Result<(
     let state = seeded_state(dir.path()).await?;
     let admin = server_admin(&state).await?;
     let org_id = create_org(&state, &admin, "acme").await?;
-    let member = operator(&state).await?;
+    let member = member_operator(&state).await?;
     set_user_org(&state, &member.1, Some(org_id.parse()?)).await?;
 
     let campaign_id = create_campaign(&state, &admin, "Release gate", Some(&org_id)).await?;
@@ -1738,17 +1685,17 @@ async fn an_account_without_a_campaign_read_grant_reads_no_campaign(
     Ok(())
 }
 
-/// A pending account reads no campaign, whatever it holds: seeded with
+/// A disabled account reads no campaign, whatever it holds: seeded with
 /// `read_any_plans`, it is refused on its standing on the listing and on every
-/// read of one. A route taking the wrong extractor would admit it.
+/// read of one.
 #[tokio::test]
-async fn a_pending_account_reads_no_campaign() -> anyhow::Result<()> {
+async fn a_disabled_account_reads_no_campaign() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = seeded_state(dir.path()).await?;
     let (campaign_id, _) =
         created_campaign(&state, &operator(&state).await?, &[("name", "Nightly")]).await?;
     let reader = registered_user(&state, &[UserPermission::ReadAnyPlans]).await?;
-    set_user_status(&state, &reader.1, UserStatus::Pending).await?;
+    set_user_status(&state, &reader.1, UserStatus::Disabled).await?;
 
     let uris =
         std::iter::once("/api/v1/campaigns".to_string()).chain(one_campaign_reads(&campaign_id));
@@ -1756,15 +1703,12 @@ async fn a_pending_account_reads_no_campaign() -> anyhow::Result<()> {
         let (status, body) = get_as(&state, &reader, &uri).await?;
         assert_eq!(
             (status, &body["error"]),
-            (
-                StatusCode::FORBIDDEN,
-                &json!("user is pending an operator's approval")
-            ),
+            (StatusCode::FORBIDDEN, &json!("user is disabled")),
             "{uri}"
         );
     }
 
-    // Approved, the same grant reads the campaign: the refusal was the standing.
+    // Enabled, the same grant reads the campaign: the refusal was the standing.
     set_user_status(&state, &reader.1, UserStatus::Active).await?;
     let (status, body) =
         get_as(&state, &reader, &format!("/api/v1/campaigns/{campaign_id}")).await?;
@@ -1777,25 +1721,18 @@ async fn a_pending_account_reads_no_campaign() -> anyhow::Result<()> {
 enum Standing {
     /// An approved device, signing with its own key.
     Device,
-    /// The campaign's owner, holding every grant a write takes, while pending.
-    PendingOwner,
-    /// The same owner, disabled.
+    /// The campaign's owner, holding every grant a write takes, while disabled.
     DisabledOwner,
 }
 
 /// Every campaign write refuses a device at the header, and the campaign's
-/// owner holding every grant while it is pending or disabled, and writes
-/// nothing. A route taking the wrong extractor would admit one of them.
+/// owner holding every grant while it is disabled, and writes nothing. A
+/// route taking the wrong extractor would admit one of them.
 #[rstest]
 #[case::a_device(
     Standing::Device,
     StatusCode::UNAUTHORIZED,
     "invalid X-Client-Id header: user id must start with `user_`"
-)]
-#[case::a_pending_owner(
-    Standing::PendingOwner,
-    StatusCode::FORBIDDEN,
-    "user is pending an operator's approval"
 )]
 #[case::a_disabled_owner(Standing::DisabledOwner, StatusCode::FORBIDDEN, "user is disabled")]
 #[tokio::test]
@@ -1811,7 +1748,6 @@ async fn a_caller_without_standing_writes_no_campaign(
     let job = manifest(&state, &first).await?.job_ids[0].clone();
     match standing {
         Standing::Device => {}
-        Standing::PendingOwner => set_user_status(&state, &owner.1, UserStatus::Pending).await?,
         Standing::DisabledOwner => set_user_status(&state, &owner.1, UserStatus::Disabled).await?,
     }
 
@@ -1819,7 +1755,7 @@ async fn a_caller_without_standing_writes_no_campaign(
         &campaign_id,
         &first,
         job.as_str(),
-        &owner.1,
+        &org_of(&state, &owner.1).await?,
     ));
     for write in writes {
         let resp = match standing {
@@ -1827,9 +1763,7 @@ async fn a_caller_without_standing_writes_no_campaign(
                 let headers = auth_headers(&client_key, &client_id, write.method, &write.uri)?;
                 send_write(&state, &write, &headers).await?
             }
-            Standing::PendingOwner | Standing::DisabledOwner => {
-                send_write_as(&state, &owner, &write).await?
-            }
+            Standing::DisabledOwner => send_write_as(&state, &owner, &write).await?,
         };
         let answered = resp.status();
         let body = body_json(resp).await?;
@@ -1871,7 +1805,7 @@ async fn handing_a_campaign_over_is_checked_at_both_ends() -> anyhow::Result<()>
     let acme = create_org(&state, &admin, "acme").await?;
     let rival = create_org(&state, &admin, "rival").await?;
 
-    // Owns campaigns, administers `acme`, and has no authority over `rival`.
+    // Files and administers `acme`'s campaigns, and has no authority over `rival`.
     let member = registered_user(
         &state,
         &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
@@ -1908,8 +1842,8 @@ async fn handing_a_campaign_over_is_checked_at_both_ends() -> anyhow::Result<()>
     .await?;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // Both ends clear: the hand-off lands, and the campaign keeps what it was
-    // running.
+    // Both ends clear, into the organization that holds it already: nothing
+    // moves, and the campaign keeps what it was running.
     let resp = signed_json(
         &state,
         &member,
@@ -1920,7 +1854,7 @@ async fn handing_a_campaign_over_is_checked_at_both_ends() -> anyhow::Result<()>
     .await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await?;
-    assert_eq!(body["changed"], json!(true));
+    assert_eq!(body["changed"], json!(false));
     assert_eq!(body["owner"]["org_id"], json!(acme));
     assert_eq!(
         body["current_plan_id"],
@@ -1950,17 +1884,15 @@ async fn handing_a_campaign_over_is_checked_at_both_ends() -> anyhow::Result<()>
         "a no-op must not move the timestamp"
     );
 
-    // And the previous owner has given it up: it holds `submit_plans`, but the
-    // campaign is the organization's now, and it administers that organization.
-    // A colleague who does not is the one that proves the transfer took.
-    let colleague = operator(&state).await?;
+    // A colleague holding `submit_plans` administers the organization's campaign.
+    let colleague = member_operator(&state).await?;
     set_user_org(&state, &colleague.1, Some(acme.parse()?)).await?;
     assert_eq!(
-        rename(&state, &colleague, &campaign_id, "Mine now")
+        rename(&state, &colleague, &campaign_id, "Ours")
             .await?
             .status(),
-        StatusCode::FORBIDDEN,
-        "an ordinary member of the new owner still may not administer it"
+        StatusCode::OK,
+        "a member of the owner administers it"
     );
     Ok(())
 }
@@ -1975,161 +1907,6 @@ async fn a_team_campaign(
     let team_admin = org_admin(state, &acme).await?;
     let campaign_id = create_campaign(state, &admin, "Release gate", Some(&acme)).await?;
     Ok((admin, team_admin, acme, campaign_id))
-}
-
-/// Both directions are pinned: a hand-down only a server admin could undo would
-/// be worse than none.
-#[tokio::test]
-async fn an_org_admin_hands_a_campaign_to_a_member_and_back() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let (_admin, team_admin, acme, campaign_id) = a_team_campaign(&state).await?;
-    let member = operator(&state).await?;
-    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
-    let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-
-    // Down to the member, by the organization's administrator.
-    let resp = signed_json(
-        &state,
-        &team_admin,
-        "PUT",
-        &uri,
-        &json!({ "owner": { "type": "user", "user_id": member.1 } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await?["owner"]["user_id"],
-        json!(member.1.as_str())
-    );
-
-    // It is the member's now, and not the administrator's to take back.
-    assert_eq!(
-        rename(&state, &team_admin, &campaign_id, "Mine again")
-            .await?
-            .status(),
-        StatusCode::FORBIDDEN,
-        "handing it down gives it up: a personal campaign is personal"
-    );
-
-    // But the member may return it, which is what keeps the hand-down from
-    // being one-way.
-    let resp = signed_json(
-        &state,
-        &member,
-        "PUT",
-        &uri,
-        &json!({ "owner": { "type": "org", "org_id": acme } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        rename(&state, &team_admin, &campaign_id, "Release gate v2")
-            .await?
-            .status(),
-        StatusCode::OK,
-        "and its administrator reaches it again"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn owning_a_campaign_without_submit_plans_names_the_missing_grant() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let admin = server_admin(&state).await?;
-    let acme = create_org(&state, &admin, "acme").await?;
-    let owner = registered_user(
-        &state,
-        &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
-    )
-    .await?;
-    set_user_org(&state, &owner.1, Some(acme.parse()?)).await?;
-    let campaign_id = create_campaign(&state, &owner, "Nightly", None).await?;
-    // `manage_orgs` on `acme` keeps a campaign authority, so the refusal is
-    // the per-campaign one and not the no-authority `403`.
-    grant_user(&state, &owner.1, &[UserPermission::ManageOrgs]).await?;
-
-    let resp = rename(&state, &owner, &campaign_id, "Mine now").await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        json_str(&body_json(resp).await?, "error")?,
-        "administering your own campaigns needs submit_plans"
-    );
-    let (status, read) =
-        get_as(&state, &owner, &format!("/api/v1/campaigns/{campaign_id}")).await?;
-    assert_eq!(status, StatusCode::OK, "{read}");
-    assert_eq!(read["name"], json!("Nightly"), "a refused rename wrote");
-    assert_eq!(read["owner"]["user_id"], json!(owner.1.as_str()));
-
-    // Granted it again, the same rename lands: the refusal was the grant.
-    grant_user(
-        &state,
-        &owner.1,
-        &[UserPermission::SubmitPlans, UserPermission::ManageOrgs],
-    )
-    .await?;
-    assert_eq!(
-        rename(&state, &owner, &campaign_id, "Mine now")
-            .await?
-            .status(),
-        StatusCode::OK
-    );
-    Ok(())
-}
-
-/// The roster is the boundary: an administrator may not hand a campaign to
-/// somebody outside the organization it administers, nor to an account on none.
-#[tokio::test]
-async fn a_hand_off_stops_at_the_roster_edge() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let (admin, team_admin, _acme, campaign_id) = a_team_campaign(&state).await?;
-    let rival = create_org(&state, &admin, "rival").await?;
-
-    let outsider = operator(&state).await?;
-    set_user_org(&state, &outsider.1, Some(rival.parse()?)).await?;
-    let unaffiliated = operator(&state).await?;
-    let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-
-    for (who, target) in [
-        ("another organization's member", outsider.1.clone()),
-        ("an account on no organization", unaffiliated.1.clone()),
-    ] {
-        let resp = signed_json(
-            &state,
-            &team_admin,
-            "PUT",
-            &uri,
-            &json!({ "owner": { "type": "user", "user_id": target } }),
-        )
-        .await?;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "must refuse {who}");
-    }
-
-    // An account that does not exist reads the same, so a refused hand-off does
-    // not report whether the destination is real.
-    let resp = signed_json(
-        &state,
-        &team_admin,
-        "PUT",
-        &uri,
-        &json!({ "owner": { "type": "user", "user_id": "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e" } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // The server admin, who may hand it anywhere, gets the honest `400`.
-    let resp = signed_json(
-        &state,
-        &admin,
-        "PUT",
-        &uri,
-        &json!({ "owner": { "type": "user", "user_id": "user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e" } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    Ok(())
 }
 
 /// `PUT /api/v1/campaigns/{campaign_id}/owner` as `signer`, handing it to `owner`:
@@ -2190,8 +1967,8 @@ async fn only_a_server_admin_moves_a_campaign_between_organizations() -> anyhow:
         stored_owner(&state, &campaign_id)
             .await?
             .org_id()
-            .map(ToString::to_string),
-        Some(acme.clone()),
+            .to_string(),
+        acme.as_str(),
         "a refused move leaves the campaign where it was"
     );
 
@@ -2204,8 +1981,8 @@ async fn only_a_server_admin_moves_a_campaign_between_organizations() -> anyhow:
         stored_owner(&state, &campaign_id)
             .await?
             .org_id()
-            .map(ToString::to_string),
-        Some(rival.clone())
+            .to_string(),
+        rival.as_str()
     );
     assert_eq!(
         rename(&state, &team_admin, &campaign_id, "Not ours")
@@ -2230,163 +2007,6 @@ async fn only_a_server_admin_moves_a_campaign_between_organizations() -> anyhow:
         )
         .await?,
         StatusCode::FORBIDDEN
-    );
-    Ok(())
-}
-
-/// Not to another organization, and not to a colleague: only the organization's
-/// administrator hands campaigns to members.
-#[tokio::test]
-async fn a_member_gives_its_campaign_only_to_its_own_organization() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let admin = server_admin(&state).await?;
-    let acme = create_org(&state, &admin, "acme").await?;
-    let rival = create_org(&state, &admin, "rival").await?;
-    let member = operator(&state).await?;
-    let colleague = operator(&state).await?;
-    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
-    set_user_org(&state, &colleague.1, Some(acme.parse()?)).await?;
-    let first = create_campaign(&state, &member, "First", None).await?;
-
-    for (to, owner) in [
-        (
-            "another organization",
-            json!({ "type": "org", "org_id": rival }),
-        ),
-        (
-            "a colleague",
-            json!({ "type": "user", "user_id": colleague.1 }),
-        ),
-    ] {
-        assert_eq!(
-            hand_over(&state, &member, &first, owner).await?,
-            StatusCode::FORBIDDEN,
-            "{to}"
-        );
-    }
-    assert_eq!(
-        stored_owner(&state, &first).await?.user_id(),
-        Some(&member.1),
-        "a refused hand-off leaves it the member's"
-    );
-    assert_eq!(
-        hand_over(
-            &state,
-            &member,
-            &first,
-            json!({ "type": "org", "org_id": acme })
-        )
-        .await?,
-        StatusCode::OK
-    );
-
-    // Moved to rival, the account is rival's alone: its next campaign goes to
-    // rival, and no longer to acme.
-    set_user_org(&state, &member.1, Some(rival.parse()?)).await?;
-    assert_eq!(
-        state
-            .org_store
-            .get_membership(&member.1)
-            .await?
-            .map(|org_id| org_id.to_string()),
-        Some(rival.clone())
-    );
-    let memberships: Vec<_> = state
-        .org_store
-        .list_memberships()
-        .await?
-        .into_iter()
-        .filter(|membership| membership.user_id == member.1)
-        .collect();
-    assert_eq!(memberships.len(), 1, "one membership, not two");
-
-    let second = create_campaign(&state, &member, "Second", None).await?;
-    assert_eq!(
-        hand_over(
-            &state,
-            &member,
-            &second,
-            json!({ "type": "org", "org_id": acme })
-        )
-        .await?,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        hand_over(
-            &state,
-            &member,
-            &second,
-            json!({ "type": "org", "org_id": rival })
-        )
-        .await?,
-        StatusCode::OK
-    );
-    Ok(())
-}
-
-/// Handing a campaign to an account without `submit_plans` is refused, the
-/// administrator itself included, and the campaign stays put until the grant.
-#[tokio::test]
-async fn a_hand_off_needs_an_owner_holding_submit_plans() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = seeded_state(dir.path()).await?;
-    let (_admin, team_admin, acme, campaign_id) = a_team_campaign(&state).await?;
-    let member = registered_user(&state, &[UserPermission::ReadPlans]).await?;
-    set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
-    let uri = format!("/api/v1/campaigns/{campaign_id}/owner");
-
-    for target in [&member.1, &team_admin.1] {
-        let resp = signed_json(
-            &state,
-            &team_admin,
-            "PUT",
-            &uri,
-            &json!({ "owner": { "type": "user", "user_id": target } }),
-        )
-        .await?;
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "handing it to {target}"
-        );
-        let error = json_str(&body_json(resp).await?, "error")?.to_string();
-        assert!(error.contains("owner needs submit_plans"), "{error}");
-    }
-    let (key, user_id, key_id) = &member;
-    let read = authed_user_get(
-        &state,
-        key,
-        user_id,
-        key_id,
-        &format!("/api/v1/campaigns/{campaign_id}"),
-    )
-    .await?;
-    assert_eq!(read.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(read).await?["owner"]["org_id"],
-        json!(acme),
-        "a refused hand-off leaves the campaign with its owner"
-    );
-
-    grant_user(
-        &state,
-        &member.1,
-        &[UserPermission::ReadPlans, UserPermission::SubmitPlans],
-    )
-    .await?;
-    let resp = signed_json(
-        &state,
-        &team_admin,
-        "PUT",
-        &uri,
-        &json!({ "owner": { "type": "user", "user_id": member.1 } }),
-    )
-    .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await?["owner"]["user_id"],
-        json!(member.1.as_str())
     );
     Ok(())
 }
@@ -2431,17 +2051,10 @@ async fn cancel_plan(
     Ok((status, error.to_string()))
 }
 
-/// An author's personal campaign with two plans filed, the first superseded; an
-/// ordinary member of its organization and the organization's administrator.
-/// All three hold `submit_plans` and `cancel_plans`.
+/// An acme campaign with two plans filed by a member, the first superseded.
 struct TeamHandOff {
     state: AppState,
     acme: String,
-    author: UserSigner,
-    member: UserSigner,
-    team_admin: UserSigner,
-    campaign_id: String,
-    first: PlanId,
     second: PlanId,
     _dir: tempfile::TempDir,
 }
@@ -2452,147 +2065,29 @@ impl TeamHandOff {
         let (state, _client_key, client_id) = approved_client(dir.path()).await?;
         let admin = server_admin(&state).await?;
         let acme = create_org(&state, &admin, "acme").await?;
-        let grants = [UserPermission::SubmitPlans, UserPermission::CancelPlans];
-        let author = registered_user(&state, &grants).await?;
-        let member = registered_user(&state, &grants).await?;
-        let team_admin = registered_user(
+        let author = registered_user(
             &state,
-            &[&grants[..], &[UserPermission::ManageOrgs]].concat(),
+            &[UserPermission::SubmitPlans, UserPermission::CancelPlans],
         )
         .await?;
-        let org_id: pipette_plan_types::OrgId = acme.parse()?;
-        futures::future::try_join_all(
-            [&author, &member, &team_admin]
-                .map(|signer| set_user_org(&state, &signer.1, Some(org_id.clone()))),
-        )
-        .await?;
-        let (campaign_id, first) =
-            created_campaign(&state, &author, &[("name", "Nightly")]).await?;
+        set_user_org(&state, &author.1, Some(acme.parse()?)).await?;
+        let (campaign_id, _) = created_campaign(&state, &author, &[("name", "Nightly")]).await?;
         let second = filed_plan(&state, &author, &campaign_id, &client_id, "nightly").await?;
         Ok(Self {
             state,
             acme,
-            author,
-            member,
-            team_admin,
-            campaign_id,
-            first,
             second,
             _dir: dir,
         })
     }
-
-    /// Hand the campaign to `owner` as `signer`, asserting it landed.
-    async fn hand_to(&self, signer: &UserSigner, owner: Value) -> anyhow::Result<()> {
-        let resp = signed_json(
-            &self.state,
-            signer,
-            "PUT",
-            &format!("/api/v1/campaigns/{}/owner", self.campaign_id),
-            &json!({ "owner": owner }),
-        )
-        .await?;
-        anyhow::ensure!(
-            resp.status() == StatusCode::OK,
-            "the hand-off failed with {}",
-            resp.status()
-        );
-        Ok(())
-    }
-}
-
-/// Handing a campaign to a team hands over every plan it filed, the superseded
-/// one included: members read and cancel them, administrators delete the
-/// campaign, and no plan record is rewritten.
-#[tokio::test]
-async fn handing_a_campaign_to_the_team_hands_over_its_plans() -> anyhow::Result<()> {
-    let team = TeamHandOff::new().await?;
-    let state = &team.state;
-    let plans = [&team.first, &team.second];
-    let job_id = manifest(state, &team.first)
-        .await?
-        .job_ids
-        .first()
-        .cloned()
-        .context("the first plan holds a job")?;
-    let by_job = format!("/api/v1/jobs/{job_id}/plans");
-    let (key, user_id, key_id) = &team.member;
-
-    assert_eq!(
-        plan_statuses(state, &team.member, &plans).await?,
-        [StatusCode::NOT_FOUND; 2],
-        "a personal campaign's plans are its owner's alone"
-    );
-    assert_eq!(
-        authed_user_get(state, key, user_id, key_id, &by_job)
-            .await?
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    let (status, error) = cancel_plan(state, &team.member, &team.second).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(error.contains("cancel_any_plans"), "{error}");
-
-    team.hand_to(&team.author, json!({ "type": "org", "org_id": team.acme }))
-        .await?;
-
-    assert_eq!(
-        plan_statuses(state, &team.member, &plans).await?,
-        [StatusCode::OK; 2]
-    );
-    let listing = listed_plans(state, &team.member, "/api/v1/plans").await?;
-    assert!(
-        plans
-            .iter()
-            .all(|plan_id| listing.contains(&plan_id.to_string())),
-        "{listing:?}"
-    );
-    let resp = authed_user_get(state, key, user_id, key_id, &by_job).await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await?["plans"][0]["plan_id"],
-        json!(team.first.as_str())
-    );
-
-    assert_eq!(
-        plan_statuses(state, &team.author, &plans).await?,
-        [StatusCode::OK; 2],
-        "the author reads them as any member does"
-    );
-
-    // The team's plans are each member's to cancel, the author's included.
-    for (signer, plan_id) in [(&team.member, &team.first), (&team.author, &team.second)] {
-        let (status, error) = cancel_plan(state, signer, plan_id).await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{error}");
-    }
-    // The record is the administrators'.
-    let delete = format!("/api/v1/campaigns/{}", team.campaign_id);
-    let resp = signed_empty(state, &team.member, "DELETE", &delete).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let resp = signed_empty(state, &team.team_admin, "DELETE", &delete).await?;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    for plan_id in plans {
-        let stored = manifest(state, plan_id).await?;
-        assert_eq!(stored.submitted_by.as_ref(), Some(&team.author.1));
-        assert_eq!(
-            stored.campaign_id.map(|id| id.to_string()),
-            Some(team.campaign_id.clone()),
-            "the plan still names the campaign that filed it"
-        );
-    }
-    Ok(())
 }
 
 /// `cancel_plans` reaches the team's plans on membership alone, from a member
-/// who files nothing, and reaches none of them from outside the organization,
-/// on no organization or on another.
+/// who files nothing, and reaches none of them from outside the organization.
 #[tokio::test]
 async fn a_member_holding_cancel_plans_alone_cancels_the_team_s_plan() -> anyhow::Result<()> {
     let team = TeamHandOff::new().await?;
     let state = &team.state;
-    team.hand_to(&team.author, json!({ "type": "org", "org_id": team.acme }))
-        .await?;
     let outsider = registered_user(state, &[UserPermission::CancelPlans]).await?;
     let rival = registered_user(state, &[UserPermission::CancelPlans]).await?;
     let other = create_org(state, &server_admin(state).await?, "rival").await?;
@@ -2607,185 +2102,6 @@ async fn a_member_holding_cancel_plans_alone_cancels_the_team_s_plan() -> anyhow
     }
     let (status, error) = cancel_plan(state, &canceller, &team.second).await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{error}");
-    Ok(())
-}
-
-/// A disabled member's personal campaign is its organization's administrator's
-/// to wind down: it reads the record, cancels the plans and hands it over. It
-/// reads no plan and files nothing before that. An active member's campaign
-/// stays personal, and nobody else gains anything.
-#[tokio::test]
-async fn an_org_admin_winds_down_a_disabled_member_s_campaign() -> anyhow::Result<()> {
-    let team = TeamHandOff::new().await?;
-    let state = &team.state;
-    let record = format!("/api/v1/campaigns/{}", team.campaign_id);
-    let plans = [&team.first, &team.second];
-    let reads = async |signer: &UserSigner| -> anyhow::Result<StatusCode> {
-        Ok(signed_empty(state, signer, "GET", &record).await?.status())
-    };
-    let to_acme = json!({ "owner": { "type": "org", "org_id": team.acme } });
-    let hands_over = async |signer: &UserSigner| -> anyhow::Result<StatusCode> {
-        let uri = format!("{record}/owner");
-        Ok(signed_json(state, signer, "PUT", &uri, &to_acme)
-            .await?
-            .status())
-    };
-
-    // While its owner is active, it is personal.
-    assert_eq!(reads(&team.team_admin).await?, StatusCode::FORBIDDEN);
-    assert_eq!(hands_over(&team.team_admin).await?, StatusCode::FORBIDDEN);
-    let (status, error) = cancel_plan(state, &team.team_admin, &team.second).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(error.contains("cancel_any_plans"), "{error}");
-
-    set_user_status(state, &team.author.1, UserStatus::Disabled).await?;
-
-    // The administrator reads the record, listed with its organization's.
-    let overview = signed_empty(
-        state,
-        &team.team_admin,
-        "GET",
-        &format!("{record}/overview"),
-    )
-    .await?;
-    assert_eq!(overview.status(), StatusCode::OK);
-    assert_eq!(body_json(overview).await?["may_administer"], json!(true));
-    // The app's hand-over field asks where it may go.
-    let owners = signed_empty(
-        state,
-        &team.team_admin,
-        "GET",
-        &format!("{record}/owners?q="),
-    )
-    .await?;
-    assert_eq!(owners.status(), StatusCode::OK);
-    let listing = signed_empty(state, &team.team_admin, "GET", "/api/v1/campaigns").await?;
-    let listing = body_json(listing).await?;
-    let listed = listing["items"]
-        .as_array()
-        .context("the listing has items")?
-        .iter()
-        .any(|row| row["campaign_id"] == json!(team.campaign_id));
-    assert!(listed, "{listing}");
-
-    // Not its plans, and it files nothing into it.
-    assert_eq!(
-        plan_statuses(state, &team.team_admin, &plans).await?,
-        [StatusCode::NOT_FOUND; 2]
-    );
-    let document = signed_empty(
-        state,
-        &team.team_admin,
-        "GET",
-        &format!("{record}/document"),
-    )
-    .await?;
-    assert_eq!(document.status(), StatusCode::FORBIDDEN);
-
-    // A member gains nothing, nor does another organization's administrator.
-    let rival = create_org(state, &server_admin(state).await?, "rival").await?;
-    let rival_admin = org_admin(state, &rival).await?;
-    for signer in [&team.member, &rival_admin] {
-        assert_eq!(reads(signer).await?, StatusCode::FORBIDDEN);
-        assert_eq!(hands_over(signer).await?, StatusCode::FORBIDDEN);
-    }
-
-    for plan_id in plans {
-        let (status, error) = cancel_plan(state, &team.team_admin, plan_id).await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{error}");
-    }
-    assert_eq!(hands_over(&team.team_admin).await?, StatusCode::OK);
-    assert_eq!(
-        plan_statuses(state, &team.team_admin, &plans).await?,
-        [StatusCode::OK; 2],
-        "handed over, its plans are the organization's"
-    );
-    Ok(())
-}
-
-/// The wind-down stops at rank, as account administration does: a disabled
-/// member holding a server-wide name the administrator lacks keeps its
-/// campaign.
-#[tokio::test]
-async fn an_org_admin_winds_down_no_campaign_of_an_account_that_outranks_it() -> anyhow::Result<()>
-{
-    let team = TeamHandOff::new().await?;
-    let state = &team.state;
-    state
-        .user_store
-        .mutate_user_permissions(&team.author.1, &|set| {
-            set.insert_all([UserPermission::ReadAnyPlans])
-        })
-        .await?;
-    set_user_status(state, &team.author.1, UserStatus::Disabled).await?;
-
-    let record = format!("/api/v1/campaigns/{}", team.campaign_id);
-    let resp = signed_empty(state, &team.team_admin, "GET", &record).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let (status, _) = cancel_plan(state, &team.team_admin, &team.second).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    Ok(())
-}
-
-/// Handing the campaign on hands its plans on with it: once the team's
-/// administrator hands it down to a member, it is that member's personal
-/// campaign, and nobody else on the team reads its plans.
-#[tokio::test]
-async fn handing_a_campaign_on_takes_its_plans_with_it() -> anyhow::Result<()> {
-    let team = TeamHandOff::new().await?;
-    let state = &team.state;
-    let plans = [&team.first, &team.second];
-    team.hand_to(&team.author, json!({ "type": "org", "org_id": team.acme }))
-        .await?;
-    team.hand_to(
-        &team.team_admin,
-        json!({ "type": "user", "user_id": team.member.1 }),
-    )
-    .await?;
-
-    for signer in [&team.author, &team.team_admin] {
-        assert_eq!(
-            plan_statuses(state, signer, &plans).await?,
-            [StatusCode::NOT_FOUND; 2]
-        );
-    }
-    assert_eq!(
-        plan_statuses(state, &team.member, &plans).await?,
-        [StatusCode::OK; 2]
-    );
-    let (status, error) = cancel_plan(state, &team.member, &team.second).await?;
-    assert_eq!(status, StatusCode::ACCEPTED, "{error}");
-    Ok(())
-}
-
-/// `scope=mine` is the plans of the caller's campaigns and its organization's,
-/// whoever filed them: a `read_any_plans` holder narrowing to it keeps a
-/// colleague's plans in the team's campaign and drops a stranger's.
-#[tokio::test]
-async fn narrowing_to_mine_keeps_the_team_s_campaigns() -> anyhow::Result<()> {
-    let team = TeamHandOff::new().await?;
-    let state = &team.state;
-    team.hand_to(&team.author, json!({ "type": "org", "org_id": team.acme }))
-        .await?;
-    let (_, stranger_plan) =
-        created_campaign(state, &operator(state).await?, &[("name", "Elsewhere")]).await?;
-    grant_user(
-        state,
-        &team.member.1,
-        &[UserPermission::SubmitPlans, UserPermission::ReadAnyPlans],
-    )
-    .await?;
-
-    let mine = listed_plans(state, &team.member, "/api/v1/plans?scope=mine").await?;
-    assert!(
-        [&team.first, &team.second]
-            .iter()
-            .all(|plan_id| mine.contains(&plan_id.to_string())),
-        "{mine:?}"
-    );
-    assert!(!mine.contains(&stranger_plan.to_string()), "{mine:?}");
-    let every = listed_plans(state, &team.member, "/api/v1/plans").await?;
-    assert!(every.contains(&stranger_plan.to_string()), "{every:?}");
     Ok(())
 }
 
@@ -3009,7 +2325,11 @@ async fn the_id_and_the_pointer_survive_the_writes() -> anyhow::Result<()> {
     let (state, _client_key, client_id) = approved_client(dir.path()).await?;
     let owner = registered_user(
         &state,
-        &[UserPermission::SubmitPlans, UserPermission::ReadPlans],
+        &[
+            UserPermission::SubmitPlans,
+            UserPermission::ReadPlans,
+            UserPermission::ManageOrgs,
+        ],
     )
     .await?;
     let campaign_id = create_campaign(&state, &owner, "Nightly", None).await?;
@@ -3085,7 +2405,7 @@ async fn a_rename_refuses_a_field_it_does_not_take() -> anyhow::Result<()> {
     let uri = format!("/api/v1/campaigns/{campaign_id}");
     let (key, user_id, key_id) = &owner;
     let before = body_json(authed_user_get(&state, key, user_id, key_id, &uri).await?).await?;
-    let caller = json!({ "type": "user", "user_id": user_id.as_str() });
+    let caller = json!({ "type": "org", "org_id": org_of(&state, user_id).await? });
 
     for (body, field) in [
         (json!({ "nmae": "Renamed" }), "nmae"),
@@ -3306,10 +2626,15 @@ async fn an_archived_campaign_files_no_plan() -> anyhow::Result<()> {
     let overview = format!("{uri}/overview");
     patch_campaign(&state, &owner, &uri, json!({ "state": "archived" })).await?;
 
-    let filings: Vec<_> = writes_to(&campaign_id, &first, job.as_str(), &owner.1)
-        .into_iter()
-        .filter(|write| write.method == "POST")
-        .collect();
+    let filings: Vec<_> = writes_to(
+        &campaign_id,
+        &first,
+        job.as_str(),
+        &org_of(&state, &owner.1).await?,
+    )
+    .into_iter()
+    .filter(|write| write.method == "POST")
+    .collect();
     for write in &filings {
         let resp = send_write_as(&state, &owner, write).await?;
         let answered = resp.status();
@@ -3390,9 +2715,14 @@ async fn a_locked_campaign_keeps_its_head() -> anyhow::Result<()> {
     let (_, listed) = get_as(&state, &owner, "/api/v1/campaigns?state=active,locked").await?;
     assert_eq!(campaign_ids(&listed)?, vec![campaign_id.clone()]);
 
-    let filings = writes_to(&campaign_id, &first, job.as_str(), &owner.1)
-        .into_iter()
-        .filter(|write| write.method == "POST");
+    let filings = writes_to(
+        &campaign_id,
+        &first,
+        job.as_str(),
+        &org_of(&state, &owner.1).await?,
+    )
+    .into_iter()
+    .filter(|write| write.method == "POST");
     for write in filings {
         let resp = send_write_as(&state, &owner, &write).await?;
         let answered = resp.status();
@@ -3817,6 +3147,7 @@ async fn deleting_a_campaign_waits_for_its_plans_and_keeps_them() -> anyhow::Res
             UserPermission::SubmitPlans,
             UserPermission::ReadPlans,
             UserPermission::CancelPlans,
+            UserPermission::ManageOrgs,
         ],
     )
     .await?;
@@ -3882,7 +3213,11 @@ async fn a_deleted_campaign_s_plan_takes_cancel_any_plans() -> anyhow::Result<()
     let state = seeded_state(dir.path()).await?;
     let author = registered_user(
         &state,
-        &[UserPermission::SubmitPlans, UserPermission::CancelPlans],
+        &[
+            UserPermission::SubmitPlans,
+            UserPermission::CancelPlans,
+            UserPermission::ManageOrgs,
+        ],
     )
     .await?;
     let (campaign_id, plan_id) = created_campaign(&state, &author, &[("name", "Nightly")]).await?;
@@ -3915,9 +3250,8 @@ async fn a_deleted_campaign_s_plan_takes_cancel_any_plans() -> anyhow::Result<()
 
 // ── listing ─────────────────────────────────────────────────────────────────
 
-/// The listing is the reach: an account sees its own campaigns and its
-/// organization's, and nobody else's. The `owner` filter narrows inside that,
-/// and never widens it.
+/// The listing is the reach: an account sees its organization's campaigns,
+/// and nobody else's. The `owner` filter never widens it.
 #[tokio::test]
 async fn the_listing_shows_the_callers_reach() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3947,17 +3281,14 @@ async fn the_listing_shows_the_callers_reach() -> anyhow::Result<()> {
     assert_eq!(seen, expected, "a stranger's campaign is not in reach");
     assert!(!seen.contains(&theirs));
 
-    // The two filters inside the reach.
-    let body = body_json(
-        authed_user_get(&state, key, user_id, key_id, "/api/v1/campaigns?owner=mine").await?,
-    )
-    .await?;
-    assert_eq!(campaign_ids(&body)?, vec![mine]);
+    // The filter inside the reach.
     let body = body_json(
         authed_user_get(&state, key, user_id, key_id, "/api/v1/campaigns?owner=org").await?,
     )
     .await?;
-    assert_eq!(campaign_ids(&body)?, vec![team]);
+    let mut filtered = campaign_ids(&body)?;
+    filtered.sort();
+    assert_eq!(filtered, expected);
 
     // The server admin sees every one of them.
     let (key, user_id, key_id) = &admin;
@@ -3968,8 +3299,8 @@ async fn the_listing_shows_the_callers_reach() -> anyhow::Result<()> {
 }
 
 /// `org_id` on its own narrows the listing to that organization's campaigns,
-/// dropping the caller's personal ones, and naming an organization outside the
-/// reach is an empty page rather than a refusal or a widening.
+/// and naming an organization outside the reach is an empty page rather than a
+/// refusal or a widening.
 #[tokio::test]
 async fn the_org_id_filter_narrows_inside_the_reach() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3984,8 +3315,7 @@ async fn the_org_id_filter_narrows_inside_the_reach() -> anyhow::Result<()> {
     .await?;
     set_user_org(&state, &member.1, Some(acme.parse()?)).await?;
 
-    // A personal campaign the filter must drop, and one the reach must hide.
-    create_campaign(&state, &member, "Mine", None).await?;
+    // One the reach must hide.
     let team = create_campaign(&state, &member, "Team", Some(&acme)).await?;
     create_campaign(&state, &admin, "Rival", Some(&rival)).await?;
 
@@ -4255,10 +3585,10 @@ async fn a_malformed_request_is_refused_at_the_boundary() -> anyhow::Result<()> 
 
 // ── variant edits ───────────────────────────────────────────────────────────
 
-/// An account that may edit the variants of its own campaign
-/// ([`pipette_web_testkit::FULL_EDITOR`]).
+/// An account that may edit the variants of its organization's campaign and
+/// administer it ([`pipette_web_testkit::FULL_OWNER`]).
 async fn editor(state: &AppState) -> anyhow::Result<UserSigner> {
-    registered_user(state, pipette_web_testkit::FULL_EDITOR).await
+    registered_user(state, pipette_web_testkit::FULL_OWNER).await
 }
 
 /// Post `edit` to `POST /api/v1/campaigns/{campaign_id}/variants` as `signer`.
@@ -5152,6 +4482,79 @@ async fn a_revision_inherits_another_campaigns_finished_runs() -> anyhow::Result
     Ok(())
 }
 
+/// `inherit_failed` lets a revision take another campaign's device timeout
+/// of a cell in place of its own queued job; without it the job stays.
+#[tokio::test]
+async fn a_revision_inherits_a_failed_run_when_asked() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = editor(&state).await?;
+    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let queued = manifest(&state, &first)
+        .await?
+        .job_ids
+        .first()
+        .cloned()
+        .context("the campaign's job")?;
+    let routed = ONE_CELL_PLAN.replace(
+        "requires = [\"os:macos\"]",
+        "requires = [\"os:macos\", \"tag:lab-boston\"]",
+    );
+    let (_, donor) = created_campaign_from(&state, &owner, &[("name", "donor")], &routed).await?;
+    let failed = manifest(&state, &donor)
+        .await?
+        .job_ids
+        .first()
+        .cloned()
+        .context("the donor's job")?;
+    let record = json!({
+        "job_id": failed.as_str(),
+        "message_type": "failure",
+        "failure_source": "client",
+        "failure_code": "attempt_timeout",
+        "failure_reason": "attempt timed out",
+    });
+    state
+        .submission_store
+        .write_processed(&failed, &record)
+        .await?;
+    state.todo_store.delete_avail_by_job(&failed).await?;
+    let dry_run = |inherit_failed: bool| {
+        format!(
+            "?base_plan_id={first}&inherit_from={donor}&inherit_failed={inherit_failed}&dry_run=true"
+        )
+    };
+
+    let resp =
+        revise_document(&state, &owner, &campaign_id, &dry_run(false), ONE_CELL_PLAN).await?;
+    let body = body_json(resp).await?;
+    assert_eq!(body["inherited_job_count"], 0, "{body}");
+    assert_eq!(body["inherited_failed_job_count"], 0, "{body}");
+    assert_eq!(body["carried_job_count"], 1, "{body}");
+
+    let resp = revise_document(&state, &owner, &campaign_id, &dry_run(true), ONE_CELL_PLAN).await?;
+    let body = body_json(resp).await?;
+    assert_eq!(body["inherited_job_count"], 1, "{body}");
+    assert_eq!(body["inherited_failed_job_count"], 1, "{body}");
+    assert_eq!(body["held_jobs"][0]["failed"], true, "{body}");
+    assert_eq!(body["dropped_job_ids"], json!([queued.as_str()]));
+
+    let resp = revise_document(
+        &state,
+        &owner,
+        &campaign_id,
+        &format!("?base_plan_id={first}&inherit_from={donor}&inherit_failed=true"),
+        ONE_CELL_PLAN,
+    )
+    .await?;
+    let status = resp.status();
+    let body = body_json(resp).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let revision = PlanId::try_new(json_str(&body["plan"], "plan_id")?)?;
+    assert_eq!(manifest(&state, &revision).await?.job_ids, vec![failed]);
+    Ok(())
+}
+
 /// A revision can inherit from at most 32 plans, including plans in
 /// `add_from` and `restore`. The server refuses an edit above the limit
 /// before it reads a plan.
@@ -5345,6 +4748,114 @@ async fn a_revision_carries_a_run_across_a_limit_when_asked(
     let resp = signed_empty(state, &owner, "GET", &format!("/api/v1/plans/{revision}")).await?;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await?["change"], change);
+    Ok(())
+}
+
+/// A cell of the new model takes a copy of the old model's finished run, on
+/// both revision routes. Neither model is pinned, so no checksum is compared.
+#[rstest]
+#[case::document(false)]
+#[case::variants(true)]
+#[tokio::test]
+async fn a_revision_copies_a_run_under_a_replacing_model(
+    #[case] variants: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = seeded_state(dir.path()).await?;
+    let owner = editor(&state).await?;
+    let (campaign_id, first) = created_campaign(&state, &owner, &[("name", "Nightly")]).await?;
+    let ran = manifest(&state, &first).await?.job_ids[0].clone();
+    pipette_store_testkit::finish_job_with_success_on_build(
+        state.submission_store.as_ref(),
+        state.todo_store.as_ref(),
+        &ran,
+        "prefill_throughput",
+        None,
+    )
+    .await?;
+    let (old, new) = (
+        "LiquidAI/LFM2.5-350M-MLX-4bit",
+        "LiquidAI/LFM2.5-350M-MLX-4bit-copy",
+    );
+    let document = ONE_CELL_PLAN.replace(
+        "repo_name = \"LFM2.5-350M-MLX-4bit\"",
+        "repo_name = \"LFM2.5-350M-MLX-4bit-copy\"",
+    );
+    let replaced = json!([{"from": old, "to": new, "verified": false}]);
+    let (document, change) = if variants {
+        (
+            document.replace("benchmarks = [\"prefill_throughput_256\"]", "remove = [0]"),
+            json!({
+                "type": "variants", "removed_variant_count": 1, "added_variant_count": 1,
+                "replace_model": replaced
+            }),
+        )
+    } else {
+        (
+            document,
+            json!({"type": "document", "replace_model": replaced}),
+        )
+    };
+    let revise = |query: String| {
+        let (state, owner, campaign_id, document) = (&state, &owner, &campaign_id, &document);
+        async move {
+            let resp = if variants {
+                edit_variants(state, owner, campaign_id, &query, document).await?
+            } else {
+                revise_document(state, owner, campaign_id, &query, document).await?
+            };
+            let status = resp.status();
+            anyhow::Ok((status, body_json(resp).await?))
+        }
+    };
+
+    let (status, body) = revise(format!(
+        "?base_plan_id={first}&replace_model={old}%3D{new}-other"
+    ))
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(head(&state, &campaign_id).await?, Some(first.clone()));
+
+    let query = format!("?base_plan_id={first}&replace_model={old}%3D{new}");
+    let (status, body) = revise(format!("{query}&dry_run=true")).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replaced_job_count"], 1);
+    assert_eq!(body["new_job_count"], 0);
+    assert_eq!(body["dropped_job_ids"], json!([]));
+    assert_eq!(
+        body["replaced_jobs"],
+        json!([{"body_index": 0, "plan_id": first.as_str(), "job_id": ran.as_str()}])
+    );
+    assert_eq!(body["replaced_models"], replaced);
+
+    let (status, body) = revise(query).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["replaced_job_count"], 1);
+    assert_eq!(body["dropped_job_count"], 0);
+    assert_eq!(body["plan"]["change"], change);
+    let revision = PlanId::try_new(json_str(&body["plan"], "plan_id")?)?;
+    let copied = manifest(&state, &revision).await?.job_ids;
+    let [copy] = copied.as_slice() else {
+        anyhow::bail!("one job, not {copied:?}");
+    };
+    assert_ne!(*copy, ran);
+    assert!(
+        !state
+            .todo_store
+            .list_avail_entries()
+            .await?
+            .iter()
+            .any(|entry| entry.job_id == *copy)
+    );
+    let record = state
+        .submission_store
+        .find_job(copy)
+        .await?
+        .context("the copy")?
+        .body;
+    assert_eq!(record["rescored_from"], ran.as_str());
+    let model: Value = serde_json::from_str(json_str(&record, "model_descriptor")?)?;
+    assert_eq!(model["repo_name"], "LFM2.5-350M-MLX-4bit-copy");
     Ok(())
 }
 
@@ -6542,8 +6053,8 @@ async fn a_revert_that_files_nothing(
         .get_campaign(&CampaignId::try_new(campaign_id.as_str())?)
         .await?
         .context("the campaign")?;
-    campaign.owner = CampaignOwner::User {
-        user_id: owner.1.clone(),
+    campaign.owner = CampaignOwner::Org {
+        org_id: org_of(&state, &owner.1).await?,
     };
     state.campaign_store.put_campaign(&campaign).await?;
     let (_, foreign) = created_campaign(&state, &author, &[("name", "Other")]).await?;

@@ -186,31 +186,19 @@ impl VaultResourceId {
     }
 }
 
-/// Who a vault fetch is for: an organization or an account, as one bare id
-/// string told apart by its prefix.
+/// Who a vault fetch is for, as one bare id string: the owning organization.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
 pub enum VaultPrincipalId {
     Org(OrgId),
-    User(UserId),
 }
 
 impl std::str::FromStr for VaultPrincipalId {
     type Err = PrincipalIdError;
 
-    /// Dispatched on the prefix, so a value of neither kind is refused as such.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        if s.starts_with(OrgId::PREFIX) {
-            return Ok(Self::Org(OrgId::try_new(s)?));
-        }
-        if s.starts_with(UserId::PREFIX) {
-            return Ok(Self::User(UserId::try_new(s)?));
-        }
-        Err(PrincipalIdError::UnknownKind {
-            kind: "principal id",
-        })
+        Ok(Self::Org(OrgId::try_new(s.trim())?))
     }
 }
 
@@ -226,7 +214,6 @@ impl std::fmt::Display for VaultPrincipalId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Org(org_id) => org_id.fmt(f),
-            Self::User(user_id) => user_id.fmt(f),
         }
     }
 }
@@ -302,10 +289,6 @@ pub enum PrincipalIdError {
         kind: &'static str,
         prefix: &'static str,
     },
-
-    /// A [`VaultPrincipalId`] that starts with neither prefix.
-    #[error("{kind} must start with `org_` or `user_`")]
-    UnknownKind { kind: &'static str },
 }
 
 /// An organization's handle, such as `acme` or `liquid-edge`: the stable name
@@ -388,11 +371,49 @@ fn validate_org_slug(s: &str) -> Result<(), OrgSlugError> {
     Ok(())
 }
 
+/// The qualifier reserved for entries in the catalog's global scope.
+pub(crate) const GLOBAL_CATALOG_QUALIFIER: &str = "global";
+
+/// An organization tried to claim a slug nobody may choose.
+#[derive(Debug, thiserror::Error)]
+pub enum ReservedOrgSlugError {
+    #[error(
+        "organization slug {slug:?} is reserved: the descriptor catalog spells a global entry `{slug}/<name>`",
+        slug = GLOBAL_CATALOG_QUALIFIER
+    )]
+    Global,
+    #[error(
+        "organization slug {0:?} is reserved: a slug starting `{prefix}` names the organization an account gets at sign-up",
+        prefix = OrgSlug::PERSONAL_PREFIX
+    )]
+    Personal(String),
+}
+
 impl OrgSlug {
     pub const MAX_LEN: usize = 64;
+    /// What the slug of an account's own organization starts with.
+    pub const PERSONAL_PREFIX: &'static str = "u-";
 
     pub fn as_str(&self) -> &str {
         self.as_ref()
+    }
+
+    /// The slug of `user_id`'s own organization: its id behind
+    /// [`Self::PERSONAL_PREFIX`], unique as the id is and claimable by nobody else.
+    pub fn personal(user_id: &UserId) -> Result<Self, OrgSlugError> {
+        let id = user_id.as_str().trim_start_matches(UserId::PREFIX);
+        Self::try_new(format!("{}{id}", Self::PERSONAL_PREFIX))
+    }
+
+    /// Call this method before you claim a slug. Stored records still parse.
+    pub fn refuse_reserved(&self) -> Result<(), ReservedOrgSlugError> {
+        if self.as_str() == GLOBAL_CATALOG_QUALIFIER {
+            return Err(ReservedOrgSlugError::Global);
+        }
+        if self.as_str().starts_with(Self::PERSONAL_PREFIX) {
+            return Err(ReservedOrgSlugError::Personal(self.to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -654,13 +675,13 @@ mod tests {
         VaultResourceId::try_new("org_a3f8").err(),
         "vault resource id must start with `vault_`"
     )]
-    #[case::principal_of_neither_kind(
-        "acme".parse::<VaultPrincipalId>().err(),
-        "principal id must start with `org_` or `user_`"
+    #[case::principal_not_an_org(
+        "user_01936d".parse::<VaultPrincipalId>().err(),
+        "organization id must start with `org_`"
     )]
-    #[case::principal_of_a_known_kind(
-        "user_has space".parse::<VaultPrincipalId>().err(),
-        "user id contains ' '; allowed: [A-Za-z0-9_-]"
+    #[case::principal_malformed(
+        "org_has space".parse::<VaultPrincipalId>().err(),
+        "organization id contains ' '; allowed: [A-Za-z0-9_-]"
     )]
     fn a_refused_id_names_the_shape(
         #[case] refusal: Option<PrincipalIdError>,
@@ -766,36 +787,22 @@ mod tests {
         assert_eq!(VaultResourceId::try_new(raw).is_ok(), accepted, "{raw:?}");
     }
 
-    /// Each prefix parses to its own kind; a client id is neither.
+    /// Only an organization id; an account or a client id is neither.
     #[rstest::rstest]
     #[case::org("org_01936d", true)]
-    #[case::user("user_01936d", true)]
+    #[case::user("user_01936d", false)]
     #[case::padded(" org_01936d ", true)]
     #[case::handle("acme", false)]
     #[case::client("ev1_a3f8", false)]
     #[case::empty("", false)]
     #[case::inner_space("org_has space", false)]
-    fn a_principal_id_accepts_exactly_the_two_kinds(#[case] raw: &str, #[case] accepted: bool) {
+    fn a_principal_id_accepts_an_organization_alone(#[case] raw: &str, #[case] accepted: bool) {
         assert_eq!(raw.parse::<VaultPrincipalId>().is_ok(), accepted, "{raw:?}");
-    }
-
-    #[test]
-    fn a_principal_id_routes_each_prefix_to_its_own_kind() -> Result<(), PrincipalIdError> {
-        assert!(matches!(
-            "org_01936d".parse::<VaultPrincipalId>()?,
-            VaultPrincipalId::Org(_)
-        ));
-        assert!(matches!(
-            "user_01936d".parse::<VaultPrincipalId>()?,
-            VaultPrincipalId::User(_)
-        ));
-        Ok(())
     }
 
     /// One bare string on the wire, both directions.
     #[rstest::rstest]
     #[case("org_01936d")]
-    #[case("user_01936d")]
     fn a_principal_id_round_trips_as_a_bare_string(
         #[case] raw: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1156,6 +1163,36 @@ mod tests {
     fn tag_serializes_transparently() -> anyhow::Result<()> {
         let t = Tag::try_new("team-mobile")?;
         assert_eq!(serde_json::to_value(&t)?, json!("team-mobile"));
+        Ok(())
+    }
+
+    /// The parser accepts reserved slugs in stored records. Organization creation
+    /// checks for reserved slugs after the parser converts uppercase letters to lowercase.
+    #[rstest]
+    #[case::reserved("global", false)]
+    #[case::folded("GLOBAL", false)]
+    #[case::padded(" Global ", false)]
+    #[case::longer("globals", true)]
+    #[case::ordinary("acme", true)]
+    #[case::personal("u-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e", false)]
+    #[case::personal_folded("U-acme", false)]
+    #[case::infix("team-u-acme", true)]
+    fn a_reserved_slug_parses_but_is_refused_for_a_create(
+        #[case] raw: &str,
+        #[case] claimable: bool,
+    ) -> anyhow::Result<()> {
+        let slug = OrgSlug::try_new(raw)?;
+        assert_eq!(slug.refuse_reserved().is_ok(), claimable, "{raw:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_personal_slug_is_the_user_id_behind_the_reserved_prefix() -> anyhow::Result<()> {
+        let user_id = UserId::try_new("user_0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e")?;
+        let slug = OrgSlug::personal(&user_id)?;
+        assert_eq!(slug.as_str(), "u-0195c3e2-a4f3-7b8c-9d1e-2f3a4b5c6d7e");
+        assert_eq!(OrgSlug::try_new(slug.as_str())?, slug, "a valid slug");
+        assert!(slug.refuse_reserved().is_err());
         Ok(())
     }
 }

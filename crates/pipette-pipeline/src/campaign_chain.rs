@@ -185,7 +185,7 @@ mod tests {
     use pipette_core::campaign::{Campaign, CampaignOwner, NewCampaign};
     use pipette_core::plan::PlanManifest;
     use pipette_core::types::Mint;
-    use pipette_plan_types::{NonEmptyTrimmedString, PlanStatus, UserId};
+    use pipette_plan_types::{NonEmptyTrimmedString, OrgId, PlanStatus};
     use pipette_store_fs::build_local_fs_plan_store;
 
     use super::*;
@@ -227,8 +227,8 @@ mod tests {
     fn campaign_on(head: Option<PlanId>) -> anyhow::Result<Campaign> {
         let campaign = NewCampaign::new(
             NonEmptyTrimmedString::try_new("Nightly")?,
-            CampaignOwner::User {
-                user_id: UserId::mint(),
+            CampaignOwner::Org {
+                org_id: OrgId::mint(),
             },
         )
         .around(PlanId::from_uuid(uuid::Uuid::now_v7()), Timestamp::now());

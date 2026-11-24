@@ -75,7 +75,7 @@
   <p class="muted">The result rows of each campaign's answered jobs whose model has no entry in the model params table,
     so the plan pages show them without parameter counts, by the key that entry takes; a row that names no model is
     left out. The pages show an entry's counts on those rows once it is added.</p>
-  <DataTable {spec} rows={gaps} id={(gap) => gap.key} noun="keys" empty="No row read lacks model params."
+  <DataTable {spec} rows={gaps} id={(gap) => gap.key} noun="keys" name="gaps" empty="No row read lacks model params."
              action={gaps.some((gap) => paramsWrite(reader, gap.key)) ? write : undefined} />
   <div class="hint ok" role="status" tabindex="-1" hidden={!said} bind:this={status}>{said}</div>
   {#if adding}

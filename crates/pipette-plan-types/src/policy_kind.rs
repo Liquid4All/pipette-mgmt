@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// The check a campaign group policy acts on. A cell the check flags is re-run
 /// up to the policy's `max_reruns` times; what becomes of a cell still flagged
-/// after that is fixed per check. `ModelParams` and `SmallerFailed` only flag. Ordered as listed,
-/// which is kind order.
+/// after that is fixed per check. `ModelParams`, `SmallerFailed` and `VaultResource` only flag.
+/// Ordered as listed, which is kind order.
 #[derive(
     Debug,
     Clone,
@@ -44,4 +44,8 @@ pub enum PolicyKind {
     /// their sizes, holds a larger job with rows and no failure. Only the
     /// preview reads it; it never re-runs or marks a job, and files nothing.
     SmallerFailed,
+    /// A job whose model or runtime is a vault resource: its job source names a
+    /// `vault_*` source, a gated Hugging Face model copied into the vault
+    /// included. It never re-runs or marks a job, and files nothing.
+    VaultResource,
 }

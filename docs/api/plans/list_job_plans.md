@@ -7,10 +7,7 @@ the body that the job ran, with `job_id` and `expires_at` stamped. The
 job source stays after the job leaves the queue, so this route also answers
 for a finished job.
 
-A **user** route. It gates on `read_plans`, widened by `read_any_plans`
-([permissions](../users.md#permissions)). It admits each
-plan exactly as
-[`GET /api/v1/plans/{plan_id}`](get_plan.md) does.
+It admits each plan exactly as [`GET /api/v1/plans/{plan_id}`](get_plan.md) does.
 The response leaves out each plan that the caller's scope does not admit, so it
 names no plan of another tenant. If no plan remains, the route answers `404`.
 The same `404` answers for a job that no plan links, so a caller cannot learn
@@ -47,7 +44,6 @@ cancel markers do not list.
 | Status | When |
 |--------|------|
 | 200 | The plans in the caller's scope that asked for the job, and the job's body |
-| 400 | `job_id` in the path contains characters outside `[A-Za-z0-9-]` |
 | 401 | Missing or invalid auth headers, or an `X-Client-Id` that is not a `user_…` |
 | 403 | Caller holds neither `read_plans` nor `read_any_plans` |
 | 404 | No readable linked plan can be confirmed in the caller's scope, including when the only linked manifests cannot be read. The message is `no readable plan holds this job` |

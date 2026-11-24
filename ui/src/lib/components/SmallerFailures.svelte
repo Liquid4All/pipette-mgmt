@@ -27,6 +27,6 @@
     no failure: the same benchmark, model, runtime and flags, with no size smaller and at least one larger, such as a
     longer context. Each is shown with the smallest such clean job. Every failure counts, a device's, a mark, a
     deadline or the queue's for a smaller run that failed.</p>
-  <DataTable {spec} rows={found} id={(row) => `${row.campaign_id}/${row.job_id}`} noun="jobs" cells={{ name }}
+  <DataTable {spec} rows={found} id={(row) => `${row.campaign_id}/${row.job_id}`} noun="jobs" name="smaller" cells={{ name }}
              empty="No failed job has a clean larger run." />
 </section>

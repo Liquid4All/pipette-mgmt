@@ -35,4 +35,3 @@ other names for the same digest. The lookup matches the whole digest.
 |--------|------|
 | 200 | Ranked names for known digests |
 | 400 | Digests are missing, invalid, or more than 100 |
-| 404 | The server has no `[database]` catalog |
